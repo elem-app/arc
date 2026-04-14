@@ -1,0 +1,27 @@
+{
+  "name": "arc",
+  "version": "0.1.0",
+  "description": "Parser and runtime for Arc scripts",
+  "private": false,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    "./types": "./src/types.ts",
+    "./parser": "./src/parser/index.ts",
+    "./runtime": "./src/runtime/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "acorn": "^8.14.1",
+    "acorn-walk": "^8.3.4"
+  },
+  "devDependencies": {
+    "prettier": "^3.8.2",
+    "prettier-plugin-organize-imports": "^4.3.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  }
+}
