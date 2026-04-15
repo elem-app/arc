@@ -15,9 +15,11 @@ import type {
   Node,
   ObserveAction,
   ObserveOrAskAction,
+  ResolutionStatement,
   SemanticPart,
   SemanticString,
   SetAction,
+  SetReturnAction,
   SourceRange,
   Statement,
   TriggerStatement,
@@ -147,6 +149,8 @@ export function parse(source: string): Document {
       new Set(imports.map((entry) => entry.localName)),
       new Map(hostModules.map((entry) => [entry.localName, entry.module])),
       new Set(),
+      new Set(),
+      undefined,
     ),
   );
 
@@ -215,6 +219,8 @@ function parseNode(
   availableImports: Set<string>,
   availableHostModules: Map<string, string>,
   visibleNodeNames: Set<string>,
+  visibleVariableNames: Set<string>,
+  inheritedDeflectWhen?: ResolutionStatement[],
 ): Node {
   if (!fn.id?.name) {
     throw new Error("Nodes must use named function declarations");
@@ -227,6 +233,7 @@ function parseNode(
   let description: string | undefined;
   let guidance: SemanticString | undefined;
   let trigger: TriggerStatement[] | undefined;
+  let deflectWhen: ResolutionStatement[] | undefined;
   let guard: GuardStatement[] | undefined;
   let effects: EffectStatement[] | undefined;
   const handledStatements = new Set<acorn.Statement>();
@@ -302,13 +309,19 @@ function parseNode(
       continue;
     }
     if (thisProperty === "trigger") {
-      if (expression.right.type !== "ArrowFunctionExpression") {
-        throw new Error("this.trigger must be an arrow function");
-      }
-      const body = getFunctionBody(expression.right);
-      if (!body) throw new Error("this.trigger must be a function");
-      trigger = parseTriggerStatements(
-        body,
+      trigger = parseTriggerArrowFunction(
+        expression.right,
+        "this.trigger",
+        nextActionId,
+        availableHostModules,
+      );
+      handledStatements.add(statement);
+      continue;
+    }
+    if (thisProperty === "deflectWhen") {
+      deflectWhen = parseResolutionDefinition(
+        expression.right,
+        "this.deflectWhen",
         nextActionId,
         availableHostModules,
       );
@@ -354,9 +367,14 @@ function parseNode(
     }
   }
 
+  const effectiveDeflectWhen = deflectWhen ?? inheritedDeflectWhen;
   const nextVisibleNodeNames = new Set([
     ...visibleNodeNames,
     ...childFunctions.keys(),
+  ]);
+  const nextVisibleVariableNames = new Set([
+    ...visibleVariableNames,
+    ...variables.map((entry) => entry.name),
   ]);
   const children = [...childFunctions.values()].map((child) =>
     parseNode(
@@ -364,6 +382,8 @@ function parseNode(
       availableImports,
       availableHostModules,
       nextVisibleNodeNames,
+      nextVisibleVariableNames,
+      effectiveDeflectWhen,
     ),
   );
   const statements = fn.body.body.flatMap((statement) =>
@@ -373,8 +393,10 @@ function parseNode(
       handledStatements,
       availableImports,
       nextVisibleNodeNames,
+      nextVisibleVariableNames,
       availableHostModules,
       nextActionId,
+      effectiveDeflectWhen,
     ),
   );
 
@@ -389,6 +411,7 @@ function parseNode(
     children,
     imports: [...availableImports],
     trigger,
+    deflectWhen,
     guard,
     effects,
     loc: locOf(fn),
@@ -545,8 +568,10 @@ function parseNodeStatement(
   handledStatements: ReadonlySet<acorn.Statement>,
   availableImports: Set<string>,
   visibleNodeNames: Set<string>,
+  visibleVariableNames: Set<string>,
   availableHostModules: Map<string, string>,
   nextActionId: () => number,
+  defaultDeflectWhen?: ResolutionStatement[],
 ): Statement[] {
   if (handledStatements.has(statement)) {
     return [];
@@ -568,8 +593,10 @@ function parseNodeStatement(
         handledStatements,
         availableImports,
         visibleNodeNames,
+        visibleVariableNames,
         availableHostModules,
         nextActionId,
+        defaultDeflectWhen,
       ),
       loc: locOf(statement),
     };
@@ -598,6 +625,7 @@ function parseNodeStatement(
         handledStatements,
         availableImports,
         visibleNodeNames,
+        visibleVariableNames,
         availableHostModules,
         nextActionId,
       ),
@@ -608,6 +636,7 @@ function parseNodeStatement(
             handledStatements,
             availableImports,
             visibleNodeNames,
+            visibleVariableNames,
             availableHostModules,
             nextActionId,
           )
@@ -632,12 +661,14 @@ function parseNodeStatement(
     childFunctions,
     availableImports,
     visibleNodeNames,
+    visibleVariableNames,
     availableHostModules,
     nextActionId,
+    defaultDeflectWhen,
   );
   if (!action) {
     throw new Error(
-      "Unsupported Arc expression statement; use an instruction template literal, observe(), observeOrAsk(), enter(), or variable.set()",
+      "Unsupported Arc expression statement; use an instruction template literal, instruct(), instructLoop(), observe(), observeOrAsk(), enter(), or variable.set()",
     );
   }
   return [action];
@@ -649,8 +680,10 @@ function parseStatementList(
   handledStatements: ReadonlySet<acorn.Statement>,
   availableImports: Set<string>,
   visibleNodeNames: Set<string>,
+  visibleVariableNames: Set<string>,
   availableHostModules: Map<string, string>,
   nextActionId: () => number,
+  defaultDeflectWhen?: ResolutionStatement[],
 ): Statement[] {
   return statements.flatMap((statement) =>
     parseNodeStatement(
@@ -659,8 +692,10 @@ function parseStatementList(
       handledStatements,
       availableImports,
       visibleNodeNames,
+      visibleVariableNames,
       availableHostModules,
       nextActionId,
+      defaultDeflectWhen,
     ),
   );
 }
@@ -670,19 +705,22 @@ function parseActionExpression(
   childFunctions: Map<string, acorn.FunctionDeclaration>,
   availableImports: Set<string>,
   visibleNodeNames: Set<string>,
+  visibleVariableNames: Set<string>,
   availableHostModules: Map<string, string>,
   nextActionId: () => number,
+  defaultDeflectWhen?: ResolutionStatement[],
 ): Statement | undefined {
   if (isTemplateLiteral(expression)) {
     const template = parseTemplateLiteral(expression);
     rejectUnsupportedInstructionIml(template);
-    const instruction: InstructionAction = {
-      id: nextActionId(),
-      kind: "instruction",
+    return createInstructionAction(
       template,
-      loc: locOf(expression),
-    };
-    return instruction;
+      "once",
+      nextActionId,
+      locOf(expression),
+      undefined,
+      defaultDeflectWhen,
+    );
   }
 
   if (isCallExpression(expression)) {
@@ -706,27 +744,195 @@ function parseActionExpression(
     }
     if (
       expression.callee.type === "Identifier" &&
+      (expression.callee.name === "instructLoop" ||
+        expression.callee.name === "instruct")
+    ) {
+      return parseInstructionCall(
+        expression,
+        availableHostModules,
+        nextActionId,
+        defaultDeflectWhen,
+      );
+    }
+    if (
+      expression.callee.type === "Identifier" &&
       expression.callee.name === "enter"
     ) {
       return parseEnterCall(
         expression,
         availableImports,
         visibleNodeNames,
+        visibleVariableNames,
         nextActionId,
       );
     }
 
-    const set = parseSetCall(expression, availableHostModules, nextActionId);
+    const set = parseSetCall(
+      expression,
+      availableHostModules,
+      nextActionId,
+      "action",
+    );
     if (set) return set;
   }
 
   return undefined;
 }
 
+function parseTriggerArrowFunction(
+  expression: acorn.Expression,
+  label: string,
+  nextActionId: () => number,
+  availableHostModules: Map<string, string>,
+): TriggerStatement[] {
+  if (expression.type !== "ArrowFunctionExpression") {
+    throw new Error(`${label} must be an arrow function`);
+  }
+  const body = getFunctionBody(expression);
+  if (!body) throw new Error(`${label} must be a function`);
+  return parseTriggerStatements(body, nextActionId, availableHostModules);
+}
+
+function parseResolutionDefinition(
+  expression: acorn.Expression,
+  label: string,
+  nextActionId: () => number,
+  availableHostModules: Map<string, string>,
+): ResolutionStatement[] {
+  if (expression.type === "ArrowFunctionExpression") {
+    return parseTriggerArrowFunction(
+      expression,
+      label,
+      nextActionId,
+      availableHostModules,
+    );
+  }
+
+  const question = parseGuidance(expression);
+  return [
+    {
+      kind: "return",
+      value: {
+        id: nextActionId(),
+        kind: "judge",
+        question,
+        loc: question.loc,
+      },
+      loc: question.loc,
+    },
+  ];
+}
+
+function createInstructionAction(
+  template: SemanticString,
+  mode: InstructionAction["mode"],
+  nextActionId: () => number,
+  loc: SourceRange | undefined,
+  resolveWhen?: ResolutionStatement[],
+  deflectWhen?: ResolutionStatement[],
+): InstructionAction {
+  return {
+    id: nextActionId(),
+    kind: "instruction",
+    mode,
+    template,
+    resolveWhen,
+    deflectWhen,
+    loc,
+  };
+}
+
+function parseInstructionCall(
+  expression: acorn.CallExpression,
+  availableHostModules: Map<string, string>,
+  nextActionId: () => number,
+  defaultDeflectWhen?: ResolutionStatement[],
+): InstructionAction {
+  const callee =
+    expression.callee.type === "Identifier"
+      ? expression.callee.name
+      : undefined;
+  if (callee !== "instructLoop" && callee !== "instruct") {
+    throw new Error("Unsupported instruction call");
+  }
+
+  const textArg = expression.arguments[0];
+  if (!textArg || textArg.type === "SpreadElement") {
+    throw new Error(`${callee}() requires an instruction template literal`);
+  }
+  const template = parseGuidance(textArg);
+  rejectUnsupportedInstructionIml(template);
+
+  if (expression.arguments.length > 2) {
+    throw new Error(
+      `${callee}() accepts at most an instruction and one options object`,
+    );
+  }
+
+  let resolveWhen: ResolutionStatement[] | undefined;
+  let deflectWhen: ResolutionStatement[] | undefined;
+  const optionsArg = expression.arguments[1];
+  if (optionsArg) {
+    if (
+      optionsArg.type === "SpreadElement" ||
+      optionsArg.type !== "ObjectExpression"
+    ) {
+      throw new Error(`${callee}() options must be an object literal`);
+    }
+    for (const property of optionsArg.properties) {
+      if (property.type === "SpreadElement") {
+        throw new Error(`${callee}() options do not support spread`);
+      }
+      if (property.computed) {
+        throw new Error(`${callee}() options do not support computed keys`);
+      }
+      const key =
+        property.key.type === "Identifier"
+          ? property.key.name
+          : property.key.type === "Literal" &&
+              typeof property.key.value === "string"
+            ? property.key.value
+            : undefined;
+      if (key !== "resolveWhen" && key !== "deflectWhen") {
+        throw new Error(
+          `${callee}() has unsupported option key: ${key ?? "<computed>"}`,
+        );
+      }
+      const parsed = parseResolutionDefinition(
+        property.value,
+        `${callee}().${key}`,
+        nextActionId,
+        availableHostModules,
+      );
+      if (key === "resolveWhen") resolveWhen = parsed;
+      if (key === "deflectWhen") deflectWhen = parsed;
+    }
+  }
+
+  const mode: InstructionAction["mode"] =
+    callee === "instruct" ? "once" : "persistent";
+  if (mode === "persistent" && !resolveWhen) {
+    throw new Error("instructLoop() requires resolveWhen");
+  }
+  if (mode === "once" && resolveWhen) {
+    throw new Error("instruct() does not support resolveWhen");
+  }
+
+  return createInstructionAction(
+    template,
+    mode,
+    nextActionId,
+    locOf(expression),
+    resolveWhen,
+    deflectWhen ?? defaultDeflectWhen,
+  );
+}
+
 function parseEnterCall(
   expression: acorn.CallExpression,
   availableImports: Set<string>,
   visibleNodeNames: Set<string>,
+  visibleVariableNames: Set<string>,
   nextActionId: () => number,
 ): Statement {
   const targetArg = expression.arguments[0];
@@ -737,9 +943,9 @@ function parseEnterCall(
   ) {
     throw new Error("enter() requires a node or imported arc identifier");
   }
-  if (expression.arguments.length !== 1) {
+  if (expression.arguments.length > 2) {
     throw new Error(
-      "enter() accepts exactly one node or imported arc identifier",
+      "enter() accepts a node/import identifier and an optional options object",
     );
   }
 
@@ -748,13 +954,103 @@ function parseEnterCall(
     throw new Error(`Unknown node: ${node}`);
   }
 
+  const optionsArg = expression.arguments[1];
+  let args: Record<string, string> | undefined;
+  let returns: Record<string, string> | undefined;
+
+  if (optionsArg) {
+    if (
+      optionsArg.type === "SpreadElement" ||
+      optionsArg.type !== "ObjectExpression"
+    ) {
+      throw new Error("enter() options must be an object literal");
+    }
+    const seenKeys = new Set<string>();
+    for (const property of optionsArg.properties) {
+      if (property.type === "SpreadElement") {
+        throw new Error("enter() options do not support spread");
+      }
+      if (property.computed) {
+        throw new Error("enter() options do not support computed keys");
+      }
+      const key =
+        property.key.type === "Identifier"
+          ? property.key.name
+          : property.key.type === "Literal" &&
+              typeof property.key.value === "string"
+            ? property.key.value
+            : undefined;
+      if (key !== "args" && key !== "returns") {
+        throw new Error(
+          `enter() has unsupported option key: ${key ?? "<computed>"}`,
+        );
+      }
+      if (seenKeys.has(key)) {
+        throw new Error(`enter() options has duplicate key: ${key}`);
+      }
+      seenKeys.add(key);
+      const parsed = parseEnterChannelMap(
+        property.value,
+        `enter().${key}`,
+        visibleVariableNames,
+      );
+      if (key === "args") args = parsed;
+      if (key === "returns") returns = parsed;
+    }
+  }
+
   return {
     id: nextActionId(),
     kind: "enter-node",
     node,
     imported: availableImports.has(node) && !visibleNodeNames.has(node),
+    args,
+    returns,
     loc: locOf(expression),
   };
+}
+
+function parseEnterChannelMap(
+  expression: acorn.Expression,
+  label: "enter().args" | "enter().returns",
+  visibleVariableNames: Set<string>,
+): Record<string, string> {
+  if (expression.type !== "ObjectExpression") {
+    throw new Error(`${label} must be an object literal`);
+  }
+  const mapping: Record<string, string> = {};
+  for (const property of expression.properties) {
+    if (property.type === "SpreadElement") {
+      throw new Error(`${label} does not support spread`);
+    }
+    if (property.computed) {
+      throw new Error(`${label} does not support computed keys`);
+    }
+    if (property.key.type !== "Identifier") {
+      throw new Error(`${label} keys must be identifiers`);
+    }
+    const key = property.key.name;
+    if (mapping[key]) {
+      throw new Error(`${label} has duplicate key: ${key}`);
+    }
+    if (!isIdentifier(property.value)) {
+      throw new Error(
+        `${label}.${key} must reference a caller variable identifier`,
+      );
+    }
+    if (property.value.name !== key) {
+      throw new Error(
+        `${label}.${key} must use same-name binding (renaming is not supported)`,
+      );
+    }
+    if (!visibleVariableNames.has(property.value.name)) {
+      throw new Error(
+        `${label}.${key} references unknown caller variable: ${property.value.name}`,
+      );
+    }
+    mapping[key] = property.value.name;
+  }
+  return mapping;
 }
 
 function parseObserveCall(
@@ -792,43 +1088,59 @@ function parseSetCall(
   expression: acorn.CallExpression,
   availableHostModules: Map<string, string>,
   nextActionId: () => number,
-): SetAction | undefined {
+  context: "action" | "effects",
+): SetAction | SetReturnAction | undefined {
   if (expression.callee.type !== "MemberExpression") return undefined;
   if (expression.callee.computed) return undefined;
-  if (!isIdentifier(expression.callee.object)) return undefined;
   if (!isIdentifier(expression.callee.property)) return undefined;
   if (expression.callee.property.name !== "set") return undefined;
 
   const valueArg = expression.arguments[0];
   if (!valueArg || valueArg.type === "SpreadElement") {
-    throw new Error(`${expression.callee.object.name}.set() requires a value`);
+    throw new Error("set() requires a value");
   }
   if (expression.arguments.length !== 1) {
-    throw new Error(
-      `${expression.callee.object.name}.set() takes exactly one value`,
-    );
+    throw new Error("set() takes exactly one value");
   }
 
+  const calleeObject = expression.callee.object;
   const value = parseExpression(valueArg, availableHostModules, nextActionId);
-  return {
-    id: nextActionId(),
-    kind: "set",
-    variable: expression.callee.object.name,
-    value,
-    loc: locOf(expression),
-  };
+
+  if (isIdentifier(calleeObject)) {
+    return {
+      id: nextActionId(),
+      kind: "set",
+      variable: calleeObject.name,
+      value,
+      loc: locOf(expression),
+    };
+  }
+
+  if (
+    calleeObject.type === "MemberExpression" &&
+    !calleeObject.computed &&
+    isIdentifier(calleeObject.object) &&
+    isIdentifier(calleeObject.property) &&
+    calleeObject.object.name === "returns"
+  ) {
+    if (context !== "effects") {
+      throw new Error("returns.*.set(...) is only allowed inside this.effects");
+    }
+    return {
+      id: nextActionId(),
+      kind: "set-return",
+      key: calleeObject.property.name,
+      value,
+      loc: locOf(expression),
+    };
+  }
+
+  return undefined;
 }
 
 function parseGuidance(node: acorn.Expression): SemanticString {
   if (isTemplateLiteral(node)) return parseTemplateLiteral(node);
-  if (isLiteral(node) && typeof node.value === "string") {
-    return {
-      kind: "semantic-string",
-      parts: [{ kind: "text", value: node.value }],
-      loc: locOf(node),
-    };
-  }
-  throw new Error("Guidance must be a template or string literal");
+  throw new Error("Semantic text must be a template literal");
 }
 
 function parseTriggerStatements(
@@ -1093,7 +1405,12 @@ function parseEffectStatements(
       throw new Error("observeOrAsk() is forbidden inside this.effects");
     }
 
-    const set = parseSetCall(expression, availableHostModules, nextActionId);
+    const set = parseSetCall(
+      expression,
+      availableHostModules,
+      nextActionId,
+      "effects",
+    );
     if (set) return [set];
 
     const hostEffect = parseHostEffect(
@@ -1104,7 +1421,7 @@ function parseEffectStatements(
     if (hostEffect) return [hostEffect];
 
     throw new Error(
-      "Unsupported this.effects call; use observe(), variable.set(), or a declared host effect",
+      "Unsupported this.effects call; use observe(), variable.set(), returns.<key>.set(...), or a declared host effect",
     );
   });
 }
@@ -1143,9 +1460,6 @@ function parseHostEffectArgument(
 ): HostCallArgument {
   if (isTemplateLiteral(expression)) {
     return { kind: "semantic", value: parseTemplateLiteral(expression) };
-  }
-  if (isLiteral(expression) && typeof expression.value === "string") {
-    return { kind: "semantic", value: parseGuidance(expression) };
   }
   if (expression.type === "ArrayExpression") {
     return {
@@ -1239,6 +1553,14 @@ function validateNode(
     validateStatement(statement, variableNames, nodeNames, context.issues);
   }
   for (const statement of node.trigger ?? []) {
+    validateTriggerStatement(
+      statement,
+      variableNames,
+      nodeNames,
+      context.issues,
+    );
+  }
+  for (const statement of node.deflectWhen ?? []) {
     validateTriggerStatement(
       statement,
       variableNames,
@@ -1342,6 +1664,16 @@ function validateStatement(
     return;
   }
 
+  if (statement.kind === "set-return") {
+    issues.push({
+      code: "SET_RETURN_OUTSIDE_EFFECTS",
+      message: "returns.*.set(...) is only allowed inside this.effects",
+      loc: statement.loc,
+    });
+    validateExpression(statement.value, variables, nodes, issues);
+    return;
+  }
+
   if (statement.kind === "enter-node") {
     if (!nodes.includes(statement.node)) {
       issues.push({
@@ -1350,10 +1682,34 @@ function validateStatement(
         loc: statement.loc,
       });
     }
+    for (const variable of Object.values(statement.args ?? {})) {
+      if (!variables.includes(variable)) {
+        issues.push({
+          code: "UNKNOWN_VARIABLE",
+          message: `Unknown variable: ${variable}`,
+          loc: statement.loc,
+        });
+      }
+    }
+    for (const variable of Object.values(statement.returns ?? {})) {
+      if (!variables.includes(variable)) {
+        issues.push({
+          code: "UNKNOWN_VARIABLE",
+          message: `Unknown variable: ${variable}`,
+          loc: statement.loc,
+        });
+      }
+    }
     return;
   }
 
   validateSemanticString(statement.template, variables, nodes, issues);
+  for (const entry of statement.resolveWhen ?? []) {
+    validateTriggerStatement(entry, variables, nodes, issues);
+  }
+  for (const entry of statement.deflectWhen ?? []) {
+    validateTriggerStatement(entry, variables, nodes, issues);
+  }
 }
 
 function validateTriggerStatement(
@@ -1473,6 +1829,11 @@ function validateEffectStatement(
         loc: statement.loc,
       });
     }
+    validateExpression(statement.value, variables, nodes, issues);
+    return;
+  }
+
+  if (statement.kind === "set-return") {
     validateExpression(statement.value, variables, nodes, issues);
     return;
   }

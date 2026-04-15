@@ -156,7 +156,7 @@ export function getBlockStatements(node: acorn.Statement): acorn.Statement[] {
   return node.type === "BlockStatement" ? node.body : [node];
 }
 
-export function expressionToSimpleExpression(
+export function expressionToLocalExpression(
   node: acorn.Expression,
   availableHostModules: ReadonlyMap<string, string> = new Map(),
   nextId?: () => number,
@@ -181,6 +181,9 @@ export function expressionToSimpleExpression(
   }
 
   if (node.type === "MemberExpression") {
+    if (node.computed) {
+      throw new Error("Computed member access is not supported in Arc");
+    }
     if (
       node.object.type === "Identifier" &&
       node.object.name === "Dialog" &&
@@ -205,6 +208,17 @@ export function expressionToSimpleExpression(
       node.property.name === "state"
     ) {
       return { kind: "nodeState", node: node.object.name };
+    }
+    if (
+      node.object.type === "Identifier" &&
+      (node.object.name === "args" || node.object.name === "returns") &&
+      node.property.type === "Identifier"
+    ) {
+      return {
+        kind: "channel",
+        namespace: node.object.name,
+        key: node.property.name,
+      };
     }
   }
   if (node.type === "CallExpression") {
@@ -342,7 +356,7 @@ export function parseExpression(
         kind: "regexTest",
         pattern: regex.pattern,
         flags: regex.flags,
-        target: expressionToSimpleExpression(
+        target: expressionToLocalExpression(
           target,
           availableHostModules,
           nextId,
@@ -351,7 +365,7 @@ export function parseExpression(
     }
   }
 
-  return expressionToSimpleExpression(node, availableHostModules, nextId);
+  return expressionToLocalExpression(node, availableHostModules, nextId);
 }
 
 export function parseHostCallTarget(
@@ -454,7 +468,7 @@ function parseHostCallArgument(expression: acorn.Expression): HostCallArgument {
   }
   return {
     kind: "value",
-    value: expressionToSimpleExpression(expression),
+    value: expressionToLocalExpression(expression),
   };
 }
 

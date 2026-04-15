@@ -47,6 +47,66 @@ function HeavyMetal() {
 `;
 
 describe("parse", () => {
+  it("ignores line and block comments across Arc source", () => {
+    const document = parse(`
+// leading line comment
+/* leading block comment */
+"use arc v2";
+
+// root comment
+function Main() {
+  const ready = new Boolean(); // trailing comment
+
+  /* action comment */ enter(Child, {
+    // option comment
+    args: { ready },
+  });
+
+  function Child({ args }) {
+    this.effects = () => {
+      // branch comment
+      if (args.ready === true) {
+        ready.set(true);
+      }
+    };
+  }
+}
+`);
+
+    expect(document.version).toBe("v2");
+    expect(document.roots[0]?.identifier).toBe("Main");
+    expect(document.roots[0]?.statements[0]).toMatchObject({
+      kind: "enter-node",
+      args: { ready: "ready" },
+    });
+  });
+
+  it("ignores comments around returns channel writes in effects", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const verdict = new Boolean();
+  enter(Child, { returns: { verdict } });
+
+  function Child({ returns }) {
+    this.effects = () => {
+      /* before write */
+      returns.verdict.set(true); // after write
+    };
+  }
+}
+`);
+
+    const child = document.roots[0]?.children.find(
+      (entry) => entry.identifier === "Child",
+    );
+    expect(child?.effects?.[0]).toMatchObject({
+      kind: "set-return",
+      key: "verdict",
+    });
+  });
+
   it("parses Arc into the new root/node IR", () => {
     const document = parse(ARC_SOURCE);
 
@@ -95,6 +155,210 @@ describe("parse", () => {
     });
     expect(surface?.statements[1]).toMatchObject({
       kind: "instruction",
+      mode: "once",
+    });
+  });
+
+  it("parses instructLoop and instruct with authored resolution rules", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  this.deflectWhen = \`\${user} wants to leave this topic\`;
+
+  instructLoop(\`Carry this topic.\`, {
+    resolveWhen: () => {
+      observe(ready);
+      return ready;
+    },
+  });
+
+  instruct(\`Mention this once.\`, {
+    deflectWhen: \`\${user} is bored\`,
+  });
+
+  const ready = new Boolean();
+}
+`);
+
+    const root = document.roots[0]!;
+    expect(root.deflectWhen).toBeDefined();
+    expect(root.statements[0]).toMatchObject({
+      kind: "instruction",
+      mode: "persistent",
+    });
+    expect(
+      (
+        root.statements[0] as Extract<
+          (typeof root.statements)[number],
+          { kind: "instruction" }
+        >
+      ).resolveWhen,
+    ).toBeDefined();
+    expect(root.statements[1]).toMatchObject({
+      kind: "instruction",
+      mode: "once",
+    });
+    expect(
+      (
+        root.statements[1] as Extract<
+          (typeof root.statements)[number],
+          { kind: "instruction" }
+        >
+      ).deflectWhen,
+    ).toBeDefined();
+  });
+
+  it("inherits the nearest node-level deflectWhen into instructions by default", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  this.deflectWhen = \`\${user} wants to stop\`;
+  enter(Child);
+
+  function Child() {
+    instructLoop(\`Stay on topic.\`, {
+      resolveWhen: \`\${self} stayed on topic\`,
+    });
+  }
+}
+`);
+
+    const child = document.roots[0]?.children.find(
+      (entry) => entry.identifier === "Child",
+    );
+    const instruction = child?.statements[0];
+
+    expect(instruction).toMatchObject({
+      kind: "instruction",
+      mode: "persistent",
+    });
+    expect(
+      (instruction as Extract<typeof instruction, { kind: "instruction" }>)
+        ?.deflectWhen,
+    ).toBeDefined();
+  });
+
+  it("lets local deflectWhen override the inherited node default", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  this.deflectWhen = \`\${user} wants to stop\`;
+  instructLoop(\`Stay on topic.\`, {
+    resolveWhen: \`\${self} stayed on topic\`,
+    deflectWhen: \`\${user} hates astronomy\`,
+  });
+}
+`);
+
+    const instruction = document.roots[0]?.statements[0];
+    expect(instruction).toMatchObject({
+      kind: "instruction",
+      mode: "persistent",
+    });
+    const deflectWhen = (
+      instruction as Extract<typeof instruction, { kind: "instruction" }>
+    )?.deflectWhen;
+    expect(deflectWhen).toHaveLength(1);
+  });
+
+  it("requires resolveWhen for instructLoop()", () => {
+    expect(() =>
+      parse(`
+"use arc v2";
+
+function Main() {
+  instructLoop(\`Carry this topic.\`);
+}
+`),
+    ).toThrow(/instructLoop\(\) requires resolveWhen/);
+  });
+
+  it("rejects resolveWhen for instruct()", () => {
+    expect(() =>
+      parse(`
+"use arc v2";
+
+function Main() {
+  instruct(\`Carry this topic.\`, {
+    resolveWhen: \`\${self} covered the topic enough\`,
+  });
+}
+`),
+    ).toThrow(/instruct\(\) does not support resolveWhen/);
+  });
+
+  it("requires template literals for semantic text positions", () => {
+    expect(() =>
+      parse(`
+"use arc v2";
+
+function Main() {
+  instructLoop("Carry this topic.", {
+    resolveWhen: \`\${self} covered the topic enough\`,
+  });
+}
+`),
+    ).toThrow(/Semantic text must be a template literal/);
+
+    expect(() =>
+      parse(`
+"use arc v2";
+
+function Main() {
+  instructLoop(\`Carry this topic.\`, {
+    resolveWhen: "\${self} covered the topic enough",
+  });
+}
+`),
+    ).toThrow(/Semantic text must be a template literal/);
+
+    expect(() =>
+      parse(`
+"use arc v2";
+
+function Main() {
+  this.deflectWhen = "\${user} wants to stop";
+  instruct(\`Mention this once.\`);
+}
+`),
+    ).toThrow(/Semantic text must be a template literal/);
+
+    expect(() =>
+      parse(`
+"use arc v2";
+
+function Main() {
+  const topic = new Boolean();
+  observe(topic, "what topic is \${user} discussing");
+}
+`),
+    ).toThrow(/Semantic text must be a template literal/);
+  });
+
+  it("treats host effect string literals as plain value arguments", () => {
+    const document = parse(`
+"use arc v2";
+
+import Memoir from "host:memoir";
+
+function Main() {
+  this.effects = () => {
+    Memoir.facts.apply("effect");
+  };
+}
+`);
+
+    expect(document.roots[0]?.effects?.[0]).toMatchObject({
+      kind: "host-call",
+      arguments: [
+        {
+          kind: "value",
+          value: { kind: "literal", value: "effect" },
+        },
+      ],
     });
   });
 
@@ -395,6 +659,130 @@ function Main() {
       node: "IntroArc",
       imported: true,
     });
+  });
+
+  it("parses enter() args/returns channel wiring with same-name bindings", () => {
+    const document = parse(`
+"use arc v2";
+function Main() {
+  const ready = new Boolean();
+  const verdict = new Boolean();
+
+  enter(Child, {
+    args: { ready },
+    returns: { verdict },
+  });
+
+  function Child({ args, returns }) {
+    this.effects = () => {
+      if (args.ready === true) {
+        returns.verdict.set(true);
+      }
+    };
+  }
+}
+`);
+
+    expect(document.roots[0]?.statements[0]).toMatchObject({
+      kind: "enter-node",
+      node: "Child",
+      args: { ready: "ready" },
+      returns: { verdict: "verdict" },
+    });
+    const child = document.roots[0]?.children.find(
+      (entry) => entry.identifier === "Child",
+    );
+    expect(child?.effects?.[0]).toMatchObject({ kind: "if" });
+    if (child?.effects?.[0]?.kind !== "if") {
+      throw new Error("expected child effects if statement");
+    }
+    expect(child.effects[0].test).toMatchObject({
+      kind: "binary",
+      left: { kind: "channel", namespace: "args", key: "ready" },
+      right: { kind: "literal", value: true },
+    });
+    expect(child.effects[0].consequent[0]).toMatchObject({
+      kind: "set-return",
+      key: "verdict",
+    });
+  });
+
+  it("rejects enter() renamed channel bindings", () => {
+    expect(() =>
+      parse(`
+"use arc v2";
+function Main() {
+  const ready = new Boolean();
+  enter(Child, {
+    args: { inputReady: ready },
+  });
+  function Child() {}
+}
+`),
+    ).toThrow(/same-name binding/);
+  });
+
+  it("rejects enter() renamed returns channel bindings", () => {
+    expect(() =>
+      parse(`
+"use arc v2";
+function Main() {
+  const verdict = new Boolean();
+  enter(Child, {
+    returns: { outputVerdict: verdict },
+  });
+  function Child() {}
+}
+`),
+    ).toThrow(/same-name binding/);
+  });
+
+  it("rejects enter() channel bindings that reference unknown caller variables", () => {
+    expect(() =>
+      parse(`
+"use arc v2";
+function Main() {
+  const ready = new Boolean();
+  enter(Child, {
+    args: { ready },
+    returns: { verdict },
+  });
+  function Child() {}
+}
+`),
+    ).toThrow(/unknown caller variable: verdict/);
+  });
+
+  it("rejects returns.*.set(...) outside this.effects", () => {
+    expect(() =>
+      parse(`
+"use arc v2";
+function Main() {
+  const verdict = new Boolean();
+  enter(Child, { returns: { verdict } });
+  function Child() {
+    returns.verdict.set(true);
+  }
+}
+`),
+    ).toThrow(/only allowed inside this\.effects/);
+  });
+
+  it("rejects returns.*.set(...) outside this.effects even inside action control flow", () => {
+    expect(() =>
+      parse(`
+"use arc v2";
+function Main() {
+  const verdict = new Boolean();
+  enter(Child, { returns: { verdict } });
+  function Child() {
+    if (true) {
+      returns.verdict.set(true);
+    }
+  }
+}
+`),
+    ).toThrow(/only allowed inside this\.effects/);
   });
 
   it("assigns stable numeric ids to every action in source order", () => {

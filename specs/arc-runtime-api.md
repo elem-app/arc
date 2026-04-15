@@ -6,7 +6,7 @@ The runtime executes parsed Arc scripts together with a **host**. It traverses a
 
 Arc execution is a conversation between the runtime and the host. The runtime walks the graph and knows what work needs doing. The host knows how to do that work. They communicate through ephemeral **briefs** (runtime → host) and **reports** (host → runtime).
 
-A turn proceeds in two stages:
+One walk of an arc proceeds in two stages:
 
 1. **Trigger stage** — the runtime evaluates dormant arcs' triggers to decide which arc becomes active. Triggers may contain semantic checks that require host resolution, so this stage follows the brief/report exchange.
 
@@ -16,11 +16,9 @@ There is only one active arc being traversed at a time.
 
 After the action graph resolves, the node's effects block runs. Effects may require additional resolution rounds. Once effects finish, any emitted host effects are surfaced in a brief for the host to handle.
 
-Instructions are ephemeral — they are not preserved across brief/report rounds. The host should check for instructions at each brief before resolving anything else.
-
 ## Traversal State
 
-Traversal state is the persistent, serializable representation of an arc's progress. It is what lets the runtime resume where it left off across turns, sessions, and process restarts.
+Traversal state is the persistent, serializable representation of an arc's progress. It lets the runtime resume walks from where it left off across turns, sessions, and process restarts.
 
 ### Arc Traversal and Node Traversal
 
@@ -83,7 +81,7 @@ Resume:
 - After a brief/report round, traversal re-walks from the top of the current active node.
 - `if` conditions are reevaluated whenever the walk reaches them.
 - Resolved actions are skipped according to the node frame.
-- The host should inspect `brief.instructions` before resolving any pending semantic work — delivered instructions are not replayed in later briefs.
+- Pending instructions continue to surface in follow-up `ActionBrief`s while they remain unresolved; a repeated instruction brief may carry the same instruction text with a different instruction `phase` and a different `postcheck` frontier as resolution work progresses.
 
 ### `TriggerBrief`
 
@@ -137,7 +135,7 @@ type ActionBrief = {
   observations: ObservationBrief[];
   /** Pending host-backed value requests. */
   hostCalls: HostCallBrief[];
-  /** Text to deliver to the user. */
+  /** Host-directed guidance text (typically used to steer host LLM output). */
   instructions: InstructionBrief[];
   /** Host effects emitted during this step. */
   hostEffects: HostEffect[];
@@ -153,10 +151,15 @@ type ActionBrief = {
 ```typescript
 type ActionReport = {
   /**
-   * "proceed" — instructions delivered, advance to the next step.
+   * "proceed" — host hands control back and requests traversal progression.
+   *   This is host-driven and does not imply exactly one new user/assistant
+   *   message since the prior brief. For instruction frontiers, this hands the
+   *   current instruction frontier back according to the semantics of its
+   *   `mode`.
    * "defer" — do not advance this round.
-   * "deflect" — user changed topic; the active node becomes deflected
-   *   and is eligible for re-entry. Pending effects still run.
+   * "deflect" — user changed topic; the active node becomes deflected and is
+   *   eligible for re-entry. Pending effects still run. Only available when
+   *   `allowedMoves` includes it.
    */
   move: ActionMove;
   /** Resolved boolean checks, keyed by brief id. */
@@ -180,8 +183,8 @@ Nodes that complete all reachable actions and effects become covered automatical
 type JudgmentBrief = {
   /** Opaque key. Echo back in the report. */
   id: BriefId;
-  /** Which arc produced this. */
-  arc: ArcRef;
+  /** Source node that produced this brief item. */
+  sourceRef: NodeRef;
   /** Rendered question text. */
   question: string;
 };
@@ -195,6 +198,8 @@ type JudgmentBrief = {
 type ObservationBrief = {
   /** Opaque key. Echo back in the report. */
   id: BriefId;
+  /** Source node that produced this brief item. */
+  sourceRef: NodeRef;
   /** Variable name. */
   variable: string;
   /** Whether the host may ask the user. */
@@ -203,6 +208,13 @@ type ObservationBrief = {
   question: string;
   /** Current value, if any. */
   currentValue?: PrimitiveValue;
+  /** Variable type metadata for host-side validation/UI. */
+  meta: {
+    type: "enum" | "boolean" | "rangedInt";
+    values?: string[];
+    min?: number;
+    max?: number;
+  };
 };
 ```
 
@@ -232,10 +244,8 @@ type ObservationReport = {
 type HostCallBrief = {
   /** Opaque key. Echo back in the report. */
   id: BriefId;
-  /** Which arc produced this. */
-  arc: ArcRef;
-  /** Which node produced this. */
-  node: string;
+  /** Source node that produced this brief item. */
+  sourceRef: NodeRef;
   /** Host module name from `host:*`. */
   module: string;
   /** Member path before the operation, e.g. `["facts"]`. */
@@ -249,16 +259,84 @@ type HostCallBrief = {
 
 #### `InstructionBrief`
 
-`InstructionBrief` represents text that the arc wants delivered to the user — from bare template literals in the action graph. The host decides how to present it.
+`InstructionBrief` represents text that the arc sends to the host — from instruction actions in the action graph (`instructLoop`, `instruct`, and bare instruction literals that desugar to one-shot instructions). Hosts typically use it as guidance for LLM generation and decide how (or whether) to surface it to the user.
 
 ```typescript
 type InstructionBrief = {
   /** Opaque key. */
   id: BriefId;
+  /** Source node that produced this instruction. */
+  sourceRef: NodeRef;
+  /** Instruction mode from arc source. */
+  mode: "once" | "persistent";
+  /**
+   * How the host should treat this instruction in the current brief.
+   * - `apply`: the instruction is in effect and should be applied as guidance.
+   * - `postcheck`: the instruction remains pending, but this brief is focused
+   *   on follow-up resolution checks.
+   */
+  phase: "apply" | "postcheck";
   /** Rendered instruction text. */
   text: string;
+  /**
+   * Reachable semantic probes attached to this instruction frontier.
+   * These are ids of items already present in the same ActionBrief's
+   * `judgments` / `observations` / `hostCalls`.
+   */
+  postcheck?: InstructionPostcheck;
+};
+
+type InstructionPostcheck = {
+  judgmentIds: BriefId[];
+  observationIds: BriefId[];
+  hostCallIds: BriefId[];
 };
 ```
+
+`postcheck` is not the full authored resolution logic. It includes only the
+check ids that are currently pending in this brief. Later briefs for the same
+instruction may expose a different `postcheck` frontier.
+
+#### Host Treatment of `InstructionBrief`
+
+Instruction handback is intentionally different from value-style actions.
+For value-style actions, the host reports values and runtime advances from those
+values.
+
+For instructions, the host should:
+
+1. Respect instruction `mode` in host logic.
+   - `once`: the host is expected to report back **only after** the instruction has been fully applied downstream. How the host establishes that is outside the runtime's concern; the runtime does not independently verify completed application. Set for `instruct()`s.
+   - `persistent`: the instruction remains pending until its authored `resolveWhen` resolves true. Set for `instructLoop()`s.
+2. Respect instruction `phase` in the current brief.
+   - `apply`: treat the instruction as guidance currently in effect.
+   - `postcheck`: the instruction is still pending, but this brief is focused on resolving follow-up checks rather than treating it as a fresh instruction presentation.
+   - Typical progression is: first reach emits `phase: "apply"`; follow-up briefs while primarily checking conditions emit `phase: "postcheck"`; after a non-terminal check cycle the same instruction may return to `phase: "apply"`.
+3. Report any available values for `postcheck` ids in the same brief
+   (`judgments` / `observations` / `hostCalls`).
+4. Use host discretion to report `move: "deflect"` **only when** deflection is
+   delegated for this instruction brief (i.e., `allowedMoves` includes
+   `"deflect"`).
+   - While an instruction brief is still present, the host is expected to finish the current instruction application window before reporting deflection.
+   - In practice, deflection is reported at the next frontier where the runtime exposes `move: "deflect"`.
+
+Runtime then derives instruction outcome from authored conditions:
+
+1. Evaluate `deflectWhen` first.
+2. Then evaluate `resolveWhen`.
+3. Else remain pending.
+
+Hosts can handle this in either style:
+
+- **Aggressive batching:** deliver instruction and resolve postcheck ids in the
+  same handback.
+- **Incremental handback:** apply instruction first, then hand back later with
+  values as they become available.
+
+If values are still missing, runtime returns the next action brief directly.
+That brief may include the same instruction again with `phase: "postcheck"`,
+or with `phase: "apply"` if the instruction has come back into effect after a
+non-terminal check cycle.
 
 ### Host Effects
 
@@ -324,16 +402,22 @@ Arc selection: (1) re-evaluate all triggers with resolved data — arcs whose tr
 
 Begins the action stage. The active arc must be in the `"entered"` phase — either via trigger outcome or manual seeding with `createTraversal`.
 
-**`progress(brief, report)`** → `ActionBrief`
+**`progress(brief, report, dialog)`** → `ActionBrief`
 
 Accepts an action report and returns the next brief.
 
+`dialog` is the current conversation snapshot at the time the host hands control
+back to Arc. It may be newer than the dialog that produced `brief`.
+
+`progress(...)` cadence is host-driven. It is not required to map one-to-one to
+conversation message cadence. A host may call `progress(...)` whenever it finishes part or all of the work specified in a brief, regardless of after how many rounds of conversation with the user.
+
 ### References
 
-| Type      | Format                  | Purpose                               |
-| --------- | ----------------------- | ------------------------------------- |
-| `ArcRef`  | opaque runtime string   | Identifies a registered arc.          |
-| `NodeRef` | opaque runtime string   | Identifies a node within a traversal. |
+| Type      | Format                | Purpose                               |
+| --------- | --------------------- | ------------------------------------- |
+| `ArcRef`  | opaque runtime string | Identifies a registered arc.          |
+| `NodeRef` | opaque runtime string | Identifies a node (source + path).    |
 
 Construct and destructure refs through the helpers exported by `arc/runtime`
 (`toArcRef`, `toArcRefParts`, `toNodeRef`, `toNodeRefParts`). Callers should
@@ -354,23 +438,11 @@ A typical host turn:
 
 3. Action stage (if an arc is active):
    a. start(traversals, dialog) → ActionBrief
-   b. Resolution loop — advance until instructions surface:
-      while brief.canProgress:
-        if brief.instructions.length > 0: break    ← present these
-        resolve brief.judgments, brief.observations, and brief.hostCalls
-        brief = progress(brief, { move: "proceed", judgments, observations, hostCalls })
-   c. Present brief.instructions to the user.
-   d. Determine move (proceed / defer / deflect).
-   e. Final progress — resolve remaining semantic work and advance:
-      resolve brief.judgments, brief.observations, and brief.hostCalls
-      brief = progress(brief, { move, judgments, observations, hostCalls })
-   f. Post-progress resolution — effects-phase observations may surface:
-      while brief.canProgress and brief has semantic work:
-        resolve and progress
-   g. Apply brief.hostEffects.
-   h. Persist traversal state.
+   b. Inspect instructions and semantic work.
+   c. Host chooses when to hand control back (after 0/1/N conversation rounds).
+   d. Resolve any available judgments/observations/hostCalls and call:
+      progress(brief, { move, judgments, observations, hostCalls }, latestDialog)
+   e. Repeat as needed until the host wants to defer or traversal cannot progress.
+   f. Apply brief.hostEffects.
+   g. Persist traversal state.
 ```
-
-Step (b) breaks on instructions rather than semantic work because instructions are not preserved across `progress()` calls — resolving before checking would consume them without presenting them.
-
-Step (f) handles observations and host calls from `this.effects` blocks, which only become reachable after the action graph advances past the current frontier.

@@ -1,6 +1,6 @@
 # Arc Scripts
 
-Arc is a JS-like language for encoding structured information graphs. Each function declaration defines a **node** — a self-contained unit of state, logic, and content. Nodes compose into trees. The runtime walks those trees turn by turn, yielding structured briefs that a host application resolves. 
+Arc is a JS-like language for encoding structured information graphs. Each function declaration defines a **node** — a self-contained unit of state, logic, and content. Nodes compose into trees. The runtime walks those trees turn by turn, yielding structured briefs that a host application resolves.
 
 Although Arc scripts employ a JS-based syntax, they can only be executed by the Arc runtime and not a standard JavaScript runtime.
 
@@ -14,24 +14,31 @@ The first statement is the version directive (the only supported version is v2):
 "use arc v2";
 ```
 
-Each top-level function declaration is an **arc** — a root node that can be independently triggered and traversed:
+Each function declaration defines a **node**; each document root-level node is an **arc**:
 
 ```js
+"use arc v2";
+
+// This function is an arc
 function HeavyMetal() {
-  this.displayName = "Heavy Metal";
-  // ...
+
+  // This is a node
+  function Artists() {
+    // ...
+  }
 }
+
+// This is another arc
+function HipHop() {}
 ```
 
-A document may contain multiple arcs. `export` is not part of the Arc DSL.
-
-Arcs can import roots from other documents via named imports:
+Arcs are `import`-able by default; `export` is not part of the Arc language:
 
 ```js
-import { AdvancedTechniques } from "advanced-techniques";
+import { HipHop } from "music";
 ```
 
-Imported arcs are entered in the action graph with `enter(AdvancedTechniques)`, the same way as child nodes. See [Composition](#composition).
+See [Composition](#composition) for details about how arcs and nodes compose.
 
 Host modules are imported with a default import whose source starts with `host:`:
 
@@ -39,18 +46,11 @@ Host modules are imported with a default import whose source starts with `host:`
 import Dice from "host:rng";
 ```
 
-See [Host Calls](#host-calls) for more introduction about host modules.
-
-### String Conventions
-
-- **String literals** (`"..."` or `'...'`) — metadata and the version directive.
-- **Template literals** (`` `...` ``) — semantic content interpreted by LLMs. Interpolated expressions (`${...}`) are type-checked for valid entity/variable references.
+See [Host Modules](#host-modules) for more introduction about host modules.
 
 ## Nodes
 
-Every function declaration defines a node. Top-level functions are arcs. Nested function declarations inside a parent are child nodes.
-
-A node body contains four sections, in order:
+A node (function) body contains four sections, in order:
 
 1. **Config statements** — `this.*` assignments that set metadata and lifecycle hooks.
 2. **Variable declarations** — typed state scoped to this node.
@@ -59,19 +59,25 @@ A node body contains four sections, in order:
 
 Config, variables, and child declarations are **declarative** — they define fixed structure. The action graph is the only part that progresses through the brief/report cycle.
 
+### String Conventions
+
+- **String literals** (`"..."` or `'...'`) — metadata and the version directive.
+- **Template literals** (`` `...` ``) — semantic content interpreted by LLMs. Interpolated expressions (`${...}`) are type-checked for valid entity/variable references.
+
 ### Config Statements
 
 `this.*` assignments at the start of a node body.
 
-| Config             | Type             | Description                                                                                                    |
-| ------------------ | ---------------- | -------------------------------------------------------------------------------------------------------------- |
-| `this.displayName` | string literal   | Optional human-facing label. Presentation metadata only.                                                       |
-| `this.description` | string literal   | Brief summary.                                                                                                 |
-| `this.guidance`    | template literal | Guidance for content delivery.                                                                                 |
+| Config             | Type             | Description                                                                                                          |
+| ------------------ | ---------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `this.displayName` | string literal   | Optional human-facing label. Presentation metadata only.                                                             |
+| `this.description` | string literal   | Brief summary.                                                                                                       |
+| `this.guidance`    | template literal | Guidance for content delivery.                                                                                       |
 | `this.resumable`   | boolean literal  | Default `true`. When `false`, the action resolution map resets on re-entry. See [Execution Model](#execution-model). |
-| `this.trigger`     | arrow function   | Trigger condition for dormant arcs. See [Trigger](#trigger).                                                   |
-| `this.guard`       | arrow function   | Explicit state guard. See [Guard](#guard).                                                                     |
-| `this.effects`     | arrow function   | Reactive observations and emitted host effects. See [Effects](#effects).                                       |
+| `this.trigger`     | arrow function   | Trigger condition for dormant arcs. See [Trigger](#trigger).                                                         |
+| `this.deflectWhen` | template literal or arrow function | Default deflection policy inherited by instruction actions in this node subtree. See [DeflectWhen](#deflectwhen). |
+| `this.guard`       | arrow function   | Explicit state guard. See [Guard](#guard).                                                                           |
+| `this.effects`     | arrow function   | Reactive observations and emitted host effects. See [Effects](#effects).                                             |
 
 Structural identity comes from the JS declaration identifier, not metadata.
 
@@ -130,15 +136,62 @@ Statement forms:
 - `observeOrAsk(variable)` — extraction with fallback to asking the user.
 - ``observeOrAsk(variable, `override question`)`` — extraction with a specific observation question, fallback to asking.
 - `variable.set(value)` — typed variable write.
-- **Instruction literal** (bare template literal) — content for the host to deliver to the user.
+- **Instruction literal** (bare template literal) — shorthand for a one-shot instruction.
+- `instruct(text, { deflectWhen? })` — one-shot instruction.
+- `instructLoop(text, { resolveWhen, deflectWhen? })` — sticky instruction with authored resolution logic.
 - `enter(ReferenceName)` — enters another node or arc by structural reference.
+- `enter(ReferenceName, { args, returns })` — enters another node or arc with explicit input/output variable wiring.
 
 Expression-capable forms:
 
 - ``judge(`semantic question`)`` — semantic boolean check against conversation context. Returns `boolean`.
-- Host calls through imported `host:*` modules — yields a host-provided value. See [Host Calls](#host-calls).
+- Host calls through imported `host:*` modules — yields a host-provided value. See [Host Modules](#host-modules).
 
-`observe()` and `judge()` can also appear in `this.trigger` and `this.effects`.
+`observe()` and `judge()` can also appear in `this.trigger`, `this.effects`, and instruction resolution logic.
+
+#### Instructions
+
+Instruction actions are authored guidance that the runtime hands to the host. Unlike value-style actions, reaching an instruction does not immediately block on a single required value. Instead, the runtime first emits guidance, then derives the instruction outcome from authored `deflectWhen` / `resolveWhen` logic over subsequent handbacks.
+
+Arc supports three instruction forms:
+
+```js
+`Mention heavy metal naturally.`;
+
+instructLoop(`Keep developing this topic.`, {
+  resolveWhen: `${self} has covered the topic enough`,
+});
+
+instruct(`Mention this once.`, {
+  deflectWhen: `${user} clearly does not want this topic`,
+});
+```
+
+The instruction text must be a template literal. A bare instruction literal desugars to `instruct(...)`.
+
+`resolveWhen` and `deflectWhen` define authored instruction semantics:
+
+- A template literal desugars to `return judge(...)`.
+- An arrow function uses the same constrained statement subset as `this.trigger`: `if` / `else`, `observe(...)`, and `return <expression>`.
+- Expressions inside those functions may use variables, `judge(...)`, host calls, regex tests, and logical composition.
+
+Authoring rules:
+
+- `instructLoop(...)` is sticky and requires `resolveWhen`.
+- `instruct(...)` is one-time and does not support `resolveWhen`.
+- `deflectWhen` is optional on both forms.
+- If an instruction omits `deflectWhen`, it inherits the nearest node-level `this.deflectWhen`, if any.
+
+Execution semantics:
+
+1. When traversal first reaches an instruction, the runtime emits the instruction text and marks the action pending.
+2. While the instruction is pending, the runtime evaluates `deflectWhen` first, then `resolveWhen`.
+3. If `deflectWhen` becomes true, the traversal is deflected.
+4. If `resolveWhen` becomes true, the instruction action resolves and traversal continues.
+5. Otherwise the instruction remains pending and continues to apply on later handbacks.
+6. `instruct(...)` resolves implicitly when the host reports back, unless it is deflected.
+
+Only the currently reachable semantic checks from `deflectWhen` / `resolveWhen` surface in a given brief. See [arc-runtime-api.md](arc-runtime-api.md) for the `InstructionBrief` and `postcheck` protocol.
 
 #### Control Flow
 
@@ -177,7 +230,7 @@ Conditions in `if` statements support:
 - Regex tests — `/pattern/flags.test(target)` (e.g., `/music|band/i.test(Dialog.lastUserMessage)`)
 - Logical composition — `&&`, `||`, `!`
 
-### Host Calls
+### Host Modules
 
 Host modules let arcs interact with host-owned systems — rolling dice, reading feature flags, writing to memoir. The arc declares what it needs; the host decides what the call means.
 
@@ -213,7 +266,7 @@ Constraint: host-call arguments must be renderable without further host work. Ne
 
 ## Lifecycle Hooks
 
-Three config functions control a node's lifecycle beyond its action graph: when the arc activates, whether a node should be entered, and what happens after actions resolve.
+Four config entries control a node's lifecycle beyond its action graph: when the arc activates, how pending instructions deflect, whether a node should be entered, and what happens after actions resolve.
 
 ### Trigger
 
@@ -251,6 +304,29 @@ this.trigger = () => {
 - `this.enterCount` — starts at `0`. Counts how many times this arc has been successfully activated after trigger evaluation. Trigger evaluation alone does not increment it.
 - `judge()` and `observe()` calls become part of the trigger brief and may be batched.
 - `observe()` calls execute only on the branch that returns `true`. Branches that do not match are not evaluated — their `observe()` and `judge()` calls do not run.
+
+### DeflectWhen
+
+`this.deflectWhen` defines the default deflection policy for instruction actions in the current node and its descendants. It is consulted only while a reachable instruction remains pending; it is not a node-entry hook like `this.guard`.
+
+```js
+this.deflectWhen = () => {
+  if (judge(`${user} wants to leave this topic`)) {
+    return true;
+  }
+};
+```
+
+It accepts the same two authored forms as instruction-level `deflectWhen`:
+
+- a template literal, which desugars to `return judge(...)`;
+- an arrow function using the trigger-style subset.
+
+Inheritance rules:
+
+- A node's own instruction actions inherit `this.deflectWhen` by default.
+- Child nodes inherit the nearest ancestor `this.deflectWhen` unless they define their own.
+- An instruction-level `deflectWhen` overrides the inherited node default.
 
 ### Guard
 
@@ -298,13 +374,18 @@ reports `unknown`, execution continues without writing a new value. By contrast,
 
 ## Composition
 
-Nodes compose via two mechanisms, distinguished by ownership and scope:
+Arc has two distinct composition layers:
+
+- **Structural composition (declaration-time)** — how nodes/arcs are declared and related in source.
+- **Execution composition (runtime)** — how control transfers between declared units during traversal.
+
+Structural composition uses two mechanisms, distinguished by ownership and scope:
 
 **Child nodes** are function declarations nested inside a parent. They are owned by the parent — their traversal state is stored inline under it. Children can read outer variables through lexical scoping.
 
 **Imported arcs** are roots from other arc documents imported at the top level. They have their own traversal lifecycle, managed directly by the runtime. Their scope is fully isolated — own variables, effects, and action graph.
 
-Both are entered the same way with `enter(ReferenceName)`:
+Execution composition uses `enter(ReferenceName)` for both forms:
 
 ```js
 "use arc v2";
@@ -334,6 +415,92 @@ Import resolution is two-stage:
 
 The local import binding is only a lexical name inside the importing document.
 
+### Enter
+
+`enter(...)` is an action for execution control-transfer. It has two forms:
+
+- `enter(ReferenceName)` — control-flow only.
+- `enter(ReferenceName, { args, returns })` — control-flow with explicit dataflow wiring.
+
+When traversing an `enter`:
+
+1. `ReferenceName` resolves to either a child node identifier or an imported arc binding.
+2. Control transfers to the referenced callee traversal.
+3. The caller action graph does not move past this `enter` until the callee resolves for this entry.
+4. The callee outcome is reflected through `ReferenceName.state` (`COVERED`, `DEFLECTED`, `SKIPPED`).
+5. When the callee becomes `COVERED` or `SKIPPED`, this `enter` action resolves and caller traversal continues.
+6. If the callee is unresolved or becomes `DEFLECTED`, then `enter` remains unresolved.
+
+#### Args and Returns Processing
+
+`enter(..., { args, returns })` wires caller variables into child input/output channels:
+
+```js
+const report = new ...;
+const verdict = new ...;
+
+enter(Child, {
+  args: { report },
+  returns: { report, verdict },
+});
+
+// then inside Child
+function Child({ args, returns }) {
+  this.effects = () => {
+    returns.report.set(...);
+  }
+}
+```
+
+Processing rules:
+
+- `args` maps **child-side input channel keys** (accessed as `args.<key>`) to **caller variables**.
+- `returns` maps **child-side output channel keys** (written as `returns.<key>.set(...)`) to **caller variables**.
+- Each entry must be same-name (no renamed binding): `args: { report }` is valid, `args: { inputReport: report }` is invalid.
+- `args` / `returns` must be object literals (no spread, no computed keys).
+- These keys live under the callee's parameter object namespaces (`args` and `returns`), not as top-level callee bindings.
+
+Arc variables are containers (cells), not scalar bindings. `enter(...)` therefore wires cells, not copied scalar values.
+
+Execution semantics:
+
+1. On child entry, `args` exposes caller-backed input cells under child-local names.
+2. Child writes output candidates through `returns.<name>.set(...)`.
+3. Return writes are staged during child execution and become visible to caller cells only when the child resolves to `State.COVERED`.
+4. If child traversal does not reach `State.COVERED` for this `enter` (for example, remains blocked, is deferred, deflected, or skipped by guard), staged return writes are not committed to caller cells.
+5. Keys in `returns` that the child never sets do not change caller cells.
+
+Write boundary:
+
+- `returns.*.set(...)` is only valid inside `this.effects`.
+- `args` is read-only from the child perspective.
+
+This model keeps control-flow ownership in `enter(...)` while making dataflow explicit at the call site.
+
+Example:
+
+```js
+function Parent() {
+  const ready = new Boolean();
+  const verdict = new Boolean();
+
+  enter(Child, {
+    args: { ready },
+    returns: { verdict },
+  });
+
+  function Child({ args, returns }) {
+    if (args.ready === true) {
+      `...`;
+    }
+
+    this.effects = () => {
+      returns.verdict.set(true);
+    };
+  }
+}
+```
+
 ## Primitives
 
 ### Values
@@ -347,10 +514,10 @@ The local import binding is only a lexical name inside the importing document.
 
 **`State`** — node outcome values used in `ReferenceName.state` comparisons.
 
-| Property          | Description                                                                              |
-| ----------------- | ---------------------------------------------------------------------------------------- |
-| `State.COVERED`   | All reachable actions and effects completed.                                             |
-| `State.DEFLECTED` | The host reported a deflection (user redirected away). Eligible for re-entry.            |
+| Property          | Description                                                                               |
+| ----------------- | ----------------------------------------------------------------------------------------- |
+| `State.COVERED`   | All reachable actions and effects completed.                                              |
+| `State.DEFLECTED` | The host reported a deflection (user redirected away). Eligible for re-entry.             |
 | `State.SKIPPED`   | Permanently resolved via explicit guard logic. Not produced automatically by the runtime. |
 
 **`Dialog`** — conversation context accessors.
@@ -377,7 +544,11 @@ When traversal is inside a node, each turn:
 1. **Sets up declarative state** — evaluates config statements and variable declarations.
 2. **Walks the action graph** — re-traverses from the top, skips every reachable action already resolved in the node frame, and stops at the first unresolved reachable action.
 
-The runtime yields a brief describing the pending work. The host resolves it and reports back. The runtime applies the report and, if the host proceeds, walks again. This loop continues until the action graph completes or the host defers/deflects.
+The runtime yields a brief describing the pending work. The host resolves it and reports back when it wants traversal to continue. The runtime applies the report and, if the host proceeds, walks again. This loop continues until the action graph completes or the host defers/deflects.
+
+Traversal progression is host-driven and does not need to map one-to-one to conversation messages. A host may call `progress(...)` immediately, after one message round, or after many rounds while carrying the same instruction frontier.
+
+Instruction actions have an extra pending phase: first the runtime emits guidance, then subsequent handbacks evaluate authored `deflectWhen` / `resolveWhen` conditions until the instruction resolves or deflects. That is why a follow-up brief may carry the same pending instruction again with a different `phase` and a different `postcheck` frontier.
 
 After the action graph resolves, `this.effects` runs. Effects may require additional resolution rounds.
 

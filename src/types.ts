@@ -31,6 +31,7 @@ export type LocalExpression =
   | { kind: "literal"; value: PrimitiveValue | null }
   | { kind: "ref"; name: "user" | "self" }
   | { kind: "variable"; name: string }
+  | { kind: "channel"; namespace: "args" | "returns"; key: string }
   | { kind: "scope"; name: "lastUserMessage" | "lastTurns"; count?: number }
   | { kind: "enterCount" }
   | { kind: "nodeState"; node: string };
@@ -159,6 +160,28 @@ export type SetAction = {
   loc?: SourceRange;
 };
 
+/** Staged write into a caller-bound return channel. */
+export type SetReturnAction = {
+  id: number;
+  kind: "set-return";
+  key: string;
+  value: ValueExpression;
+  loc?: SourceRange;
+};
+
+/**
+ * Enter-call channel binding map.
+ * key: child channel key.
+ * value: caller lexical variable name.
+ *
+ * Current parser/runtime constraint: key and value must be identical
+ * (same-name binding only), for example `{ report: "report" }`.
+ *
+ * This map shape is intentionally retained to allow a future relaxation to
+ * renamed bindings without changing the IR type.
+ */
+export type EnterChannelBindings = Record<string, string>;
+
 /**
  * Enter a child node or imported arc from the current action graph.
  *
@@ -170,16 +193,29 @@ export type EnterNodeAction = {
   kind: "enter-node";
   node: string;
   imported: boolean;
+  /**
+   * Args channel bindings.
+   * key: child-side args channel key (`args.<key>`).
+   * value: caller lexical variable name to bind.
+   */
+  args?: EnterChannelBindings;
+  /**
+   * Returns channel bindings.
+   * key: child-side returns channel key (`returns.<key>.set(...)`).
+   * value: caller lexical variable name to bind.
+   */
+  returns?: EnterChannelBindings;
   loc?: SourceRange;
 };
 
-/**
- * Bare template literal in the action graph.
- */
+/** Authored instruction emitted from the action graph. */
 export type InstructionAction = {
   id: number;
   kind: "instruction";
+  mode: "once" | "persistent";
   template: SemanticString;
+  resolveWhen?: ResolutionStatement[];
+  deflectWhen?: ResolutionStatement[];
   loc?: SourceRange;
 };
 
@@ -188,6 +224,7 @@ export type ActionStatement =
   | ObserveAction
   | ObserveOrAskAction
   | SetAction
+  | SetReturnAction
   | EnterNodeAction
   | InstructionAction;
 
@@ -227,6 +264,12 @@ export type TriggerStatement =
   | ObserveAction
   | TriggerIfStatement
   | { kind: "return"; value?: ValueExpression; loc?: SourceRange };
+
+/**
+ * Instruction resolution logic uses the same constrained statement subset as
+ * `this.trigger`.
+ */
+export type ResolutionStatement = TriggerStatement;
 
 /** Conditional inside trigger functions. */
 export type TriggerIfStatement = {
@@ -285,6 +328,7 @@ export type EffectIfStatement = {
 export type EffectStatement =
   | ObserveAction
   | SetAction
+  | SetReturnAction
   | HostEffectStatement
   | EffectIfStatement;
 
@@ -308,6 +352,7 @@ export type Node = {
   children: Node[];
   imports: string[];
   trigger?: TriggerStatement[];
+  deflectWhen?: ResolutionStatement[];
   guard?: GuardStatement[];
   effects?: EffectStatement[];
   loc?: SourceRange;
@@ -365,7 +410,7 @@ export type NodeState = "covered" | "deflected" | "skipped";
  */
 export type ActionState = {
   kind: ActionStatement["kind"] | HostEffectStatement["kind"];
-  resolved: true;
+  status: "pending" | "resolved";
 };
 
 /**
@@ -377,6 +422,26 @@ export type ActionState = {
  */
 export type NodeFrame = {
   actionStates: Record<number, ActionState | undefined>;
+  evaluatorActionStates: Record<
+    string,
+    Record<number, ActionState | undefined> | undefined
+  >;
+};
+
+/** Reference to a caller variable in an `enter` channel. */
+export type CallerVarRef = {
+  ownerRef: NodeRef;
+  variable: string;
+};
+
+/** `enter(..., { args, returns })` channel data for one traversal. */
+export type EnterChannelState = {
+  /** key: args channel key. */
+  args: Record<string, CallerVarRef>;
+  /** key: returns channel key. */
+  returns: Record<string, CallerVarRef>;
+  /** key: returns channel key. */
+  stagedReturns: Record<string, PrimitiveValue>;
 };
 
 /**
@@ -398,6 +463,8 @@ export type TraversalBase<TRef extends ArcRef | NodeRef> = {
   refChildren: ArcRef[];
   /** Idempotency keys for host effects already emitted from this traversal. */
   appliedHostCallKeys: string[];
+  /** Enter-time channels set by `enter(..., { args, returns })`. */
+  enterChannels: EnterChannelState;
 };
 
 /** Persisted runtime state for an owned nested node. */
@@ -415,6 +482,9 @@ export type NodeTraversal = TraversalBase<NodeRef>;
  * - `completed`: all nodes covered.
  * - `suspended`: entered but left before completing.
  */
+// TODO: add compatDate/version metadata for runtime/API upgrades, then enforce
+// on-demand migration policy (migrate only traversals that are re-entered).
+// Placement (ArcTraversal vs ArcTraversalSet) is still an open design choice.
 export type ArcTraversal = TraversalBase<ArcRef> & {
   returnTo: ArcRef | null;
   phase: "dormant" | "entered" | "completed" | "suspended";
@@ -483,13 +553,11 @@ export type BriefId = string;
 /**
  * A semantic boolean judgment the host may resolve for this turn.
  *
- * `arc` identifies which registered arc requested this judgment. Trigger briefs
- * may contain judgments from multiple arcs at once.
+ * `sourceRef` identifies the source node that requested this judgment.
  */
 export type JudgmentBrief = {
   id: BriefId;
-  arc: ArcRef;
-  node: string;
+  sourceRef: NodeRef;
   question: string;
 };
 
@@ -503,12 +571,11 @@ export type JudgmentBrief = {
  * `currentValue` is included when the traversal already holds a value, so the
  * host can decide whether a refresh is still needed.
  *
- * `arc` identifies which registered arc requested this observation.
+ * `sourceRef` identifies the source node that requested this observation.
  */
 export type ObservationBrief = {
   id: BriefId;
-  arc: ArcRef;
-  node: string;
+  sourceRef: NodeRef;
   variable: string;
   mode: "observe" | "observeOrAsk";
   question: string;
@@ -522,19 +589,26 @@ export type ObservationBrief = {
 };
 
 /**
- * Instruction text that the host may weave into the companion response.
+ * Host-directed instruction text emitted by the arc.
  *
- * This is not a provider prompt. It is authored guidance surfaced in a
- * structured form so another system can decide whether and how to present it.
+ * Hosts typically apply this as guidance for LLM generation and decide how
+ * (or whether) to surface it in user-visible output.
  *
- * `arc` identifies which registered arc emitted this instruction.
+ * `sourceRef` identifies the source node that emitted this instruction.
  */
 export type InstructionBrief = {
   id: BriefId;
-  arc: ArcRef;
-  node: string;
-  statementIndex: number;
+  sourceRef: NodeRef;
+  mode: InstructionAction["mode"];
+  phase: "apply" | "postcheck";
   text: string;
+  postcheck?: InstructionPostcheck;
+};
+
+export type InstructionPostcheck = {
+  judgmentIds: BriefId[];
+  observationIds: BriefId[];
+  hostCallIds: BriefId[];
 };
 
 /**
@@ -544,8 +618,7 @@ export type InstructionBrief = {
  */
 export type HostCallBrief = {
   id: BriefId;
-  arc: ArcRef;
-  node: string;
+  sourceRef: NodeRef;
   module: string;
   target: string[];
   operation: string;
@@ -600,7 +673,8 @@ export type TriggerBrief = {
  *
  * - `proceed`: report semantic results and continue traversal
  * - `defer`: leave traversal unchanged for this turn
- * - `deflect`: mark the active node as intentionally deflected
+ * - `deflect`: mark the active node as intentionally deflected. This move is
+ *   only available when `allowedMoves` includes it for the current frontier.
  */
 export type ActionMove = "proceed" | "defer" | "deflect";
 
@@ -611,7 +685,8 @@ export type ActionMove = "proceed" | "defer" | "deflect";
  * reports back an `ActionReport` through `Runtime.progress(...)`.
  *
  * Unlike `Traversal`, this brief is ephemeral. It is bound to the exact
- * document/traversal-set/context snapshot used to build it.
+ * document/traversal-set snapshot used to build it. Hosts may later call
+ * `Runtime.progress(...)` with a newer dialog.
  *
  * `traversals` is the full persisted state the caller should save after this
  * yield. `active` identifies which traversal inside that set currently owns the
@@ -621,9 +696,6 @@ export type ActionMove = "proceed" | "defer" | "deflect";
  * `canProgress` answers the host control-flow question directly:
  * - `true`: calling `Runtime.progress(...)` may advance this root further
  * - `false`: this root has stopped for now
- *
- * `blockedBy` points at the guard or statement frontier that prevented local
- * deterministic execution from advancing further before delegation.
  */
 export type ActionBrief = {
   /** Full persisted traversal state to save after this yield. */
@@ -636,15 +708,6 @@ export type ActionBrief = {
   hostCalls: HostCallBrief[];
   /** Append-only host effects produced before this yield. */
   hostEffects: HostEffect[];
-  blockedBy?:
-    | { kind: "guard"; arc: ArcRef; node: string }
-    | {
-        kind: "statement";
-        arc: ArcRef;
-        node: string;
-        statementIndex: number;
-        statementKind: Statement["kind"];
-      };
   judgments: JudgmentBrief[];
   observations: ObservationBrief[];
   instructions: InstructionBrief[];
@@ -670,7 +733,8 @@ export type ObservationReport = {
  * Structured report returned by the host or presenter.
  *
  * It is accepted only through `Runtime.progress(...)`, which validates the
- * report against the originating brief snapshot.
+ * report against the originating brief snapshot and replans using the dialog
+ * supplied for that progress call.
  */
 export type ActionReport = {
   move: ActionMove;

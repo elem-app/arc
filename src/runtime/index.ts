@@ -8,9 +8,11 @@ import type {
   ArcTraversal,
   ArcTraversalSet,
   BinaryOperator,
+  CallerVarRef,
   Dialog,
   Document,
   EffectStatement,
+  EnterChannelState,
   GuardStatement,
   HostCallArgument,
   HostCallBrief,
@@ -19,6 +21,7 @@ import type {
   HostEffectStatement,
   InstructionAction,
   InstructionBrief,
+  InstructionPostcheck,
   JudgeExpression,
   JudgmentBrief,
   LocalExpression,
@@ -86,17 +89,6 @@ type RegistryEntry = {
   importRefs: Record<string, ArcRef>;
 };
 
-type BlockedBy =
-  | { kind: "trigger"; arc: ArcRef; node: string }
-  | { kind: "guard"; arc: ArcRef; node: string }
-  | {
-      kind: "statement";
-      arc: ArcRef;
-      node: string;
-      statementIndex: number;
-      statementKind: Statement["kind"];
-    };
-
 type Accumulator = {
   entries: ReadonlyMap<ArcRef, RegistryEntry>;
   entry: RegistryEntry;
@@ -109,10 +101,11 @@ type Accumulator = {
   hostCalls: HostCallBrief[];
   instructions: InstructionBrief[];
   hostEffects: HostEffect[];
-  blockedBy: BlockedBy | undefined;
+  blocked: boolean;
   active?: NodeRef;
   briefActive?: NodeRef;
   instructionBatchNode?: NodeRef;
+  instructionBatchSignature?: string;
   judgmentResults: Map<string, boolean>;
   observationResults: Map<string, ObservationReport>;
   hostCallResults: Map<string, PayloadValue>;
@@ -126,6 +119,7 @@ type RunStatus =
   | { status: "done" }
   | { status: "blocked" }
   | { status: "yielded" }
+  | { status: "deflected"; active: NodeRef }
   | { status: "break"; label: string };
 
 type ActionBriefSnapshot = Omit<ActionBrief, "traversals" | "hostEffects">;
@@ -135,7 +129,6 @@ type ActionBriefState = {
   entries: ReadonlyMap<ArcRef, RegistryEntry>;
   entry: RegistryEntry;
   traversals: ArcTraversalSet;
-  dialog: Dialog;
   snapshot: ActionBriefSnapshot;
 };
 
@@ -198,7 +191,7 @@ export class Runtime {
       const base = existing
         ? cloneArcTraversal(existing)
         : createFreshArcTraversal(entry.arc, entry.root, 0);
-      const runtime = createAccumulator(
+      const accum = createAccumulator(
         this.#entries,
         entry,
         base,
@@ -206,11 +199,11 @@ export class Runtime {
         dialog,
         "plan",
       );
-      const matched = runTrigger(entry.root, base, runtime);
-      judgments.push(...runtime.judgments);
-      observations.push(...runtime.observations);
-      hostCalls.push(...runtime.hostCalls);
-      if (matched && !runtime.blockedBy) {
+      const matched = runTrigger(entry.root, base, accum);
+      judgments.push(...accum.judgments);
+      observations.push(...accum.observations);
+      hostCalls.push(...accum.hostCalls);
+      if (matched && !accum.blocked) {
         matchableArcs.push(entry.arc);
       }
     }
@@ -255,7 +248,11 @@ export class Runtime {
     return this.#createActionBrief(entry, traversals, dialog);
   }
 
-  progress(brief: ActionBrief, report: ActionReport): ActionBrief {
+  progress(
+    brief: ActionBrief,
+    report: ActionReport,
+    dialog: Dialog,
+  ): ActionBrief {
     const state = this.#actionBriefState.get(brief);
     if (!state) throw new Error("Unknown action brief");
 
@@ -265,18 +262,14 @@ export class Runtime {
     );
     if (rootTraversal.phase !== "entered") {
       validateActionReport(state.snapshot, report);
-      return this.#createActionBrief(
-        state.entry,
-        state.traversals,
-        state.dialog,
-      );
+      return this.#createActionBrief(state.entry, state.traversals, dialog);
     }
 
     const applied = acceptActionReport(
       state.entries,
       state.entry,
       state.traversals,
-      state.dialog,
+      dialog,
       state.snapshot,
       report,
     );
@@ -284,7 +277,7 @@ export class Runtime {
     return this.#createActionBrief(
       state.entry,
       applied.traversals,
-      state.dialog,
+      dialog,
       applied.hostEffects,
       applied.instructions,
       isStopped(selectActionRootTraversal(applied.traversals, state.entry.arc))
@@ -322,7 +315,7 @@ export class Runtime {
   ): ActionBrief {
     const workingTraversals = cloneTraversalSet(traversals);
     const workingRoot = selectActionRootTraversal(workingTraversals, entry.arc);
-    const runtime = createAccumulator(
+    const accum = createAccumulator(
       this.#entries,
       entry,
       workingRoot,
@@ -331,9 +324,9 @@ export class Runtime {
       "plan",
     );
     if (workingRoot.phase === "entered") {
-      runTurn(runtime);
+      runTurn(accum);
     } else if (activeHint) {
-      runtime.active = activeHint;
+      accum.active = activeHint;
     }
     for (const traversal of workingTraversals) {
       const traversalEntry = this.#getEntry(rootRefOf(traversal.ref));
@@ -342,34 +335,31 @@ export class Runtime {
     const yieldedTraversals = cloneTraversalSet(workingTraversals);
     const snapshot = cloneActionBriefSnapshot(
       finalizeActionBrief(
-        runtime,
+        accum,
         selectActionRootTraversal(yieldedTraversals, entry.arc),
       ),
+    );
+    const instructions = mergeInstructionBriefs(
+      leadingInstructions,
+      snapshot.instructions,
     );
     const brief: ActionBrief = {
       traversals: yieldedTraversals,
       hostEffects: [
         ...leadingHostEffects.map(cloneHostEffect),
-        ...runtime.hostEffects.map(cloneHostEffect),
+        ...accum.hostEffects.map(cloneHostEffect),
       ],
       ...snapshot,
-      instructions: [
-        ...leadingInstructions.map((item) => ({ ...item })),
-        ...snapshot.instructions,
-      ],
+      instructions,
     };
 
     this.#actionBriefState.set(brief, {
       entries: this.#entries,
       entry,
       traversals: cloneTraversalSet(yieldedTraversals),
-      dialog: cloneDialog(dialog),
       snapshot: cloneActionBriefSnapshot({
         ...snapshot,
-        instructions: [
-          ...leadingInstructions.map((item) => ({ ...item })),
-          ...snapshot.instructions,
-        ],
+        instructions,
       }),
     });
 
@@ -397,14 +387,19 @@ function createAccumulator(
     hostCalls: [],
     instructions: [],
     hostEffects: [],
-    blockedBy: undefined,
+    blocked: false,
     active: undefined,
     briefActive: undefined,
     instructionBatchNode: undefined,
+    instructionBatchSignature: undefined,
     judgmentResults: new Map(),
     observationResults: new Map(),
     hostCallResults: new Map(),
   };
+}
+
+function createEmptyEnterChannelState(): EnterChannelState {
+  return { args: {}, returns: {}, stagedReturns: {} };
 }
 
 function createFreshArcTraversal(
@@ -422,10 +417,11 @@ function createFreshArcTraversal(
     enterCount,
     state: undefined,
     variables,
-    frame: { actionStates: {} },
+    frame: { actionStates: {}, evaluatorActionStates: {} },
     ownedChildren: [],
     refChildren: [],
     appliedHostCallKeys: [],
+    enterChannels: createEmptyEnterChannelState(),
   };
 }
 
@@ -441,10 +437,11 @@ function createFreshNodeTraversal(
     enterCount,
     state: undefined,
     variables,
-    frame: { actionStates: {} },
+    frame: { actionStates: {}, evaluatorActionStates: {} },
     ownedChildren: [],
     refChildren: [],
     appliedHostCallKeys: [],
+    enterChannels: createEmptyEnterChannelState(),
   };
 }
 
@@ -463,6 +460,7 @@ function restartTraversal(
   next.pendingEffects = undefined;
   next.state = undefined;
   next.returnTo = null;
+  next.enterChannels = createEmptyEnterChannelState();
   if (!entry.root.resumable) clearFrame(next);
   return next;
 }
@@ -498,12 +496,40 @@ function cloneTraversalBase<T extends Traversal>(traversal: T) {
           state ? { ...state } : undefined,
         ]),
       ),
+      evaluatorActionStates: Object.fromEntries(
+        Object.entries(traversal.frame.evaluatorActionStates ?? {}).map(
+          ([scopeKey, scopedStates]) => [
+            scopeKey,
+            scopedStates
+              ? Object.fromEntries(
+                  Object.entries(scopedStates).map(([id, state]) => [
+                    id,
+                    state ? { ...state } : undefined,
+                  ]),
+                )
+              : undefined,
+          ],
+        ),
+      ),
     },
     ownedChildren: traversal.ownedChildren.map((child) =>
       cloneNodeTraversal(child),
     ),
     refChildren: [...traversal.refChildren],
     appliedHostCallKeys: [...traversal.appliedHostCallKeys],
+    enterChannels: {
+      args: Object.fromEntries(
+        Object.entries(traversal.enterChannels.args).map(
+          ([key, channelLink]) => [key, { ...channelLink }],
+        ),
+      ),
+      returns: Object.fromEntries(
+        Object.entries(traversal.enterChannels.returns).map(
+          ([key, channelLink]) => [key, { ...channelLink }],
+        ),
+      ),
+      stagedReturns: { ...traversal.enterChannels.stagedReturns },
+    },
   };
 }
 
@@ -551,8 +577,7 @@ function cloneHostEffect(call: HostEffect): HostEffect {
 function cloneHostCallBrief(brief: HostCallBrief): HostCallBrief {
   return {
     id: brief.id,
-    arc: brief.arc,
-    node: brief.node,
+    sourceRef: brief.sourceRef,
     module: brief.module,
     target: [...brief.target],
     operation: brief.operation,
@@ -560,10 +585,178 @@ function cloneHostCallBrief(brief: HostCallBrief): HostCallBrief {
   };
 }
 
+function cloneInstructionBrief(brief: InstructionBrief): InstructionBrief {
+  return {
+    id: brief.id,
+    sourceRef: brief.sourceRef,
+    mode: brief.mode,
+    phase: brief.phase,
+    text: brief.text,
+    postcheck: brief.postcheck
+      ? {
+          judgmentIds: [...brief.postcheck.judgmentIds],
+          observationIds: [...brief.postcheck.observationIds],
+          hostCallIds: [...brief.postcheck.hostCallIds],
+        }
+      : undefined,
+  };
+}
+
+function mergeInstructionBriefs(
+  ...groups: readonly (readonly InstructionBrief[])[]
+): InstructionBrief[] {
+  const merged = new Map<string, InstructionBrief>();
+  for (const group of groups) {
+    for (const brief of group) {
+      const current = merged.get(brief.id);
+      if (!current) {
+        merged.set(brief.id, cloneInstructionBrief(brief));
+        continue;
+      }
+      merged.set(brief.id, {
+        ...cloneInstructionBrief(brief),
+        phase:
+          current.phase === "apply" || brief.phase === "apply"
+            ? "apply"
+            : "postcheck",
+        postcheck: brief.postcheck
+          ? {
+              judgmentIds: [...brief.postcheck.judgmentIds],
+              observationIds: [...brief.postcheck.observationIds],
+              hostCallIds: [...brief.postcheck.hostCallIds],
+            }
+          : current.postcheck
+            ? {
+                judgmentIds: [...current.postcheck.judgmentIds],
+                observationIds: [...current.postcheck.observationIds],
+                hostCallIds: [...current.postcheck.hostCallIds],
+              }
+            : undefined,
+      });
+    }
+  }
+  return [...merged.values()];
+}
+
+function cloneValueExpression(expression: ValueExpression): ValueExpression {
+  switch (expression.kind) {
+    case "literal":
+      return { kind: "literal", value: expression.value };
+    case "ref":
+      return { kind: "ref", name: expression.name };
+    case "variable":
+      return { kind: "variable", name: expression.name };
+    case "channel":
+      return {
+        kind: "channel",
+        namespace: expression.namespace,
+        key: expression.key,
+      };
+    case "scope":
+      return {
+        kind: "scope",
+        name: expression.name,
+        count: expression.count,
+      };
+    case "enterCount":
+      return { kind: "enterCount" };
+    case "nodeState":
+      return { kind: "nodeState", node: expression.node };
+    case "judge":
+      return {
+        id: expression.id,
+        kind: "judge",
+        question: cloneSemanticString(expression.question),
+        loc: expression.loc,
+      };
+    case "host-call":
+      return {
+        id: expression.id,
+        kind: "host-call",
+        module: expression.module,
+        target: [...expression.target],
+        operation: expression.operation,
+        arguments: expression.arguments.map((arg) =>
+          cloneHostCallArgument(arg),
+        ),
+        loc: expression.loc,
+      };
+    case "regexTest":
+      return {
+        kind: "regexTest",
+        pattern: expression.pattern,
+        flags: expression.flags,
+        target: cloneValueExpression(
+          expression.target,
+        ) as typeof expression.target,
+      };
+    case "binary":
+      return {
+        kind: "binary",
+        op: expression.op,
+        left: cloneValueExpression(expression.left),
+        right: cloneValueExpression(expression.right),
+      };
+    case "logical":
+      return {
+        kind: "logical",
+        op: expression.op,
+        left: cloneValueExpression(expression.left),
+        right: cloneValueExpression(expression.right),
+      };
+    case "unary":
+      return {
+        kind: "unary",
+        op: expression.op,
+        argument: cloneValueExpression(expression.argument),
+      };
+  }
+}
+
+function cloneHostCallArgument(arg: HostCallArgument): HostCallArgument {
+  if (arg.kind === "semantic") {
+    return { kind: "semantic", value: cloneSemanticString(arg.value) };
+  }
+  if (arg.kind === "value") {
+    return { kind: "value", value: cloneValueExpression(arg.value) };
+  }
+  if (arg.kind === "array") {
+    return {
+      kind: "array",
+      value: arg.value.map((entry) => cloneHostCallArgument(entry)),
+    };
+  }
+  return {
+    kind: "object",
+    value: Object.fromEntries(
+      Object.entries(arg.value).map(([key, value]) => [
+        key,
+        cloneHostCallArgument(value),
+      ]),
+    ),
+  };
+}
+
+function cloneSemanticString(semantic: SemanticString): SemanticString {
+  return {
+    kind: "semantic-string",
+    parts: semantic.parts.map((part) =>
+      part.kind === "text"
+        ? { kind: "text", value: part.value }
+        : {
+            kind: "expression",
+            expression: cloneValueExpression(part.expression),
+          },
+    ),
+    loc: semantic.loc,
+  };
+}
+
 function pruneFrames(entry: RegistryEntry, traversal: Traversal): void {
   const node = resolveNodeForRef(entry, traversal.ref);
   if (!node) return;
-  if (!node.resumable) traversal.frame = { actionStates: {} };
+  if (!node.resumable)
+    traversal.frame = { actionStates: {}, evaluatorActionStates: {} };
   for (const child of traversal.ownedChildren) pruneFrames(entry, child);
 }
 
@@ -677,7 +870,7 @@ function findTraversalInSet(
 }
 
 function ensureOwnedTraversal(
-  runtime: Accumulator,
+  accum: Accumulator,
   childRef: NodeRef,
   childNode: Node,
 ): Traversal {
@@ -687,7 +880,7 @@ function ensureOwnedTraversal(
       `Owned child ${formatNodeRef(childRef)} has no lexical owner`,
     );
   }
-  const ownerTraversal = findTraversalInSet(runtime.traversals, ownerRef);
+  const ownerTraversal = findTraversalInSet(accum.traversals, ownerRef);
   if (!ownerTraversal) {
     throw new Error(
       `Missing lexical owner traversal ${formatNodeRef(ownerRef)} for ${formatNodeRef(childRef)}`,
@@ -720,12 +913,64 @@ function getActionState(
   return traversal.frame.actionStates[action.id];
 }
 
+function getEvaluatorActionStates(
+  traversal: Traversal,
+  scopeKey: string,
+): Record<number, ActionState | undefined> {
+  traversal.frame.evaluatorActionStates ??= {};
+  traversal.frame.evaluatorActionStates[scopeKey] ??= {};
+  return traversal.frame.evaluatorActionStates[scopeKey]!;
+}
+
+function getEvaluatorActionState(
+  traversal: Traversal,
+  scopeKey: string,
+  action: ObserveAction,
+): ActionState | undefined {
+  return getEvaluatorActionStates(traversal, scopeKey)[action.id];
+}
+
+function markEvaluatorActionResolved(
+  traversal: Traversal,
+  scopeKey: string,
+  action: ObserveAction,
+): void {
+  getEvaluatorActionStates(traversal, scopeKey)[action.id] = {
+    kind: action.kind,
+    status: "resolved",
+  };
+}
+
+function clearEvaluatorActionStates(
+  traversal: Traversal,
+  scopeKey: string,
+): void {
+  traversal.frame.evaluatorActionStates ??= {};
+  delete traversal.frame.evaluatorActionStates[scopeKey];
+}
+
+function clearActionState(traversal: Traversal, actionId: number): void {
+  delete traversal.frame.actionStates[actionId];
+}
+
+function isResolvedActionState(state: ActionState | undefined): boolean {
+  return state?.status === "resolved";
+}
+
 function markResolvedActionState(
   traversal: Traversal,
   actionId: number,
   kind: ActionState["kind"],
 ): void {
-  traversal.frame.actionStates[actionId] = { kind, resolved: true };
+  traversal.frame.actionStates[actionId] = { kind, status: "resolved" };
+}
+
+function markPendingActionState(
+  traversal: Traversal,
+  actionId: number,
+  kind: ActionState["kind"],
+): void {
+  traversal.frame.actionStates[actionId] = { kind, status: "pending" };
 }
 
 function markActionResolved(
@@ -736,7 +981,7 @@ function markActionResolved(
 }
 
 function clearFrame(traversal: Traversal): void {
-  traversal.frame = { actionStates: {} };
+  traversal.frame = { actionStates: {}, evaluatorActionStates: {} };
 }
 
 function childState(
@@ -762,96 +1007,100 @@ function isNodeState(value: unknown): value is NodeState {
 function runTrigger(
   node: Node,
   traversal: Traversal,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): boolean {
   if (!node.trigger) return true;
-  return runTriggerStatements(
+  const result = runTriggerStatements(
     node,
     traversal,
     node.trigger,
-    runtime,
+    accum,
     "trigger",
   );
+  if (result.status === "blocked") return false;
+  clearEvaluatorActionStates(traversal, "trigger");
+  return truthy(result.value);
 }
 
 function runTriggerStatements(
   node: Node,
   traversal: Traversal,
   statements: TriggerStatement[],
-  runtime: Accumulator,
-  kind: "trigger",
-): boolean {
+  accum: Accumulator,
+  frameKey: string,
+): EvalResult {
   for (const statement of statements) {
     if (statement.kind === "if") {
       const result = evaluateValueExpression(
         statement.test,
         traversal,
         node,
-        runtime,
+        accum,
       );
       if (result.status === "blocked") {
-        runtime.active = traversalToNodeRef(traversal);
-        runtime.blockedBy = {
-          kind,
-          arc: runtime.entry.arc,
-          node: node.identifier,
-        };
-        return false;
+        accum.active = traversalToNodeRef(traversal);
+        accum.blocked = true;
+        return { status: "blocked" };
       }
       const branch = truthy(result.value)
         ? statement.consequent
         : (statement.alternate ?? []);
-      if (runTriggerStatements(node, traversal, branch, runtime, kind))
-        return true;
+      const branchResult = runTriggerStatements(
+        node,
+        traversal,
+        branch,
+        accum,
+        frameKey,
+      );
+      if (branchResult.status === "blocked") return branchResult;
+      if (truthy(branchResult.value)) return branchResult;
       continue;
     }
 
     if (statement.kind === "return") {
-      if (!statement.value) return false;
+      if (!statement.value) return { status: "value", value: false };
       const result = evaluateValueExpression(
         statement.value,
         traversal,
         node,
-        runtime,
+        accum,
       );
       if (result.status === "blocked") {
-        runtime.active = traversalToNodeRef(traversal);
-        runtime.blockedBy = {
-          kind,
-          arc: runtime.entry.arc,
-          node: node.identifier,
-        };
-        return false;
+        accum.active = traversalToNodeRef(traversal);
+        accum.blocked = true;
+        return { status: "blocked" };
       }
-      return truthy(result.value);
+      return { status: "value", value: truthy(result.value) };
     }
 
-    if (getActionState(traversal, statement)?.resolved) continue;
+    if (
+      isResolvedActionState(
+        getEvaluatorActionState(traversal, frameKey, statement),
+      )
+    ) {
+      continue;
+    }
 
     if (statement.kind === "observe") {
-      const apply = applyObserve(statement, traversal, node, runtime);
+      const apply = applyObserve(statement, traversal, node, accum);
       if (apply.status === "blocked") {
-        runtime.active = traversalToNodeRef(traversal);
-        runtime.blockedBy = {
-          kind,
-          arc: runtime.entry.arc,
-          node: node.identifier,
-        };
-        return false;
+        accum.active = traversalToNodeRef(traversal);
+        accum.blocked = true;
+        return { status: "blocked" };
       }
-      markActionResolved(traversal, statement);
+      markEvaluatorActionResolved(traversal, frameKey, statement);
       continue;
     }
   }
 
-  return false;
+  return { status: "value", value: false };
 }
 
 function runGuardStatements(
   node: Node,
   traversal: Traversal,
   statements: GuardStatement[],
-  runtime: Accumulator,
+  accum: Accumulator,
 ): NodeState | undefined {
   for (const statement of statements) {
     if (statement.kind === "if") {
@@ -859,22 +1108,18 @@ function runGuardStatements(
         statement.test,
         traversal,
         node,
-        runtime,
+        accum,
       );
       if (result.status === "blocked") {
-        runtime.active = traversalToNodeRef(traversal);
-        runtime.blockedBy = {
-          kind: "guard",
-          arc: runtime.entry.arc,
-          node: node.identifier,
-        };
+        accum.active = traversalToNodeRef(traversal);
+        accum.blocked = true;
         return undefined;
       }
       const branch = truthy(result.value)
         ? statement.consequent
         : (statement.alternate ?? []);
-      const state = runGuardStatements(node, traversal, branch, runtime);
-      if (runtime.blockedBy || state) return state;
+      const state = runGuardStatements(node, traversal, branch, accum);
+      if (accum.blocked || state) return state;
       continue;
     }
 
@@ -884,31 +1129,23 @@ function runGuardStatements(
         statement.value,
         traversal,
         node,
-        runtime,
+        accum,
       );
       if (result.status === "blocked") {
-        runtime.active = traversalToNodeRef(traversal);
-        runtime.blockedBy = {
-          kind: "guard",
-          arc: runtime.entry.arc,
-          node: node.identifier,
-        };
+        accum.active = traversalToNodeRef(traversal);
+        accum.blocked = true;
         return undefined;
       }
       return isNodeState(result.value) ? result.value : undefined;
     }
 
-    if (getActionState(traversal, statement)?.resolved) continue;
+    if (isResolvedActionState(getActionState(traversal, statement))) continue;
 
     if (statement.kind === "observe") {
-      const apply = applyObserve(statement, traversal, node, runtime);
+      const apply = applyObserve(statement, traversal, node, accum);
       if (apply.status === "blocked") {
-        runtime.active = traversalToNodeRef(traversal);
-        runtime.blockedBy = {
-          kind: "guard",
-          arc: runtime.entry.arc,
-          node: node.identifier,
-        };
+        accum.active = traversalToNodeRef(traversal);
+        accum.blocked = true;
         return undefined;
       }
       markActionResolved(traversal, statement);
@@ -938,7 +1175,7 @@ function acceptTriggerReport(
     const base = existing
       ? cloneArcTraversal(existing)
       : createFreshArcTraversal(entry.arc, entry.root, 0);
-    const runtime = createAccumulator(
+    const accum = createAccumulator(
       entries,
       entry,
       base,
@@ -947,13 +1184,13 @@ function acceptTriggerReport(
       "apply",
     );
     for (const [id, value] of Object.entries(report.judgments ?? {}))
-      runtime.judgmentResults.set(id, value);
+      accum.judgmentResults.set(id, value);
     for (const [id, value] of Object.entries(report.observations ?? {}))
-      if (value) runtime.observationResults.set(id, value);
+      if (value) accum.observationResults.set(id, value);
     for (const [id, value] of Object.entries(report.hostCalls ?? {}))
-      runtime.hostCallResults.set(id, value);
-    const matched = runTrigger(entry.root, base, runtime);
-    if (matched && !runtime.blockedBy) matchable.add(arcKey);
+      accum.hostCallResults.set(id, value);
+    const matched = runTrigger(entry.root, base, accum);
+    if (matched && !accum.blocked) matchable.add(arcKey);
   }
 
   let matchKey = report.match ? report.match : undefined;
@@ -971,7 +1208,7 @@ function acceptTriggerReport(
   const base = existing
     ? cloneArcTraversal(existing)
     : createFreshArcTraversal(entry.arc, entry.root, 0);
-  const runtime = createAccumulator(
+  const accum = createAccumulator(
     entries,
     entry,
     base,
@@ -980,13 +1217,13 @@ function acceptTriggerReport(
     "apply",
   );
   for (const [id, value] of Object.entries(report.judgments ?? {}))
-    runtime.judgmentResults.set(id, value);
+    accum.judgmentResults.set(id, value);
   for (const [id, value] of Object.entries(report.observations ?? {}))
-    if (value) runtime.observationResults.set(id, value);
+    if (value) accum.observationResults.set(id, value);
   for (const [id, value] of Object.entries(report.hostCalls ?? {}))
-    runtime.hostCallResults.set(id, value);
-  const matched = runTrigger(entry.root, base, runtime);
-  if (!matched || runtime.blockedBy) {
+    accum.hostCallResults.set(id, value);
+  const matched = runTrigger(entry.root, base, accum);
+  if (!matched || accum.blocked) {
     throw new Error(
       `Arc ${formatNodeRef(entry.arc)} did not satisfy its trigger under the accepted report`,
     );
@@ -1014,9 +1251,9 @@ function validateTriggerReport(
   if (report.match) {
     const candidate = new Set([
       ...plan.matchableArcs,
-      ...plan.judgments.map((item) => item.arc),
-      ...plan.observations.map((item) => item.arc),
-      ...plan.hostCalls.map((item) => item.arc),
+      ...plan.judgments.map((item) => rootRefOf(item.sourceRef)),
+      ...plan.observations.map((item) => rootRefOf(item.sourceRef)),
+      ...plan.hostCalls.map((item) => rootRefOf(item.sourceRef)),
     ]);
     if (!candidate.has(report.match)) {
       throw new Error(
@@ -1044,50 +1281,56 @@ function validateTriggerReport(
   }
 }
 
-function runTurn(runtime: Accumulator): void {
-  const rootNode = resolveNodeForRef(runtime.entry, runtime.traversal.ref);
+function runTurn(accum: Accumulator): void {
+  const rootNode = resolveNodeForRef(accum.entry, accum.traversal.ref);
   if (!rootNode)
     throw new Error(
-      `Unknown root traversal node: ${formatNodeRef(runtime.traversal.ref)}`,
+      `Unknown root traversal node: ${formatNodeRef(accum.traversal.ref)}`,
     );
-  if (isArcTraversal(runtime.traversal) && runtime.traversal.pendingEffects) {
-    const pendingEffects = runtime.traversal.pendingEffects;
-    const status = runPendingEffects(runtime, pendingEffects);
+  if (isArcTraversal(accum.traversal) && accum.traversal.pendingEffects) {
+    const pendingEffects = accum.traversal.pendingEffects;
+    const status = runPendingEffects(accum, pendingEffects);
     if (status.status !== "done") return;
-    completePendingEffects(runtime, pendingEffects);
+    completePendingEffects(accum, pendingEffects);
     return;
   }
-  const status = runTraversal(runtime.traversal, rootNode, runtime, true);
+  const status = runTraversal(accum.traversal, rootNode, accum, true);
   if (status.status === "break") {
     throw new Error(`Unhandled break label: ${status.label}`);
   }
+  if (status.status === "deflected") {
+    const rootTraversal = accum.traversal;
+    if (!isArcTraversal(rootTraversal) || !rootTraversal.pendingEffects) {
+      throw new Error("Deflected root traversal is missing pending effects");
+    }
+    const pendingEffects = rootTraversal.pendingEffects;
+    const pendingStatus = runPendingEffects(accum, pendingEffects);
+    if (pendingStatus.status !== "done") return;
+    completePendingEffects(accum, pendingEffects);
+    return;
+  }
   if (status.status !== "done") return;
-  runtime.traversal.state = "covered";
-  if (isArcTraversal(runtime.traversal)) {
-    runtime.traversal.phase = "completed";
+  accum.traversal.state = "covered";
+  if (isArcTraversal(accum.traversal)) {
+    accum.traversal.phase = "completed";
   }
 }
 
 function runTraversal(
   traversal: Traversal,
   node: Node,
-  runtime: Accumulator,
+  accum: Accumulator,
   isRoot = false,
 ): RunStatus {
-  runtime.active = traversalToNodeRef(traversal);
+  accum.active = traversalToNodeRef(traversal);
 
   if (!isRoot) {
     if (traversal.state === "covered" || traversal.state === "skipped") {
       return { status: "done" };
     }
     if (node.guard) {
-      const guardState = runGuardStatements(
-        node,
-        traversal,
-        node.guard,
-        runtime,
-      );
-      if (runtime.blockedBy) return { status: "blocked" };
+      const guardState = runGuardStatements(node, traversal, node.guard, accum);
+      if (accum.blocked) return { status: "blocked" };
       if (guardState) {
         traversal.state = guardState;
         return { status: "done" };
@@ -1098,22 +1341,15 @@ function runTraversal(
   for (let index = 0; index < node.statements.length; index++) {
     const statement = node.statements[index];
     if (!statement) continue;
-    const status = runStatement(
-      traversal,
-      node,
-      statement,
-      runtime,
-      index,
-      index,
-    );
+    const status = runStatement(traversal, node, statement, accum);
     if (status.status !== "done") return status;
   }
 
-  if (isInstructionBatchActive(runtime, traversal)) {
+  if (isInstructionBatchActive(accum, traversal)) {
     return { status: "yielded" };
   }
 
-  const effects = runEffects(traversal, node, runtime);
+  const effects = runEffects(traversal, node, accum);
   if (effects.status !== "done") return effects;
 
   traversal.state = "covered";
@@ -1127,18 +1363,10 @@ function runStatementBlock(
   traversal: Traversal,
   node: Node,
   statements: Statement[],
-  runtime: Accumulator,
-  topLevelIndex: number,
+  accum: Accumulator,
 ): RunStatus {
   for (const statement of statements) {
-    const status = runStatement(
-      traversal,
-      node,
-      statement,
-      runtime,
-      topLevelIndex,
-      topLevelIndex,
-    );
+    const status = runStatement(traversal, node, statement, accum);
     if (status.status !== "done") return status;
   }
   return { status: "done" };
@@ -1148,45 +1376,31 @@ function runStatement(
   traversal: Traversal,
   node: Node,
   statement: Statement,
-  runtime: Accumulator,
-  topLevelIndex: number,
-  statementIndex: number,
+  accum: Accumulator,
 ): RunStatus {
   if (statement.kind === "if") {
     const result = evaluateValueExpression(
       statement.test,
       traversal,
       node,
-      runtime,
+      accum,
     );
     if (result.status === "blocked") {
-      if (isInstructionBatchActive(runtime, traversal)) {
+      if (isInstructionBatchActive(accum, traversal)) {
         return { status: "yielded" };
       }
-      runtime.active = traversalToNodeRef(traversal);
-      runtime.blockedBy = {
-        kind: "statement",
-        arc: runtime.entry.arc,
-        node: node.identifier,
-        statementIndex: topLevelIndex,
-        statementKind: "if",
-      };
+      accum.active = traversalToNodeRef(traversal);
+      accum.blocked = true;
       return { status: "blocked" };
     }
     const branch = truthy(result.value)
       ? statement.consequent
       : (statement.alternate ?? []);
-    return runStatementBlock(traversal, node, branch, runtime, topLevelIndex);
+    return runStatementBlock(traversal, node, branch, accum);
   }
 
   if (statement.kind === "label") {
-    const status = runStatementBlock(
-      traversal,
-      node,
-      statement.body,
-      runtime,
-      topLevelIndex,
-    );
+    const status = runStatementBlock(traversal, node, statement.body, accum);
     if (status.status === "break" && status.label === statement.label) {
       return { status: "done" };
     }
@@ -1197,44 +1411,39 @@ function runStatement(
     return { status: "break", label: statement.label };
   }
 
-  return runAction(
-    traversal,
-    node,
-    statement,
-    runtime,
-    topLevelIndex,
-    statementIndex,
-  );
+  return runAction(traversal, node, statement, accum);
 }
 
 function runAction(
   traversal: Traversal,
   node: Node,
   statement: ActionStatement,
-  runtime: Accumulator,
-  topLevelIndex: number,
-  statementIndex: number,
+  accum: Accumulator,
 ): RunStatus {
-  if (getActionState(traversal, statement)?.resolved) return { status: "done" };
+  if (isResolvedActionState(getActionState(traversal, statement))) {
+    return { status: "done" };
+  }
 
   if (
-    isInstructionBatchActive(runtime, traversal) &&
+    statement.kind === "instruction" &&
+    isInstructionBatchActive(accum, traversal) &&
+    !canBatchInstruction(accum, statement)
+  ) {
+    return { status: "yielded" };
+  }
+
+  if (
+    isInstructionBatchActive(accum, traversal) &&
     statement.kind !== "instruction"
   ) {
     return { status: "yielded" };
   }
 
   if (statement.kind === "observe" || statement.kind === "observeOrAsk") {
-    const status = applyObserve(statement, traversal, node, runtime);
+    const status = applyObserve(statement, traversal, node, accum);
     if (status.status === "blocked") {
-      runtime.active = traversalToNodeRef(traversal);
-      runtime.blockedBy = {
-        kind: "statement",
-        arc: runtime.entry.arc,
-        node: node.identifier,
-        statementIndex: topLevelIndex,
-        statementKind: statement.kind,
-      };
+      accum.active = traversalToNodeRef(traversal);
+      accum.blocked = true;
       return status;
     }
     markActionResolved(traversal, statement);
@@ -1242,16 +1451,21 @@ function runAction(
   }
 
   if (statement.kind === "set") {
-    const apply = applySet(statement, traversal, node, runtime);
+    const apply = applySet(statement, traversal, node, accum);
     if (apply.status === "blocked") {
-      runtime.active = traversalToNodeRef(traversal);
-      runtime.blockedBy = {
-        kind: "statement",
-        arc: runtime.entry.arc,
-        node: node.identifier,
-        statementIndex: topLevelIndex,
-        statementKind: "set",
-      };
+      accum.active = traversalToNodeRef(traversal);
+      accum.blocked = true;
+      return apply;
+    }
+    markActionResolved(traversal, statement);
+    return { status: "done" };
+  }
+
+  if (statement.kind === "set-return") {
+    const apply = applySetReturn(statement, traversal, node, accum);
+    if (apply.status === "blocked") {
+      accum.active = traversalToNodeRef(traversal);
+      accum.blocked = true;
       return apply;
     }
     markActionResolved(traversal, statement);
@@ -1259,12 +1473,10 @@ function runAction(
   }
 
   if (statement.kind === "instruction") {
-    emitInstruction(statement, traversal, node, runtime, statementIndex);
-    markActionResolved(traversal, statement);
-    return { status: "done" };
+    return runInstructionAction(traversal, node, statement, accum);
   }
 
-  const target = resolveEnterTarget(runtime, traversal, node, statement);
+  const target = resolveEnterTarget(accum, traversal, node, statement);
   if (!target) {
     throw new Error(`Missing child node implementation: ${statement.node}`);
   }
@@ -1274,72 +1486,328 @@ function runAction(
       traversal.refChildren.push(target.ref);
     }
     const referencedTraversal = ensureReferencedTraversal(
-      runtime,
+      accum,
       target.ref,
       target.entry.root,
       rootRefOf(traversal.ref),
     );
+    applyEnterChannels(traversal, node, statement, referencedTraversal, accum);
     const status = runTraversal(
       referencedTraversal,
       target.entry.root,
-      runtime,
+      accum,
       false,
     );
     if (status.status === "blocked") {
-      runtime.blockedBy ??= {
-        kind: "statement",
-        arc: runtime.entry.arc,
-        node: node.identifier,
-        statementIndex: topLevelIndex,
-        statementKind: "enter-node",
-      };
+      accum.blocked = true;
       return status;
     }
+    if (status.status === "deflected") return status;
     if (status.status === "yielded") return status;
     if (
       referencedTraversal.state === "covered" ||
       referencedTraversal.state === "skipped"
     ) {
+      if (referencedTraversal.state === "covered") {
+        commitEnterReturnChannels(referencedTraversal, accum);
+      }
       markActionResolved(traversal, statement);
     }
     return { status: "done" };
   }
 
   const childRef = target.ref;
-  if (childResolved(runtime.traversals, childRef)) {
+  if (childResolved(accum.traversals, childRef)) {
     markActionResolved(traversal, statement);
     return { status: "done" };
   }
 
-  const childTraversal = ensureOwnedTraversal(runtime, childRef, target.node);
+  const childTraversal = ensureOwnedTraversal(accum, childRef, target.node);
   prepareChildTraversalForEntry(childTraversal, target.node);
+  applyEnterChannels(traversal, node, statement, childTraversal, accum);
 
-  const childStatus = runTraversal(childTraversal, target.node, runtime, false);
+  const childStatus = runTraversal(childTraversal, target.node, accum, false);
   if (childStatus.status === "blocked") {
-    runtime.blockedBy ??= {
-      kind: "statement",
-      arc: runtime.entry.arc,
-      node: node.identifier,
-      statementIndex: topLevelIndex,
-      statementKind: "enter-node",
-    };
+    accum.blocked = true;
     return childStatus;
   }
+  if (childStatus.status === "deflected") return childStatus;
   if (childStatus.status === "yielded") return childStatus;
 
   if (
     childTraversal.state === "covered" ||
     childTraversal.state === "skipped"
   ) {
+    if (childTraversal.state === "covered") {
+      commitEnterReturnChannels(childTraversal, accum);
+    }
     markActionResolved(traversal, statement);
   }
   return { status: "done" };
+}
+
+function runInstructionAction(
+  traversal: Traversal,
+  node: Node,
+  statement: InstructionAction,
+  accum: Accumulator,
+): RunStatus {
+  const actionState = getActionState(traversal, statement);
+  if (actionState?.status !== "pending") {
+    const postcheck =
+      accum.phase === "plan"
+        ? collectInstructionPostcheck(statement, traversal, node, accum)
+        : undefined;
+    emitInstruction(statement, traversal, node, accum, "apply", postcheck);
+    markPendingActionState(traversal, statement.id, statement.kind);
+    return { status: "done" };
+  }
+
+  const judgmentStart = accum.judgments.length;
+  const observationStart = accum.observations.length;
+  const hostCallStart = accum.hostCalls.length;
+  const deflectResult = statement.deflectWhen
+    ? evaluateResolutionFunction(
+        statement.deflectWhen,
+        traversal,
+        node,
+        accum,
+        instructionResolutionFrameKey(statement, "deflectWhen"),
+      )
+    : ({ status: "value", value: false } satisfies EvalResult);
+  const resolveResult = evaluateInstructionResolution(
+    statement,
+    traversal,
+    node,
+    accum,
+  );
+  if (deflectResult.status !== "blocked" && truthy(deflectResult.value)) {
+    clearActionState(traversal, statement.id);
+    return deflectTraversal(accum, traversal);
+  }
+  if (
+    deflectResult.status === "blocked" ||
+    resolveResult.status === "blocked"
+  ) {
+    const postcheck =
+      accum.phase === "plan"
+        ? instructionPostcheckFromAccum(
+            accum,
+            judgmentStart,
+            observationStart,
+            hostCallStart,
+          )
+        : undefined;
+    emitInstruction(statement, traversal, node, accum, "postcheck", postcheck);
+    accum.active = traversalToNodeRef(traversal);
+    accum.blocked = true;
+    return { status: "blocked" };
+  }
+  if (truthy(resolveResult.value)) {
+    markActionResolved(traversal, statement);
+    return { status: "done" };
+  }
+
+  emitInstruction(statement, traversal, node, accum, "apply");
+  return { status: "done" };
+}
+
+function evaluateInstructionResolution(
+  statement: InstructionAction,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): EvalResult {
+  if (!statement.resolveWhen) {
+    return { status: "value", value: statement.mode === "once" };
+  }
+  return evaluateResolutionFunction(
+    statement.resolveWhen,
+    traversal,
+    node,
+    accum,
+    instructionResolutionFrameKey(statement, "resolveWhen"),
+  );
+}
+
+function collectInstructionPostcheck(
+  statement: InstructionAction,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): InstructionPostcheck | undefined {
+  const judgmentStart = accum.judgments.length;
+  const observationStart = accum.observations.length;
+  const hostCallStart = accum.hostCalls.length;
+
+  if (statement.deflectWhen) {
+    evaluateResolutionFunction(
+      statement.deflectWhen,
+      traversal,
+      node,
+      accum,
+      instructionResolutionFrameKey(statement, "deflectWhen"),
+    );
+  }
+  if (statement.resolveWhen) {
+    evaluateResolutionFunction(
+      statement.resolveWhen,
+      traversal,
+      node,
+      accum,
+      instructionResolutionFrameKey(statement, "resolveWhen"),
+    );
+  }
+
+  return instructionPostcheckFromAccum(
+    accum,
+    judgmentStart,
+    observationStart,
+    hostCallStart,
+  );
+}
+
+function instructionPostcheckFromAccum(
+  accum: Accumulator,
+  judgmentStart: number,
+  observationStart: number,
+  hostCallStart: number,
+): InstructionPostcheck | undefined {
+  const judgmentIds = dedupeBriefIds(
+    accum.judgments.slice(judgmentStart).map((item) => item.id),
+  );
+  const observationIds = dedupeBriefIds(
+    accum.observations.slice(observationStart).map((item) => item.id),
+  );
+  const hostCallIds = dedupeBriefIds(
+    accum.hostCalls.slice(hostCallStart).map((item) => item.id),
+  );
+
+  if (
+    judgmentIds.length === 0 &&
+    observationIds.length === 0 &&
+    hostCallIds.length === 0
+  ) {
+    return undefined;
+  }
+
+  return {
+    judgmentIds,
+    observationIds,
+    hostCallIds,
+  };
+}
+
+function dedupeBriefIds(ids: string[]): string[] {
+  return [...new Set(ids)];
+}
+
+function instructionResolutionFrameKey(
+  statement: InstructionAction,
+  kind: "resolveWhen" | "deflectWhen",
+): string {
+  return `instruction:${String(statement.id)}:${kind}`;
+}
+
+function evaluateResolutionFunction(
+  statements: TriggerStatement[],
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+  frameKey: string,
+): EvalResult {
+  const result = evaluateResolutionStatements(
+    statements,
+    traversal,
+    node,
+    accum,
+    frameKey,
+  );
+  if (result.status !== "blocked") {
+    clearEvaluatorActionStates(traversal, frameKey);
+  }
+  return result;
+}
+
+function evaluateResolutionStatements(
+  statements: TriggerStatement[],
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+  frameKey: string,
+): EvalResult {
+  for (const statement of statements) {
+    if (statement.kind === "if") {
+      const test = evaluateValueExpression(
+        statement.test,
+        traversal,
+        node,
+        accum,
+      );
+      if (test.status === "blocked") return test;
+      const branch = truthy(test.value)
+        ? statement.consequent
+        : (statement.alternate ?? []);
+      const branchResult = evaluateResolutionStatements(
+        branch,
+        traversal,
+        node,
+        accum,
+        frameKey,
+      );
+      if (branchResult.status === "blocked") return branchResult;
+      if (truthy(branchResult.value)) return branchResult;
+      continue;
+    }
+
+    if (statement.kind === "return") {
+      if (!statement.value) return { status: "value", value: false };
+      const result = evaluateValueExpression(
+        statement.value,
+        traversal,
+        node,
+        accum,
+      );
+      if (result.status === "blocked") return result;
+      return { status: "value", value: truthy(result.value) };
+    }
+
+    if (
+      isResolvedActionState(
+        getEvaluatorActionState(traversal, frameKey, statement),
+      )
+    ) {
+      continue;
+    }
+    const observeStatus = applyObserve(statement, traversal, node, accum);
+    if (observeStatus.status === "blocked") return observeStatus;
+    markEvaluatorActionResolved(traversal, frameKey, statement);
+  }
+
+  return { status: "value", value: false };
+}
+
+function deflectTraversal(accum: Accumulator, traversal: Traversal): RunStatus {
+  const activeRef = traversalToNodeRef(traversal);
+  traversal.state = "deflected";
+
+  const rootTraversal = selectActionRootTraversal(
+    accum.traversals,
+    accum.entry.arc,
+  );
+  rootTraversal.pendingEffects = {
+    reason: "deflected",
+    active: activeRef,
+  };
+
+  return { status: "deflected", active: activeRef };
 }
 
 function prepareChildTraversalForEntry(traversal: Traversal, node: Node): void {
   if (traversal.enterCount === 0) {
     traversal.enterCount = 1;
     traversal.state = undefined;
+    traversal.enterChannels = createEmptyEnterChannelState();
     if (isArcTraversal(traversal)) {
       traversal.phase = "entered";
     }
@@ -1352,6 +1820,7 @@ function prepareChildTraversalForEntry(traversal: Traversal, node: Node): void {
   ) {
     traversal.enterCount += 1;
     traversal.state = undefined;
+    traversal.enterChannels = createEmptyEnterChannelState();
     if (isArcTraversal(traversal)) {
       traversal.phase = "entered";
     }
@@ -1360,7 +1829,7 @@ function prepareChildTraversalForEntry(traversal: Traversal, node: Node): void {
 }
 
 function resolveEnterTarget(
-  runtime: Accumulator,
+  accum: Accumulator,
   traversal: Traversal,
   node: Node,
   statement: Extract<ActionStatement, { kind: "enter-node" }>,
@@ -1368,66 +1837,175 @@ function resolveEnterTarget(
   | { kind: "owned"; ref: NodeRef; node: Node }
   | { kind: "referenced"; ref: ArcRef; entry: RegistryEntry }
   | undefined {
-  const ref = resolveReferenceRef(runtime, traversal, node, statement.node);
+  const ref = resolveReferenceRef(accum, traversal, node, statement.node);
   if (!ref) return undefined;
 
   if (!isArcRef(ref)) {
-    const ownedNode = resolveNodeForRef(runtime.entry, ref);
+    const ownedNode = resolveNodeForRef(accum.entry, ref);
     if (ownedNode) return { kind: "owned", ref, node: ownedNode };
   }
 
   const importedRef = rootRefOf(ref);
-  const importedEntry = runtime.entries.get(importedRef);
+  const importedEntry = accum.entries.get(importedRef);
   if (!importedEntry) return undefined;
   return { kind: "referenced", ref: importedRef, entry: importedEntry };
 }
 
+function applyEnterChannels(
+  callerTraversal: Traversal,
+  callerNode: Node,
+  statement: Extract<ActionStatement, { kind: "enter-node" }>,
+  calleeTraversal: Traversal,
+  accum: Accumulator,
+): void {
+  const hasArgs = !!statement.args && Object.keys(statement.args).length > 0;
+  const hasReturns =
+    !!statement.returns && Object.keys(statement.returns).length > 0;
+  if (!hasArgs && !hasReturns) {
+    calleeTraversal.enterChannels = createEmptyEnterChannelState();
+    return;
+  }
+
+  const nextArgs = resolveEnterChannelLinks(
+    statement.args ?? {},
+    callerTraversal,
+    callerNode,
+    accum,
+    "args",
+  );
+  const nextReturns = resolveEnterChannelLinks(
+    statement.returns ?? {},
+    callerTraversal,
+    callerNode,
+    accum,
+    "returns",
+  );
+
+  if (
+    sameEnterChannelLinks(calleeTraversal.enterChannels.args, nextArgs) &&
+    sameEnterChannelLinks(calleeTraversal.enterChannels.returns, nextReturns)
+  ) {
+    return;
+  }
+
+  calleeTraversal.enterChannels = {
+    args: nextArgs,
+    returns: nextReturns,
+    stagedReturns: {},
+  };
+}
+
+function resolveEnterChannelLinks(
+  mapping: Record<string, string>,
+  callerTraversal: Traversal,
+  callerNode: Node,
+  accum: Accumulator,
+  label: "args" | "returns",
+): Record<string, CallerVarRef> {
+  const resolved: Record<string, CallerVarRef> = {};
+  for (const [key, variable] of Object.entries(mapping)) {
+    const owner = findVariableOwner(variable, callerTraversal, accum);
+    if (!owner) {
+      throw new Error(
+        `Unknown ${label} variable mapping "${variable}" in ${callerNode.identifier}`,
+      );
+    }
+    resolved[key] = {
+      ownerRef: traversalToNodeRef(owner.traversal),
+      variable,
+    };
+  }
+  return resolved;
+}
+
+function sameEnterChannelLinks(
+  left: Record<string, CallerVarRef>,
+  right: Record<string, CallerVarRef>,
+): boolean {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) return false;
+  for (const key of leftKeys) {
+    const l = left[key];
+    const r = right[key];
+    if (!l || !r) return false;
+    if (l.ownerRef !== r.ownerRef || l.variable !== r.variable) return false;
+  }
+  return true;
+}
+
+function commitEnterReturnChannels(
+  traversal: Traversal,
+  accum: Accumulator,
+): void {
+  const channelState = traversal.enterChannels;
+  for (const [key, value] of Object.entries(channelState.stagedReturns)) {
+    const callerVarRef = channelState.returns[key];
+    if (!callerVarRef) {
+      throw new Error(
+        `Unknown staged return channel key "${key}" for ${formatNodeRef(traversalToNodeRef(traversal))}`,
+      );
+    }
+    const callerTraversal = findTraversalInSet(
+      accum.traversals,
+      callerVarRef.ownerRef,
+    );
+    if (!callerTraversal) {
+      throw new Error(
+        `Return channel caller not found for binding: ${formatNodeRef(callerVarRef.ownerRef)}`,
+      );
+    }
+    callerTraversal.variables[callerVarRef.variable] = value;
+  }
+  channelState.stagedReturns = {};
+}
+
 function ensureReferencedTraversal(
-  runtime: Accumulator,
+  accum: Accumulator,
   ref: ArcRef,
   root: Node,
   returnTo: ArcRef,
 ): ArcTraversal {
-  let traversal = runtime.traversals.find((item) => item.ref === ref);
+  let traversal = accum.traversals.find((item) => item.ref === ref);
   if (!traversal) {
     traversal = createFreshArcTraversal(ref, root, 1, returnTo);
-    runtime.traversals.push(traversal);
+    accum.traversals.push(traversal);
   }
   traversal.returnTo = returnTo;
   return traversal;
 }
 
 function runPendingEffects(
-  runtime: Accumulator,
+  accum: Accumulator,
   pendingEffects: PendingEffects,
 ): RunStatus {
   for (const ref of deflectionEffectRefs(pendingEffects.active)) {
-    const traversal = findTraversalInSet(runtime.traversals, ref);
+    const traversal = findTraversalInSet(accum.traversals, ref);
     if (!traversal) {
       throw new Error(
         `Pending effects traversal not found: ${formatNodeRef(ref)}`,
       );
     }
 
-    const entry = getEntryForRef(runtime.entries, ref);
+    const entry = getEntryForRef(accum.entries, ref);
     const node = entry ? resolveNodeForRef(entry, ref) : undefined;
     if (!node) {
       throw new Error(`Pending effects node not found: ${formatNodeRef(ref)}`);
     }
 
-    runtime.active = ref;
-    const status = runEffects(traversal, node, runtime);
+    accum.active = ref;
+    const status = runEffects(traversal, node, accum);
     if (status.status === "blocked") return status;
   }
   return { status: "done" };
 }
 
 function completePendingEffects(
-  runtime: Accumulator,
+  accum: Accumulator,
   pendingEffects: PendingEffects,
 ): void {
   const activeTraversal = findTraversalInSet(
-    runtime.traversals,
+    accum.traversals,
     pendingEffects.active,
   );
   if (!activeTraversal) {
@@ -1438,11 +2016,11 @@ function completePendingEffects(
   if (isArcTraversal(activeTraversal)) {
     activeTraversal.phase = "suspended";
   }
-  if (!isArcTraversal(runtime.traversal)) {
+  if (!isArcTraversal(accum.traversal)) {
     throw new Error("Pending effects can only finalize an arc traversal");
   }
-  runtime.traversal.pendingEffects = undefined;
-  runtime.traversal.phase = "suspended";
+  accum.traversal.pendingEffects = undefined;
+  accum.traversal.phase = "suspended";
 }
 
 function deflectionEffectRefs(active: NodeRef): NodeRef[] {
@@ -1457,17 +2035,17 @@ function deflectionEffectRefs(active: NodeRef): NodeRef[] {
 function runEffects(
   traversal: Traversal,
   node: Node,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): RunStatus {
   if (!node.effects) return { status: "done" };
-  return runEffectStatements(traversal, node, node.effects, runtime);
+  return runEffectStatements(traversal, node, node.effects, accum);
 }
 
 function runEffectStatements(
   traversal: Traversal,
   node: Node,
   statements: EffectStatement[],
-  runtime: Accumulator,
+  accum: Accumulator,
 ): RunStatus {
   for (const statement of statements) {
     if (statement.kind === "if") {
@@ -1475,38 +2053,45 @@ function runEffectStatements(
         statement.test,
         traversal,
         node,
-        runtime,
+        accum,
       );
       if (result.status === "blocked") return { status: "blocked" };
       const branch = truthy(result.value)
         ? statement.consequent
         : (statement.alternate ?? []);
-      const status = runEffectStatements(traversal, node, branch, runtime);
+      const status = runEffectStatements(traversal, node, branch, accum);
       if (status.status === "blocked") return status;
       continue;
     }
 
-    if (getActionState(traversal, statement)?.resolved) continue;
+    if (isResolvedActionState(getActionState(traversal, statement))) continue;
 
     if (statement.kind === "observe") {
-      const apply = applyObserve(statement, traversal, node, runtime);
+      const apply = applyObserve(statement, traversal, node, accum);
       if (apply.status === "blocked") return apply;
       markActionResolved(traversal, statement);
       continue;
     }
 
     if (statement.kind === "set") {
-      const apply = applySet(statement, traversal, node, runtime);
+      const apply = applySet(statement, traversal, node, accum);
       if (apply.status === "blocked") return apply;
       markActionResolved(traversal, statement);
       continue;
     }
 
-    const effect = renderHostEffect(statement, traversal, node, runtime);
+    if (statement.kind === "set-return") {
+      const apply = applySetReturn(statement, traversal, node, accum);
+      if (apply.status === "blocked") return apply;
+      markActionResolved(traversal, statement);
+      continue;
+    }
+
+    const effect = renderHostEffect(statement, traversal, node, accum);
     const key = `${traversal.ref}:${statement.id}:${JSON.stringify(effect)}`;
     if (!traversal.appliedHostCallKeys.includes(key)) {
       traversal.appliedHostCallKeys.push(key);
-      runtime.hostEffects.push(effect);
+      accum.hostEffects.push(effect);
     }
     markActionResolved(traversal, statement);
   }
@@ -1517,14 +2102,14 @@ function applyObserve(
   statement: ObserveAction | ObserveOrAskAction,
   traversal: Traversal,
   node: Node,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): RunStatus {
   const workId = makeObservationId(
-    runtime.entry.arc,
+    accum.entry.arc,
     nodeIdentifier(traversalToNodeRef(traversal)),
     statement.id,
   );
-  const resolution = runtime.observationResults.get(workId);
+  const resolution = accum.observationResults.get(workId);
 
   if (resolution) {
     if (resolution.status === "resolved" && resolution.value !== undefined) {
@@ -1533,7 +2118,7 @@ function applyObserve(
         resolution.value,
         traversal,
         node,
-        runtime,
+        accum,
       );
       return { status: "done" };
     }
@@ -1543,20 +2128,19 @@ function applyObserve(
     return { status: "blocked" };
   }
 
-  if (runtime.phase === "plan") {
-    noteBriefYield(runtime, traversal);
-    const variable = getVariableMeta(statement.variable, traversal, runtime);
+  if (accum.phase === "plan") {
+    noteBriefYield(accum, traversal);
+    const variable = getVariableMeta(statement.variable, traversal, accum);
     if (!variable) {
       throw new Error(`Unknown variable for observe(): ${statement.variable}`);
     }
-    runtime.observations.push({
+    accum.observations.push({
       id: workId,
-      arc: runtime.entry.arc,
-      node: node.identifier,
+      sourceRef: traversalToNodeRef(traversal),
       variable: statement.variable,
       mode: statement.kind,
-      question: renderObservationQuestion(statement, traversal, node, runtime),
-      currentValue: getVariableValue(statement.variable, traversal, runtime),
+      question: renderObservationQuestion(statement, traversal, node, accum),
+      currentValue: getVariableValue(statement.variable, traversal, accum),
       meta: {
         type: variable.type,
         values: variable.values,
@@ -1572,16 +2156,16 @@ function applySet(
   statement: SetAction,
   traversal: Traversal,
   node: Node,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): RunStatus {
-  const owner = findVariableOwner(statement.variable, traversal, runtime);
+  const owner = findVariableOwner(statement.variable, traversal, accum);
   if (!owner)
     throw new Error(`Unknown variable for set(): ${statement.variable}`);
   const value = evaluateValueExpression(
     statement.value,
     traversal,
     node,
-    runtime,
+    accum,
   );
   if (value.status === "blocked") return { status: "blocked" };
   if (
@@ -1600,25 +2184,95 @@ function applySet(
   return { status: "done" };
 }
 
+function applySetReturn(
+  statement: Extract<ActionStatement, { kind: "set-return" }>,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): RunStatus {
+  const value = evaluateValueExpression(
+    statement.value,
+    traversal,
+    node,
+    accum,
+  );
+  if (value.status === "blocked") return { status: "blocked" };
+  if (
+    value.value !== undefined &&
+    value.value !== null &&
+    typeof value.value !== "string" &&
+    typeof value.value !== "number" &&
+    typeof value.value !== "boolean"
+  ) {
+    throw new Error(
+      `returns.${statement.key}.set() requires a primitive host call result`,
+    );
+  }
+  const callerVarRef = traversal.enterChannels.returns[statement.key];
+  if (!callerVarRef) {
+    throw new Error(
+      `Unknown return channel key "${statement.key}" for ${formatNodeRef(traversalToNodeRef(traversal))}`,
+    );
+  }
+  const callerTraversal = findTraversalInSet(
+    accum.traversals,
+    callerVarRef.ownerRef,
+  );
+  if (!callerTraversal) {
+    throw new Error(
+      `Return channel caller-owner traversal not found for binding: ${formatNodeRef(callerVarRef.ownerRef)}`,
+    );
+  }
+  const ownerEntry = getEntryForRef(accum.entries, callerVarRef.ownerRef);
+  const ownerNode = ownerEntry
+    ? resolveNodeForRef(ownerEntry, callerVarRef.ownerRef)
+    : undefined;
+  const ownerVariable = ownerNode?.variables.find(
+    (item) => item.name === callerVarRef.variable,
+  );
+  if (!ownerVariable) {
+    throw new Error(
+      `Return channel binding references unknown caller variable "${callerVarRef.variable}" on ${formatNodeRef(callerVarRef.ownerRef)}`,
+    );
+  }
+  assertAssignableValue(
+    callerVarRef.variable,
+    ownerVariable,
+    value.value as PrimitiveValue | undefined,
+  );
+  traversal.enterChannels.stagedReturns[statement.key] =
+    value.value as PrimitiveValue;
+  return { status: "done" };
+}
+
 function emitInstruction(
   statement: InstructionAction,
   traversal: Traversal,
   node: Node,
-  runtime: Accumulator,
-  statementIndex: number,
+  accum: Accumulator,
+  phase: InstructionBrief["phase"],
+  postcheck?: InstructionPostcheck,
 ): void {
-  noteBriefYield(runtime, traversal);
-  runtime.instructionBatchNode ??= traversalToNodeRef(traversal);
-  runtime.instructions.push({
+  noteBriefYield(accum, traversal);
+  accum.instructionBatchNode ??= traversalToNodeRef(traversal);
+  accum.instructionBatchSignature ??= instructionBatchSignature(statement);
+  accum.instructions.push({
     id: makeInstructionId(
-      runtime.entry.arc,
+      accum.entry.arc,
       nodeIdentifier(traversalToNodeRef(traversal)),
       statement.id,
     ),
-    arc: runtime.entry.arc,
-    node: node.identifier,
-    statementIndex,
-    text: renderSemanticString(statement.template, traversal, node, runtime),
+    sourceRef: traversalToNodeRef(traversal),
+    mode: statement.mode,
+    phase,
+    text: renderSemanticString(statement.template, traversal, node, accum),
+    postcheck: postcheck
+      ? {
+          judgmentIds: [...postcheck.judgmentIds],
+          observationIds: [...postcheck.observationIds],
+          hostCallIds: [...postcheck.hostCallIds],
+        }
+      : undefined,
   });
 }
 
@@ -1626,14 +2280,14 @@ function renderHostEffect(
   statement: HostEffectStatement,
   traversal: Traversal,
   node: Node,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): HostEffect {
   return {
     module: statement.module,
     target: [...statement.target],
     operation: statement.operation,
     arguments: statement.arguments.map((arg) =>
-      renderHostCallArgument(arg, traversal, node, runtime),
+      renderHostCallArgument(arg, traversal, node, accum),
     ),
   };
 }
@@ -1642,13 +2296,13 @@ function renderHostCallArgument(
   arg: HostCallArgument,
   traversal: Traversal,
   node: Node,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): PayloadValue {
   if (arg.kind === "semantic") {
-    return renderSemanticString(arg.value, traversal, node, runtime);
+    return renderSemanticString(arg.value, traversal, node, accum);
   }
   if (arg.kind === "value") {
-    const value = evaluateValueExpression(arg.value, traversal, node, runtime);
+    const value = evaluateValueExpression(arg.value, traversal, node, accum);
     if (value.status === "blocked") {
       throw new Error("Host call value argument cannot block");
     }
@@ -1656,13 +2310,13 @@ function renderHostCallArgument(
   }
   if (arg.kind === "array") {
     return arg.value.map((item) =>
-      renderHostCallArgument(item, traversal, node, runtime),
+      renderHostCallArgument(item, traversal, node, accum),
     );
   }
   return Object.fromEntries(
     Object.entries(arg.value).map(([key, value]) => [
       key,
-      renderHostCallArgument(value, traversal, node, runtime),
+      renderHostCallArgument(value, traversal, node, accum),
     ]),
   );
 }
@@ -1671,30 +2325,29 @@ function evaluateHostCall(
   expression: HostCallExpression,
   traversal: Traversal,
   node: Node,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): EvalResult {
   const id = makeHostCallId(
-    runtime.entry.arc,
+    accum.entry.arc,
     nodeIdentifier(traversalToNodeRef(traversal)),
     expression.id,
   );
-  if (runtime.hostCallResults.has(id)) {
-    return { status: "value", value: runtime.hostCallResults.get(id) };
+  if (accum.hostCallResults.has(id)) {
+    return { status: "value", value: accum.hostCallResults.get(id) };
   }
   const rendered = {
     id,
-    arc: runtime.entry.arc,
-    node: node.identifier,
+    sourceRef: traversalToNodeRef(traversal),
     module: expression.module,
     target: [...expression.target],
     operation: expression.operation,
     arguments: expression.arguments.map((arg) =>
-      renderHostCallArgument(arg, traversal, node, runtime),
+      renderHostCallArgument(arg, traversal, node, accum),
     ),
   } satisfies HostCallBrief;
-  if (runtime.phase === "plan") {
-    noteBriefYield(runtime, traversal);
-    runtime.hostCalls.push(cloneHostCallBrief(rendered));
+  if (accum.phase === "plan") {
+    noteBriefYield(accum, traversal);
+    accum.hostCalls.push(cloneHostCallBrief(rendered));
   }
   return { status: "blocked" };
 }
@@ -1703,27 +2356,26 @@ function evaluateJudge(
   expression: JudgeExpression,
   traversal: Traversal,
   node: Node,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): EvalResult {
   const rendered = renderSemanticString(
     expression.question,
     traversal,
     node,
-    runtime,
+    accum,
   );
   const id = makeJudgeId(
-    runtime.entry.arc,
+    accum.entry.arc,
     nodeIdentifier(traversalToNodeRef(traversal)),
     expression.id,
   );
-  const result = runtime.judgmentResults.get(id);
+  const result = accum.judgmentResults.get(id);
   if (result !== undefined) return { status: "value", value: result };
-  if (runtime.phase === "plan") {
-    noteBriefYield(runtime, traversal);
-    runtime.judgments.push({
+  if (accum.phase === "plan") {
+    noteBriefYield(accum, traversal);
+    accum.judgments.push({
       id,
-      arc: runtime.entry.arc,
-      node: node.identifier,
+      sourceRef: traversalToNodeRef(traversal),
       question: rendered,
     });
   }
@@ -1734,18 +2386,18 @@ function evaluateValueExpression(
   expression: ValueExpression,
   traversal: Traversal,
   node: Node,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): EvalResult {
   if (expression.kind === "host-call")
-    return evaluateHostCall(expression, traversal, node, runtime);
+    return evaluateHostCall(expression, traversal, node, accum);
   if (expression.kind === "judge")
-    return evaluateJudge(expression, traversal, node, runtime);
+    return evaluateJudge(expression, traversal, node, accum);
   if (expression.kind === "regexTest") {
-    const target = evaluateSimpleExpression(
+    const target = evaluateLocalExpression(
       expression.target,
       traversal,
       node,
-      runtime,
+      accum,
     );
     if (target.status === "blocked") return target;
     const value = target.value;
@@ -1760,14 +2412,14 @@ function evaluateValueExpression(
       expression.left,
       traversal,
       node,
-      runtime,
+      accum,
     );
     if (left.status === "blocked") return left;
     const right = evaluateValueExpression(
       expression.right,
       traversal,
       node,
-      runtime,
+      accum,
     );
     if (right.status === "blocked") return right;
     const isOrdering =
@@ -1777,8 +2429,8 @@ function evaluateValueExpression(
       expression.op === "<=";
     if (isOrdering) {
       const enumValues =
-        findEnumValues(expression.left, traversal, runtime) ??
-        findEnumValues(expression.right, traversal, runtime);
+        findEnumValues(expression.left, traversal, accum) ??
+        findEnumValues(expression.right, traversal, accum);
       if (enumValues) {
         const li =
           typeof left.value === "string" ? enumValues.indexOf(left.value) : -1;
@@ -1802,39 +2454,34 @@ function evaluateValueExpression(
       expression.left,
       traversal,
       node,
-      runtime,
+      accum,
     );
     if (left.status === "blocked") return left;
     if (expression.op === "&&") {
       if (!truthy(left.value)) return { status: "value", value: left.value };
-      return evaluateValueExpression(
-        expression.right,
-        traversal,
-        node,
-        runtime,
-      );
+      return evaluateValueExpression(expression.right, traversal, node, accum);
     }
     if (truthy(left.value)) return { status: "value", value: left.value };
-    return evaluateValueExpression(expression.right, traversal, node, runtime);
+    return evaluateValueExpression(expression.right, traversal, node, accum);
   }
   if (expression.kind === "unary") {
     const argument = evaluateValueExpression(
       expression.argument,
       traversal,
       node,
-      runtime,
+      accum,
     );
     if (argument.status === "blocked") return argument;
     return { status: "value", value: !truthy(argument.value) };
   }
-  return evaluateSimpleExpression(expression, traversal, node, runtime);
+  return evaluateLocalExpression(expression, traversal, node, accum);
 }
 
-function evaluateSimpleExpression(
+function evaluateLocalExpression(
   expression: LocalExpression,
   traversal: Traversal,
   node: Node,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): EvalResult {
   switch (expression.kind) {
     case "literal":
@@ -1842,51 +2489,56 @@ function evaluateSimpleExpression(
     case "ref":
       return {
         status: "value",
-        value: runtime.dialog.names?.[expression.name] ?? expression.name,
+        value: accum.dialog.names?.[expression.name] ?? expression.name,
       };
     case "variable":
       return {
         status: "value",
-        value: getVariableValue(expression.name, traversal, runtime),
+        value: getVariableValue(expression.name, traversal, accum),
+      };
+    case "channel":
+      return {
+        status: "value",
+        value: readChannelValue(
+          traversal,
+          expression.namespace,
+          expression.key,
+          accum,
+        ),
       };
     case "scope":
       if (expression.name === "lastUserMessage") {
-        const lastUser = [...runtime.dialog.lastTurns]
+        const lastUser = [...accum.dialog.lastTurns]
           .reverse()
           .find((turn) => turn.role === "user");
         return { status: "value", value: lastUser?.message };
       }
       return {
         status: "value",
-        value: runtime.dialog.lastTurns
-          .slice(-(expression.count ?? runtime.dialog.lastTurns.length))
+        value: accum.dialog.lastTurns
+          .slice(-(expression.count ?? accum.dialog.lastTurns.length))
           .map((turn) => `${turn.role}: ${turn.message}`)
           .join("\n"),
       };
     case "enterCount":
       return { status: "value", value: traversal.enterCount };
     case "nodeState": {
-      const ref = resolveReferenceRef(
-        runtime,
-        traversal,
-        node,
-        expression.node,
-      );
+      const ref = resolveReferenceRef(accum, traversal, node, expression.node);
       return {
         status: "value",
-        value: ref ? childState(runtime.traversals, ref) : undefined,
+        value: ref ? childState(accum.traversals, ref) : undefined,
       };
     }
   }
 }
 
 function resolveReferenceRef(
-  runtime: Accumulator,
+  accum: Accumulator,
   traversal: Traversal,
   node: Node,
   name: string,
 ): ArcRef | NodeRef | undefined {
-  const entry = getEntryForRef(runtime.entries, traversal.ref);
+  const entry = getEntryForRef(accum.entries, traversal.ref);
   if (!entry) return undefined;
   const traversalRef = traversalToNodeRef(traversal);
   const traversalParts = toNodeRefParts(traversalRef);
@@ -1903,7 +2555,7 @@ function resolveReferenceRef(
 
   const ownerRef = lexicalParentRef(traversalRef);
   if (!ownerRef) return undefined;
-  const resolvedOwnerEntry = getEntryForRef(runtime.entries, ownerRef) ?? entry;
+  const resolvedOwnerEntry = getEntryForRef(accum.entries, ownerRef) ?? entry;
   const ownerNode = resolveNodeForRef(resolvedOwnerEntry, ownerRef);
   if (!ownerNode) return undefined;
   const sibling = ownerNode.children.find((child) => child.identifier === name);
@@ -1923,16 +2575,16 @@ function resolveReferenceRef(
 function findVariableOwner(
   variable: string,
   traversal: Traversal,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): { traversal: Traversal; variable: Variable } | undefined {
   let ref: NodeRef | undefined = traversalToNodeRef(traversal);
   while (ref) {
-    const entry = getEntryForRef(runtime.entries, ref);
+    const entry = getEntryForRef(accum.entries, ref);
     if (!entry) return undefined;
     const node = resolveNodeForRef(entry, ref);
     const found = node?.variables.find((item) => item.name === variable);
     if (found) {
-      const ownerTraversal = findTraversalInSet(runtime.traversals, ref);
+      const ownerTraversal = findTraversalInSet(accum.traversals, ref);
       if (!ownerTraversal) break;
       return { traversal: ownerTraversal, variable: found };
     }
@@ -1944,19 +2596,47 @@ function findVariableOwner(
 function getVariableMeta(
   variable: string,
   traversal: Traversal,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): Variable | undefined {
-  return findVariableOwner(variable, traversal, runtime)?.variable;
+  return findVariableOwner(variable, traversal, accum)?.variable;
 }
 
 function getVariableValue(
   variable: string,
   traversal: Traversal,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): PrimitiveValue | undefined {
-  return findVariableOwner(variable, traversal, runtime)?.traversal.variables[
+  return findVariableOwner(variable, traversal, accum)?.traversal.variables[
     variable
   ];
+}
+
+function readChannelValue(
+  traversal: Traversal,
+  namespace: "args" | "returns",
+  key: string,
+  accum: Accumulator,
+): PrimitiveValue | undefined {
+  const channelState = traversal.enterChannels;
+  if (namespace === "returns" && key in channelState.stagedReturns) {
+    return channelState.stagedReturns[key];
+  }
+  const callerVarRef = channelState[namespace][key];
+  if (!callerVarRef) {
+    throw new Error(
+      `Unknown ${namespace} channel key "${key}" for ${formatNodeRef(traversalToNodeRef(traversal))}`,
+    );
+  }
+  const callerTraversal = findTraversalInSet(
+    accum.traversals,
+    callerVarRef.ownerRef,
+  );
+  if (!callerTraversal) {
+    throw new Error(
+      `${namespace}.${key} caller-owner traversal not found for binding: ${formatNodeRef(callerVarRef.ownerRef)}`,
+    );
+  }
+  return callerTraversal.variables[callerVarRef.variable];
 }
 
 function setVariableValue(
@@ -1964,9 +2644,9 @@ function setVariableValue(
   value: PrimitiveValue | undefined,
   traversal: Traversal,
   node: Node,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): void {
-  const owner = findVariableOwner(variable, traversal, runtime);
+  const owner = findVariableOwner(variable, traversal, accum);
   if (!owner)
     throw new Error(`Unknown variable: ${variable} in ${node.identifier}`);
   owner.traversal.variables[variable] = value;
@@ -1975,10 +2655,10 @@ function setVariableValue(
 function findEnumValues(
   expression: ValueExpression,
   traversal: Traversal,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): string[] | undefined {
   if (expression.kind === "variable") {
-    const meta = getVariableMeta(expression.name, traversal, runtime);
+    const meta = getVariableMeta(expression.name, traversal, accum);
     if (meta?.type === "enum" && meta.values) return meta.values;
   }
   return undefined;
@@ -1988,13 +2668,13 @@ function renderObservationQuestion(
   statement: ObserveAction | ObserveOrAskAction,
   traversal: Traversal,
   node: Node,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): string {
   if (statement.question)
-    return renderSemanticString(statement.question, traversal, node, runtime);
-  const variable = getVariableMeta(statement.variable, traversal, runtime);
+    return renderSemanticString(statement.question, traversal, node, accum);
+  const variable = getVariableMeta(statement.variable, traversal, accum);
   if (!variable?.observing) return `observe ${statement.variable}`;
-  return renderSemanticString(variable.observing, traversal, node, runtime);
+  return renderSemanticString(variable.observing, traversal, node, accum);
 }
 
 function assertAssignableValue(
@@ -2033,7 +2713,7 @@ function renderSemanticString(
   semantic: SemanticString,
   traversal: Traversal,
   node: Node,
-  runtime: Accumulator,
+  accum: Accumulator,
 ): string {
   return semantic.parts
     .map((part) => {
@@ -2042,7 +2722,7 @@ function renderSemanticString(
         part.expression,
         traversal,
         node,
-        runtime,
+        accum,
       );
       if (value.status === "blocked") return "";
       return value.value == null ? "" : String(value.value);
@@ -2110,45 +2790,198 @@ function truthy(value: unknown): boolean {
   return Boolean(value);
 }
 
-function noteBriefYield(runtime: Accumulator, traversal: Traversal): void {
-  runtime.briefActive ??= traversalToNodeRef(traversal);
+function noteBriefYield(accum: Accumulator, traversal: Traversal): void {
+  accum.briefActive ??= traversalToNodeRef(traversal);
 }
 
 function isInstructionBatchActive(
-  runtime: Accumulator,
+  accum: Accumulator,
   traversal: Traversal,
 ): boolean {
-  return runtime.instructionBatchNode === traversalToNodeRef(traversal);
+  return accum.instructionBatchNode === traversalToNodeRef(traversal);
+}
+
+function canBatchInstruction(
+  accum: Accumulator,
+  statement: InstructionAction,
+): boolean {
+  // TODO: Loosen this beyond strict signature equality so non-conflicting
+  // instruction briefs can batch together without forcing identical policy.
+  const signature = accum.instructionBatchSignature;
+  return (
+    signature === undefined ||
+    signature === instructionBatchSignature(statement)
+  );
+}
+
+function instructionBatchSignature(statement: InstructionAction): string {
+  return JSON.stringify({
+    mode: statement.mode,
+    resolveWhen: normalizeResolutionStatements(statement.resolveWhen),
+    deflectWhen: normalizeResolutionStatements(statement.deflectWhen),
+  });
+}
+
+function normalizeResolutionStatements(
+  statements: TriggerStatement[] | undefined,
+): unknown {
+  return (
+    statements?.map((statement) => normalizeResolutionStatement(statement)) ??
+    null
+  );
+}
+
+function normalizeResolutionStatement(statement: TriggerStatement): unknown {
+  if (statement.kind === "if") {
+    return {
+      kind: "if",
+      test: normalizeValueExpression(statement.test),
+      consequent: statement.consequent.map((entry) =>
+        normalizeResolutionStatement(entry),
+      ),
+      alternate: statement.alternate?.map((entry) =>
+        normalizeResolutionStatement(entry),
+      ),
+    };
+  }
+  if (statement.kind === "return") {
+    return {
+      kind: "return",
+      value: statement.value ? normalizeValueExpression(statement.value) : null,
+    };
+  }
+  return {
+    kind: "observe",
+    variable: statement.variable,
+    question: statement.question
+      ? normalizeSemanticString(statement.question)
+      : null,
+  };
+}
+
+function normalizeValueExpression(expression: ValueExpression): unknown {
+  switch (expression.kind) {
+    case "literal":
+      return { kind: "literal", value: expression.value };
+    case "ref":
+      return { kind: "ref", name: expression.name };
+    case "variable":
+      return { kind: "variable", name: expression.name };
+    case "scope":
+      return {
+        kind: "scope",
+        name: expression.name,
+        count: expression.count ?? null,
+      };
+    case "enterCount":
+      return { kind: "enterCount" };
+    case "nodeState":
+      return { kind: "nodeState", node: expression.node };
+    case "judge":
+      return {
+        kind: "judge",
+        question: normalizeSemanticString(expression.question),
+      };
+    case "host-call":
+      return {
+        kind: "host-call",
+        module: expression.module,
+        target: [...expression.target],
+        operation: expression.operation,
+        arguments: expression.arguments.map((arg) =>
+          normalizeHostCallArgument(arg),
+        ),
+      };
+    case "regexTest":
+      return {
+        kind: "regexTest",
+        pattern: expression.pattern,
+        flags: expression.flags,
+        target: normalizeValueExpression(expression.target),
+      };
+    case "binary":
+      return {
+        kind: "binary",
+        op: expression.op,
+        left: normalizeValueExpression(expression.left),
+        right: normalizeValueExpression(expression.right),
+      };
+    case "logical":
+      return {
+        kind: "logical",
+        op: expression.op,
+        left: normalizeValueExpression(expression.left),
+        right: normalizeValueExpression(expression.right),
+      };
+    case "unary":
+      return {
+        kind: "unary",
+        op: expression.op,
+        argument: normalizeValueExpression(expression.argument),
+      };
+  }
+}
+
+function normalizeHostCallArgument(arg: HostCallArgument): unknown {
+  if (arg.kind === "semantic") {
+    return { kind: "semantic", value: normalizeSemanticString(arg.value) };
+  }
+  if (arg.kind === "value") {
+    return { kind: "value", value: normalizeValueExpression(arg.value) };
+  }
+  if (arg.kind === "array") {
+    return {
+      kind: "array",
+      value: arg.value.map((entry) => normalizeHostCallArgument(entry)),
+    };
+  }
+  return {
+    kind: "object",
+    value: Object.fromEntries(
+      Object.entries(arg.value).map(([key, value]) => [
+        key,
+        normalizeHostCallArgument(value),
+      ]),
+    ),
+  };
+}
+
+function normalizeSemanticString(semantic: SemanticString): unknown {
+  return semantic.parts.map((part) =>
+    part.kind === "text"
+      ? { kind: "text", value: part.value }
+      : {
+          kind: "expression",
+          expression: normalizeValueExpression(part.expression),
+        },
+  );
 }
 
 function finalizeActionBrief(
-  runtime: Accumulator,
+  accum: Accumulator,
   traversal: ArcTraversal,
 ): ActionBriefSnapshot {
   const allowedMoves = new Set<ActionMove>();
   if (
-    runtime.instructions.length > 0 ||
-    runtime.judgments.length > 0 ||
-    runtime.observations.length > 0 ||
-    runtime.hostCalls.length > 0
+    accum.instructions.length > 0 ||
+    accum.judgments.length > 0 ||
+    accum.observations.length > 0 ||
+    accum.hostCalls.length > 0
   ) {
     allowedMoves.add("proceed");
     allowedMoves.add("defer");
-    allowedMoves.add("deflect");
+    if (accum.instructions.length === 0) {
+      allowedMoves.add("deflect");
+    }
   }
   if (allowedMoves.size === 0) allowedMoves.add("proceed");
   return {
-    active:
-      runtime.briefActive ?? runtime.active ?? arcToNodeRef(traversal.ref),
+    active: accum.briefActive ?? accum.active ?? arcToNodeRef(traversal.ref),
     canProgress: traversal.phase === "entered",
-    blockedBy:
-      runtime.blockedBy && runtime.blockedBy.kind !== "trigger"
-        ? { ...runtime.blockedBy }
-        : undefined,
-    judgments: runtime.judgments.map((item) => ({ ...item })),
-    observations: runtime.observations.map((item) => ({ ...item })),
-    hostCalls: runtime.hostCalls.map(cloneHostCallBrief),
-    instructions: runtime.instructions.map((item) => ({ ...item })),
+    judgments: accum.judgments.map((item) => ({ ...item })),
+    observations: accum.observations.map((item) => ({ ...item })),
+    hostCalls: accum.hostCalls.map(cloneHostCallBrief),
+    instructions: accum.instructions.map(cloneInstructionBrief),
     allowedMoves: [...allowedMoves],
   };
 }
@@ -2159,11 +2992,10 @@ function cloneActionBriefSnapshot(
   return {
     active: plan.active,
     canProgress: plan.canProgress,
-    blockedBy: plan.blockedBy ? { ...plan.blockedBy } : undefined,
     judgments: plan.judgments.map((item) => ({ ...item })),
     observations: plan.observations.map((item) => ({ ...item })),
     hostCalls: plan.hostCalls.map(cloneHostCallBrief),
-    instructions: plan.instructions.map((item) => ({ ...item })),
+    instructions: plan.instructions.map(cloneInstructionBrief),
     allowedMoves: [...plan.allowedMoves],
   };
 }
@@ -2226,7 +3058,7 @@ function acceptActionReport(
       active: plan.active,
     };
 
-    const runtime = createAccumulator(
+    const accum = createAccumulator(
       entries,
       entry,
       rootTraversal,
@@ -2234,15 +3066,15 @@ function acceptActionReport(
       dialog,
       "apply",
     );
-    runTurn(runtime);
+    runTurn(accum);
     return {
       traversals: working,
-      hostEffects: runtime.hostEffects.map(cloneHostEffect),
-      instructions: runtime.instructions.map((item) => ({ ...item })),
+      hostEffects: accum.hostEffects.map(cloneHostEffect),
+      instructions: accum.instructions.map(cloneInstructionBrief),
     };
   }
 
-  const runtime = createAccumulator(
+  const accum = createAccumulator(
     entries,
     entry,
     selectActionRootTraversal(working, entry.arc),
@@ -2251,16 +3083,16 @@ function acceptActionReport(
     "apply",
   );
   for (const [id, value] of Object.entries(report.judgments ?? {}))
-    runtime.judgmentResults.set(id, value);
+    accum.judgmentResults.set(id, value);
   for (const [id, value] of Object.entries(report.observations ?? {}))
-    if (value) runtime.observationResults.set(id, value);
+    if (value) accum.observationResults.set(id, value);
   for (const [id, value] of Object.entries(report.hostCalls ?? {}))
-    runtime.hostCallResults.set(id, value);
-  runTurn(runtime);
+    accum.hostCallResults.set(id, value);
+  runTurn(accum);
   return {
     traversals: working,
-    hostEffects: runtime.hostEffects.map(cloneHostEffect),
-    instructions: runtime.instructions.map((item) => ({ ...item })),
+    hostEffects: accum.hostEffects.map(cloneHostEffect),
+    instructions: accum.instructions.map(cloneInstructionBrief),
   };
 }
 

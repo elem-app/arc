@@ -9,6 +9,7 @@ import {
 } from "../src/runtime/index.js";
 import type {
   ActionBrief,
+  ActionReport,
   ArcRef,
   ArcTraversal,
   ArcTraversalSet,
@@ -44,6 +45,17 @@ function rootTraversal(brief: ActionBrief): ArcTraversal {
   );
   if (!root) throw new Error("Missing root traversal");
   return root;
+}
+
+const EMPTY_DIALOG: Dialog = { lastTurns: [] };
+
+function progressBrief(
+  runtime: Runtime,
+  brief: ReturnType<Runtime["start"]>,
+  report: ActionReport,
+  dialog: Dialog = EMPTY_DIALOG,
+): ActionBrief {
+  return runtime.progress(brief, report, dialog);
 }
 
 const SOURCE = `
@@ -102,8 +114,7 @@ function Second() {
     expect(triggerBrief.matchableArcs).toEqual([]);
     expect(triggerBrief.judgments).toHaveLength(1);
     expect(triggerBrief.judgments[0]).toMatchObject({
-      arc: metalRef,
-      node: "Metal",
+      sourceRef: node("metal-arc", "Metal"),
     });
 
     const triggerOutcome = runtime.progressTrigger(triggerBrief, {
@@ -128,12 +139,6 @@ function Second() {
     expect(rootTraversal(brief).ref).toEqual(metalRef);
     expect(brief.canProgress).toBe(true);
     expect(brief.active).toEqual(node("metal-arc", "Metal.Surface"));
-    expect(brief.blockedBy).toMatchObject({
-      kind: "statement",
-      arc: metalRef,
-      node: "Surface",
-      statementKind: "observeOrAsk",
-    });
     expect(brief.observations).toHaveLength(1);
     expect(brief.allowedMoves).toContain("proceed");
 
@@ -304,6 +309,33 @@ function Second() {
     expect(outcome.traversals).toEqual([]);
   });
 
+  it("auto-selects the only matchable arc when trigger report omits match", () => {
+    const document = parse(`
+"use arc v2";
+
+function First() {
+  this.trigger = () => {
+    return true;
+  };
+}
+
+function Second() {
+  this.trigger = () => {
+    return false;
+  };
+}
+`);
+    const runtime = new Runtime().add("single-match-trigger-arc", document);
+    const triggerBrief = runtime.startTrigger({ lastTurns: [] });
+
+    expect(triggerBrief.matchableArcs).toEqual([
+      arc("single-match-trigger-arc", "First"),
+    ]);
+
+    const outcome = runtime.progressTrigger(triggerBrief, {});
+    expect(outcome.matched).toEqual(arc("single-match-trigger-arc", "First"));
+  });
+
   it("resolves imported arcs by source first, then root identifier", () => {
     const main = parse(`
 "use arc v2";
@@ -360,12 +392,17 @@ function AnotherArc() {
     });
 
     const brief = runtime.start(triggerOutcome.traversals, dialog);
-    const afterAsk = runtime.progress(brief, {
-      move: "proceed",
-      observations: {
-        [brief.observations[0]!.id]: { status: "needs-user" },
+    const afterAsk = progressBrief(
+      runtime,
+      brief,
+      {
+        move: "proceed",
+        observations: {
+          [brief.observations[0]!.id]: { status: "needs-user" },
+        },
       },
-    });
+      dialog,
+    );
 
     expect(afterAsk.canProgress).toBe(true);
     expect(afterAsk.active).toEqual(node("metal-arc", "Metal.Surface"));
@@ -378,7 +415,7 @@ function AnotherArc() {
         { role: "user", message: "I like thrash" },
       ],
     });
-    const afterProceed = runtime.progress(resumed, {
+    const afterProceed = progressBrief(runtime, resumed, {
       move: "proceed",
       observations: {
         [resumed.observations[0]!.id]: {
@@ -397,6 +434,508 @@ function AnotherArc() {
       ownedChild(rootTraversal(afterProceed), "Metal.Surface")?.variables
         .subgenre,
     ).toBe("thrash");
+  });
+
+  it("treats bare instruction literals as one-shot instructions", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  \`hello\`;
+}
+`);
+    const runtime = new Runtime().add("once-arc", document);
+    const seeded = runtime.createTraversal(arc("once-arc", "Main"));
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], { lastTurns: [] });
+
+    expect(brief.instructions).toMatchObject([
+      {
+        mode: "once",
+        phase: "apply",
+        text: "hello",
+        postcheck: undefined,
+      },
+    ]);
+    expect(brief.allowedMoves).toEqual(["proceed", "defer"]);
+
+    const afterProceed = progressBrief(runtime, brief, { move: "proceed" });
+    expect(afterProceed.instructions).toEqual([]);
+    expect(afterProceed.canProgress).toBe(false);
+    expect(rootTraversal(afterProceed).phase).toBe("completed");
+  });
+
+  it("rejects deflect move while an instruction brief is pending", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  \`hello\`;
+}
+`);
+    const runtime = new Runtime().add("instruction-move-arc", document);
+    const seeded = runtime.createTraversal(arc("instruction-move-arc", "Main"));
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    expect(brief.allowedMoves).toEqual(["proceed", "defer"]);
+    expect(() => progressBrief(runtime, brief, { move: "deflect" })).toThrow(
+      /Illegal turn move: deflect/,
+    );
+  });
+
+  it("prefers deflectWhen over resolveWhen when both evaluate true", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  this.deflectWhen = \`\${user} wants to leave this topic\`;
+  instructLoop(\`Carry the topic.\`, {
+    resolveWhen: \`\${self} covered the topic enough\`,
+  });
+}
+`);
+    const runtime = new Runtime().add("instruction-precedence-arc", document);
+    const seeded = runtime.createTraversal(
+      arc("instruction-precedence-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    const deflect = brief.judgments.find(
+      (item) => item.question === "user wants to leave this topic",
+    );
+    const resolve = brief.judgments.find(
+      (item) => item.question === "self covered the topic enough",
+    );
+    expect(deflect).toBeDefined();
+    expect(resolve).toBeDefined();
+
+    const nextBrief = progressBrief(runtime, brief, {
+      move: "proceed",
+      judgments: {
+        [deflect!.id]: true,
+        [resolve!.id]: true,
+      },
+    });
+
+    expect(nextBrief.canProgress).toBe(false);
+    expect(rootTraversal(nextBrief).state).toBe("deflected");
+    expect(rootTraversal(nextBrief).phase).toBe("suspended");
+  });
+
+  it("captures only currently reachable postchecks and defers deeper checks", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const ready = new Boolean();
+  ready.observing = \`is \${self} ready\`;
+  instructLoop(\`Carry the topic.\`, {
+    resolveWhen: () => {
+      observe(ready);
+      if (ready === true) {
+        return judge(\`\${self} covered the topic enough\`);
+      }
+      return false;
+    },
+  });
+}
+`);
+    const runtime = new Runtime().add("instruction-postcheck-arc", document);
+    const seeded = runtime.createTraversal(
+      arc("instruction-postcheck-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    expect(brief.observations).toHaveLength(1);
+    expect(brief.judgments).toEqual([]);
+    expect(brief.instructions[0]).toMatchObject({
+      phase: "apply",
+      postcheck: {
+        judgmentIds: [],
+        observationIds: [brief.observations[0]!.id],
+        hostCallIds: [],
+      },
+    });
+
+    const afterReady = progressBrief(runtime, brief, {
+      move: "proceed",
+      observations: {
+        [brief.observations[0]!.id]: {
+          status: "resolved",
+          value: true,
+        },
+      },
+    });
+    expect(afterReady.instructions[0]).toMatchObject({
+      phase: "postcheck",
+      postcheck: {
+        judgmentIds: [afterReady.judgments[0]!.id],
+        observationIds: [],
+        hostCallIds: [],
+      },
+    });
+    expect(afterReady.observations).toEqual([]);
+    expect(afterReady.judgments.map((item) => item.question)).toEqual([
+      "self covered the topic enough",
+    ]);
+  });
+
+  it("re-emits resolution observe after terminal false clears function frame", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const ready = new Boolean();
+  ready.observing = \`is \${self} ready\`;
+  instructLoop(\`Carry the topic.\`, {
+    resolveWhen: () => {
+      observe(ready);
+      return ready === true;
+    },
+  });
+}
+`);
+    const runtime = new Runtime().add(
+      "instruction-observe-unknown-arc",
+      document,
+    );
+    const seeded = runtime.createTraversal(
+      arc("instruction-observe-unknown-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    expect(brief.observations).toHaveLength(1);
+
+    const afterUnknown = progressBrief(runtime, brief, {
+      move: "proceed",
+      observations: {
+        [brief.observations[0]!.id]: { status: "unknown" },
+      },
+    });
+    expect(afterUnknown.observations).toHaveLength(1);
+    expect(afterUnknown.observations[0]?.question).toEqual("is self ready");
+    expect(afterUnknown.instructions).toMatchObject([
+      {
+        text: "Carry the topic.",
+        phase: "apply",
+      },
+    ]);
+
+    const nextBrief = progressBrief(runtime, afterUnknown, {
+      move: "proceed",
+    });
+    expect(nextBrief.observations).toHaveLength(1);
+    expect(nextBrief.observations[0]?.question).toEqual("is self ready");
+    expect(nextBrief.instructions).toMatchObject([
+      {
+        text: "Carry the topic.",
+        phase: "postcheck",
+      },
+    ]);
+  });
+
+  it("re-emits trigger observe after terminal false clears trigger function frame", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const ready = new Boolean();
+  ready.observing = \`is \${user} ready\`;
+  this.trigger = () => {
+    observe(ready);
+    return ready === true;
+  };
+}
+`);
+    const runtime = new Runtime().add("trigger-frame-reset-arc", document);
+    const seeded = runtime.createTraversal(
+      arc("trigger-frame-reset-arc", "Main"),
+    );
+
+    const firstBrief = runtime.startTrigger({ lastTurns: [] }, [seeded]);
+    expect(firstBrief.observations).toHaveLength(1);
+
+    const firstOutcome = runtime.progressTrigger(firstBrief, {
+      observations: {
+        [firstBrief.observations[0]!.id]: { status: "unknown" },
+      },
+    });
+    expect(firstOutcome.matched).toBeUndefined();
+
+    const secondBrief = runtime.startTrigger(
+      { lastTurns: [{ role: "user", message: "still not sure" }] },
+      firstOutcome.traversals,
+    );
+    expect(secondBrief.observations).toHaveLength(1);
+    expect(secondBrief.observations[0]?.question).toEqual("is user ready");
+  });
+
+  it("resolves instruct implicitly after handback", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  instruct(\`Mention this once.\`);
+  \`after\`;
+}
+`);
+    const runtime = new Runtime().add("instruct-implicit-arc", document);
+    const seeded = runtime.createTraversal(
+      arc("instruct-implicit-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    expect(brief.instructions.map((item) => item.text)).toEqual([
+      "Mention this once.",
+      "after",
+    ]);
+    expect(brief.judgments).toEqual([]);
+
+    const resolved = progressBrief(runtime, brief, { move: "proceed" });
+    expect(resolved.instructions).toEqual([]);
+    expect(resolved.canProgress).toBe(false);
+  });
+
+  it("includes host-call resolution probes in instruction postcheck ids", () => {
+    const document = parse(`
+"use arc v2";
+
+import Dice from "host:rng";
+
+function Main() {
+  instructLoop(\`Carry the topic.\`, {
+    resolveWhen: () => {
+      return Dice.roll(20) > 10;
+    },
+  });
+}
+`);
+    const runtime = new Runtime().add(
+      "instruction-hostcall-postcheck-arc",
+      document,
+    );
+    const seeded = runtime.createTraversal(
+      arc("instruction-hostcall-postcheck-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    expect(brief.hostCalls).toHaveLength(1);
+    expect(brief.judgments).toEqual([]);
+    expect(brief.observations).toEqual([]);
+    expect(brief.instructions[0]).toMatchObject({
+      phase: "apply",
+      postcheck: {
+        judgmentIds: [],
+        observationIds: [],
+        hostCallIds: [brief.hostCalls[0]!.id],
+      },
+    });
+  });
+
+  it("asks authored resolution questions for persistent instructions after handback", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  instructLoop(\`Carry the topic.\`, {
+    resolveWhen: \`\${self} covered the topic enough\`,
+  });
+  \`after\`;
+}
+`);
+    const runtime = new Runtime().add("persistent-arc", document);
+    const seeded = runtime.createTraversal(arc("persistent-arc", "Main"));
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    expect(brief.instructions.map((item) => item.text)).toEqual([
+      "Carry the topic.",
+    ]);
+    expect(brief.instructions[0]?.phase).toBe("apply");
+    expect(brief.judgments.map((item) => item.question)).toEqual([
+      "self covered the topic enough",
+    ]);
+    expect(brief.instructions[0]?.postcheck).toEqual({
+      judgmentIds: [brief.judgments[0]!.id],
+      observationIds: [],
+      hostCallIds: [],
+    });
+    expect(brief.allowedMoves).toEqual(["proceed", "defer"]);
+
+    const afterHandback = progressBrief(runtime, brief, { move: "proceed" });
+    expect(afterHandback.instructions).toMatchObject([
+      {
+        text: "Carry the topic.",
+        phase: "postcheck",
+      },
+    ]);
+    expect(afterHandback.judgments.map((item) => item.question)).toEqual([
+      "self covered the topic enough",
+    ]);
+
+    const afterFalse = progressBrief(runtime, afterHandback, {
+      move: "proceed",
+      judgments: { [afterHandback.judgments[0]!.id]: false },
+    });
+    expect(afterFalse.instructions).toMatchObject([
+      {
+        text: "Carry the topic.",
+        phase: "apply",
+      },
+    ]);
+
+    const resolutionBrief = progressBrief(runtime, afterFalse, {
+      move: "proceed",
+    });
+    expect(resolutionBrief.instructions).toMatchObject([
+      {
+        text: "Carry the topic.",
+        phase: "postcheck",
+      },
+    ]);
+    const afterTrue = progressBrief(runtime, resolutionBrief, {
+      move: "proceed",
+      judgments: { [resolutionBrief.judgments[0]!.id]: true },
+    });
+    expect(afterTrue.instructions.map((item) => item.text)).toEqual(["after"]);
+  });
+
+  it("does not consume instruction postcheck answers on defer", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  instructLoop(\`Carry the topic.\`, {
+    resolveWhen: \`\${self} covered the topic enough\`,
+  });
+  \`after\`;
+}
+`);
+    const runtime = new Runtime().add("instruction-defer-arc", document);
+    const seeded = runtime.createTraversal(
+      arc("instruction-defer-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    expect(brief.instructions.map((item) => item.text)).toEqual([
+      "Carry the topic.",
+    ]);
+    expect(brief.judgments.map((item) => item.question)).toEqual([
+      "self covered the topic enough",
+    ]);
+
+    const deferred = progressBrief(runtime, brief, {
+      move: "defer",
+      judgments: { [brief.judgments[0]!.id]: true },
+    });
+    expect(deferred.instructions).toMatchObject([
+      {
+        text: "Carry the topic.",
+        phase: "postcheck",
+      },
+    ]);
+    expect(deferred.judgments.map((item) => item.question)).toEqual([
+      "self covered the topic enough",
+    ]);
+
+    const resumed = progressBrief(runtime, deferred, {
+      move: "proceed",
+      judgments: { [deferred.judgments[0]!.id]: true },
+    });
+    expect(resumed.instructions.map((item) => item.text)).toEqual(["after"]);
+  });
+
+  it("accepts batched instruction deflect/resolve semantics in one report", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const ready = new Boolean();
+  ready.observing = \`is \${self} ready\`;
+  this.deflectWhen = \`\${user} wants to leave this topic\`;
+  instructLoop(\`Carry the topic.\`, {
+    resolveWhen: () => {
+      observe(ready);
+      return ready === true;
+    },
+  });
+  \`after\`;
+}
+`);
+    const runtime = new Runtime().add("instruction-batched-arc", document);
+    const seeded = runtime.createTraversal(
+      arc("instruction-batched-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    const handback = progressBrief(runtime, brief, { move: "proceed" });
+
+    const deflectCheck = handback.judgments.find(
+      (item) => item.question === "user wants to leave this topic",
+    );
+    expect(deflectCheck).toBeDefined();
+    expect(handback.observations).toHaveLength(1);
+
+    const resolved = progressBrief(runtime, handback, {
+      move: "proceed",
+      judgments: { [deflectCheck!.id]: false },
+      observations: {
+        [handback.observations[0]!.id]: {
+          status: "resolved",
+          value: true,
+        },
+      },
+    });
+
+    expect(rootTraversal(resolved).state).not.toBe("deflected");
+    expect(resolved.instructions.map((item) => item.text)).toEqual(["after"]);
+  });
+
+  it("derives instruction deflection from authored deflectWhen", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  this.deflectWhen = \`\${user} wants to leave this topic\`;
+  instructLoop(\`Carry the topic.\`, {
+    resolveWhen: \`\${self} covered the topic enough\`,
+  });
+}
+`);
+    const runtime = new Runtime().add("instruction-deflect-arc", document);
+    const seeded = runtime.createTraversal(
+      arc("instruction-deflect-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    const resolutionBrief = progressBrief(runtime, brief, { move: "proceed" });
+
+    expect(resolutionBrief.judgments.map((item) => item.question)).toEqual([
+      "user wants to leave this topic",
+      "self covered the topic enough",
+    ]);
+
+    const deflected = progressBrief(runtime, resolutionBrief, {
+      move: "proceed",
+      judgments: {
+        [resolutionBrief.judgments[0]!.id]: true,
+        [resolutionBrief.judgments[1]!.id]: false,
+      },
+    });
+
+    expect(deflected.canProgress).toBe(false);
+    expect(rootTraversal(deflected).state).toBe("deflected");
+    expect(rootTraversal(deflected).phase).toBe("suspended");
   });
 
   it("blocks on a semantic guard and records skipped state on the owned child traversal", () => {
@@ -425,13 +964,7 @@ function Main() {
     });
 
     expect(brief.active).toEqual(node("guard-semantic-arc", "Main.Optional"));
-    expect(brief.blockedBy).toMatchObject({
-      kind: "guard",
-      arc: arc("guard-semantic-arc", "Main"),
-      node: "Optional",
-    });
-
-    const nextBrief = runtime.progress(brief, {
+    const nextBrief = progressBrief(runtime, brief, {
       move: "proceed",
       judgments: {
         [brief.judgments[0]!.id]: false,
@@ -470,20 +1003,12 @@ function Main() {
 
     expect(brief.hostCalls).toHaveLength(1);
     expect(brief.hostCalls[0]).toMatchObject({
-      arc: arc("host-call-arc", "Main"),
-      node: "Main",
+      sourceRef: node("host-call-arc", "Main"),
       module: "rng",
       operation: "roll",
       arguments: [20],
     });
-    expect(brief.blockedBy).toMatchObject({
-      kind: "statement",
-      arc: arc("host-call-arc", "Main"),
-      node: "Main",
-      statementKind: "set",
-    });
-
-    const resumed = runtime.progress(brief, {
+    const resumed = progressBrief(runtime, brief, {
       move: "proceed",
       hostCalls: {
         [brief.hostCalls[0]!.id]: true,
@@ -527,7 +1052,7 @@ function Main() {
       lastTurns: [{ role: "user", message: "I like metal" }],
     });
 
-    const nextBrief = runtime.progress(brief, {
+    const nextBrief = progressBrief(runtime, brief, {
       move: "proceed",
       observations: {
         [brief.observations[0]!.id]: {
@@ -580,7 +1105,7 @@ function Main() {
       lastTurns: [{ role: "user", message: "I like metal" }],
     });
 
-    const nextBrief = runtime.progress(brief, {
+    const nextBrief = progressBrief(runtime, brief, {
       move: "proceed",
       observations: {
         [brief.observations[0]!.id]: { status: "unknown" },
@@ -610,7 +1135,7 @@ function Main() {
     seeded.phase = "entered";
     const brief = runtime.start([seeded], { lastTurns: [] });
 
-    const nextBrief = runtime.progress(brief, {
+    const nextBrief = progressBrief(runtime, brief, {
       move: "proceed",
       observations: {
         [brief.observations[0]!.id]: { status: "unknown" },
@@ -619,6 +1144,50 @@ function Main() {
 
     expect(rootTraversal(nextBrief).variables.interest).toBe("warm");
     expect(rootTraversal(nextBrief).phase).toBe("completed");
+  });
+
+  it("suppresses duplicate host effects across repeated briefs for one traversal", () => {
+    const document = parse(`
+"use arc v2";
+
+import Memoir from "host:memoir";
+
+function Main() {
+  const ready = new Boolean();
+  ready.observing = \`is \${user} ready\`;
+
+  this.effects = () => {
+    Memoir.facts.apply(\`idempotent effect\`);
+    observe(ready);
+  };
+}
+`);
+    const runtime = new Runtime().add("idempotent-effects-arc", document);
+    const seeded = runtime.createTraversal(
+      arc("idempotent-effects-arc", "Main"),
+    );
+    seeded.phase = "entered";
+    const firstBrief = runtime.start([seeded], { lastTurns: [] });
+
+    expect(firstBrief.hostEffects).toEqual([
+      {
+        module: "memoir",
+        target: ["facts"],
+        operation: "apply",
+        arguments: ["idempotent effect"],
+      },
+    ]);
+    expect(firstBrief.observations).toHaveLength(1);
+
+    const secondBrief = progressBrief(runtime, firstBrief, {
+      move: "proceed",
+      observations: {
+        [firstBrief.observations[0]!.id]: { status: "needs-user" },
+      },
+    });
+
+    expect(secondBrief.hostEffects).toEqual([]);
+    expect(secondBrief.observations).toHaveLength(1);
   });
 
   it("runs active child effects when the child is deflected", () => {
@@ -647,7 +1216,7 @@ function Main() {
     const seeded = runtime.createTraversal(arc("deflect-effects-arc", "Main"));
     seeded.phase = "entered";
     const brief = runtime.start([seeded], { lastTurns: [] });
-    const nextBrief = runtime.progress(brief, { move: "deflect" });
+    const nextBrief = progressBrief(runtime, brief, { move: "deflect" });
 
     expect(nextBrief.hostEffects).toEqual([
       {
@@ -695,7 +1264,7 @@ function Main() {
     );
     seeded.phase = "entered";
     const brief = runtime.start([seeded], { lastTurns: [] });
-    const nextBrief = runtime.progress(brief, { move: "deflect" });
+    const nextBrief = progressBrief(runtime, brief, { move: "deflect" });
 
     expect(nextBrief.hostEffects).toEqual([
       {
@@ -747,7 +1316,7 @@ function Main() {
     );
     seeded.phase = "entered";
     const brief = runtime.start([seeded], { lastTurns: [] });
-    const afterDeflect = runtime.progress(brief, { move: "deflect" });
+    const afterDeflect = progressBrief(runtime, brief, { move: "deflect" });
 
     expect(afterDeflect.canProgress).toBe(true);
     expect(afterDeflect.observations).toHaveLength(1);
@@ -760,7 +1329,7 @@ function Main() {
       "deflected",
     );
 
-    const nextBrief = runtime.progress(afterDeflect, {
+    const nextBrief = progressBrief(runtime, afterDeflect, {
       move: "proceed",
       observations: {
         [afterDeflect.observations[0]!.id]: {
@@ -797,7 +1366,7 @@ function Main() {
 
     const brief = runtime.start(triggerOutcome.traversals, { lastTurns: [] });
     const yielded = JSON.parse(JSON.stringify(brief.traversals));
-    const nextBrief = runtime.progress(brief, { move: "defer" });
+    const nextBrief = progressBrief(runtime, brief, { move: "defer" });
 
     expect(nextBrief.traversals).toEqual(yielded);
     expect(nextBrief.traversals).not.toBe(brief.traversals);
@@ -827,7 +1396,7 @@ function Main() {
     const resumableInitial = resumableRuntime.start([resumableSeeded], {
       lastTurns: [{ role: "user", message: "hi" }],
     });
-    const resumableAsk = resumableRuntime.progress(resumableInitial, {
+    const resumableAsk = progressBrief(resumableRuntime, resumableInitial, {
       move: "proceed",
     });
     const resumableResumed = resumableRuntime.start(
@@ -869,9 +1438,13 @@ function Main() {
         lastTurns: [{ role: "user", message: "hi" }],
       },
     );
-    const nonResumableAsk = nonResumableRuntime.progress(nonResumableInitial, {
-      move: "proceed",
-    });
+    const nonResumableAsk = progressBrief(
+      nonResumableRuntime,
+      nonResumableInitial,
+      {
+        move: "proceed",
+      },
+    );
     const nonResumableResumed = nonResumableRuntime.start(
       runtimeAfterAsk(nonResumableRuntime, nonResumableAsk),
       {
@@ -914,7 +1487,7 @@ function Main() {
     const firstBrief = runtime.start(firstOutcome.traversals, {
       lastTurns: [],
     });
-    const deflected = runtime.progress(firstBrief, { move: "deflect" });
+    const deflected = progressBrief(runtime, firstBrief, { move: "deflect" });
 
     expect(ownedChild(deflected.traversals[0]!, "Main.Intro")?.state).toBe(
       "deflected",
@@ -963,17 +1536,25 @@ function Main() {
       "intro",
     ]);
 
-    const secondCoveredBrief = coveredRuntime.progress(firstCoveredBrief, {
-      move: "proceed",
-    });
+    const secondCoveredBrief = progressBrief(
+      coveredRuntime,
+      firstCoveredBrief,
+      {
+        move: "proceed",
+      },
+    );
 
     expect(secondCoveredBrief.instructions.map((item) => item.text)).toEqual([
       "after",
     ]);
 
-    const completedCoveredBrief = coveredRuntime.progress(secondCoveredBrief, {
-      move: "proceed",
-    });
+    const completedCoveredBrief = progressBrief(
+      coveredRuntime,
+      secondCoveredBrief,
+      {
+        move: "proceed",
+      },
+    );
 
     const restartedCoveredOutcome = coveredRuntime.progressTrigger(
       coveredRuntime.startTrigger(
@@ -992,6 +1573,52 @@ function Main() {
     );
   });
 
+  it("re-enters a suspended arc with incremented enterCount after trigger restart", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  this.trigger = () => {
+    return true;
+  };
+
+  enter(Intro);
+
+  function Intro() {
+    const topic = new Enum(["unknown", "metal"]);
+    topic.observing = \`what topic does \${user} want\`;
+    observeOrAsk(topic);
+  }
+}
+`);
+    const runtime = new Runtime().add("suspend-reenter-arc", document);
+    const firstOutcome = runtime.progressTrigger(
+      runtime.startTrigger({ lastTurns: [] }),
+      { match: arc("suspend-reenter-arc", "Main") },
+    );
+    const firstBrief = runtime.start(firstOutcome.traversals, {
+      lastTurns: [],
+    });
+    const deflected = progressBrief(runtime, firstBrief, { move: "deflect" });
+
+    const suspendedRoot = rootTraversal(deflected);
+    expect(suspendedRoot.phase).toBe("suspended");
+    expect(suspendedRoot.enterCount).toBe(1);
+
+    const restarted = runtime.progressTrigger(
+      runtime.startTrigger({ lastTurns: [] }, deflected.traversals),
+      { match: arc("suspend-reenter-arc", "Main") },
+    );
+    const restartedRoot = restarted.traversals.find(
+      (item) => item.ref === arc("suspend-reenter-arc", "Main"),
+    );
+    expect(restartedRoot).toMatchObject({
+      phase: "entered",
+      enterCount: 2,
+      state: undefined,
+    });
+  });
+
   it("marks the active node deflected when the report deflects", () => {
     const document = parse(SOURCE);
     const runtime = new Runtime().add("metal-arc", document);
@@ -1006,7 +1633,7 @@ function Main() {
     });
 
     const brief = runtime.start(triggerOutcome.traversals, { lastTurns: [] });
-    const nextBrief = runtime.progress(brief, { move: "deflect" });
+    const nextBrief = progressBrief(runtime, brief, { move: "deflect" });
 
     expect(nextBrief.active).toEqual(node("metal-arc", "Metal.Surface"));
     expect(nextBrief.canProgress).toBe(false);
@@ -1111,7 +1738,7 @@ function Main() {
       "first",
     ]);
 
-    const afterBrief = runtime.progress(branchBrief, { move: "proceed" });
+    const afterBrief = progressBrief(runtime, branchBrief, { move: "proceed" });
 
     expect(afterBrief.instructions.map((item) => item.text)).toEqual(["after"]);
   });
@@ -1146,7 +1773,7 @@ function Main() {
       "inner",
     ]);
 
-    const afterBrief = runtime.progress(branchBrief, { move: "proceed" });
+    const afterBrief = progressBrief(runtime, branchBrief, { move: "proceed" });
 
     expect(afterBrief.instructions.map((item) => item.text)).toEqual(["after"]);
   });
@@ -1180,7 +1807,7 @@ function Main() {
 
     expect(brief.instructions.map((item) => item.text)).toEqual(["inner"]);
 
-    const afterBrief = runtime.progress(brief, { move: "proceed" });
+    const afterBrief = progressBrief(runtime, brief, { move: "proceed" });
 
     expect(afterBrief.instructions.map((item) => item.text)).toEqual(["after"]);
   });
@@ -1198,12 +1825,12 @@ function Main() {
     const brief = runtime.start(triggerOutcome.traversals, { lastTurns: [] });
 
     expect(() =>
-      runtime.progress(brief, { move: "deflect" as "proceed" }),
+      progressBrief(runtime, brief, { move: "deflect" as "proceed" }),
     ).not.toThrow();
 
     const brief2 = runtime.start(triggerOutcome.traversals, { lastTurns: [] });
     expect(() =>
-      runtime.progress(brief2, {
+      progressBrief(runtime, brief2, {
         move: "proceed",
         judgments: { "bogus-id": true },
       }),
@@ -1211,11 +1838,45 @@ function Main() {
 
     const brief3 = runtime.start(triggerOutcome.traversals, { lastTurns: [] });
     expect(() =>
-      runtime.progress(brief3, {
+      progressBrief(runtime, brief3, {
         move: "proceed",
         observations: { "bogus-id": { status: "resolved", value: "x" } },
       }),
     ).toThrow(/Unknown observation id in action report/);
+  });
+
+  it("rejects stale host call ids in action reports", () => {
+    const document = parse(`
+"use arc v2";
+
+import Dice from "host:rng";
+
+function Main() {
+  const lucky = new Boolean();
+  lucky.set(Dice.roll(20));
+  \`after\`;
+}
+`);
+    const runtime = new Runtime().add("action-host-id-arc", document);
+    const seeded = runtime.createTraversal(arc("action-host-id-arc", "Main"));
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    expect(brief.hostCalls).toHaveLength(1);
+    const staleId = brief.hostCalls[0]!.id;
+
+    const afterHostCall = progressBrief(runtime, brief, {
+      move: "proceed",
+      hostCalls: { [staleId]: true },
+    });
+    expect(afterHostCall.hostCalls).toEqual([]);
+
+    expect(() =>
+      progressBrief(runtime, afterHostCall, {
+        move: "proceed",
+        hostCalls: { [staleId]: false },
+      }),
+    ).toThrow(/Unknown host call id in action report/);
   });
 
   it("rejects invalid trigger reports: unknown arc, bogus judgment id", () => {
@@ -1236,6 +1897,34 @@ function Main() {
         judgments: { "bogus-id": true },
       }),
     ).toThrow(/Unknown judgment id in trigger report/);
+  });
+
+  it("resolves trigger host calls and rejects unknown trigger host call ids", () => {
+    const document = parse(`
+"use arc v2";
+
+import Dice from "host:rng";
+
+function Main() {
+  this.trigger = () => {
+    return Dice.roll(20);
+  };
+}
+`);
+    const runtime = new Runtime().add("trigger-host-id-arc", document);
+    const triggerBrief = runtime.startTrigger({ lastTurns: [] });
+    expect(triggerBrief.hostCalls).toHaveLength(1);
+
+    expect(() =>
+      runtime.progressTrigger(triggerBrief, {
+        hostCalls: { "bogus-id": true },
+      }),
+    ).toThrow(/Unknown host call id in trigger report/);
+
+    const accepted = runtime.progressTrigger(triggerBrief, {
+      hostCalls: { [triggerBrief.hostCalls[0]!.id]: true },
+    });
+    expect(accepted.matched).toEqual(arc("trigger-host-id-arc", "Main"));
   });
 
   it("compares enum variables by declaration order, not lexicographic order", () => {
@@ -1268,6 +1957,261 @@ function Main() {
     ]);
   });
 
+  it("commits returns channel values when an entered child reaches COVERED", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const ready = new Boolean();
+  const verdict = new Boolean();
+
+  ready.set(true);
+  enter(Child, {
+    args: { ready },
+    returns: { verdict },
+  });
+
+  function Child({ args, returns }) {
+    this.effects = () => {
+      if (args.ready === true) {
+        returns.verdict.set(true);
+      }
+    };
+  }
+}
+`);
+    const runtime = new Runtime().add("enter-channels-arc", document);
+    const seeded = runtime.createTraversal(arc("enter-channels-arc", "Main"));
+    seeded.phase = "entered";
+    const brief = runtime.start([seeded], { lastTurns: [] });
+
+    expect(rootTraversal(brief).variables.verdict).toBe(true);
+    expect(ownedChild(rootTraversal(brief), "Main.Child")?.state).toBe(
+      "covered",
+    );
+    expect(rootTraversal(brief).phase).toBe("completed");
+  });
+
+  it("reads args.* in normal action flow for child branching", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const ready = new Boolean();
+  ready.set(true);
+
+  enter(Child, {
+    args: { ready },
+  });
+
+  function Child({ args }) {
+    if (args.ready === true) {
+      \`ready branch\`;
+    } else {
+      \`fallback branch\`;
+    }
+  }
+}
+`);
+    const runtime = new Runtime().add("enter-args-action-arc", document);
+    const seeded = runtime.createTraversal(
+      arc("enter-args-action-arc", "Main"),
+    );
+    seeded.phase = "entered";
+    const brief = runtime.start([seeded], { lastTurns: [] });
+
+    expect(brief.instructions.map((item) => item.text)).toEqual([
+      "ready branch",
+    ]);
+  });
+
+  it("reads args.* in normal action flow for false branch", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const ready = new Boolean();
+  ready.set(false);
+
+  enter(Child, {
+    args: { ready },
+  });
+
+  function Child({ args }) {
+    if (args.ready === true) {
+      \`ready branch\`;
+    } else {
+      \`fallback branch\`;
+    }
+  }
+}
+`);
+    const runtime = new Runtime().add("enter-args-action-false-arc", document);
+    const seeded = runtime.createTraversal(
+      arc("enter-args-action-false-arc", "Main"),
+    );
+    seeded.phase = "entered";
+    const brief = runtime.start([seeded], { lastTurns: [] });
+
+    expect(brief.instructions.map((item) => item.text)).toEqual([
+      "fallback branch",
+    ]);
+  });
+
+  it("does not commit returns channel values when the child is SKIPPED", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const verdict = new Boolean();
+
+  enter(Child, {
+    returns: { verdict },
+  });
+
+  function Child({ returns }) {
+    this.guard = () => {
+      return State.SKIPPED;
+    };
+    this.effects = () => {
+      returns.verdict.set(true);
+    };
+  }
+}
+`);
+    const runtime = new Runtime().add("enter-channels-skip-arc", document);
+    const seeded = runtime.createTraversal(
+      arc("enter-channels-skip-arc", "Main"),
+    );
+    seeded.phase = "entered";
+    const brief = runtime.start([seeded], { lastTurns: [] });
+
+    expect(rootTraversal(brief).variables.verdict).toBeUndefined();
+    expect(ownedChild(rootTraversal(brief), "Main.Child")?.state).toBe(
+      "skipped",
+    );
+  });
+
+  it("does not commit returns channel values when the child is DEFLECTED", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const verdict = new Boolean();
+  enter(Child, { returns: { verdict } });
+
+  function Child({ returns }) {
+    const topic = new Enum(["unknown", "metal"]);
+    topic.observing = \`what topic does \${user} want\`;
+
+    this.effects = () => {
+      returns.verdict.set(true);
+    };
+
+    observeOrAsk(topic);
+  }
+}
+`);
+    const runtime = new Runtime().add("enter-channels-deflect-arc", document);
+    const seeded = runtime.createTraversal(
+      arc("enter-channels-deflect-arc", "Main"),
+    );
+    seeded.phase = "entered";
+    const firstBrief = runtime.start([seeded], { lastTurns: [] });
+    const afterDeflect = progressBrief(runtime, firstBrief, {
+      move: "deflect",
+    });
+
+    expect(rootTraversal(afterDeflect).variables.verdict).toBeUndefined();
+    expect(ownedChild(rootTraversal(afterDeflect), "Main.Child")?.state).toBe(
+      "deflected",
+    );
+    expect(rootTraversal(afterDeflect).phase).toBe("suspended");
+  });
+
+  it("fails fast at runtime when args channel keys are not wired by enter()", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  enter(Child);
+
+  function Child({ args }) {
+    this.effects = () => {
+      if (args.ready === true) {
+      }
+      if (args.ready === false) {
+      }
+    };
+  }
+}
+`);
+    const runtime = new Runtime().add("enter-missing-args-arc", document);
+    const seeded = runtime.createTraversal(
+      arc("enter-missing-args-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    expect(() => runtime.start([seeded], { lastTurns: [] })).toThrow(
+      /Unknown args channel key "ready"/,
+    );
+  });
+
+  it("fails fast at runtime when args channel keys are read in normal action flow but not wired", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  enter(Child);
+
+  function Child({ args }) {
+    if (args.ready === true) {
+      \`ready\`;
+    }
+  }
+}
+`);
+    const runtime = new Runtime().add(
+      "enter-missing-args-action-arc",
+      document,
+    );
+    const seeded = runtime.createTraversal(
+      arc("enter-missing-args-action-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    expect(() => runtime.start([seeded], { lastTurns: [] })).toThrow(
+      /Unknown args channel key "ready"/,
+    );
+  });
+
+  it("fails fast at runtime when returns channel keys are not wired by enter()", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  enter(Child, {
+    returns: {},
+  });
+
+  function Child({ returns }) {
+    this.effects = () => {
+      returns.verdict.set(true);
+    };
+  }
+}
+`);
+    const runtime = new Runtime().add("enter-missing-returns-arc", document);
+    const seeded = runtime.createTraversal(
+      arc("enter-missing-returns-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    expect(() => runtime.start([seeded], { lastTurns: [] })).toThrow(
+      /Unknown return channel key "verdict"/,
+    );
+  });
+
   it("evaluates regexTest expressions at runtime", () => {
     const document = parse(`
 "use arc v2";
@@ -1290,13 +2234,48 @@ function Main() {
 
     expect(brief.instructions.map((item) => item.text)).toEqual(["matched"]);
   });
+
+  it("replans against the latest dialog passed to progress", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  \`first\`;
+  if (/later/i.test(Dialog.lastUserMessage)) {
+    \`second\`;
+  }
+}
+`);
+    const runtime = new Runtime().add("dialog-arc", document);
+    const seeded = runtime.createTraversal(arc("dialog-arc", "Main"));
+    seeded.phase = "entered";
+
+    const firstDialog: Dialog = {
+      lastTurns: [{ role: "user", message: "hello" }],
+    };
+    const secondDialog: Dialog = {
+      lastTurns: [{ role: "user", message: "later now" }],
+    };
+
+    const brief = runtime.start([seeded], firstDialog);
+    expect(brief.instructions.map((item) => item.text)).toEqual(["first"]);
+
+    const nextBrief = progressBrief(
+      runtime,
+      brief,
+      { move: "proceed" },
+      secondDialog,
+    );
+
+    expect(nextBrief.instructions.map((item) => item.text)).toEqual(["second"]);
+  });
 });
 
 function runtimeAfterAsk(
   runtime: Runtime,
   brief: ReturnType<Runtime["start"]>,
 ): ArcTraversalSet {
-  return runtime.progress(brief, {
+  return progressBrief(runtime, brief, {
     move: "proceed",
     observations: {
       [brief.observations[0]!.id]: { status: "needs-user" },
