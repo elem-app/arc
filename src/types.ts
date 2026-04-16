@@ -3,6 +3,9 @@
  */
 export type PrimitiveValue = string | number | boolean;
 
+/** Stable parser-assigned statement/expression id, unique within its containing node. */
+export type StatementId = number;
+
 /** 1-based source position retained for parser diagnostics. */
 export type SourcePosition = {
   line: number;
@@ -34,11 +37,11 @@ export type LocalExpression =
   | { kind: "channel"; namespace: "args" | "returns"; key: string }
   | { kind: "scope"; name: "lastUserMessage" | "lastTurns"; count?: number }
   | { kind: "enterCount" }
-  | { kind: "nodeState"; node: string };
+  | { kind: "nodeState"; identifier: string };
 
 /** Semantic boolean check that may suspend on the brief/report boundary. */
 export type JudgeExpression = {
-  id: number;
+  id: StatementId;
   kind: "judge";
   question: SemanticString;
   loc?: SourceRange;
@@ -53,7 +56,7 @@ export type HostCallArgument =
 
 /** Host-backed value lookup that may suspend on the brief/report boundary. */
 export type HostCallExpression = {
-  id: number;
+  id: StatementId;
   kind: "host-call";
   module: string;
   target: string[];
@@ -135,7 +138,7 @@ export type Variable = {
 
 /** Passive semantic observation. */
 export type ObserveAction = {
-  id: number;
+  id: StatementId;
   kind: "observe";
   variable: string;
   question?: SemanticString;
@@ -144,7 +147,7 @@ export type ObserveAction = {
 
 /** Observation with fallback to asking the user. */
 export type ObserveOrAskAction = {
-  id: number;
+  id: StatementId;
   kind: "observeOrAsk";
   variable: string;
   question?: SemanticString;
@@ -153,7 +156,7 @@ export type ObserveOrAskAction = {
 
 /** Deterministic variable write without host semantic work. */
 export type SetAction = {
-  id: number;
+  id: StatementId;
   kind: "set";
   variable: string;
   value: ValueExpression;
@@ -162,7 +165,7 @@ export type SetAction = {
 
 /** Staged write into a caller-bound return channel. */
 export type SetReturnAction = {
-  id: number;
+  id: StatementId;
   kind: "set-return";
   key: string;
   value: ValueExpression;
@@ -182,6 +185,13 @@ export type SetReturnAction = {
  */
 export type EnterChannelBindings = Record<string, string>;
 
+/** Control-transfer target referenced by `enter(...)` / `enterLoop(...)`. */
+export type EnterTarget = {
+  identifier: string;
+  imported: boolean;
+  fresh: boolean;
+};
+
 /**
  * Enter a child node or imported arc from the current action graph.
  *
@@ -189,10 +199,9 @@ export type EnterChannelBindings = Record<string, string>;
  * import binding, not a display label.
  */
 export type EnterNodeAction = {
-  id: number;
+  id: StatementId;
   kind: "enter-node";
-  node: string;
-  imported: boolean;
+  target: EnterTarget;
   /**
    * Args channel bindings.
    * key: child-side args channel key (`args.<key>`).
@@ -208,9 +217,20 @@ export type EnterNodeAction = {
   loc?: SourceRange;
 };
 
+/** Repeated enter action with caller-authored loop resolution. */
+export type EnterLoopAction = {
+  id: StatementId;
+  kind: "enter-loop";
+  target: EnterTarget;
+  resolveWhen: ResolutionStatement[];
+  args?: EnterChannelBindings;
+  returns?: EnterChannelBindings;
+  loc?: SourceRange;
+};
+
 /** Authored instruction emitted from the action graph. */
 export type InstructionAction = {
-  id: number;
+  id: StatementId;
   kind: "instruction";
   mode: "once" | "persistent";
   template: SemanticString;
@@ -226,6 +246,7 @@ export type ActionStatement =
   | SetAction
   | SetReturnAction
   | EnterNodeAction
+  | EnterLoopAction
   | InstructionAction;
 
 /** Control-flow statement in the action graph. */
@@ -306,7 +327,7 @@ export type HostModuleBinding = {
 
 /** Non-blocking host invocation emitted from `this.effects`. */
 export type HostEffectStatement = {
-  id: number;
+  id: StatementId;
   kind: "host-call";
   module: string;
   target: string[];
@@ -332,6 +353,13 @@ export type EffectStatement =
   | HostEffectStatement
   | EffectIfStatement;
 
+/** Synthetic alias used only for `fresh(...)` pseudo-child definition lookup. */
+export type FreshNodeAlias = {
+  identifier: string;
+  target: string;
+  imported: boolean;
+};
+
 /**
  * Parsed node definition.
  *
@@ -350,6 +378,7 @@ export type Node = {
   variables: Variable[];
   statements: Statement[];
   children: Node[];
+  freshAliases: FreshNodeAlias[];
   imports: string[];
   trigger?: TriggerStatement[];
   deflectWhen?: ResolutionStatement[];
@@ -421,10 +450,10 @@ export type ActionState = {
  * parser-assigned action id.
  */
 export type NodeFrame = {
-  actionStates: Record<number, ActionState | undefined>;
+  actionStates: Record<StatementId, ActionState | undefined>;
   evaluatorActionStates: Record<
     string,
-    Record<number, ActionState | undefined> | undefined
+    Record<StatementId, ActionState | undefined> | undefined
   >;
 };
 
@@ -459,6 +488,8 @@ export type TraversalBase<TRef extends ArcRef | NodeRef> = {
   frame: NodeFrame;
   /** Inline persisted traversals for owned nested child nodes. */
   ownedChildren: NodeTraversal[];
+  /** Ephemeral fresh traversals owned by specific action sites. */
+  ephemeralChildren: NodeTraversal[];
   /** Referenced/imported arcs managed elsewhere in the traversal set. */
   refChildren: ArcRef[];
   /** Idempotency keys for host effects already emitted from this traversal. */
@@ -660,6 +691,9 @@ export type TriggerOutcome = {
  * `matchableArcs` contains arcs whose triggers already evaluate true under the
  * currently known state, before any additional host reports are
  * accepted.
+ *
+ * Hosts may inspect this object freely, but must treat it as immutable and
+ * pass the same object instance back to `Runtime.progressTrigger(...)`.
  */
 export type TriggerBrief = {
   judgments: JudgmentBrief[];
@@ -696,6 +730,9 @@ export type ActionMove = "proceed" | "defer" | "deflect";
  * `canProgress` answers the host control-flow question directly:
  * - `true`: calling `Runtime.progress(...)` may advance this root further
  * - `false`: this root has stopped for now
+ *
+ * Hosts may inspect this object freely, but must treat it as immutable and
+ * pass the same object instance back to `Runtime.progress(...)`.
  */
 export type ActionBrief = {
   /** Full persisted traversal state to save after this yield. */

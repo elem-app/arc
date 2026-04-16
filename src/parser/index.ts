@@ -5,6 +5,7 @@ import type {
   BreakStatement,
   Document,
   EffectStatement,
+  EnterTarget,
   GuardStatement,
   HostCallArgument,
   HostEffectStatement,
@@ -399,6 +400,7 @@ function parseNode(
       effectiveDeflectWhen,
     ),
   );
+  const freshAliases = collectFreshNodeAliases(statements);
 
   return {
     identifier: fn.id.name,
@@ -409,6 +411,7 @@ function parseNode(
     variables,
     statements,
     children,
+    freshAliases,
     imports: [...availableImports],
     trigger,
     deflectWhen,
@@ -416,6 +419,37 @@ function parseNode(
     effects,
     loc: locOf(fn),
   };
+}
+
+function collectFreshNodeAliases(
+  statements: Statement[],
+): Node["freshAliases"] {
+  const aliases: Node["freshAliases"] = [];
+
+  const visit = (statement: Statement): void => {
+    if (statement.kind === "if") {
+      statement.consequent.forEach(visit);
+      statement.alternate?.forEach(visit);
+      return;
+    }
+    if (statement.kind === "label") {
+      statement.body.forEach(visit);
+      return;
+    }
+    if (
+      (statement.kind === "enter-node" || statement.kind === "enter-loop") &&
+      statement.target.fresh
+    ) {
+      aliases.push({
+        identifier: `${statement.target.identifier}#${statement.id}`,
+        target: statement.target.identifier,
+        imported: statement.target.imported,
+      });
+    }
+  };
+
+  statements.forEach(visit);
+  return aliases;
 }
 
 function parseVariableDeclarations(
@@ -668,7 +702,7 @@ function parseNodeStatement(
   );
   if (!action) {
     throw new Error(
-      "Unsupported Arc expression statement; use an instruction template literal, instruct(), instructLoop(), observe(), observeOrAsk(), enter(), or variable.set()",
+      "Unsupported Arc expression statement; use an instruction template literal, instruct(), instructLoop(), observe(), observeOrAsk(), enter(), enterLoop(), or variable.set()",
     );
   }
   return [action];
@@ -763,6 +797,19 @@ function parseActionExpression(
         availableImports,
         visibleNodeNames,
         visibleVariableNames,
+        nextActionId,
+      );
+    }
+    if (
+      expression.callee.type === "Identifier" &&
+      expression.callee.name === "enterLoop"
+    ) {
+      return parseEnterLoopCall(
+        expression,
+        availableImports,
+        visibleNodeNames,
+        visibleVariableNames,
+        availableHostModules,
         nextActionId,
       );
     }
@@ -935,23 +982,14 @@ function parseEnterCall(
   visibleVariableNames: Set<string>,
   nextActionId: () => number,
 ): Statement {
-  const targetArg = expression.arguments[0];
-  if (
-    !targetArg ||
-    targetArg.type === "SpreadElement" ||
-    !isIdentifier(targetArg)
-  ) {
-    throw new Error("enter() requires a node or imported arc identifier");
-  }
+  const target = parseEnterTarget(
+    expression.arguments[0],
+    "enter()",
+    availableImports,
+    visibleNodeNames,
+  );
   if (expression.arguments.length > 2) {
-    throw new Error(
-      "enter() accepts a node/import identifier and an optional options object",
-    );
-  }
-
-  const node = targetArg.name;
-  if (!visibleNodeNames.has(node) && !availableImports.has(node)) {
-    throw new Error(`Unknown node: ${node}`);
+    throw new Error("enter() accepts a target and an optional options object");
   }
 
   const optionsArg = expression.arguments[1];
@@ -1002,17 +1040,168 @@ function parseEnterCall(
   return {
     id: nextActionId(),
     kind: "enter-node",
-    node,
-    imported: availableImports.has(node) && !visibleNodeNames.has(node),
+    target,
     args,
     returns,
     loc: locOf(expression),
   };
 }
 
+function parseEnterLoopCall(
+  expression: acorn.CallExpression,
+  availableImports: Set<string>,
+  visibleNodeNames: Set<string>,
+  visibleVariableNames: Set<string>,
+  availableHostModules: Map<string, string>,
+  nextActionId: () => number,
+): Statement {
+  const target = parseEnterTarget(
+    expression.arguments[0],
+    "enterLoop()",
+    availableImports,
+    visibleNodeNames,
+  );
+  if (expression.arguments.length !== 2) {
+    throw new Error("enterLoop() accepts a target and one options object");
+  }
+
+  const optionsArg = expression.arguments[1];
+  if (
+    !optionsArg ||
+    optionsArg.type === "SpreadElement" ||
+    optionsArg.type !== "ObjectExpression"
+  ) {
+    throw new Error("enterLoop() options must be an object literal");
+  }
+
+  let resolveWhen: ResolutionStatement[] | undefined;
+  let args: Record<string, string> | undefined;
+  let returns: Record<string, string> | undefined;
+  const seenKeys = new Set<string>();
+  for (const property of optionsArg.properties) {
+    if (property.type === "SpreadElement") {
+      throw new Error("enterLoop() options do not support spread");
+    }
+    if (property.computed) {
+      throw new Error("enterLoop() options do not support computed keys");
+    }
+    const key =
+      property.key.type === "Identifier"
+        ? property.key.name
+        : property.key.type === "Literal" &&
+            typeof property.key.value === "string"
+          ? property.key.value
+          : undefined;
+    if (key !== "resolveWhen" && key !== "args" && key !== "returns") {
+      throw new Error(
+        `enterLoop() has unsupported option key: ${key ?? "<computed>"}`,
+      );
+    }
+    if (seenKeys.has(key)) {
+      throw new Error(`enterLoop() options has duplicate key: ${key}`);
+    }
+    seenKeys.add(key);
+    if (key === "resolveWhen") {
+      resolveWhen = parseResolutionDefinition(
+        property.value,
+        "enterLoop().resolveWhen",
+        nextActionId,
+        availableHostModules,
+      );
+      continue;
+    }
+    const parsed = parseEnterChannelMap(
+      property.value,
+      `enterLoop().${key}`,
+      visibleVariableNames,
+    );
+    if (key === "args") args = parsed;
+    if (key === "returns") returns = parsed;
+  }
+
+  if (!resolveWhen) {
+    throw new Error("enterLoop() requires resolveWhen");
+  }
+
+  return {
+    id: nextActionId(),
+    kind: "enter-loop",
+    target,
+    resolveWhen,
+    args,
+    returns,
+    loc: locOf(expression),
+  };
+}
+
+function parseEnterTarget(
+  expression: acorn.Expression | acorn.SpreadElement | undefined,
+  label: "enter()" | "enterLoop()",
+  availableImports: Set<string>,
+  visibleNodeNames: Set<string>,
+): EnterTarget {
+  if (!expression || expression.type === "SpreadElement") {
+    throw new Error(`${label} requires a target`);
+  }
+  if (isIdentifier(expression)) {
+    const identifier = expression.name;
+    if (
+      !visibleNodeNames.has(identifier) &&
+      !availableImports.has(identifier)
+    ) {
+      throw new Error(`Unknown node: ${identifier}`);
+    }
+    return {
+      identifier,
+      imported:
+        availableImports.has(identifier) && !visibleNodeNames.has(identifier),
+      fresh: false,
+    };
+  }
+  if (
+    isCallExpression(expression) &&
+    expression.callee.type === "Identifier" &&
+    expression.callee.name === "fresh"
+  ) {
+    if (expression.arguments.length !== 1) {
+      throw new Error(
+        "fresh() accepts exactly one node or imported arc identifier",
+      );
+    }
+    const targetArg = expression.arguments[0];
+    if (
+      !targetArg ||
+      targetArg.type === "SpreadElement" ||
+      !isIdentifier(targetArg)
+    ) {
+      throw new Error("fresh() requires a node or imported arc identifier");
+    }
+    const identifier = targetArg.name;
+    if (
+      !visibleNodeNames.has(identifier) &&
+      !availableImports.has(identifier)
+    ) {
+      throw new Error(`Unknown node: ${identifier}`);
+    }
+    return {
+      identifier,
+      imported:
+        availableImports.has(identifier) && !visibleNodeNames.has(identifier),
+      fresh: true,
+    };
+  }
+  throw new Error(
+    `${label} requires a node/import identifier or fresh(node/import)`,
+  );
+}
+
 function parseEnterChannelMap(
   expression: acorn.Expression,
-  label: "enter().args" | "enter().returns",
+  label:
+    | "enter().args"
+    | "enter().returns"
+    | "enterLoop().args"
+    | "enterLoop().returns",
   visibleVariableNames: Set<string>,
 ): Record<string, string> {
   if (expression.type !== "ObjectExpression") {
@@ -1674,11 +1863,11 @@ function validateStatement(
     return;
   }
 
-  if (statement.kind === "enter-node") {
-    if (!nodes.includes(statement.node)) {
+  if (statement.kind === "enter-node" || statement.kind === "enter-loop") {
+    if (!nodes.includes(statement.target.identifier)) {
       issues.push({
         code: "UNDEFINED_NODE",
-        message: `Unknown node: ${statement.node}`,
+        message: `Unknown node: ${statement.target.identifier}`,
         loc: statement.loc,
       });
     }
@@ -1698,6 +1887,11 @@ function validateStatement(
           message: `Unknown variable: ${variable}`,
           loc: statement.loc,
         });
+      }
+    }
+    if (statement.kind === "enter-loop") {
+      for (const entry of statement.resolveWhen) {
+        validateTriggerStatement(entry, variables, nodes, issues);
       }
     }
     return;
@@ -1956,10 +2150,10 @@ function validateExpression(
       }
       return;
     case "nodeState":
-      if (!nodes.includes(expression.node)) {
+      if (!nodes.includes(expression.identifier)) {
         issues.push({
           code: "UNDEFINED_NODE",
-          message: `Unknown node: ${expression.node}`,
+          message: `Unknown node: ${expression.identifier}`,
         });
       }
       return;

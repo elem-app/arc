@@ -39,6 +39,15 @@ function ownedChild(
   );
 }
 
+function ephemeralChild(
+  traversal: ArcTraversal | NodeTraversal,
+  identifier: string,
+): NodeTraversal | undefined {
+  return traversal.ephemeralChildren.find(
+    (child) => nodeIdentifier(child.ref) === identifier,
+  );
+}
+
 function rootTraversal(brief: ActionBrief): ArcTraversal {
   const root = brief.traversals.find(
     (traversal) => traversal.returnTo === null,
@@ -56,6 +65,14 @@ function progressBrief(
   dialog: Dialog = EMPTY_DIALOG,
 ): ActionBrief {
   return runtime.progress(brief, report, dialog);
+}
+
+function startTrigger(
+  runtime: Runtime,
+  dialog: Dialog,
+  traversals: ArcTraversalSet = runtime.newTraversalSet(),
+) {
+  return runtime.startTrigger(traversals, dialog);
 }
 
 const SOURCE = `
@@ -109,7 +126,7 @@ function Second() {
     };
     const metalRef = arc("metal-arc", "Metal");
 
-    const triggerBrief = runtime.startTrigger(dialog);
+    const triggerBrief = startTrigger(runtime, dialog);
 
     expect(triggerBrief.matchableArcs).toEqual([]);
     expect(triggerBrief.judgments).toHaveLength(1);
@@ -117,12 +134,16 @@ function Second() {
       sourceRef: node("metal-arc", "Metal"),
     });
 
-    const triggerOutcome = runtime.progressTrigger(triggerBrief, {
-      match: metalRef,
-      judgments: {
-        [triggerBrief.judgments[0]!.id]: true,
+    const triggerOutcome = runtime.progressTrigger(
+      triggerBrief,
+      {
+        match: metalRef,
+        judgments: {
+          [triggerBrief.judgments[0]!.id]: true,
+        },
       },
-    });
+      dialog,
+    );
 
     expect(triggerOutcome.matched).toEqual(metalRef);
     const matchedTraversal = triggerOutcome.traversals.find(
@@ -146,6 +167,135 @@ function Second() {
     expect(surface?.ref).toEqual(node("metal-arc", "Metal.Surface"));
   });
 
+  it("treats fresh owned children as pseudo-children stored in ephemeralChildren", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  enter(fresh(Child));
+
+  function Child() {
+    const ready = new Boolean();
+    observeOrAsk(ready);
+  }
+}
+`);
+    const runtime = new Runtime().add("fresh-owned-arc", document);
+    const traversal = runtime.newTraversal(arc("fresh-owned-arc", "Main"));
+    traversal.phase = "entered";
+
+    const brief = runtime.start([traversal], EMPTY_DIALOG);
+
+    expect(brief.active).toEqual(node("fresh-owned-arc", "Main.Child#0"));
+    expect(rootTraversal(brief).ownedChildren).toHaveLength(0);
+    const child = ephemeralChild(rootTraversal(brief), "Main.Child#0");
+    expect(child?.ref).toEqual(node("fresh-owned-arc", "Main.Child#0"));
+  });
+
+  it("folds fresh imported arcs into pseudo-children instead of the root traversal set", () => {
+    const main = parse(`
+"use arc v2";
+import { Intro } from "intro-arc";
+
+function Main() {
+  enter(fresh(Intro));
+}
+`);
+    const intro = parse(`
+"use arc v2";
+
+function Intro() {
+  const topic = new Boolean();
+  observeOrAsk(topic);
+}
+`);
+    const runtime = new Runtime().add("main-arc", main).add("intro-arc", intro);
+    const traversal = runtime.newTraversal(arc("main-arc", "Main"));
+    traversal.phase = "entered";
+
+    const brief = runtime.start([traversal], EMPTY_DIALOG);
+
+    expect(brief.active).toEqual(node("main-arc", "Main.Intro#0"));
+    expect(brief.traversals).toHaveLength(1);
+    expect(rootTraversal(brief).refChildren).toEqual([]);
+    const child = ephemeralChild(rootTraversal(brief), "Main.Intro#0");
+    expect(child?.ref).toEqual(node("main-arc", "Main.Intro#0"));
+  });
+
+  it("walks nested owned and pseudo-child traversals with synthetic refs", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  enter(fresh(B));
+
+  function B() {
+    enter(C);
+
+    function C() {
+      enter(fresh(D));
+
+      function D() {
+        const ready = new Boolean();
+        observeOrAsk(ready);
+      }
+    }
+  }
+}
+`);
+    const runtime = new Runtime().add("nested-fresh-arc", document);
+    const traversal = runtime.newTraversal(arc("nested-fresh-arc", "Main"));
+    traversal.phase = "entered";
+
+    const brief = runtime.start([traversal], EMPTY_DIALOG);
+
+    expect(brief.active).toEqual(node("nested-fresh-arc", "Main.B#0.C.D#0"));
+    const b = ephemeralChild(rootTraversal(brief), "Main.B#0");
+    expect(b?.ref).toEqual(node("nested-fresh-arc", "Main.B#0"));
+    const c = b ? ownedChild(b, "Main.B#0.C") : undefined;
+    expect(c?.ref).toEqual(node("nested-fresh-arc", "Main.B#0.C"));
+    const d = c ? ephemeralChild(c, "Main.B#0.C.D#0") : undefined;
+    expect(d?.ref).toEqual(node("nested-fresh-arc", "Main.B#0.C.D#0"));
+  });
+
+  it("goes past enter(fresh(...)) after the fresh child resolves", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  enter(fresh(Child));
+  \`done\`;
+
+  function Child() {
+    const ready = new Boolean();
+    observeOrAsk(ready);
+  }
+}
+`);
+    const runtime = new Runtime().add("fresh-resolution-arc", document);
+    const traversal = runtime.newTraversal(arc("fresh-resolution-arc", "Main"));
+    traversal.phase = "entered";
+
+    const brief = runtime.start([traversal], EMPTY_DIALOG);
+    expect(brief.active).toEqual(node("fresh-resolution-arc", "Main.Child#0"));
+    expect(brief.observations).toHaveLength(1);
+
+    const next = progressBrief(runtime, brief, {
+      move: "proceed",
+      observations: {
+        [brief.observations[0]!.id]: {
+          status: "resolved",
+          value: true,
+        },
+      },
+    });
+
+    expect(next.active).toEqual(node("fresh-resolution-arc", "Main"));
+    expect(next.instructions).toHaveLength(1);
+    const child = ephemeralChild(rootTraversal(next), "Main.Child#0");
+    expect(child?.state).toBe("covered");
+  });
+
   it("seeds traversal variables from trigger observations before entry", () => {
     const document = parse(`
 "use arc v2";
@@ -164,18 +314,23 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("trigger-arc", document);
-    const triggerBrief = runtime.startTrigger({
+    const dialog: Dialog = {
       lastTurns: [{ role: "user", message: "let's talk about music" }],
-    });
+    };
+    const triggerBrief = startTrigger(runtime, dialog);
 
-    const outcome = runtime.progressTrigger(triggerBrief, {
-      observations: {
-        [triggerBrief.observations[0]!.id]: {
-          status: "resolved",
-          value: "metal",
+    const outcome = runtime.progressTrigger(
+      triggerBrief,
+      {
+        observations: {
+          [triggerBrief.observations[0]!.id]: {
+            status: "resolved",
+            value: "metal",
+          },
         },
       },
-    });
+      dialog,
+    );
 
     expect(outcome.matched).toEqual(arc("trigger-arc", "Main"));
     const matched = outcome.traversals.find((t) => t.ref === outcome.matched);
@@ -198,15 +353,20 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("trigger-arc", document);
-    const triggerBrief = runtime.startTrigger({
+    const dialog: Dialog = {
       lastTurns: [{ role: "user", message: "hello there" }],
-    });
+    };
+    const triggerBrief = startTrigger(runtime, dialog);
 
-    const outcome = runtime.progressTrigger(triggerBrief, {
-      observations: {
-        [triggerBrief.observations[0]!.id]: { status: "unknown" },
+    const outcome = runtime.progressTrigger(
+      triggerBrief,
+      {
+        observations: {
+          [triggerBrief.observations[0]!.id]: { status: "unknown" },
+        },
       },
-    });
+      dialog,
+    );
 
     expect(outcome.matched).toBeUndefined();
     expect(
@@ -239,24 +399,30 @@ function Main() {
 `);
     const runtime = new Runtime().add("trigger-arc", document);
 
-    const firstBrief = runtime.startTrigger({
+    const firstDialog: Dialog = {
       lastTurns: [{ role: "user", message: "music" }],
-    });
+    };
+    const firstBrief = startTrigger(runtime, firstDialog);
 
     expect(firstBrief.judgments.map((item) => item.question)).toEqual([
       "user mentions music for the first time",
     ]);
 
-    const firstOutcome = runtime.progressTrigger(firstBrief, {
-      judgments: { [firstBrief.judgments[0]!.id]: true },
-    });
+    const firstOutcome = runtime.progressTrigger(
+      firstBrief,
+      {
+        judgments: { [firstBrief.judgments[0]!.id]: true },
+      },
+      firstDialog,
+    );
 
     expect(
       firstOutcome.traversals.find((t) => t.ref === firstOutcome.matched)
         ?.enterCount,
     ).toBe(1);
 
-    const secondBrief = runtime.startTrigger(
+    const secondBrief = startTrigger(
+      runtime,
       {
         lastTurns: [{ role: "user", message: "music again" }],
       },
@@ -267,9 +433,16 @@ function Main() {
       "user mentions music again",
     ]);
 
-    const secondOutcome = runtime.progressTrigger(secondBrief, {
-      judgments: { [secondBrief.judgments[0]!.id]: true },
-    });
+    const secondDialog: Dialog = {
+      lastTurns: [{ role: "user", message: "music again" }],
+    };
+    const secondOutcome = runtime.progressTrigger(
+      secondBrief,
+      {
+        judgments: { [secondBrief.judgments[0]!.id]: true },
+      },
+      secondDialog,
+    );
 
     expect(
       secondOutcome.traversals.find((t) => t.ref === secondOutcome.matched)
@@ -298,8 +471,8 @@ function Second() {
       .add("first-arc", first)
       .add("second-arc", second);
 
-    const triggerBrief = runtime.startTrigger({ lastTurns: [] });
-    const outcome = runtime.progressTrigger(triggerBrief, {});
+    const triggerBrief = startTrigger(runtime, EMPTY_DIALOG);
+    const outcome = runtime.progressTrigger(triggerBrief, {}, EMPTY_DIALOG);
 
     expect(triggerBrief.matchableArcs).toEqual([
       arc("first-arc", "First"),
@@ -326,13 +499,13 @@ function Second() {
 }
 `);
     const runtime = new Runtime().add("single-match-trigger-arc", document);
-    const triggerBrief = runtime.startTrigger({ lastTurns: [] });
+    const triggerBrief = startTrigger(runtime, EMPTY_DIALOG);
 
     expect(triggerBrief.matchableArcs).toEqual([
       arc("single-match-trigger-arc", "First"),
     ]);
 
-    const outcome = runtime.progressTrigger(triggerBrief, {});
+    const outcome = runtime.progressTrigger(triggerBrief, {}, EMPTY_DIALOG);
     expect(outcome.matched).toEqual(arc("single-match-trigger-arc", "First"));
   });
 
@@ -366,7 +539,7 @@ function AnotherArc() {
       .add("another-arc", expected)
       .add("wrong-arc", wrong);
 
-    const seeded = runtime.createTraversal(arc("main-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("main-arc", "Main"));
     seeded.phase = "entered";
     const brief = runtime.start([seeded], { lastTurns: [] });
 
@@ -383,13 +556,17 @@ function AnotherArc() {
       lastTurns: [{ role: "user", message: "what music are you into?" }],
     };
 
-    const triggerBrief = runtime.startTrigger(dialog);
-    const triggerOutcome = runtime.progressTrigger(triggerBrief, {
-      match: arc("metal-arc", "Metal"),
-      judgments: {
-        [triggerBrief.judgments[0]!.id]: true,
+    const triggerBrief = startTrigger(runtime, dialog);
+    const triggerOutcome = runtime.progressTrigger(
+      triggerBrief,
+      {
+        match: arc("metal-arc", "Metal"),
+        judgments: {
+          [triggerBrief.judgments[0]!.id]: true,
+        },
       },
-    });
+      dialog,
+    );
 
     const brief = runtime.start(triggerOutcome.traversals, dialog);
     const afterAsk = progressBrief(
@@ -445,7 +622,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("once-arc", document);
-    const seeded = runtime.createTraversal(arc("once-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("once-arc", "Main"));
     seeded.phase = "entered";
 
     const brief = runtime.start([seeded], { lastTurns: [] });
@@ -475,7 +652,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("instruction-move-arc", document);
-    const seeded = runtime.createTraversal(arc("instruction-move-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("instruction-move-arc", "Main"));
     seeded.phase = "entered";
 
     const brief = runtime.start([seeded], { lastTurns: [] });
@@ -497,7 +674,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("instruction-precedence-arc", document);
-    const seeded = runtime.createTraversal(
+    const seeded = runtime.newTraversal(
       arc("instruction-precedence-arc", "Main"),
     );
     seeded.phase = "entered";
@@ -544,7 +721,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("instruction-postcheck-arc", document);
-    const seeded = runtime.createTraversal(
+    const seeded = runtime.newTraversal(
       arc("instruction-postcheck-arc", "Main"),
     );
     seeded.phase = "entered";
@@ -603,7 +780,7 @@ function Main() {
       "instruction-observe-unknown-arc",
       document,
     );
-    const seeded = runtime.createTraversal(
+    const seeded = runtime.newTraversal(
       arc("instruction-observe-unknown-arc", "Main"),
     );
     seeded.phase = "entered";
@@ -653,21 +830,24 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("trigger-frame-reset-arc", document);
-    const seeded = runtime.createTraversal(
-      arc("trigger-frame-reset-arc", "Main"),
-    );
+    const seeded = runtime.newTraversal(arc("trigger-frame-reset-arc", "Main"));
 
-    const firstBrief = runtime.startTrigger({ lastTurns: [] }, [seeded]);
+    const firstBrief = startTrigger(runtime, EMPTY_DIALOG, [seeded]);
     expect(firstBrief.observations).toHaveLength(1);
 
-    const firstOutcome = runtime.progressTrigger(firstBrief, {
-      observations: {
-        [firstBrief.observations[0]!.id]: { status: "unknown" },
+    const firstOutcome = runtime.progressTrigger(
+      firstBrief,
+      {
+        observations: {
+          [firstBrief.observations[0]!.id]: { status: "unknown" },
+        },
       },
-    });
+      EMPTY_DIALOG,
+    );
     expect(firstOutcome.matched).toBeUndefined();
 
-    const secondBrief = runtime.startTrigger(
+    const secondBrief = startTrigger(
+      runtime,
       { lastTurns: [{ role: "user", message: "still not sure" }] },
       firstOutcome.traversals,
     );
@@ -685,9 +865,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("instruct-implicit-arc", document);
-    const seeded = runtime.createTraversal(
-      arc("instruct-implicit-arc", "Main"),
-    );
+    const seeded = runtime.newTraversal(arc("instruct-implicit-arc", "Main"));
     seeded.phase = "entered";
 
     const brief = runtime.start([seeded], { lastTurns: [] });
@@ -720,7 +898,7 @@ function Main() {
       "instruction-hostcall-postcheck-arc",
       document,
     );
-    const seeded = runtime.createTraversal(
+    const seeded = runtime.newTraversal(
       arc("instruction-hostcall-postcheck-arc", "Main"),
     );
     seeded.phase = "entered";
@@ -751,7 +929,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("persistent-arc", document);
-    const seeded = runtime.createTraversal(arc("persistent-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("persistent-arc", "Main"));
     seeded.phase = "entered";
 
     const brief = runtime.start([seeded], { lastTurns: [] });
@@ -819,9 +997,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("instruction-defer-arc", document);
-    const seeded = runtime.createTraversal(
-      arc("instruction-defer-arc", "Main"),
-    );
+    const seeded = runtime.newTraversal(arc("instruction-defer-arc", "Main"));
     seeded.phase = "entered";
 
     const brief = runtime.start([seeded], { lastTurns: [] });
@@ -871,9 +1047,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("instruction-batched-arc", document);
-    const seeded = runtime.createTraversal(
-      arc("instruction-batched-arc", "Main"),
-    );
+    const seeded = runtime.newTraversal(arc("instruction-batched-arc", "Main"));
     seeded.phase = "entered";
 
     const brief = runtime.start([seeded], { lastTurns: [] });
@@ -912,9 +1086,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("instruction-deflect-arc", document);
-    const seeded = runtime.createTraversal(
-      arc("instruction-deflect-arc", "Main"),
-    );
+    const seeded = runtime.newTraversal(arc("instruction-deflect-arc", "Main"));
     seeded.phase = "entered";
 
     const brief = runtime.start([seeded], { lastTurns: [] });
@@ -957,7 +1129,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("guard-semantic-arc", document);
-    const seeded = runtime.createTraversal(arc("guard-semantic-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("guard-semantic-arc", "Main"));
     seeded.phase = "entered";
     const brief = runtime.start([seeded], {
       lastTurns: [{ role: "user", message: "not now" }],
@@ -996,7 +1168,7 @@ function Main() {
 `);
 
     const runtime = new Runtime().add("host-call-arc", document);
-    const seeded = runtime.createTraversal(arc("host-call-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("host-call-arc", "Main"));
     seeded.phase = "entered";
 
     const brief = runtime.start([seeded], { lastTurns: [] });
@@ -1046,7 +1218,7 @@ function Main() {
 `);
 
     const runtime = new Runtime().add("effects-arc", document);
-    const seeded = runtime.createTraversal(arc("effects-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("effects-arc", "Main"));
     seeded.phase = "entered";
     const brief = runtime.start([seeded], {
       lastTurns: [{ role: "user", message: "I like metal" }],
@@ -1099,7 +1271,7 @@ function Main() {
 `);
 
     const runtime = new Runtime().add("effects-arc", document);
-    const seeded = runtime.createTraversal(arc("effects-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("effects-arc", "Main"));
     seeded.phase = "entered";
     const brief = runtime.start([seeded], {
       lastTurns: [{ role: "user", message: "I like metal" }],
@@ -1131,7 +1303,7 @@ function Main() {
 `);
 
     const runtime = new Runtime().add("observe-arc", document);
-    const seeded = runtime.createTraversal(arc("observe-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("observe-arc", "Main"));
     seeded.phase = "entered";
     const brief = runtime.start([seeded], { lastTurns: [] });
 
@@ -1163,9 +1335,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("idempotent-effects-arc", document);
-    const seeded = runtime.createTraversal(
-      arc("idempotent-effects-arc", "Main"),
-    );
+    const seeded = runtime.newTraversal(arc("idempotent-effects-arc", "Main"));
     seeded.phase = "entered";
     const firstBrief = runtime.start([seeded], { lastTurns: [] });
 
@@ -1213,7 +1383,7 @@ function Main() {
 `);
 
     const runtime = new Runtime().add("deflect-effects-arc", document);
-    const seeded = runtime.createTraversal(arc("deflect-effects-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("deflect-effects-arc", "Main"));
     seeded.phase = "entered";
     const brief = runtime.start([seeded], { lastTurns: [] });
     const nextBrief = progressBrief(runtime, brief, { move: "deflect" });
@@ -1259,7 +1429,7 @@ function Main() {
 `);
 
     const runtime = new Runtime().add("deflect-parent-effects-arc", document);
-    const seeded = runtime.createTraversal(
+    const seeded = runtime.newTraversal(
       arc("deflect-parent-effects-arc", "Main"),
     );
     seeded.phase = "entered";
@@ -1311,7 +1481,7 @@ function Main() {
 `);
 
     const runtime = new Runtime().add("deflect-observe-effects-arc", document);
-    const seeded = runtime.createTraversal(
+    const seeded = runtime.newTraversal(
       arc("deflect-observe-effects-arc", "Main"),
     );
     seeded.phase = "entered";
@@ -1354,15 +1524,21 @@ function Main() {
   it("supports defer without mutating the yielded traversal", () => {
     const document = parse(SOURCE);
     const runtime = new Runtime().add("metal-arc", document);
-    const triggerBrief = runtime.startTrigger({
+    const triggerBrief = startTrigger(runtime, {
       lastTurns: [{ role: "user", message: "what music are you into?" }],
     });
-    const triggerOutcome = runtime.progressTrigger(triggerBrief, {
-      match: arc("metal-arc", "Metal"),
-      judgments: {
-        [triggerBrief.judgments[0]!.id]: true,
+    const triggerOutcome = runtime.progressTrigger(
+      triggerBrief,
+      {
+        match: arc("metal-arc", "Metal"),
+        judgments: {
+          [triggerBrief.judgments[0]!.id]: true,
+        },
       },
-    });
+      {
+        lastTurns: [{ role: "user", message: "what music are you into?" }],
+      },
+    );
 
     const brief = runtime.start(triggerOutcome.traversals, { lastTurns: [] });
     const yielded = JSON.parse(JSON.stringify(brief.traversals));
@@ -1389,7 +1565,7 @@ function Main() {
       "resumable-arc",
       resumableDocument,
     );
-    const resumableSeeded = resumableRuntime.createTraversal(
+    const resumableSeeded = resumableRuntime.newTraversal(
       arc("resumable-arc", "Main"),
     );
     resumableSeeded.phase = "entered";
@@ -1428,7 +1604,7 @@ function Main() {
       "non-resumable-arc",
       nonResumableDocument,
     );
-    const nonResumableSeeded = nonResumableRuntime.createTraversal(
+    const nonResumableSeeded = nonResumableRuntime.newTraversal(
       arc("non-resumable-arc", "Main"),
     );
     nonResumableSeeded.phase = "entered";
@@ -1479,10 +1655,11 @@ function Main() {
 `);
     const runtime = new Runtime().add("retry-arc", retryDocument);
     const firstOutcome = runtime.progressTrigger(
-      runtime.startTrigger({ lastTurns: [] }),
+      startTrigger(runtime, EMPTY_DIALOG),
       {
         match: arc("retry-arc", "Main"),
       },
+      EMPTY_DIALOG,
     );
     const firstBrief = runtime.start(firstOutcome.traversals, {
       lastTurns: [],
@@ -1494,8 +1671,9 @@ function Main() {
     );
 
     const restartedOutcome = runtime.progressTrigger(
-      runtime.startTrigger({ lastTurns: [] }, deflected.traversals),
+      startTrigger(runtime, EMPTY_DIALOG, deflected.traversals),
       { match: arc("retry-arc", "Main") },
+      EMPTY_DIALOG,
     );
     const restartedBrief = runtime.start(restartedOutcome.traversals, {
       lastTurns: [],
@@ -1523,10 +1701,11 @@ function Main() {
 `);
     const coveredRuntime = new Runtime().add("covered-arc", coveredDocument);
     const coveredOutcome = coveredRuntime.progressTrigger(
-      coveredRuntime.startTrigger({ lastTurns: [] }),
+      startTrigger(coveredRuntime, EMPTY_DIALOG),
       {
         match: arc("covered-arc", "Main"),
       },
+      EMPTY_DIALOG,
     );
     const firstCoveredBrief = coveredRuntime.start(coveredOutcome.traversals, {
       lastTurns: [],
@@ -1557,11 +1736,13 @@ function Main() {
     );
 
     const restartedCoveredOutcome = coveredRuntime.progressTrigger(
-      coveredRuntime.startTrigger(
-        { lastTurns: [] },
+      startTrigger(
+        coveredRuntime,
+        EMPTY_DIALOG,
         completedCoveredBrief.traversals,
       ),
       { match: arc("covered-arc", "Main") },
+      EMPTY_DIALOG,
     );
     const restartedCoveredBrief = coveredRuntime.start(
       restartedCoveredOutcome.traversals,
@@ -1593,8 +1774,9 @@ function Main() {
 `);
     const runtime = new Runtime().add("suspend-reenter-arc", document);
     const firstOutcome = runtime.progressTrigger(
-      runtime.startTrigger({ lastTurns: [] }),
+      startTrigger(runtime, EMPTY_DIALOG),
       { match: arc("suspend-reenter-arc", "Main") },
+      EMPTY_DIALOG,
     );
     const firstBrief = runtime.start(firstOutcome.traversals, {
       lastTurns: [],
@@ -1606,8 +1788,9 @@ function Main() {
     expect(suspendedRoot.enterCount).toBe(1);
 
     const restarted = runtime.progressTrigger(
-      runtime.startTrigger({ lastTurns: [] }, deflected.traversals),
+      startTrigger(runtime, EMPTY_DIALOG, deflected.traversals),
       { match: arc("suspend-reenter-arc", "Main") },
+      EMPTY_DIALOG,
     );
     const restartedRoot = restarted.traversals.find(
       (item) => item.ref === arc("suspend-reenter-arc", "Main"),
@@ -1622,15 +1805,21 @@ function Main() {
   it("marks the active node deflected when the report deflects", () => {
     const document = parse(SOURCE);
     const runtime = new Runtime().add("metal-arc", document);
-    const triggerBrief = runtime.startTrigger({
+    const triggerBrief = startTrigger(runtime, {
       lastTurns: [{ role: "user", message: "what music are you into?" }],
     });
-    const triggerOutcome = runtime.progressTrigger(triggerBrief, {
-      match: arc("metal-arc", "Metal"),
-      judgments: {
-        [triggerBrief.judgments[0]!.id]: true,
+    const triggerOutcome = runtime.progressTrigger(
+      triggerBrief,
+      {
+        match: arc("metal-arc", "Metal"),
+        judgments: {
+          [triggerBrief.judgments[0]!.id]: true,
+        },
       },
-    });
+      {
+        lastTurns: [{ role: "user", message: "what music are you into?" }],
+      },
+    );
 
     const brief = runtime.start(triggerOutcome.traversals, { lastTurns: [] });
     const nextBrief = progressBrief(runtime, brief, { move: "deflect" });
@@ -1660,7 +1849,7 @@ function Outer() {
 }
 `);
     const runtime = new Runtime().add("outer-arc", document);
-    const seeded = runtime.createTraversal(arc("outer-arc", "Outer"));
+    const seeded = runtime.newTraversal(arc("outer-arc", "Outer"));
     seeded.phase = "entered";
     const brief = runtime.start([seeded], { lastTurns: [] });
 
@@ -1692,7 +1881,7 @@ function A() {
 }
 `);
     const runtime = new Runtime().add("owner-arc", document);
-    const seeded = runtime.createTraversal(arc("owner-arc", "A"));
+    const seeded = runtime.newTraversal(arc("owner-arc", "A"));
     seeded.phase = "entered";
     const brief = runtime.start([seeded], { lastTurns: [] });
 
@@ -1729,7 +1918,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("break-outside-if-arc", document);
-    const seeded = runtime.createTraversal(arc("break-outside-if-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("break-outside-if-arc", "Main"));
     seeded.phase = "entered";
 
     const branchBrief = runtime.start([seeded], { lastTurns: [] });
@@ -1764,7 +1953,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("break-inside-if-arc", document);
-    const seeded = runtime.createTraversal(arc("break-inside-if-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("break-inside-if-arc", "Main"));
     seeded.phase = "entered";
 
     const branchBrief = runtime.start([seeded], { lastTurns: [] });
@@ -1800,7 +1989,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("nested-break-arc", document);
-    const seeded = runtime.createTraversal(arc("nested-break-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("nested-break-arc", "Main"));
     seeded.phase = "entered";
 
     const brief = runtime.start([seeded], { lastTurns: [] });
@@ -1815,13 +2004,19 @@ function Main() {
   it("rejects invalid action reports: illegal move, bogus judgment id, bogus observation id", () => {
     const document = parse(SOURCE);
     const runtime = new Runtime().add("metal-arc", document);
-    const triggerBrief = runtime.startTrigger({
+    const triggerBrief = startTrigger(runtime, {
       lastTurns: [{ role: "user", message: "music" }],
     });
-    const triggerOutcome = runtime.progressTrigger(triggerBrief, {
-      match: arc("metal-arc", "Metal"),
-      judgments: { [triggerBrief.judgments[0]!.id]: true },
-    });
+    const triggerOutcome = runtime.progressTrigger(
+      triggerBrief,
+      {
+        match: arc("metal-arc", "Metal"),
+        judgments: { [triggerBrief.judgments[0]!.id]: true },
+      },
+      {
+        lastTurns: [{ role: "user", message: "music" }],
+      },
+    );
     const brief = runtime.start(triggerOutcome.traversals, { lastTurns: [] });
 
     expect(() =>
@@ -1858,7 +2053,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("action-host-id-arc", document);
-    const seeded = runtime.createTraversal(arc("action-host-id-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("action-host-id-arc", "Main"));
     seeded.phase = "entered";
 
     const brief = runtime.start([seeded], { lastTurns: [] });
@@ -1882,20 +2077,32 @@ function Main() {
   it("rejects invalid trigger reports: unknown arc, bogus judgment id", () => {
     const document = parse(SOURCE);
     const runtime = new Runtime().add("metal-arc", document);
-    const triggerBrief = runtime.startTrigger({
+    const triggerBrief = startTrigger(runtime, {
       lastTurns: [{ role: "user", message: "music" }],
     });
 
     expect(() =>
-      runtime.progressTrigger(triggerBrief, {
-        match: arc("nonexistent", "Nope"),
-      }),
+      runtime.progressTrigger(
+        triggerBrief,
+        {
+          match: arc("nonexistent", "Nope"),
+        },
+        {
+          lastTurns: [{ role: "user", message: "music" }],
+        },
+      ),
     ).toThrow(/Unknown arc selected in trigger report/);
 
     expect(() =>
-      runtime.progressTrigger(triggerBrief, {
-        judgments: { "bogus-id": true },
-      }),
+      runtime.progressTrigger(
+        triggerBrief,
+        {
+          judgments: { "bogus-id": true },
+        },
+        {
+          lastTurns: [{ role: "user", message: "music" }],
+        },
+      ),
     ).toThrow(/Unknown judgment id in trigger report/);
   });
 
@@ -1912,18 +2119,26 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("trigger-host-id-arc", document);
-    const triggerBrief = runtime.startTrigger({ lastTurns: [] });
+    const triggerBrief = startTrigger(runtime, EMPTY_DIALOG);
     expect(triggerBrief.hostCalls).toHaveLength(1);
 
     expect(() =>
-      runtime.progressTrigger(triggerBrief, {
-        hostCalls: { "bogus-id": true },
-      }),
+      runtime.progressTrigger(
+        triggerBrief,
+        {
+          hostCalls: { "bogus-id": true },
+        },
+        EMPTY_DIALOG,
+      ),
     ).toThrow(/Unknown host call id in trigger report/);
 
-    const accepted = runtime.progressTrigger(triggerBrief, {
-      hostCalls: { [triggerBrief.hostCalls[0]!.id]: true },
-    });
+    const accepted = runtime.progressTrigger(
+      triggerBrief,
+      {
+        hostCalls: { [triggerBrief.hostCalls[0]!.id]: true },
+      },
+      EMPTY_DIALOG,
+    );
     expect(accepted.matched).toEqual(arc("trigger-host-id-arc", "Main"));
   });
 
@@ -1947,7 +2162,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("enum-arc", document);
-    const seeded = runtime.createTraversal(arc("enum-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("enum-arc", "Main"));
     seeded.phase = "entered";
     const brief = runtime.start([seeded], { lastTurns: [] });
 
@@ -1981,7 +2196,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("enter-channels-arc", document);
-    const seeded = runtime.createTraversal(arc("enter-channels-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("enter-channels-arc", "Main"));
     seeded.phase = "entered";
     const brief = runtime.start([seeded], { lastTurns: [] });
 
@@ -2014,9 +2229,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("enter-args-action-arc", document);
-    const seeded = runtime.createTraversal(
-      arc("enter-args-action-arc", "Main"),
-    );
+    const seeded = runtime.newTraversal(arc("enter-args-action-arc", "Main"));
     seeded.phase = "entered";
     const brief = runtime.start([seeded], { lastTurns: [] });
 
@@ -2047,7 +2260,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("enter-args-action-false-arc", document);
-    const seeded = runtime.createTraversal(
+    const seeded = runtime.newTraversal(
       arc("enter-args-action-false-arc", "Main"),
     );
     seeded.phase = "entered";
@@ -2080,9 +2293,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("enter-channels-skip-arc", document);
-    const seeded = runtime.createTraversal(
-      arc("enter-channels-skip-arc", "Main"),
-    );
+    const seeded = runtime.newTraversal(arc("enter-channels-skip-arc", "Main"));
     seeded.phase = "entered";
     const brief = runtime.start([seeded], { lastTurns: [] });
 
@@ -2113,7 +2324,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("enter-channels-deflect-arc", document);
-    const seeded = runtime.createTraversal(
+    const seeded = runtime.newTraversal(
       arc("enter-channels-deflect-arc", "Main"),
     );
     seeded.phase = "entered";
@@ -2147,9 +2358,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("enter-missing-args-arc", document);
-    const seeded = runtime.createTraversal(
-      arc("enter-missing-args-arc", "Main"),
-    );
+    const seeded = runtime.newTraversal(arc("enter-missing-args-arc", "Main"));
     seeded.phase = "entered";
 
     expect(() => runtime.start([seeded], { lastTurns: [] })).toThrow(
@@ -2175,7 +2384,7 @@ function Main() {
       "enter-missing-args-action-arc",
       document,
     );
-    const seeded = runtime.createTraversal(
+    const seeded = runtime.newTraversal(
       arc("enter-missing-args-action-arc", "Main"),
     );
     seeded.phase = "entered";
@@ -2202,7 +2411,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("enter-missing-returns-arc", document);
-    const seeded = runtime.createTraversal(
+    const seeded = runtime.newTraversal(
       arc("enter-missing-returns-arc", "Main"),
     );
     seeded.phase = "entered";
@@ -2226,7 +2435,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("regex-arc", document);
-    const seeded = runtime.createTraversal(arc("regex-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("regex-arc", "Main"));
     seeded.phase = "entered";
     const brief = runtime.start([seeded], {
       lastTurns: [{ role: "user", message: "I love Metal" }],
@@ -2247,7 +2456,7 @@ function Main() {
 }
 `);
     const runtime = new Runtime().add("dialog-arc", document);
-    const seeded = runtime.createTraversal(arc("dialog-arc", "Main"));
+    const seeded = runtime.newTraversal(arc("dialog-arc", "Main"));
     seeded.phase = "entered";
 
     const firstDialog: Dialog = {
@@ -2268,6 +2477,43 @@ function Main() {
     );
 
     expect(nextBrief.instructions.map((item) => item.text)).toEqual(["second"]);
+  });
+
+  it("re-evaluates triggers against the latest dialog passed to progressTrigger", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  this.trigger = () => {
+    if (judge(\`the user wants to start\`)) {
+      return /later/i.test(Dialog.lastUserMessage);
+    }
+    return false;
+  };
+}
+`);
+    const runtime = new Runtime().add("trigger-dialog-arc", document);
+    const firstDialog: Dialog = {
+      lastTurns: [{ role: "user", message: "hello" }],
+    };
+    const secondDialog: Dialog = {
+      lastTurns: [{ role: "user", message: "later now" }],
+    };
+
+    const brief = startTrigger(runtime, firstDialog);
+    expect(brief.judgments).toHaveLength(1);
+
+    const outcome = runtime.progressTrigger(
+      brief,
+      {
+        judgments: {
+          [brief.judgments[0]!.id]: true,
+        },
+      },
+      secondDialog,
+    );
+
+    expect(outcome.matched).toEqual(arc("trigger-dialog-arc", "Main"));
   });
 });
 

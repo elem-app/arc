@@ -45,6 +45,8 @@ Two pieces of traversal state that serve distinct purposes:
 
 **Node state** is the outcome — what happened to the node as a whole. It is one of `COVERED`, `DEFLECTED`, `SKIPPED`, or not yet resolved. The parent's action graph reads it through `ReferenceName.state` to decide whether to re-enter or move on. Node state is set by the runtime (`COVERED` when all reachable actions and effects complete, `DEFLECTED` on host-initiated deflection) or by explicit guard logic (`SKIPPED`).
 
+Canonical node state is addressable from Arc source through `ReferenceName.state`. Fresh traversal instances created through `fresh(ReferenceName)` are not addressable from Arc source and do not change the meaning of `ReferenceName.state`.
+
 **Node frame** is the internal resolution map — which individual actions within the node have been resolved. It is what makes turn-by-turn progression work: each walk re-traverses the action graph from the top, skips actions the frame marks as resolved, and stops at the first unresolved one. The frame is bookkeeping that the action graph author never sees directly.
 
 When `this.resumable = false`, the frame is discarded on re-entry — previously resolved actions are forgotten and the walk starts fresh. But node state, variable values, and child states are preserved. A non-resumable node replays its action sequence without losing its accumulated state.
@@ -53,7 +55,16 @@ When `this.resumable = false`, the frame is discarded on re-entry — previously
 
 The runtime communicates with the host exclusively through briefs and reports. When the runtime reaches a point requiring host involvement, it yields a **brief** describing the pending work and carrying contextual information. The host resolves the pending items, chooses a move, and sends back a **report**. The runtime uses the report to advance.
 
-Briefs also carry information the host may use at its discretion — traversal snapshots, instructions to deliver, host effects to apply. The report only needs to address the pending work items and the chosen move.
+Briefs also carry information the host may use at its discretion — traversal snapshots, instructions to deliver, host effects to apply. Hosts must treat brief objects as immutable:
+
+- Do not mutate brief fields in place.
+- Do not reconstruct or clone a brief and pass the copy back.
+- Pass the same brief object instance returned by `startTrigger()` to
+  `progressTrigger()`.
+- Pass the same brief object instance returned by `start()` / `progress()` to
+  the next `progress()` call.
+
+The report only needs to address the pending work items and the chosen move.
 
 Briefs and reports are ephemeral — they are valid only for the runtime call that produced them.
 
@@ -380,17 +391,28 @@ type DialogTurn = {
 
 **`has(arc)`** — check whether an arc is registered.
 
-**`createTraversal(arc)`** — create a fresh arc traversal in the `"dormant"` phase. Useful for seeding an arc without going through the trigger cycle. The caller must set `phase = "entered"` before passing it to `start()`.
+**`newTraversalSet()`** — create an empty traversal set for a fresh trigger or action session.
+
+**`newTraversal(arc)`** — create a fresh arc traversal in the `"dormant"` phase. Useful for seeding an arc without going through the trigger cycle. The caller must set `phase = "entered"` before passing it to `start()`.
 
 ### Trigger Stage
 
-**`startTrigger(dialog, traversals?)`** → `TriggerBrief`
+**`startTrigger(traversals, dialog)`** → `TriggerBrief`
 
-Evaluates every registered arc's trigger against the dialog. Returns pending semantic work and any arcs that already matched. If matches exist with nothing pending, the caller can skip resolution and select the first match.
+Evaluates every registered arc's trigger against the dialog and supplied traversal state. Returns pending semantic work and any arcs that already matched. If matches exist with nothing pending, the caller can skip resolution and select the first match.
 
-**`progressTrigger(brief, report)`** → `TriggerOutcome`
+For a fresh trigger probe with no persisted state, call:
+
+```typescript
+runtime.startTrigger(runtime.newTraversalSet(), dialog);
+```
+
+**`progressTrigger(brief, report, dialog)`** → `TriggerOutcome`
 
 Accepts a trigger report and returns the outcome: which arc matched (if any) and the updated traversal state.
+
+`dialog` is the current conversation snapshot at the time the host hands
+control back to Arc. It may be newer than the dialog that produced `brief`.
 
 Arc selection: (1) re-evaluate all triggers with resolved data — arcs whose triggers now return `true` join the matchable set; (2) if `report.match` is set, select it (must be matchable); (3) if exactly one arc is matchable, auto-select; (4) otherwise no activation.
 
@@ -400,7 +422,7 @@ Arc selection: (1) re-evaluate all triggers with resolved data — arcs whose tr
 
 **`start(traversals, dialog)`** → `ActionBrief`
 
-Begins the action stage. The active arc must be in the `"entered"` phase — either via trigger outcome or manual seeding with `createTraversal`.
+Begins the action stage. There should be exactly one active traversal in the `"entered"` phase. In most cases, just use the traversal set in `TriggerOutcome`.
 
 **`progress(brief, report, dialog)`** → `ActionBrief`
 
@@ -414,10 +436,10 @@ conversation message cadence. A host may call `progress(...)` whenever it finish
 
 ### References
 
-| Type      | Format                | Purpose                               |
-| --------- | --------------------- | ------------------------------------- |
-| `ArcRef`  | opaque runtime string | Identifies a registered arc.          |
-| `NodeRef` | opaque runtime string | Identifies a node (source + path).    |
+| Type      | Format                | Purpose                            |
+| --------- | --------------------- | ---------------------------------- |
+| `ArcRef`  | opaque runtime string | Identifies a registered arc.       |
+| `NodeRef` | opaque runtime string | Identifies a node (source + path). |
 
 Construct and destructure refs through the helpers exported by `arc/runtime`
 (`toArcRef`, `toArcRefParts`, `toNodeRef`, `toNodeRefParts`). Callers should
@@ -431,9 +453,9 @@ A typical host turn:
 1. Build Dialog from session history.
 
 2. Trigger stage:
-   a. startTrigger(dialog, traversals) → TriggerBrief
+   a. startTrigger(traversals, dialog) → TriggerBrief
    b. Resolve judgments/observations/hostCalls.
-   c. progressTrigger(brief, report) → TriggerOutcome
+   c. progressTrigger(brief, report, latestDialog) → TriggerOutcome
    d. If a match exists, proceed to action stage.
 
 3. Action stage (if an arc is active):

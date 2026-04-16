@@ -207,7 +207,7 @@ export function expressionToLocalExpression(
       node.property.type === "Identifier" &&
       node.property.name === "state"
     ) {
-      return { kind: "nodeState", node: node.object.name };
+      return { kind: "nodeState", identifier: node.object.name };
     }
     if (
       node.object.type === "Identifier" &&

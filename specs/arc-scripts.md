@@ -139,8 +139,9 @@ Statement forms:
 - **Instruction literal** (bare template literal) — shorthand for a one-shot instruction.
 - `instruct(text, { deflectWhen? })` — one-shot instruction.
 - `instructLoop(text, { resolveWhen, deflectWhen? })` — sticky instruction with authored resolution logic.
-- `enter(ReferenceName)` — enters another node or arc by structural reference.
-- `enter(ReferenceName, { args, returns })` — enters another node or arc with explicit input/output variable wiring.
+- `enter(Target)` — enters a node or arc target.
+- `enter(Target, { args, returns })` — enters a node or arc target with explicit input/output variable wiring.
+- `enterLoop(Target, { resolveWhen, args?, returns? })` — repeatedly enters a target until the caller-authored loop condition resolves true.
 
 Expression-capable forms:
 
@@ -415,21 +416,41 @@ Import resolution is two-stage:
 
 The local import binding is only a lexical name inside the importing document.
 
-### Enter
+### Targets
+
+A control-transfer target in Arc is one of:
+
+- `ReferenceName` — the canonical traversal for that node or arc.
+- `fresh(ReferenceName)` — a fresh ephemeral traversal instance of that node or arc.
+
+`fresh(ReferenceName)` requests a new empty traversal instance for the current call. Fresh targets are ephemeral and non-addressable:
+
+- They do not participate in `ReferenceName.state`.
+- They are not queryable from Arc source.
+- They are valid only as direct targets to `enter(...)` and `enterLoop(...)`.
+
+For owned child nodes, `fresh(ReferenceName)` creates a fresh traversal instance of that child for the current call.
+
+For imported arcs, `fresh(ReferenceName)` creates a fresh call instance of the imported arc. This does not reset, replace, or mutate the canonical imported-arc traversal managed by the runtime.
+
+### Control Transfer
+
+#### Enter
 
 `enter(...)` is an action for execution control-transfer. It has two forms:
 
-- `enter(ReferenceName)` — control-flow only.
-- `enter(ReferenceName, { args, returns })` — control-flow with explicit dataflow wiring.
+- `enter(Target)` — control-flow only.
+- `enter(Target, { args, returns })` — control-flow with explicit dataflow wiring.
 
 When traversing an `enter`:
 
-1. `ReferenceName` resolves to either a child node identifier or an imported arc binding.
+1. `Target` resolves to either a canonical traversal (`ReferenceName`) or a fresh ephemeral traversal (`fresh(ReferenceName)`).
 2. Control transfers to the referenced callee traversal.
 3. The caller action graph does not move past this `enter` until the callee resolves for this entry.
-4. The callee outcome is reflected through `ReferenceName.state` (`COVERED`, `DEFLECTED`, `SKIPPED`).
-5. When the callee becomes `COVERED` or `SKIPPED`, this `enter` action resolves and caller traversal continues.
-6. If the callee is unresolved or becomes `DEFLECTED`, then `enter` remains unresolved.
+4. If `Target` is `ReferenceName`, the callee outcome is reflected through `ReferenceName.state` (`COVERED`, `DEFLECTED`, `SKIPPED`).
+5. If `Target` is `fresh(ReferenceName)`, the callee outcome is not reflected through `ReferenceName.state`.
+6. When the callee becomes `COVERED` or `SKIPPED`, this `enter` action resolves and caller traversal continues.
+7. If the callee is unresolved or becomes `DEFLECTED`, then `enter` remains unresolved.
 
 #### Args and Returns Processing
 
@@ -477,7 +498,37 @@ Write boundary:
 
 This model keeps control-flow ownership in `enter(...)` while making dataflow explicit at the call site.
 
-Example:
+#### Enter Loop
+
+`enterLoop(...)` is an action for repeated control-transfer. It repeatedly enters the target and evaluates a caller-authored loop condition after each completed iteration.
+
+`enterLoop(...)` has one form:
+
+- `enterLoop(Target, { resolveWhen, args?, returns? })`
+
+Authoring rules:
+
+- `resolveWhen` is required.
+- `resolveWhen` accepts the same authored forms as instruction `resolveWhen`:
+  - a template literal, which desugars to `return judge(...)`
+  - an arrow function using the constrained statement subset allowed in `this.trigger`
+- `Target` may be either `ReferenceName` or `fresh(ReferenceName)`.
+- `enterLoop(fresh(ReferenceName), ...)` is the explicit fresh-loop form.
+- `enterLoop(ReferenceName, ...)` reuses the canonical traversal each iteration.
+
+Execution semantics:
+
+1. The runtime enters the target once, using normal `enter(...)` semantics for `args` and `returns`.
+2. When one iteration reaches `State.COVERED`, staged `returns` are committed to caller cells.
+3. After a covered iteration, the runtime evaluates `resolveWhen` in the caller context.
+4. If `resolveWhen` is true, the `enterLoop(...)` action resolves.
+5. If `resolveWhen` is false, the runtime begins a new iteration by entering the same target shape again.
+6. For `fresh(ReferenceName)`, each iteration creates a new empty traversal instance.
+7. For plain `ReferenceName`, each iteration re-enters the canonical traversal according to normal Arc semantics.
+8. If an iteration is `SKIPPED`, the loop does not commit staged `returns`; `resolveWhen` is still evaluated.
+9. If an iteration becomes `DEFLECTED` or remains unresolved, the `enterLoop(...)` action remains unresolved.
+
+#### Examples
 
 ```js
 function Parent() {

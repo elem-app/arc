@@ -141,7 +141,7 @@ function Main() {
     });
     expect(root.statements[0]).toMatchObject({
       kind: "enter-node",
-      node: "Surface",
+      target: { identifier: "Surface", fresh: false },
     });
 
     const surface = root.children.find(
@@ -656,8 +656,7 @@ function Main() {
     });
     expect(document.roots[0]?.statements[1]).toMatchObject({
       kind: "enter-node",
-      node: "IntroArc",
-      imported: true,
+      target: { identifier: "IntroArc", imported: true, fresh: false },
     });
   });
 
@@ -685,7 +684,7 @@ function Main() {
 
     expect(document.roots[0]?.statements[0]).toMatchObject({
       kind: "enter-node",
-      node: "Child",
+      target: { identifier: "Child", fresh: false },
       args: { ready: "ready" },
       returns: { verdict: "verdict" },
     });
@@ -705,6 +704,40 @@ function Main() {
       kind: "set-return",
       key: "verdict",
     });
+  });
+
+  it("parses fresh targets and synthesizes node aliases for pseudo-children", () => {
+    const document = parse(`
+"use arc v2";
+import { Intro } from "intro-arc";
+
+function Main() {
+  enter(fresh(Child));
+  enterLoop(fresh(Intro), {
+    resolveWhen: () => {
+      return true;
+    },
+  });
+
+  function Child() {
+    \`child\`;
+  }
+}
+`);
+
+    const root = document.roots[0]!;
+    expect(root.statements[0]).toMatchObject({
+      kind: "enter-node",
+      target: { identifier: "Child", imported: false, fresh: true },
+    });
+    expect(root.statements[1]).toMatchObject({
+      kind: "enter-loop",
+      target: { identifier: "Intro", imported: true, fresh: true },
+    });
+    expect(root.freshAliases).toEqual([
+      { identifier: "Child#0", target: "Child", imported: false },
+      { identifier: "Intro#1", target: "Intro", imported: true },
+    ]);
   });
 
   it("rejects enter() renamed channel bindings", () => {
