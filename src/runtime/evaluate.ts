@@ -2,6 +2,7 @@ import type {
   ActionStatement,
   ArcRef,
   BinaryOperator,
+  EnterTarget,
   HostCallArgument,
   HostCallBrief,
   HostCallExpression,
@@ -23,17 +24,18 @@ import type {
   Variable,
 } from "../types.js";
 import {
+  arcToNodeRef,
   findTraversalInSet,
   formatRef,
   getEntryForRef,
   getNodeForRef,
+  isArcRef,
   lexicalParentRef,
   resolveLexicalRef,
   traversalToNodeRef,
 } from "./refs.js";
 import {
   type Accumulator,
-  type EvalResult,
   childState,
   cloneHostCallBrief,
   makeHostCallId,
@@ -42,17 +44,28 @@ import {
   noteBriefYield,
 } from "./state.js";
 
+export type ActionOutcome<T = undefined> =
+  | { status: "resolved"; value: T }
+  | { status: "blocked" };
+
 export function applyObserve(
   statement: ObserveAction | ObserveOrAskAction,
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): import("./state.js").RunStatus {
+): ActionOutcome {
   const workId = makeObservationId(accum.entry.arc, traversal, statement.id);
   const resolution = accum.observationResults.get(workId);
 
   if (resolution) {
     if (resolution.status === "resolved" && resolution.value !== undefined) {
+      const variable = getVariableMeta(statement.variable, traversal, accum);
+      if (!variable) {
+        throw new Error(
+          `Unknown variable for observe(): ${statement.variable}`,
+        );
+      }
+      assertAssignableValue(statement.variable, variable, resolution.value);
       setVariableValue(
         statement.variable,
         resolution.value,
@@ -60,10 +73,10 @@ export function applyObserve(
         node,
         accum,
       );
-      return { status: "done" };
+      return { status: "resolved", value: undefined };
     }
     if (statement.kind === "observe" && resolution.status !== "needs-user") {
-      return { status: "done" };
+      return { status: "resolved", value: undefined };
     }
     return { status: "blocked" };
   }
@@ -97,7 +110,7 @@ export function applySet(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): import("./state.js").RunStatus {
+): ActionOutcome {
   const owner = findVariableOwner(statement.variable, traversal, accum);
   if (!owner)
     throw new Error(`Unknown variable for set(): ${statement.variable}`);
@@ -121,7 +134,7 @@ export function applySet(
   }
   assertAssignableValue(statement.variable, owner.variable, value.value);
   owner.traversal.variables[statement.variable] = value.value ?? undefined;
-  return { status: "done" };
+  return { status: "resolved", value: undefined };
 }
 
 export function applySetReturn(
@@ -129,7 +142,7 @@ export function applySetReturn(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): import("./state.js").RunStatus {
+): ActionOutcome {
   const value = evaluateValueExpression(
     statement.value,
     traversal,
@@ -182,7 +195,7 @@ export function applySetReturn(
   );
   traversal.enterChannels.stagedReturns[statement.key] =
     value.value as PrimitiveValue;
-  return { status: "done" };
+  return { status: "resolved", value: undefined };
 }
 
 export function renderHostEffect(
@@ -230,15 +243,18 @@ export function renderHostCallArgument(
   );
 }
 
+// Host-call expressions do not persist their resolved value in node frame
+// state. A later re-walk or resumed execution walk re-evaluates them
+// against the current accepted report via `accum.hostCallResults`.
 export function evaluateHostCall(
   expression: HostCallExpression,
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): EvalResult {
+): ActionOutcome<PayloadValue> {
   const id = makeHostCallId(accum.entry.arc, traversal, expression.id);
   if (accum.hostCallResults.has(id)) {
-    return { status: "value", value: accum.hostCallResults.get(id) };
+    return { status: "resolved", value: accum.hostCallResults.get(id) };
   }
   const rendered = {
     id,
@@ -257,12 +273,15 @@ export function evaluateHostCall(
   return { status: "blocked" };
 }
 
+// Judge expressions do not persist their resolved value in node
+// frame state. A later re-walk or resumed execution walk re-evaluates them
+// against the current accepted report via `accum.judgmentResults`.
 export function evaluateJudge(
   expression: JudgeExpression,
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): EvalResult {
+): ActionOutcome<boolean> {
   const rendered = renderSemanticString(
     expression.question,
     traversal,
@@ -271,7 +290,7 @@ export function evaluateJudge(
   );
   const id = makeJudgeId(accum.entry.arc, traversal, expression.id);
   const result = accum.judgmentResults.get(id);
-  if (result !== undefined) return { status: "value", value: result };
+  if (result !== undefined) return { status: "resolved", value: result };
   if (accum.phase === "plan") {
     noteBriefYield(accum, traversal);
     accum.judgments.push({
@@ -288,7 +307,7 @@ export function evaluateValueExpression(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): EvalResult {
+): ActionOutcome<PayloadValue | NodeState> {
   if (expression.kind === "host-call")
     return evaluateHostCall(expression, traversal, node, accum);
   if (expression.kind === "judge")
@@ -302,9 +321,9 @@ export function evaluateValueExpression(
     );
     if (target.status === "blocked") return target;
     const value = target.value;
-    if (typeof value !== "string") return { status: "value", value: false };
+    if (typeof value !== "string") return { status: "resolved", value: false };
     return {
-      status: "value",
+      status: "resolved",
       value: new RegExp(expression.pattern, expression.flags).test(value),
     };
   }
@@ -340,13 +359,13 @@ export function evaluateValueExpression(
             ? enumValues.indexOf(right.value)
             : -1;
         return {
-          status: "value",
+          status: "resolved",
           value: evaluateBinary(expression.op, li, ri),
         };
       }
     }
     return {
-      status: "value",
+      status: "resolved",
       value: evaluateBinary(expression.op, left.value, right.value),
     };
   }
@@ -359,10 +378,10 @@ export function evaluateValueExpression(
     );
     if (left.status === "blocked") return left;
     if (expression.op === "&&") {
-      if (!truthy(left.value)) return { status: "value", value: left.value };
+      if (!truthy(left.value)) return { status: "resolved", value: left.value };
       return evaluateValueExpression(expression.right, traversal, node, accum);
     }
-    if (truthy(left.value)) return { status: "value", value: left.value };
+    if (truthy(left.value)) return { status: "resolved", value: left.value };
     return evaluateValueExpression(expression.right, traversal, node, accum);
   }
   if (expression.kind === "unary") {
@@ -373,7 +392,7 @@ export function evaluateValueExpression(
       accum,
     );
     if (argument.status === "blocked") return argument;
-    return { status: "value", value: !truthy(argument.value) };
+    return { status: "resolved", value: !truthy(argument.value) };
   }
   return evaluateLocalExpression(expression, traversal, node, accum);
 }
@@ -383,27 +402,37 @@ export function evaluateLocalExpression(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): EvalResult {
+): ActionOutcome<PayloadValue | NodeState> {
   switch (expression.kind) {
     case "literal":
-      return { status: "value", value: expression.value };
+      return { status: "resolved", value: expression.value };
     case "ref":
       return {
-        status: "value",
+        status: "resolved",
         value: accum.dialog.names?.[expression.name] ?? expression.name,
       };
     case "variable":
       return {
-        status: "value",
+        status: "resolved",
         value: getVariableValue(expression.name, traversal, accum),
       };
     case "channel":
       return {
-        status: "value",
+        status: "resolved",
         value: readChannelValue(
           traversal,
           expression.namespace,
           expression.key,
+          accum,
+        ),
+      };
+    case "deflectionFrom":
+      return {
+        status: "resolved",
+        value: matchesDeflectionTarget(
+          expression.target,
+          traversal,
+          node,
           accum,
         ),
       };
@@ -416,20 +445,20 @@ export function evaluateLocalExpression(
         ) {
           const turn = accum.dialog.lastTurns[index];
           if (turn?.role === "user") {
-            return { status: "value", value: turn.message };
+            return { status: "resolved", value: turn.message };
           }
         }
-        return { status: "value", value: undefined };
+        return { status: "resolved", value: undefined };
       }
       return {
-        status: "value",
+        status: "resolved",
         value: accum.dialog.lastTurns
           .slice(-(expression.count ?? accum.dialog.lastTurns.length))
           .map((turn) => `${turn.role}: ${turn.message}`)
           .join("\n"),
       };
     case "enterCount":
-      return { status: "value", value: traversal.enterCount };
+      return { status: "resolved", value: traversal.enterCount };
     case "nodeState": {
       const ref = resolveRefInTraversal(
         accum,
@@ -438,11 +467,33 @@ export function evaluateLocalExpression(
         expression.identifier,
       );
       return {
-        status: "value",
+        status: "resolved",
         value: ref ? childState(accum.traversals, ref) : undefined,
       };
     }
   }
+}
+
+function matchesDeflectionTarget(
+  target: EnterTarget,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): boolean {
+  const active = accum.deflectionActive;
+  if (!active) return false;
+  const activeTraversal = findTraversalInSet(accum.traversals, active);
+  if (!activeTraversal) return false;
+
+  const ref = resolveRefInTraversal(
+    accum,
+    traversal,
+    node,
+    target.identifier,
+    target.imported,
+  );
+  if (!ref) return false;
+  return (isArcRef(ref) ? arcToNodeRef(ref) : ref) === active;
 }
 
 export function resolveRefInTraversal(

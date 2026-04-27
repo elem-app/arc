@@ -26,10 +26,13 @@ import type {
   ObserveAction,
   PayloadValue,
   PrimitiveValue,
+  RuntimeIssue,
   SemanticString,
+  SetAction,
   StatementId,
   Traversal,
   TriggerBrief,
+  TriggerReport,
   TriggerStatement,
   ValueExpression,
 } from "../types.js";
@@ -39,6 +42,7 @@ import {
   formatRef,
   getNodeForRef,
   isArcRef,
+  isArcTraversal,
   lexicalParentRef,
   traversalToNodeRef,
 } from "./refs.js";
@@ -70,24 +74,9 @@ export type Accumulator = {
   judgmentResults: Map<string, boolean>;
   observationResults: Map<string, ObservationReport>;
   hostCallResults: Map<string, PayloadValue>;
+  deflectionActive?: NodeRef;
+  yieldedInstructionIds: Set<BriefId>;
 };
-
-export type EvalResult =
-  | { status: "value"; value: PayloadValue | NodeState }
-  | { status: "blocked" };
-
-export type RunStatus =
-  | { status: "done" }
-  | { status: "blocked" }
-  | { status: "yielded" }
-  | { status: "deflected"; active: NodeRef }
-  | { status: "break"; label: string };
-
-export type EnterIterationStatus =
-  | { status: "done"; traversal: Traversal; finalState?: NodeState }
-  | { status: "blocked"; traversal: Traversal }
-  | { status: "yielded"; traversal: Traversal }
-  | { status: "deflected"; traversal: Traversal; active: NodeRef };
 
 export type ActionBriefSnapshot = Omit<
   ActionBrief,
@@ -107,6 +96,7 @@ export type TriggerBriefState = {
   entryByArc: ReadonlyMap<ArcRef, RegistryEntry>;
   traversals: ArcTraversalSet;
   dialog: Dialog;
+  priorReport: TriggerReport;
   snapshot: TriggerBriefSnapshot;
 };
 
@@ -138,6 +128,8 @@ export function createAccumulator(
     judgmentResults: new Map(),
     observationResults: new Map(),
     hostCallResults: new Map(),
+    deflectionActive: undefined,
+    yieldedInstructionIds: new Set(),
   };
 }
 
@@ -160,14 +152,13 @@ function createTraversalFrame(): NodeFrame {
 export function createFreshArcTraversal(
   arcRef: ArcRef,
   node: Node,
-  enterCount: number,
   returnTo: ArcRef | null = null,
 ): ArcTraversal {
   return {
     ref: arcRef,
     returnTo,
     phase: "dormant",
-    enterCount,
+    enterCount: 0,
     state: undefined,
     variables: createVariableSlots(node),
     frame: createTraversalFrame(),
@@ -182,11 +173,10 @@ export function createFreshArcTraversal(
 export function createFreshNodeTraversal(
   nodeRef: NodeRef,
   node: Node,
-  enterCount: number,
 ): NodeTraversal {
   return {
     ref: nodeRef,
-    enterCount,
+    enterCount: 0,
     state: undefined,
     variables: createVariableSlots(node),
     frame: createTraversalFrame(),
@@ -203,15 +193,16 @@ export function restartTraversal(
   base?: ArcTraversal,
 ): ArcTraversal {
   if (!base) {
-    const fresh = createFreshArcTraversal(entry.arc, entry.root, 1);
+    const fresh = createFreshArcTraversal(entry.arc, entry.root);
     fresh.phase = "entered";
+    fresh.enterCount = 1;
     return fresh;
   }
   const next = cloneArcTraversal(base);
   next.enterCount += 1;
   next.phase = "entered";
-  next.pendingEffects = undefined;
   next.state = undefined;
+  next.finalizing = undefined;
   next.returnTo = null;
   next.enterChannels = createEmptyEnterChannelState();
   if (!entry.root.resumable) clearFrame(next);
@@ -231,9 +222,6 @@ export function cloneArcTraversal(traversal: ArcTraversal): ArcTraversal {
     ref: traversal.ref,
     returnTo: traversal.returnTo,
     phase: traversal.phase,
-    pendingEffects: traversal.pendingEffects
-      ? { ...traversal.pendingEffects }
-      : undefined,
   };
 }
 
@@ -241,12 +229,21 @@ function cloneTraversalBase<T extends Traversal>(traversal: T) {
   return {
     enterCount: traversal.enterCount,
     state: traversal.state,
+    finalizing: traversal.finalizing ? { ...traversal.finalizing } : undefined,
     variables: { ...traversal.variables },
     frame: {
       actionStates: Object.fromEntries(
         Object.entries(traversal.frame.actionStates).map(([id, state]) => [
           id,
-          state ? { ...state } : undefined,
+          state
+            ? {
+                ...state,
+                stagedReturns: state.stagedReturns
+                  ? { ...state.stagedReturns }
+                  : undefined,
+                enterLoopPhase: state.enterLoopPhase,
+              }
+            : undefined,
         ]),
       ),
       evaluatorActionStates: Object.fromEntries(
@@ -296,7 +293,21 @@ export function cloneTraversalSet(
 }
 
 export function isStopped(traversal: ArcTraversal): boolean {
-  return traversal.phase === "completed" || traversal.phase === "suspended";
+  return (
+    traversal.phase === "completed" ||
+    traversal.phase === "suspended" ||
+    traversal.phase === "poisoned"
+  );
+}
+
+export function isEnteredTraversal(traversal: Traversal): boolean {
+  return isArcTraversal(traversal)
+    ? traversal.phase === "entered" && traversal.state === undefined
+    : traversal.state === undefined;
+}
+
+export function isSuspendedArcTraversal(traversal: Traversal): boolean {
+  return isArcTraversal(traversal) && traversal.phase === "suspended";
 }
 
 export function selectActionRootTraversal(
@@ -340,6 +351,27 @@ export function cloneHostCallBrief(brief: HostCallBrief): HostCallBrief {
     target: [...brief.target],
     operation: brief.operation,
     arguments: [...brief.arguments],
+  };
+}
+
+export function cloneRuntimeIssue(issue: RuntimeIssue): RuntimeIssue {
+  if (issue.kind === "invalid-item" || issue.kind === "invalid-report") {
+    return { ...issue };
+  }
+  if (issue.kind === "ambiguous-match") {
+    return {
+      ...issue,
+      matchableArcs: [...issue.matchableArcs],
+    };
+  }
+  return {
+    ...issue,
+    source: issue.source
+      ? {
+          start: { ...issue.source.start },
+          end: { ...issue.source.end },
+        }
+      : undefined,
   };
 }
 
@@ -410,6 +442,11 @@ export function cloneValueExpression(
         kind: "channel",
         namespace: expression.namespace,
         key: expression.key,
+      };
+    case "deflectionFrom":
+      return {
+        kind: "deflectionFrom",
+        target: { ...expression.target },
       };
     case "scope":
       return {
@@ -554,7 +591,7 @@ export function ensureOwnedTraversal(
     (entry) => entry.ref === childRef,
   );
   if (!child) {
-    child = createFreshNodeTraversal(childRef, childNode, 0);
+    child = createFreshNodeTraversal(childRef, childNode);
     ownerTraversal.ownedChildren.push(child);
   }
   return child;
@@ -594,7 +631,7 @@ export function ensureEphemeralTraversal(
   return replaceEphemeralTraversal(
     ownerTraversal,
     childRef,
-    createFreshNodeTraversal(childRef, childNode, 0),
+    createFreshNodeTraversal(childRef, childNode),
   );
 }
 
@@ -635,7 +672,7 @@ export function getEvaluatorActionStates(
 export function getEvaluatorActionState(
   traversal: Traversal,
   scopeKey: string,
-  action: ObserveAction,
+  action: ObserveAction | SetAction,
 ): ActionState | undefined {
   return getEvaluatorActionStates(traversal, scopeKey)[action.id];
 }
@@ -643,7 +680,7 @@ export function getEvaluatorActionState(
 export function markEvaluatorActionResolved(
   traversal: Traversal,
   scopeKey: string,
-  action: ObserveAction,
+  action: ObserveAction | SetAction,
 ): void {
   getEvaluatorActionStates(traversal, scopeKey)[action.id] = {
     kind: action.kind,
@@ -679,8 +716,16 @@ export function markPendingActionState(
   traversal: Traversal,
   actionId: number,
   kind: ActionState["kind"],
+  extras?: Pick<ActionState, "stagedReturns" | "enterLoopPhase">,
 ): void {
-  traversal.frame.actionStates[actionId] = { kind, status: "pending" };
+  traversal.frame.actionStates[actionId] = {
+    kind,
+    status: "pending",
+    stagedReturns: extras?.stagedReturns
+      ? { ...extras.stagedReturns }
+      : undefined,
+    enterLoopPhase: extras?.enterLoopPhase,
+  };
 }
 
 export function markActionResolved(
@@ -714,10 +759,6 @@ export function childState(
     isArcRef(ref) ? arcToNodeRef(ref) : ref,
   );
   return child?.state;
-}
-
-export function isNodeState(value: unknown): value is NodeState {
-  return value === "covered" || value === "deflected" || value === "skipped";
 }
 
 export function makeBriefId(
@@ -836,6 +877,26 @@ export function normalizeResolutionStatement(
       value: statement.value ? normalizeValueExpression(statement.value) : null,
     };
   }
+  if (statement.kind === "label") {
+    return {
+      kind: "label",
+      label: statement.label,
+      body: statement.body.map((entry) => normalizeResolutionStatement(entry)),
+    };
+  }
+  if (statement.kind === "break") {
+    return {
+      kind: "break",
+      label: statement.label,
+    };
+  }
+  if (statement.kind === "set") {
+    return {
+      kind: "set",
+      variable: statement.variable,
+      value: normalizeValueExpression(statement.value),
+    };
+  }
   return {
     kind: "observe",
     variable: statement.variable,
@@ -858,6 +919,11 @@ export function normalizeValueExpression(expression: ValueExpression): unknown {
         kind: "channel",
         namespace: expression.namespace,
         key: expression.key,
+      };
+    case "deflectionFrom":
+      return {
+        kind: "deflectionFrom",
+        target: { ...expression.target },
       };
     case "scope":
       return {

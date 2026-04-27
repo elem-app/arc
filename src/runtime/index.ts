@@ -6,36 +6,22 @@ import type {
   ArcTraversalSet,
   Dialog,
   Document,
-  HostCallBrief,
-  HostEffect,
-  InstructionBrief,
-  JudgmentBrief,
-  NodeRef,
-  ObservationBrief,
   TriggerBrief,
-  TriggerOutcome,
   TriggerReport,
 } from "../types.js";
 import {
   acceptActionReport,
-  acceptTriggerReport,
-  cloneActionBriefSnapshot,
-  cloneTriggerBriefSnapshot,
-  finalizeActionBrief,
+  buildActionBrief,
+  buildPoisonedActionBrief,
+  buildRetryTriggerBrief,
+  buildTriggerBrief,
   validateActionReport,
+  validateTriggerReport,
 } from "./briefs.js";
-import { runTrigger, runTurn } from "./execute.js";
-import { formatRef, indexTraversals, rootRefOf, toArcRef } from "./refs.js";
+import { arcToNodeRef, formatRef, toArcRef } from "./refs.js";
 import {
-  cloneArcTraversal,
-  cloneDialog,
-  cloneHostEffect,
-  cloneTraversalSet,
-  createAccumulator,
   createFreshArcTraversal,
   isStopped,
-  mergeInstructionBriefs,
-  pruneFrames,
   selectActionRootTraversal,
   type ActionBriefState,
   type RegistryEntry,
@@ -83,65 +69,50 @@ export class Runtime {
 
   newTraversal(arc: ArcRef): ArcTraversal {
     const entry = this.#getEntry(arc);
-    return createFreshArcTraversal(arc, entry.root, 1);
+    return createFreshArcTraversal(arc, entry.root);
   }
 
   startTrigger(traversals: ArcTraversalSet, dialog: Dialog): TriggerBrief {
-    const entries = [...this.#entries.values()];
-    const entryByArc = new Map(entries.map((entry) => [entry.arc, entry]));
-    const traversalByArc = indexTraversals(traversals);
-    const judgments: JudgmentBrief[] = [];
-    const observations: ObservationBrief[] = [];
-    const hostCalls: HostCallBrief[] = [];
-    const matchableArcs: ArcRef[] = [];
-
-    for (const entry of entries) {
-      const existing = traversalByArc.get(entry.arc);
-      const base = existing
-        ? cloneArcTraversal(existing)
-        : createFreshArcTraversal(entry.arc, entry.root, 0);
-      const accum = createAccumulator(
+    return this.#storeTriggerBrief(
+      buildTriggerBrief(
         this.#entries,
-        entry,
-        base,
-        [base],
+        new Map([...this.#entries.values()].map((entry) => [entry.arc, entry])),
+        traversals,
         dialog,
-        "plan",
-      );
-      const matched = runTrigger(entry.root, base, accum);
-      judgments.push(...accum.judgments);
-      observations.push(...accum.observations);
-      hostCalls.push(...accum.hostCalls);
-      if (matched && !accum.blocked) {
-        matchableArcs.push(entry.arc);
-      }
-    }
-
-    const snapshot = {
-      judgments,
-      observations,
-      hostCalls,
-      matchableArcs,
-    } satisfies TriggerBrief;
-    const brief: TriggerBrief = cloneTriggerBriefSnapshot(snapshot);
-    this.#triggerBriefState.set(brief, {
-      entries: new Map(this.#entries),
-      entryByArc,
-      traversals: cloneTraversalSet(traversals),
-      dialog: cloneDialog(dialog),
-      snapshot: cloneTriggerBriefSnapshot(snapshot),
-    });
-    return brief;
+      ),
+      dialog,
+    );
   }
 
   progressTrigger(
     brief: TriggerBrief,
     report: TriggerReport,
     dialog: Dialog,
-  ): TriggerOutcome {
+  ): TriggerBrief {
     const state = this.#triggerBriefState.get(brief);
     if (!state) throw new Error("Unknown trigger brief");
-    return acceptTriggerReport(state, dialog, report);
+    const validation = validateTriggerReport(state.snapshot, report);
+    if (validation.rejected) {
+      return this.#storeTriggerBrief(
+        buildRetryTriggerBrief(
+          state.snapshot,
+          validation.issues,
+          state.priorReport,
+        ),
+        dialog,
+      );
+    }
+    return this.#storeTriggerBrief(
+      buildTriggerBrief(
+        state.entries,
+        state.entryByArc,
+        state.traversals,
+        dialog,
+        validation.accepted,
+        state.priorReport,
+      ),
+      dialog,
+    );
   }
 
   start(traversals: ArcTraversalSet, dialog: Dialog): ActionBrief {
@@ -152,7 +123,24 @@ export class Runtime {
       );
     }
     const entry = this.#getEntry(rootTraversal.ref);
-    return this.#createActionBrief(entry, traversals, dialog);
+    try {
+      return this.#storeActionBrief(
+        entry,
+        buildActionBrief(this.#entries, entry, traversals, dialog),
+      );
+    } catch (error) {
+      return this.#storeActionBrief(
+        entry,
+        buildPoisonedActionBrief(
+          this.#entries,
+          entry,
+          traversals,
+          dialog,
+          arcToNodeRef(entry.arc),
+          error,
+        ),
+      );
+    }
   }
 
   progress(
@@ -167,29 +155,99 @@ export class Runtime {
       state.traversals,
       state.entry.arc,
     );
+    const validation = validateActionReport(state.snapshot, report);
+    if (validation.rejected) {
+      return this.#storeActionBrief(
+        state.entry,
+        buildActionBrief(
+          state.entries,
+          state.entry,
+          state.traversals,
+          dialog,
+          [],
+          [],
+          state.snapshot.active,
+          validation.issues,
+        ),
+      );
+    }
     if (rootTraversal.phase !== "entered") {
-      validateActionReport(state.snapshot, report);
-      return this.#createActionBrief(state.entry, state.traversals, dialog);
+      return this.#storeActionBrief(
+        state.entry,
+        buildActionBrief(
+          state.entries,
+          state.entry,
+          state.traversals,
+          dialog,
+          [],
+          [],
+          state.snapshot.active,
+          validation.issues,
+        ),
+      );
     }
 
-    const applied = acceptActionReport(state, dialog, report);
+    try {
+      const applied = acceptActionReport(state, dialog, validation.accepted);
 
-    return this.#createActionBrief(
-      state.entry,
-      applied.traversals,
-      dialog,
-      applied.hostEffects,
-      applied.instructions,
-      isStopped(selectActionRootTraversal(applied.traversals, state.entry.arc))
-        ? state.snapshot.active
-        : undefined,
-    );
+      return this.#storeActionBrief(
+        state.entry,
+        buildActionBrief(
+          state.entries,
+          state.entry,
+          applied.traversals,
+          dialog,
+          applied.hostEffects,
+          applied.instructions,
+          isStopped(
+            selectActionRootTraversal(applied.traversals, state.entry.arc),
+          )
+            ? state.snapshot.active
+            : undefined,
+          validation.issues,
+        ),
+      );
+    } catch (error) {
+      return this.#storeActionBrief(
+        state.entry,
+        buildPoisonedActionBrief(
+          state.entries,
+          state.entry,
+          state.traversals,
+          dialog,
+          state.snapshot.active,
+          error,
+        ),
+      );
+    }
   }
 
   #getEntry(ref: ArcRef): RegistryEntry {
     const entry = this.#entries.get(ref);
     if (!entry) throw new Error(`Unknown arc: ${formatRef(ref)}`);
     return entry;
+  }
+
+  #storeTriggerBrief(
+    built: {
+      brief: TriggerBrief;
+      traversals: ArcTraversalSet;
+      priorReport: TriggerReport;
+      snapshot: TriggerBriefState["snapshot"];
+    },
+    dialog: Dialog,
+  ): TriggerBrief {
+    this.#triggerBriefState.set(built.brief, {
+      entries: new Map(this.#entries),
+      entryByArc: new Map(
+        [...this.#entries.values()].map((entry) => [entry.arc, entry]),
+      ),
+      traversals: built.traversals,
+      dialog,
+      priorReport: built.priorReport,
+      snapshot: built.snapshot,
+    });
+    return built.brief;
   }
 
   #refreshImportRefs(): void {
@@ -205,65 +263,22 @@ export class Runtime {
     }
   }
 
-  #createActionBrief(
+  #storeActionBrief(
     entry: RegistryEntry,
-    traversals: ArcTraversalSet,
-    dialog: Dialog,
-    leadingHostEffects: HostEffect[] = [],
-    leadingInstructions: InstructionBrief[] = [],
-    activeHint?: NodeRef,
+    built: {
+      brief: ActionBrief;
+      traversals: ArcTraversalSet;
+      snapshot: ActionBriefState["snapshot"];
+    },
   ): ActionBrief {
-    const workingTraversals = cloneTraversalSet(traversals);
-    const workingRoot = selectActionRootTraversal(workingTraversals, entry.arc);
-    const accum = createAccumulator(
-      this.#entries,
-      entry,
-      workingRoot,
-      workingTraversals,
-      dialog,
-      "plan",
-    );
-    if (workingRoot.phase === "entered") {
-      runTurn(accum);
-    } else if (activeHint) {
-      accum.active = activeHint;
-    }
-    for (const traversal of workingTraversals) {
-      const traversalEntry = this.#getEntry(rootRefOf(traversal.ref));
-      pruneFrames(this.#entries, traversalEntry, traversal);
-    }
-    const yieldedTraversals = cloneTraversalSet(workingTraversals);
-    const snapshot = cloneActionBriefSnapshot(
-      finalizeActionBrief(
-        accum,
-        selectActionRootTraversal(yieldedTraversals, entry.arc),
-      ),
-    );
-    const instructions = mergeInstructionBriefs(
-      leadingInstructions,
-      snapshot.instructions,
-    );
-    const brief: ActionBrief = {
-      traversals: yieldedTraversals,
-      hostEffects: [
-        ...leadingHostEffects.map(cloneHostEffect),
-        ...accum.hostEffects.map(cloneHostEffect),
-      ],
-      ...snapshot,
-      instructions,
-    };
-
-    this.#actionBriefState.set(brief, {
+    this.#actionBriefState.set(built.brief, {
       entries: new Map(this.#entries),
       entry,
-      traversals: cloneTraversalSet(yieldedTraversals),
-      snapshot: cloneActionBriefSnapshot({
-        ...snapshot,
-        instructions,
-      }),
+      traversals: built.traversals,
+      snapshot: built.snapshot,
     });
 
-    return brief;
+    return built.brief;
   }
 }
 
@@ -276,6 +291,7 @@ export type {
   ArcTraversalSet,
   BriefId,
   Dialog,
+  DialogTurn,
   HostCallBrief,
   HostEffect,
   InstructionBrief,
@@ -285,7 +301,7 @@ export type {
   ObservationBrief,
   ObservationReport,
   PayloadValue,
+  RuntimeIssue,
   TriggerBrief,
-  TriggerOutcome,
   TriggerReport,
 } from "../types.js";

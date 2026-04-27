@@ -1,12 +1,12 @@
 # Arc Scripts
 
-Arc is a JS-like language for encoding structured information graphs. Each function declaration defines a **node** — a self-contained unit of state, logic, and content. Nodes compose into trees. The runtime walks those trees turn by turn, yielding structured briefs that a host application resolves.
+Arc is a language for encoding structured information graphs. Arc scripts center around **nodes** — a self-contained unit of state, logic, and content. Nodes compose into trees. The runtime walks those trees and yields structured briefs that a host application resolves.
 
-Although Arc scripts employ a JS-based syntax, they can only be executed by the Arc runtime and not a standard JavaScript runtime.
+Arc has a familiar function-and-block surface syntax, but its semantics are its own. Arc scripts can only be executed by the Arc runtime.
 
 ## Document Structure
 
-An Arc script is a `.js` file (or more commonly, a `.arc.js` file). **Semicolons are required** after every statement.
+An Arc script is a `.arc` file, (or `.arc.js` file for more available grammar highlights).
 
 The first statement is the version directive (the only supported version is v2):
 
@@ -54,7 +54,7 @@ A node (function) body contains four sections, in order:
 
 1. **Config statements** — `this.*` assignments that set metadata and lifecycle hooks.
 2. **Variable declarations** — typed state scoped to this node.
-3. **Action graph** — the executable logic that progresses turn by turn.
+3. **Action graph** — the executable logic that progresses through runtime walks.
 4. **Child node declarations** — nested function declarations.
 
 Config, variables, and child declarations are **declarative** — they define fixed structure. The action graph is the only part that progresses through the brief/report cycle.
@@ -76,16 +76,17 @@ Config, variables, and child declarations are **declarative** — they define fi
 | `this.resumable`   | boolean literal  | Default `true`. When `false`, the action resolution map resets on re-entry. See [Execution Model](#execution-model). |
 | `this.trigger`     | arrow function   | Trigger condition for dormant arcs. See [Trigger](#trigger).                                                         |
 | `this.deflectWhen` | template literal or arrow function | Default deflection policy inherited by instruction actions in this node subtree. See [DeflectWhen](#deflectwhen). |
+| `this.catchDeflection` | arrow function | Deflection interception hook for the current node. See [CatchDeflection](#catchdeflection). |
 | `this.guard`       | arrow function   | Explicit state guard. See [Guard](#guard).                                                                           |
 | `this.effects`     | arrow function   | Reactive observations and emitted host effects. See [Effects](#effects).                                             |
 
-Structural identity comes from the JS declaration identifier, not metadata.
+Structural identity comes from the function declaration identifier, not metadata.
 
 - `function HeavyMetal() {}` — structural identifier is `HeavyMetal`
 - `this.displayName = "Heavy Metal"` — presentation metadata only
 - `enter(HeavyMetal)` and `HeavyMetal.state` resolve by structural identifier or import binding
 
-A **reference name** in Arc source is either a local function declaration identifier or a local import binding.
+A **reference name** in Arc source is either a local node declaration identifier or a local import binding.
 
 ### Variables
 
@@ -123,7 +124,7 @@ Enum comparisons use **ordinal position** within the declared values array. For 
 
 The action graph is the executable part of a node body. It contains **action forms** — things the runtime delegates to the host — and **control flow** that routes between them.
 
-The runtime walks the action graph top-down each turn. Actions already resolved in prior turns are skipped. The walk stops at the first unresolved action and yields a brief for the host. This turn-by-turn progression is what makes nodes stateful.
+An action graph describes reachable work, not a one-time imperative block. Arc interprets it repeatedly against node state: resolved actions are skipped, conditions are re-evaluated when reached, and the next unresolved reachable action becomes the current frontier. This persisted graph state is what makes nodes stateful.
 
 #### Action Forms
 
@@ -148,7 +149,7 @@ Expression-capable forms:
 - ``judge(`semantic question`)`` — semantic boolean check against conversation context. Returns `boolean`.
 - Host calls through imported `host:*` modules — yields a host-provided value. See [Host Modules](#host-modules).
 
-`observe()` and `judge()` can also appear in `this.trigger`, `this.effects`, and instruction resolution logic.
+`observe()`, `judge()`, and `variable.set(...)` can also appear in hooks where their statement or expression positions make sense. `judge()` is expression-only.
 
 #### Instructions
 
@@ -173,7 +174,7 @@ The instruction text must be a template literal. A bare instruction literal desu
 `resolveWhen` and `deflectWhen` define authored instruction semantics:
 
 - A template literal desugars to `return judge(...)`.
-- An arrow function uses the same constrained statement subset as `this.trigger`: `if` / `else`, `observe(...)`, and `return <expression>`.
+- An arrow function uses the same hook statement subset as `this.trigger`: `if` / `else`, labeled blocks, labeled `break`, `observe(...)`, `variable.set(...)`, and `return <expression>`.
 - Expressions inside those functions may use variables, `judge(...)`, host calls, regex tests, and logical composition.
 
 Authoring rules:
@@ -200,7 +201,7 @@ Only the currently reachable semantic checks from `deflectWhen` / `resolveWhen` 
 - `label: { ... }` — a labeled block that establishes a lexical control-flow region.
 - `break label;` — exits the nearest enclosing labeled block whose label matches.
 
-Labels are only allowed on block statements in the main action graph. `break` must specify a label. Labels and `break` are not allowed in `this.trigger`, `this.guard`, or `this.effects`.
+Labels are only allowed on block statements. `break` must specify a label. Labels and labeled `break` are supported in the main action graph, hook arrow functions, and `this.effects`.
 
 Example:
 
@@ -329,6 +330,38 @@ Inheritance rules:
 - Child nodes inherit the nearest ancestor `this.deflectWhen` unless they define their own.
 - An instruction-level `deflectWhen` overrides the inherited node default.
 
+### CatchDeflection
+
+`this.catchDeflection` runs when a deflection reaches the current node. It can inspect the transient deflection context with `deflection.from(Target)`, perform hook-local work such as `observe(...)`, `judge(...)`, and `variable.set(...)`, and return `true` to catch the deflection for this node.
+
+```js
+function Main() {
+  const wantsPricing = new Boolean();
+
+  this.catchDeflection = () => {
+    if (deflection.from(ProductIntro) && judge(`${user} wants pricing`)) {
+      wantsPricing.set(true);
+      return true;
+    }
+    return false;
+  };
+
+  if (wantsPricing === true) {
+    enter(Pricing);
+    wantsPricing.set(false);
+  }
+
+  enter(ProductIntro);
+}
+```
+
+Processing rules:
+
+- `deflection.from(Target)` v1 accepts only a bare node/import target. It does not accept `fresh(Target)` or `reopen(Target)`.
+- If the hook returns `true`, the current node catches the deflection and immediately rewalks its own action graph.
+- If the hook returns false or is absent, the current node becomes `State.DEFLECTED`, runs uncaught-deflection effects, and propagates the deflection to its parent.
+- A node's catch hook only prevents that node from becoming deflected. It does not undo the triggering child or instruction deflection.
+
 ### Guard
 
 `this.guard` is evaluated when traversal reaches a node — after the parent's `if` condition passes but before the node's action graph runs. It may return a `State.*` value to resolve the node without entering it. If it returns `undefined`, traversal continues normally.
@@ -339,7 +372,7 @@ this.guard = () => {
 };
 ```
 
-Guards are for explicit, unconditional node-state decisions. `if` conditions in the parent's action graph serve a different purpose — they are re-evaluated each turn and route based on current state.
+Guards are for explicit, unconditional node-state decisions. `if` conditions in the parent's action graph serve a different purpose — they are re-evaluated whenever the walk reaches them and route based on current state.
 
 ### Effects
 
@@ -422,6 +455,7 @@ A control-transfer target in Arc is one of:
 
 - `ReferenceName` — the canonical traversal for that node or arc.
 - `fresh(ReferenceName)` — a fresh ephemeral traversal instance of that node or arc.
+- `reopen(ReferenceName)` — a forced new entry on the canonical traversal for that node or arc.
 
 `fresh(ReferenceName)` requests a new empty traversal instance for the current call. Fresh targets are ephemeral and non-addressable:
 
@@ -433,28 +467,55 @@ For owned child nodes, `fresh(ReferenceName)` creates a fresh traversal instance
 
 For imported arcs, `fresh(ReferenceName)` creates a fresh call instance of the imported arc. This does not reset, replace, or mutate the canonical imported-arc traversal managed by the runtime.
 
+`reopen(ReferenceName)` forces a new entry on the canonical traversal for the current call:
+
+- It preserves canonical identity and therefore still participates in `ReferenceName.state`.
+- It preserves variable values and child traversals.
+- It clears the current node frame before the reopened entry begins.
+- It is valid only as a direct target to `enter(...)` and `enterLoop(...)`.
+
 ### Control Transfer
 
 #### Enter
 
-`enter(...)` is an action for execution control-transfer. It has two forms:
+Enter primitives transfer control into another node or arc traversal. They use a target to decide which traversal instance to run, suspend caller progress until that target iteration reaches a terminal outcome or remains unresolved, and optionally wire caller variables through explicit `args` / `returns` channels.
 
-- `enter(Target)` — control-flow only.
-- `enter(Target, { args, returns })` — control-flow with explicit dataflow wiring.
+Arc supports three enter forms:
 
-When traversing an `enter`:
+- `enterLoop(Target, { resolveWhen, args?, returns? })`
+- `enter(Target)`
+- `enter(Target, { args, returns })`
 
-1. `Target` resolves to either a canonical traversal (`ReferenceName`) or a fresh ephemeral traversal (`fresh(ReferenceName)`).
-2. Control transfers to the referenced callee traversal.
-3. The caller action graph does not move past this `enter` until the callee resolves for this entry.
-4. If `Target` is `ReferenceName`, the callee outcome is reflected through `ReferenceName.state` (`COVERED`, `DEFLECTED`, `SKIPPED`).
-5. If `Target` is `fresh(ReferenceName)`, the callee outcome is not reflected through `ReferenceName.state`.
-6. When the callee becomes `COVERED` or `SKIPPED`, this `enter` action resolves and caller traversal continues.
-7. If the callee is unresolved or becomes `DEFLECTED`, then `enter` remains unresolved.
+`enterLoop(...)` is the primitive form. `enter(...)` is the convenience form layered on top of it.
+
+Form rules:
+
+- `enterLoop(...)` requires `resolveWhen`.
+- `resolveWhen` accepts the same authored forms as instruction `resolveWhen`:
+  - a template literal, which desugars to `return judge(...)`
+  - an arrow function using the constrained statement subset allowed in `this.trigger`
+- `enter(...)` does not expose authored `resolveWhen`. Its resolution depends on the target node state.
+
+Target semantics:
+
+1. `Target` may be `ReferenceName`, `fresh(ReferenceName)`, or `reopen(ReferenceName)`.
+2. A target iteration transfers control into the referenced callee traversal.
+3. If `Target` is `ReferenceName`, the callee outcome is reflected through `ReferenceName.state` (`COVERED`, `DEFLECTED`, `SKIPPED`).
+4. If `Target` is `fresh(ReferenceName)`, the callee outcome is not reflected through `ReferenceName.state`.
+5. If `Target` is `reopen(ReferenceName)`, the runtime starts a new entry on the canonical traversal before control transfers: prior terminal node state is cleared, the node frame is cleared, variable values and child traversals are preserved, and the reopened run's eventual outcome becomes the new meaning of `ReferenceName.state`.
+
+Execution semantics:
+
+1. The runtime runs one target iteration using the target semantics.
+2. During that iteration, `args` reads from caller-backed cells and `returns.<name>.set(...)` stages output candidates on the callee traversal.
+3. Each iteration reaches a definite callee node state.
+   - For `enter(...)`, the action resolves when the callee reaches `COVERED` or `SKIPPED`. If the callee reaches `COVERED`, staged `returns` commit to caller cells. If the callee reaches `SKIPPED`, becomes `DEFLECTED`, or remains unresolved, staged `returns` do not commit.
+   - For `enterLoop(...)`, the runtime evaluates `resolveWhen` in the caller context after a covered or skipped iteration. Covered iterations may stage `returns` candidates to the enclosing loop action, but caller cells are updated only if the whole `enterLoop(...)` action later resolves normally. If the callee becomes `DEFLECTED` or remains unresolved, the action remains unresolved.
+4. If `enterLoop(...)` is not resolved after an iteration, the runtime begins a new iteration by entering the same target shape again while respecting the target semantics described above.
 
 #### Args and Returns Processing
 
-`enter(..., { args, returns })` wires caller variables into child input/output channels:
+`enter(..., { args, returns })` and `enterLoop(..., { args, returns })` wire caller variables into child input/output channels:
 
 ```js
 const report = new ...;
@@ -481,52 +542,21 @@ Processing rules:
 - `args` / `returns` must be object literals (no spread, no computed keys).
 - These keys live under the callee's parameter object namespaces (`args` and `returns`), not as top-level callee bindings.
 
-Arc variables are containers (cells), not scalar bindings. `enter(...)` therefore wires cells, not copied scalar values.
+Arc variables are containers (cells), not scalar bindings. `enter(...)`/`enterLoop(...)` therefore wires cells, not copied scalar values.
 
-Execution semantics:
+Channel behavior:
 
 1. On child entry, `args` exposes caller-backed input cells under child-local names.
-2. Child writes output candidates through `returns.<name>.set(...)`.
-3. Return writes are staged during child execution and become visible to caller cells only when the child resolves to `State.COVERED`.
-4. If child traversal does not reach `State.COVERED` for this `enter` (for example, remains blocked, is deferred, deflected, or skipped by guard), staged return writes are not committed to caller cells.
-5. Keys in `returns` that the child never sets do not change caller cells.
+2. Child writes output candidates through `returns.<name>.set(...)`; this stages a candidate output for the enclosing `enter(...)`-family action rather than mutating caller cells immediately.
+3. Caller cells update only when the enclosing `enter(...)` or `enterLoop(...)` action resolves normally.
+4. Keys in `returns` that the child never sets do not change caller cells.
 
 Write boundary:
 
 - `returns.*.set(...)` is only valid inside `this.effects`.
 - `args` is read-only from the child perspective.
 
-This model keeps control-flow ownership in `enter(...)` while making dataflow explicit at the call site.
-
-#### Enter Loop
-
-`enterLoop(...)` is an action for repeated control-transfer. It repeatedly enters the target and evaluates a caller-authored loop condition after each completed iteration.
-
-`enterLoop(...)` has one form:
-
-- `enterLoop(Target, { resolveWhen, args?, returns? })`
-
-Authoring rules:
-
-- `resolveWhen` is required.
-- `resolveWhen` accepts the same authored forms as instruction `resolveWhen`:
-  - a template literal, which desugars to `return judge(...)`
-  - an arrow function using the constrained statement subset allowed in `this.trigger`
-- `Target` may be either `ReferenceName` or `fresh(ReferenceName)`.
-- `enterLoop(fresh(ReferenceName), ...)` is the explicit fresh-loop form.
-- `enterLoop(ReferenceName, ...)` reuses the canonical traversal each iteration.
-
-Execution semantics:
-
-1. The runtime enters the target once, using normal `enter(...)` semantics for `args` and `returns`.
-2. When one iteration reaches `State.COVERED`, staged `returns` are committed to caller cells.
-3. After a covered iteration, the runtime evaluates `resolveWhen` in the caller context.
-4. If `resolveWhen` is true, the `enterLoop(...)` action resolves.
-5. If `resolveWhen` is false, the runtime begins a new iteration by entering the same target shape again.
-6. For `fresh(ReferenceName)`, each iteration creates a new empty traversal instance.
-7. For plain `ReferenceName`, each iteration re-enters the canonical traversal according to normal Arc semantics.
-8. If an iteration is `SKIPPED`, the loop does not commit staged `returns`; `resolveWhen` is still evaluated.
-9. If an iteration becomes `DEFLECTED` or remains unresolved, the `enterLoop(...)` action remains unresolved.
+This model keeps control-flow ownership in `enter(...)`/`enterLoop(...)` while making dataflow explicit at the call site.
 
 #### Examples
 
@@ -580,30 +610,30 @@ function Parent() {
 
 ## Execution Model
 
-Arc's execution model is built around persistent **traversal state** and ephemeral **briefs**. Three concepts are essential to understand:
+Arc scripts are interpreted by the Arc runtime. The runtime handles control flow according to the action graph, and it works together with a supplied host which drives the runtime and handles semantic work or external effects.
 
-**Node state** is the outcome of a node: `COVERED`, `DEFLECTED`, `SKIPPED`, or not yet resolved. It answers "what happened to this node?" and determines whether `enter(ReferenceName)` re-enters or skips it. Node state is visible to the parent's action graph through `ReferenceName.state`.
+```text
+┌────────────┐                    ┌─────────┐                        ┌──────┐
+│            │                    │         │  ── delegates to ──▶   │      │
+│ Arc script │ ◀── interprets ──  │ Runtime │                        │ Host │
+│            │                    │         │  ◀──── drives ──────   │      │
+└────────────┘                    └─────────┘                        └──────┘
+```
 
-**Node frame** is the per-action resolution map inside a node. It tracks which individual actions have been resolved so the walk can skip them on re-entry. The frame is internal bookkeeping — it is what makes turn-by-turn progression work. When `this.resumable = false`, the frame is discarded on re-entry (previously resolved actions are forgotten), but node state, variable values, and child states are preserved.
+The runtime does not advance on its own like an event loop in a separate process or thread. A useful analogy is a kernel: The host drives runtime entry, the runtime interprets the graph and decides what work is now reachable and delegates some to the host. Delegated work later hands new facts back for the runtime to interpret and drives the runtime forward.
 
-**Traversal** is the full runtime state for an arc or node: its lifecycle phase, enter count, variable values, node frame, child traversals, and node state.
+A node's action graph is the unit the runtime interprets. The runtime works the graph to find the next reachable action frontier. Reaching an action creates a delegation boundary. The runtime then delegates that action in one of two ways:
 
-### Turn Execution
+- to the host, for actions whose outcome must be supplied externally;
+- to another node or arc's action graph, for `enter(...)` and `enterLoop(...)`.
 
-When traversal is inside a node, each turn:
+Delegated work produces inputs back to the runtime, such as a host report or an entered node's resulting state. The runtime interprets those inputs and decides whether the current action resolves normally.
 
-1. **Sets up declarative state** — evaluates config statements and variable declarations.
-2. **Walks the action graph** — re-traverses from the top, skips every reachable action already resolved in the node frame, and stops at the first unresolved reachable action.
+When an action resolves after changing traversal-visible state (for example, `observe(...)` or `variable.set(...)`) or callee outcome state (for example, `enter(...)` finishing with `State.COVERED`), the runtime re-walks the _smallest enclosing graph_ from the top, goes past resolved actions, and continues with the next reachable unresolved action. Arc progression is graph re-interpretation under updated state, not fallthrough from a stored statement pointer.
 
-The runtime yields a brief describing the pending work. The host resolves it and reports back when it wants traversal to continue. The runtime applies the report and, if the host proceeds, walks again. This loop continues until the action graph completes or the host defers/deflects.
+Deflection is separate from normal resolution. Instruction actions may deflect instead of resolving. The runtime pauses normal work and propagates the deflection to the nearest enclosing handler. If no handler catches it, deflection escapes the current work and the root traversal becomes deflected and suspended.
 
-Traversal progression is host-driven and does not need to map one-to-one to conversation messages. A host may call `progress(...)` immediately, after one message round, or after many rounds while carrying the same instruction frontier.
-
-Instruction actions have an extra pending phase: first the runtime emits guidance, then subsequent handbacks evaluate authored `deflectWhen` / `resolveWhen` conditions until the instruction resolves or deflects. That is why a follow-up brief may carry the same pending instruction again with a different `phase` and a different `postcheck` frontier.
-
-After the action graph resolves, `this.effects` runs. Effects may require additional resolution rounds.
-
-See [arc-runtime-api.md](arc-runtime-api.md) for the full brief/report protocol and host integration contract.
+For traversal state, node state, node frames, and the brief/report protocol, see [arc-runtime-api.md](arc-runtime-api.md).
 
 ## Examples
 

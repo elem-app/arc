@@ -38,18 +38,19 @@ Each arc traversal tracks where it is in its lifecycle:
 | `"entered"`   | The arc is active and being traversed.           |
 | `"completed"` | All reachable actions and effects have resolved. |
 | `"suspended"` | The arc was entered but left before completing.  |
+| `"poisoned"`  | Progression failed due to an authored runtime error. |
 
 ### Node State vs. Node Frame
 
 Two pieces of traversal state that serve distinct purposes:
 
-**Node state** is the outcome — what happened to the node as a whole. It is one of `COVERED`, `DEFLECTED`, `SKIPPED`, or not yet resolved. The parent's action graph reads it through `ReferenceName.state` to decide whether to re-enter or move on. Node state is set by the runtime (`COVERED` when all reachable actions and effects complete, `DEFLECTED` on host-initiated deflection) or by explicit guard logic (`SKIPPED`).
+**Node state** is the outcome — what happened to the node as a whole. It is one of `COVERED`, `DEFLECTED`, `SKIPPED`, or not yet resolved. The parent's action graph reads it through `ReferenceName.state` to decide whether to re-enter or move on. Node state is set by the runtime (`COVERED` when all reachable actions and effects complete, `DEFLECTED` on host-initiated deflection) or by explicit guard logic (`SKIPPED`). `reopen(ReferenceName)` explicitly clears the prior canonical node state and starts a new entry whose eventual outcome becomes the new `ReferenceName.state`.
 
-Canonical node state is addressable from Arc source through `ReferenceName.state`. Fresh traversal instances created through `fresh(ReferenceName)` are not addressable from Arc source and do not change the meaning of `ReferenceName.state`.
+Canonical node state is addressable from Arc source through `ReferenceName.state`. Fresh traversal instances created through `fresh(ReferenceName)` are not addressable from Arc source and do not change the meaning of `ReferenceName.state`. Reopened canonical traversals created through `reopen(ReferenceName)` remain addressable and replace the prior canonical outcome with the reopened run's new outcome.
 
-**Node frame** is the internal resolution map — which individual actions within the node have been resolved. It is what makes turn-by-turn progression work: each walk re-traverses the action graph from the top, skips actions the frame marks as resolved, and stops at the first unresolved one. The frame is bookkeeping that the action graph author never sees directly.
+**Node frame** is the internal resolution map — which individual actions within the node have been resolved. It is what makes host-driven progression work: each walk re-traverses the action graph from the top, skips actions the frame marks as resolved, and stops at the first unresolved one. The frame is bookkeeping that the action graph author never sees directly.
 
-When `this.resumable = false`, the frame is discarded on re-entry — previously resolved actions are forgotten and the walk starts fresh. But node state, variable values, and child states are preserved. A non-resumable node replays its action sequence without losing its accumulated state.
+When `this.resumable = false` or when entered via `reopen()`, the frame is discarded — resolved actions are forgotten and a walk starts fresh. But node state, variable values, and child states are preserved. A non-resumable node replays its action sequence without losing its accumulated state.
 
 ## Brief/Report Protocol
 
@@ -59,8 +60,8 @@ Briefs also carry information the host may use at its discretion — traversal s
 
 - Do not mutate brief fields in place.
 - Do not reconstruct or clone a brief and pass the copy back.
-- Pass the same brief object instance returned by `startTrigger()` to
-  `progressTrigger()`.
+- Pass the same trigger brief object instance returned by `startTrigger()` or
+  `progressTrigger()` to the next `progressTrigger()` call.
 - Pass the same brief object instance returned by `start()` / `progress()` to
   the next `progress()` call.
 
@@ -90,35 +91,47 @@ Batching:
 Resume:
 
 - After a brief/report round, traversal re-walks from the top of the current active node.
+- Leaf actions that resolve after changing traversal-visible state or callee outcome state re-walk their smallest enclosing graph before later reachability is decided.
 - `if` conditions are reevaluated whenever the walk reaches them.
 - Resolved actions are skipped according to the node frame.
 - Pending instructions continue to surface in follow-up `ActionBrief`s while they remain unresolved; a repeated instruction brief may carry the same instruction text with a different instruction `phase` and a different `postcheck` frontier as resolution work progresses.
 
 ### `TriggerBrief`
 
-`TriggerBrief` is what the runtime yields during the trigger stage. It carries unresolved semantic work from trigger bodies and a list of arcs that already matched.
+`TriggerBrief` is what the runtime yields during the trigger stage. It carries
+the persisted trigger traversal state, unresolved semantic work from trigger
+bodies, and the set of arcs that are currently matchable. Trigger stage ends
+when `matched` is set.
 
 ```typescript
 type TriggerBrief = {
+  /** Selected arc once trigger stage resolves to one activation. */
+  matched?: ArcRef;
+  /** Updated trigger traversal state to persist after this yield. */
+  traversals: ArcTraversalSet;
+  /** Protocol or authored-execution issues surfaced while advancing from the previous yield. */
+  issues: RuntimeIssue[];
   /** Unresolved semantic checks from trigger bodies. */
   judgments: JudgmentBrief[];
   /** Unresolved observations from trigger bodies. */
   observations: ObservationBrief[];
   /** Unresolved host-backed value requests from trigger bodies. */
   hostCalls: HostCallBrief[];
-  /** Arcs whose triggers returned `true` with no unresolved work. */
+  /** Arcs whose triggers currently evaluate `true`. */
   matchableArcs: ArcRef[];
 };
 ```
 
 ### `TriggerReport`
 
-`TriggerReport` is what the host sends back after inspecting a trigger brief. It includes resolved work items and may explicitly select which arc to activate.
+`TriggerReport` is what the host sends back after inspecting a trigger brief. It
+includes resolved work items and may name a preferred arc when multiple trigger
+candidates may match.
 
 ```typescript
 type TriggerReport = {
-  /** Explicitly select an arc from the matchable set. */
-  match?: ArcRef;
+  /** Preferred arc to activate if it becomes matchable. */
+  preferredMatch?: ArcRef;
   /** Resolved boolean checks, keyed by brief id. */
   judgments?: Record<BriefId, boolean>;
   /** Resolved observations, keyed by brief id. */
@@ -140,6 +153,8 @@ type ActionBrief = {
   active: NodeRef;
   /** Whether the runtime can advance further. */
   canProgress: boolean;
+  /** Protocol or authored-execution issues surfaced while advancing from the previous yield. */
+  issues: RuntimeIssue[];
   /** Pending boolean checks. */
   judgments: JudgmentBrief[];
   /** Pending variable assessments. */
@@ -167,7 +182,6 @@ type ActionReport = {
    *   message since the prior brief. For instruction frontiers, this hands the
    *   current instruction frontier back according to the semantics of its
    *   `mode`.
-   * "defer" — do not advance this round.
    * "deflect" — user changed topic; the active node becomes deflected and is
    *   eligible for re-entry. Pending effects still run. Only available when
    *   `allowedMoves` includes it.
@@ -393,13 +407,16 @@ type DialogTurn = {
 
 **`newTraversalSet()`** — create an empty traversal set for a fresh trigger or action session.
 
-**`newTraversal(arc)`** — create a fresh arc traversal in the `"dormant"` phase. Useful for seeding an arc without going through the trigger cycle. The caller must set `phase = "entered"` before passing it to `start()`.
+**`newTraversal(arc)`** — create a fresh arc traversal in the `"dormant"` phase with `enterCount = 0`.
 
 ### Trigger Stage
 
 **`startTrigger(traversals, dialog)`** → `TriggerBrief`
 
-Evaluates every registered arc's trigger against the dialog and supplied traversal state. Returns pending semantic work and any arcs that already matched. If matches exist with nothing pending, the caller can skip resolution and select the first match.
+Evaluates every registered arc's trigger against the dialog and supplied
+traversal state. Returns a `TriggerBrief` that either identifies a matched arc
+or asks the host for more trigger-stage data. The brief also includes the
+updated traversal state.
 
 For a fresh trigger probe with no persisted state, call:
 
@@ -407,22 +424,39 @@ For a fresh trigger probe with no persisted state, call:
 runtime.startTrigger(runtime.newTraversalSet(), dialog);
 ```
 
-**`progressTrigger(brief, report, dialog)`** → `TriggerOutcome`
+**`progressTrigger(brief, report, dialog)`** → `TriggerBrief`
 
-Accepts a trigger report and returns the outcome: which arc matched (if any) and the updated traversal state.
+Accepts a trigger report and returns the next trigger brief.
 
 `dialog` is the current conversation snapshot at the time the host hands
 control back to Arc. It may be newer than the dialog that produced `brief`.
 
-Arc selection: (1) re-evaluate all triggers with resolved data — arcs whose triggers now return `true` join the matchable set; (2) if `report.match` is set, select it (must be matchable); (3) if exactly one arc is matchable, auto-select; (4) otherwise no activation.
+Arc selection: (1) re-evaluate all triggers with the accepted report data; (2)
+if `report.preferredMatch` is currently matchable, select it; (3) otherwise, if
+exactly one arc is matchable, auto-select it; (4) otherwise return another
+trigger brief.
 
-**Constraint:** observations inside judgment-guarded blocks in triggers produce a two-step dependency the single-round trigger protocol cannot resolve. Place observations at the top level of the trigger body or seed variables in the effects phase.
+When trigger report validation fails, `progressTrigger(...)` returns a new
+`TriggerBrief` with `issues` describing the rejection. For issues with
+`kind: "invalid-report"`, the runtime rejects the report as a whole, applies no
+changes, and re-yields the same trigger frontier. For issues with
+`kind: "invalid-item"`, the runtime applies the valid subset of reported
+results and re-yields the rejected work items.
+
+When authored trigger execution fails, the runtime returns a `TriggerBrief` with
+`issues`, marks the affected arc traversal `"poisoned"`, and bars that arc from
+future trigger matching.
+
+When multiple arcs are matchable and no `preferredMatch` selects one, the
+runtime returns a `TriggerBrief` with `issues` containing `kind:"ambiguous-match"` and expects a later `TriggerReport` to name one specific `preferredMatch`.
 
 ### Action Stage
 
 **`start(traversals, dialog)`** → `ActionBrief`
 
-Begins the action stage. There should be exactly one active traversal in the `"entered"` phase. In most cases, just use the traversal set in `TriggerOutcome`.
+Begins the action stage. There should be exactly one active traversal in the
+`"entered"` phase. In most cases, just use the traversal set in the latest
+`TriggerBrief` once `matched` is set.
 
 **`progress(brief, report, dialog)`** → `ActionBrief`
 
@@ -433,6 +467,17 @@ back to Arc. It may be newer than the dialog that produced `brief`.
 
 `progress(...)` cadence is host-driven. It is not required to map one-to-one to
 conversation message cadence. A host may call `progress(...)` whenever it finishes part or all of the work specified in a brief, regardless of after how many rounds of conversation with the user.
+
+When the report is accepted and execution continues normally, `progress(...)`
+returns the next action frontier for the active root.
+
+When report validation fails, `progress(...)` returns an `ActionBrief` with
+`issues`. For issues with `kind: "invalid-report"`, the runtime rejects the
+report as a whole, applies no changes, and re-yields the same frontier. For
+issues with `kind: "invalid-item"`, the runtime applies the valid subset of
+reported results and re-yields only the rejected work items. When authored
+execution fails, `progress(...)` returns a terminal `ActionBrief` with the root
+traversal in the `"poisoned"` phase.
 
 ### References
 
@@ -454,17 +499,22 @@ A typical host turn:
 
 2. Trigger stage:
    a. startTrigger(traversals, dialog) → TriggerBrief
-   b. Resolve judgments/observations/hostCalls.
-   c. progressTrigger(brief, report, latestDialog) → TriggerOutcome
-   d. If a match exists, proceed to action stage.
+   b. Persist `brief.traversals`.
+   c. While `brief.matched` is not set:
+   d. Resolve judgments/observations/hostCalls and optional `preferredMatch`.
+   e. progressTrigger(brief, report, latestDialog) → TriggerBrief
+   f. Persist `brief.traversals`.
+   g. Once `brief.matched` is set, proceed to action stage.
 
 3. Action stage (if an arc is active):
    a. start(traversals, dialog) → ActionBrief
-   b. Inspect instructions and semantic work.
-   c. Host chooses when to hand control back (after 0/1/N conversation rounds).
-   d. Resolve any available judgments/observations/hostCalls and call:
+   b. A new brief has now been issued: apply `brief.hostEffects` and persist
+      `brief.traversals`.
+   c. Inspect instructions and semantic work.
+   d. Host chooses when to hand control back (after 0/1/N conversation rounds).
+   e. Resolve any available judgments/observations/hostCalls and call:
       progress(brief, { move, judgments, observations, hostCalls }, latestDialog)
-   e. Repeat as needed until the host wants to defer or traversal cannot progress.
-   f. Apply brief.hostEffects.
-   g. Persist traversal state.
+   f. `progress(...)` returns a new ActionBrief. For that newly issued brief,
+      apply `brief.hostEffects` and persist `brief.traversals`.
+   g. Repeat from c as needed until traversal cannot progress.
 ```

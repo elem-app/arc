@@ -56,6 +56,13 @@ function rootTraversal(brief: ActionBrief): ArcTraversal {
   return root;
 }
 
+function traversalByRef(
+  brief: ActionBrief,
+  ref: ArcRef,
+): ArcTraversal | undefined {
+  return brief.traversals.find((traversal) => traversal.ref === ref);
+}
+
 const EMPTY_DIALOG: Dialog = { lastTurns: [] };
 
 function progressBrief(
@@ -137,7 +144,7 @@ function Second() {
     const triggerOutcome = runtime.progressTrigger(
       triggerBrief,
       {
-        match: metalRef,
+        preferredMatch: metalRef,
         judgments: {
           [triggerBrief.judgments[0]!.id]: true,
         },
@@ -296,6 +303,165 @@ function Main() {
     expect(child?.state).toBe("covered");
   });
 
+  it("creates dormant root traversals with enterCount 0 until first entry", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  \`hello\`;
+}
+`);
+    const runtime = new Runtime().add("dormant-enter-count-arc", document);
+    const traversal = runtime.newTraversal(
+      arc("dormant-enter-count-arc", "Main"),
+    );
+
+    expect(traversal.phase).toBe("dormant");
+    expect(traversal.enterCount).toBe(0);
+
+    traversal.phase = "entered";
+    const brief = runtime.start([traversal], EMPTY_DIALOG);
+
+    expect(rootTraversal(brief).enterCount).toBe(0);
+    expect(brief.instructions.map((item) => item.text)).toEqual(["hello"]);
+  });
+
+  it("reopens a covered canonical child with preserved variables and a cleared frame", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  enter(Child);
+  enter(reopen(Child));
+  \`done\`;
+
+  function Child() {
+    const seen = new Boolean();
+    \`intro\`;
+
+    if (seen === true) {
+      \`again\`;
+    }
+
+    this.effects = () => {
+      seen.set(true);
+    };
+  }
+}
+`);
+    const runtime = new Runtime().add("reopen-covered-arc", document);
+    const traversal = runtime.newTraversal(arc("reopen-covered-arc", "Main"));
+    traversal.phase = "entered";
+
+    const firstBrief = runtime.start([traversal], EMPTY_DIALOG);
+    expect(firstBrief.instructions.map((item) => item.text)).toEqual(["intro"]);
+
+    const secondBrief = progressBrief(runtime, firstBrief, { move: "proceed" });
+    const child = ownedChild(rootTraversal(secondBrief), "Main.Child");
+    expect(child?.enterCount).toBe(2);
+    expect(child?.variables.seen).toBe(true);
+    expect(secondBrief.instructions.map((item) => item.text)).toEqual([
+      "intro",
+      "again",
+    ]);
+    const thirdBrief = progressBrief(runtime, secondBrief, { move: "proceed" });
+    expect(thirdBrief.instructions.map((item) => item.text)).toEqual(["done"]);
+    expect(ownedChild(rootTraversal(thirdBrief), "Main.Child")?.state).toBe(
+      "covered",
+    );
+  });
+
+  it("reopens a skipped canonical child and re-evaluates its guard", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const ready = new Boolean();
+
+  enter(Child, {
+    args: { ready },
+  });
+  ready.set(true);
+  enter(reopen(Child), {
+    args: { ready },
+  });
+  \`done\`;
+
+  function Child({ args }) {
+    this.guard = () => {
+      if (args.ready !== true) {
+        return State.SKIPPED;
+      }
+    };
+
+    \`child\`;
+  }
+}
+`);
+    const runtime = new Runtime().add("reopen-skipped-arc", document);
+    const traversal = runtime.newTraversal(arc("reopen-skipped-arc", "Main"));
+    traversal.phase = "entered";
+
+    const firstBrief = runtime.start([traversal], EMPTY_DIALOG);
+    const child = ownedChild(rootTraversal(firstBrief), "Main.Child");
+    expect(child?.enterCount).toBe(2);
+    expect(child?.state).toBeUndefined();
+    expect(firstBrief.instructions.map((item) => item.text)).toEqual(["child"]);
+
+    const finalBrief = progressBrief(runtime, firstBrief, { move: "proceed" });
+    expect(finalBrief.instructions.map((item) => item.text)).toEqual(["done"]);
+    expect(ownedChild(rootTraversal(finalBrief), "Main.Child")?.state).toBe(
+      "covered",
+    );
+  });
+
+  it("reflects a reopened child's new terminal state through Child.state", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  enter(Child);
+  enter(reopen(Child));
+
+  if (Child.state === State.SKIPPED) {
+    \`reopened skipped\`;
+  }
+
+  function Child() {
+    const shouldSkip = new Boolean();
+
+    this.guard = () => {
+      if (shouldSkip === true) {
+        return State.SKIPPED;
+      }
+    };
+
+    this.effects = () => {
+      shouldSkip.set(true);
+    };
+
+    \`child body\`;
+  }
+}
+`);
+    const runtime = new Runtime().add("reopen-state-arc", document);
+    const traversal = runtime.newTraversal(arc("reopen-state-arc", "Main"));
+    traversal.phase = "entered";
+
+    const firstBrief = runtime.start([traversal], EMPTY_DIALOG);
+    expect(firstBrief.instructions.map((item) => item.text)).toEqual([
+      "child body",
+    ]);
+
+    const secondBrief = progressBrief(runtime, firstBrief, { move: "proceed" });
+    expect(secondBrief.instructions.map((item) => item.text)).toEqual([
+      "reopened skipped",
+    ]);
+    expect(ownedChild(rootTraversal(secondBrief), "Main.Child")?.state).toBe(
+      "skipped",
+    );
+  });
+
   it("seeds traversal variables from trigger observations before entry", () => {
     const document = parse(`
 "use arc v2";
@@ -373,7 +539,10 @@ function Main() {
       outcome.traversals.find(
         (traversal) => traversal.ref === arc("trigger-arc", "Main"),
       ),
-    ).toBeUndefined();
+    ).toMatchObject({
+      ref: arc("trigger-arc", "Main"),
+      phase: "dormant",
+    });
   });
 
   it("evaluates this.enterCount inside trigger functions across re-entry", () => {
@@ -501,12 +670,144 @@ function Second() {
     const runtime = new Runtime().add("single-match-trigger-arc", document);
     const triggerBrief = startTrigger(runtime, EMPTY_DIALOG);
 
-    expect(triggerBrief.matchableArcs).toEqual([
+    expect(triggerBrief.matched).toEqual(
       arc("single-match-trigger-arc", "First"),
+    );
+    expect(triggerBrief.matchableArcs).toEqual([]);
+  });
+
+  it("returns ambiguous-match until a later trigger report names a preferred match", () => {
+    const first = parse(`
+"use arc v2";
+
+function First() {
+  this.trigger = () => {
+    return true;
+  };
+}
+`);
+    const second = parse(`
+"use arc v2";
+
+function Second() {
+  this.trigger = () => {
+    return true;
+  };
+}
+`);
+    const runtime = new Runtime()
+      .add("ambiguous-first-arc", first)
+      .add("ambiguous-second-arc", second);
+
+    const brief = startTrigger(runtime, EMPTY_DIALOG);
+
+    expect(brief.matched).toBeUndefined();
+    expect(brief.matchableArcs).toEqual([
+      arc("ambiguous-first-arc", "First"),
+      arc("ambiguous-second-arc", "Second"),
+    ]);
+    expect(brief.issues).toEqual([
+      expect.objectContaining({
+        kind: "ambiguous-match",
+        matchableArcs: [
+          arc("ambiguous-first-arc", "First"),
+          arc("ambiguous-second-arc", "Second"),
+        ],
+      }),
     ]);
 
-    const outcome = runtime.progressTrigger(triggerBrief, {}, EMPTY_DIALOG);
-    expect(outcome.matched).toEqual(arc("single-match-trigger-arc", "First"));
+    const selected = runtime.progressTrigger(
+      brief,
+      {
+        preferredMatch: arc("ambiguous-second-arc", "Second"),
+      },
+      EMPTY_DIALOG,
+    );
+
+    expect(selected.matched).toEqual(arc("ambiguous-second-arc", "Second"));
+    expect(selected.matchableArcs).toEqual([]);
+    expect(selected.judgments).toEqual([]);
+    expect(selected.observations).toEqual([]);
+    expect(selected.hostCalls).toEqual([]);
+    expect(
+      selected.traversals.find(
+        (traversal) => traversal.ref === arc("ambiguous-second-arc", "Second"),
+      ),
+    ).toMatchObject({
+      ref: arc("ambiguous-second-arc", "Second"),
+      phase: "entered",
+      enterCount: 1,
+    });
+  });
+
+  it("supports multi-round trigger resolution when later trigger work is unlocked by earlier answers", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const topic = new Enum(["metal", "jazz"]);
+  topic.observing = \`what topic is \${user} discussing\`;
+
+  this.trigger = () => {
+    if (judge(\`\${user} is discussing music\`)) {
+      observe(topic);
+      return topic === "metal";
+    }
+    return false;
+  };
+}
+`);
+    const runtime = new Runtime().add("nested-trigger-arc", document);
+    const dialog: Dialog = {
+      lastTurns: [{ role: "user", message: "let's talk about records" }],
+    };
+
+    const firstBrief = startTrigger(runtime, dialog);
+
+    expect(firstBrief.matched).toBeUndefined();
+    expect(firstBrief.judgments).toHaveLength(1);
+    expect(firstBrief.observations).toHaveLength(0);
+
+    const secondBrief = runtime.progressTrigger(
+      firstBrief,
+      {
+        judgments: {
+          [firstBrief.judgments[0]!.id]: true,
+        },
+      },
+      dialog,
+    );
+
+    expect(secondBrief.matched).toBeUndefined();
+    expect(secondBrief.judgments).toHaveLength(0);
+    expect(secondBrief.observations).toHaveLength(1);
+    expect(secondBrief.matchableArcs).toEqual([]);
+
+    const finalBrief = runtime.progressTrigger(
+      secondBrief,
+      {
+        observations: {
+          [secondBrief.observations[0]!.id]: {
+            status: "resolved",
+            value: "metal",
+          },
+        },
+      },
+      dialog,
+    );
+
+    expect(finalBrief.matched).toEqual(arc("nested-trigger-arc", "Main"));
+    expect(finalBrief.judgments).toEqual([]);
+    expect(finalBrief.observations).toEqual([]);
+    expect(
+      finalBrief.traversals.find(
+        (traversal) => traversal.ref === arc("nested-trigger-arc", "Main"),
+      ),
+    ).toMatchObject({
+      ref: arc("nested-trigger-arc", "Main"),
+      phase: "entered",
+      enterCount: 1,
+    });
   });
 
   it("resolves imported arcs by source first, then root identifier", () => {
@@ -547,6 +848,45 @@ function AnotherArc() {
     expect(rootTraversal(brief).refChildren).toEqual([
       arc("another-arc", "AnotherArc"),
     ]);
+    expect(
+      brief.traversals.find(
+        (traversal) => traversal.ref === arc("another-arc", "AnotherArc"),
+      )?.enterCount,
+    ).toBe(1);
+  });
+
+  it("does not reopen a covered imported arc on plain enter", () => {
+    const main = parse(`
+"use arc v2";
+import { Intro } from "intro-arc";
+
+function Main() {
+  enter(Intro);
+  enter(Intro);
+  \`done\`;
+}
+`);
+    const intro = parse(`
+"use arc v2";
+
+function Intro() {
+  \`intro\`;
+}
+`);
+    const runtime = new Runtime().add("main-arc", main).add("intro-arc", intro);
+    const seeded = runtime.newTraversal(arc("main-arc", "Main"));
+    seeded.phase = "entered";
+
+    const firstBrief = runtime.start([seeded], EMPTY_DIALOG);
+    expect(firstBrief.instructions.map((item) => item.text)).toEqual(["intro"]);
+
+    const secondBrief = progressBrief(runtime, firstBrief, { move: "proceed" });
+    expect(secondBrief.instructions.map((item) => item.text)).toEqual(["done"]);
+    expect(
+      secondBrief.traversals.find(
+        (traversal) => traversal.ref === arc("intro-arc", "Intro"),
+      )?.enterCount,
+    ).toBe(1);
   });
 
   it("records needs-user/proceed flow against the active owned child", () => {
@@ -560,7 +900,7 @@ function AnotherArc() {
     const triggerOutcome = runtime.progressTrigger(
       triggerBrief,
       {
-        match: arc("metal-arc", "Metal"),
+        preferredMatch: arc("metal-arc", "Metal"),
         judgments: {
           [triggerBrief.judgments[0]!.id]: true,
         },
@@ -605,12 +945,18 @@ function AnotherArc() {
     expect(afterProceed.instructions.map((item) => item.text)).toEqual([
       "Talk about thrash.",
     ]);
-    expect(afterProceed.canProgress).toBe(false);
-    expect(rootTraversal(afterProceed).phase).toBe("completed");
+    expect(afterProceed.canProgress).toBe(true);
+    expect(rootTraversal(afterProceed).phase).toBe("entered");
     expect(
       ownedChild(rootTraversal(afterProceed), "Metal.Surface")?.variables
         .subgenre,
     ).toBe("thrash");
+
+    const completed = progressBrief(runtime, afterProceed, {
+      move: "proceed",
+    });
+    expect(completed.canProgress).toBe(false);
+    expect(rootTraversal(completed).phase).toBe("completed");
   });
 
   it("treats bare instruction literals as one-shot instructions", () => {
@@ -635,7 +981,7 @@ function Main() {
         postcheck: undefined,
       },
     ]);
-    expect(brief.allowedMoves).toEqual(["proceed", "defer"]);
+    expect(brief.allowedMoves).toEqual(["proceed"]);
 
     const afterProceed = progressBrief(runtime, brief, { move: "proceed" });
     expect(afterProceed.instructions).toEqual([]);
@@ -656,10 +1002,14 @@ function Main() {
     seeded.phase = "entered";
 
     const brief = runtime.start([seeded], { lastTurns: [] });
-    expect(brief.allowedMoves).toEqual(["proceed", "defer"]);
-    expect(() => progressBrief(runtime, brief, { move: "deflect" })).toThrow(
-      /Illegal turn move: deflect/,
-    );
+    expect(brief.allowedMoves).toEqual(["proceed"]);
+    const nextBrief = progressBrief(runtime, brief, { move: "deflect" });
+    expect(nextBrief.issues).toEqual([
+      expect.objectContaining({
+        kind: "invalid-report",
+        reasonCode: "illegal-move",
+      }),
+    ]);
   });
 
   it("prefers deflectWhen over resolveWhen when both evaluate true", () => {
@@ -702,7 +1052,7 @@ function Main() {
     expect(rootTraversal(nextBrief).phase).toBe("suspended");
   });
 
-  it("captures only currently reachable postchecks and defers deeper checks", () => {
+  it("captures only currently reachable postchecks and postpones deeper checks", () => {
     const document = parse(`
 "use arc v2";
 
@@ -794,8 +1144,7 @@ function Main() {
         [brief.observations[0]!.id]: { status: "unknown" },
       },
     });
-    expect(afterUnknown.observations).toHaveLength(1);
-    expect(afterUnknown.observations[0]?.question).toEqual("is self ready");
+    expect(afterUnknown.observations).toHaveLength(0);
     expect(afterUnknown.instructions).toMatchObject([
       {
         text: "Carry the topic.",
@@ -945,7 +1294,7 @@ function Main() {
       observationIds: [],
       hostCallIds: [],
     });
-    expect(brief.allowedMoves).toEqual(["proceed", "defer"]);
+    expect(brief.allowedMoves).toEqual(["proceed"]);
 
     const afterHandback = progressBrief(runtime, brief, { move: "proceed" });
     expect(afterHandback.instructions).toMatchObject([
@@ -983,50 +1332,6 @@ function Main() {
       judgments: { [resolutionBrief.judgments[0]!.id]: true },
     });
     expect(afterTrue.instructions.map((item) => item.text)).toEqual(["after"]);
-  });
-
-  it("does not consume instruction postcheck answers on defer", () => {
-    const document = parse(`
-"use arc v2";
-
-function Main() {
-  instructLoop(\`Carry the topic.\`, {
-    resolveWhen: \`\${self} covered the topic enough\`,
-  });
-  \`after\`;
-}
-`);
-    const runtime = new Runtime().add("instruction-defer-arc", document);
-    const seeded = runtime.newTraversal(arc("instruction-defer-arc", "Main"));
-    seeded.phase = "entered";
-
-    const brief = runtime.start([seeded], { lastTurns: [] });
-    expect(brief.instructions.map((item) => item.text)).toEqual([
-      "Carry the topic.",
-    ]);
-    expect(brief.judgments.map((item) => item.question)).toEqual([
-      "self covered the topic enough",
-    ]);
-
-    const deferred = progressBrief(runtime, brief, {
-      move: "defer",
-      judgments: { [brief.judgments[0]!.id]: true },
-    });
-    expect(deferred.instructions).toMatchObject([
-      {
-        text: "Carry the topic.",
-        phase: "postcheck",
-      },
-    ]);
-    expect(deferred.judgments.map((item) => item.question)).toEqual([
-      "self covered the topic enough",
-    ]);
-
-    const resumed = progressBrief(runtime, deferred, {
-      move: "proceed",
-      judgments: { [deferred.judgments[0]!.id]: true },
-    });
-    expect(resumed.instructions.map((item) => item.text)).toEqual(["after"]);
   });
 
   it("accepts batched instruction deflect/resolve semantics in one report", () => {
@@ -1108,6 +1413,34 @@ function Main() {
     expect(deflected.canProgress).toBe(false);
     expect(rootTraversal(deflected).state).toBe("deflected");
     expect(rootTraversal(deflected).phase).toBe("suspended");
+  });
+
+  it("derives instruction deflection from inherited node-level deflectWhen after handback", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  this.deflectWhen = \`\${user} wants to leave this topic\`;
+  instructLoop(\`Carry the topic.\`, {
+    resolveWhen: \`\${self} covered the topic enough\`,
+  });
+}
+`);
+    const runtime = new Runtime().add("inherited-deflect-arc", document);
+    const seeded = runtime.newTraversal(arc("inherited-deflect-arc", "Main"));
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    expect(brief.instructions.map((item) => item.text)).toEqual([
+      "Carry the topic.",
+    ]);
+
+    const handback = progressBrief(runtime, brief, { move: "proceed" });
+
+    expect(handback.judgments.map((item) => item.question)).toEqual([
+      "user wants to leave this topic",
+      "self covered the topic enough",
+    ]);
   });
 
   it("blocks on a semantic guard and records skipped state on the owned child traversal", () => {
@@ -1318,6 +1651,110 @@ function Main() {
     expect(rootTraversal(nextBrief).phase).toBe("completed");
   });
 
+  it("returns invalid-item when observe() values do not match the variable type", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const interest = new Enum(["cold", "warm"]);
+  interest.observing = \`how interested is \${user}\`;
+  observe(interest);
+}
+`);
+    const runtime = new Runtime().add("observe-type-arc", document);
+    const seeded = runtime.newTraversal(arc("observe-type-arc", "Main"));
+    seeded.phase = "entered";
+    const brief = runtime.start([seeded], { lastTurns: [] });
+
+    const nextBrief = progressBrief(runtime, brief, {
+      move: "proceed",
+      observations: {
+        [brief.observations[0]!.id]: {
+          status: "resolved",
+          value: true,
+        },
+      },
+    });
+
+    expect(nextBrief.issues).toEqual([
+      expect.objectContaining({
+        kind: "invalid-item",
+        briefId: brief.observations[0]!.id,
+        reasonCode: "observation-enum",
+      }),
+    ]);
+    expect(nextBrief.observations.map((item) => item.id)).toEqual([
+      brief.observations[0]!.id,
+    ]);
+  });
+
+  it("compares enum values by ordinal position, not lexicographic order", () => {
+    const document = parse(`
+"use arc v2";
+
+import Memoir from "host:memoir";
+
+function Main() {
+  const interest = new Enum(["cold", "lukewarm", "curious", "enthusiastic"]);
+  const topic = new Enum(["unknown", "metal"]);
+  interest.observing = \`how interested is \${user}\`;
+
+  this.effects = () => {
+    observe(interest);
+    if (interest >= "curious") {
+      topic.set("metal");
+    }
+    if (topic === "metal") {
+      Memoir.facts.apply(\`\${user} is engaged\`);
+    }
+  };
+}
+`);
+
+    const runtime = new Runtime().add("ordinal-arc", document);
+    const seeded = runtime.newTraversal(arc("ordinal-arc", "Main"));
+    seeded.phase = "entered";
+    const brief = runtime.start([seeded], {
+      lastTurns: [{ role: "user", message: "kinda" }],
+    });
+
+    const lukewarmBrief = progressBrief(runtime, brief, {
+      move: "proceed",
+      observations: {
+        [brief.observations[0]!.id]: { status: "resolved", value: "lukewarm" },
+      },
+    });
+
+    expect(rootTraversal(lukewarmBrief).variables.interest).toBe("lukewarm");
+    expect(rootTraversal(lukewarmBrief).variables.topic).toBeUndefined();
+    expect(lukewarmBrief.hostEffects).toEqual([]);
+
+    const runtime2 = new Runtime().add("ordinal-arc", document);
+    const seeded2 = runtime2.newTraversal(arc("ordinal-arc", "Main"));
+    seeded2.phase = "entered";
+    const brief2 = runtime2.start([seeded2], {
+      lastTurns: [{ role: "user", message: "very" }],
+    });
+
+    const curiousBrief = progressBrief(runtime2, brief2, {
+      move: "proceed",
+      observations: {
+        [brief2.observations[0]!.id]: { status: "resolved", value: "curious" },
+      },
+    });
+
+    expect(rootTraversal(curiousBrief).variables.interest).toBe("curious");
+    expect(rootTraversal(curiousBrief).variables.topic).toBe("metal");
+    expect(curiousBrief.hostEffects).toEqual([
+      {
+        module: "memoir",
+        target: ["facts"],
+        operation: "apply",
+        arguments: ["user is engaged"],
+      },
+    ]);
+  });
+
   it("suppresses duplicate host effects across repeated briefs for one traversal", () => {
     const document = parse(`
 "use arc v2";
@@ -1399,7 +1836,503 @@ function Main() {
     expect(ownedChild(rootTraversal(nextBrief), "Main.Intro")?.state).toBe(
       "deflected",
     );
+    expect(rootTraversal(nextBrief).state).toBe("deflected");
     expect(rootTraversal(nextBrief).phase).toBe("suspended");
+  });
+
+  it("lets a parent catch child deflection, set a routing flag, and rewalk itself", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const wantsPricing = new Boolean();
+
+  this.catchDeflection = () => {
+    if (deflection.from(ProductIntro) && judge(\`\${user} wants pricing\`)) {
+      wantsPricing.set(true);
+      return true;
+    }
+    return false;
+  };
+
+  if (wantsPricing === true) {
+    enter(Pricing);
+    wantsPricing.set(false);
+  }
+
+  enter(ProductIntro);
+
+  function ProductIntro() {
+    const topic = new Enum(["unknown", "product"]);
+    topic.observing = \`what product topic does \${user} want\`;
+    observeOrAsk(topic);
+  }
+
+  function Pricing() {
+    const priceTopic = new Enum(["unknown", "pricing"]);
+    priceTopic.observing = \`what pricing detail does \${user} want\`;
+    observeOrAsk(priceTopic);
+  }
+}
+`);
+
+    const runtime = new Runtime().add("catch-deflection-arc", document);
+    const seeded = runtime.newTraversal(arc("catch-deflection-arc", "Main"));
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    expect(brief.active).toEqual(
+      node("catch-deflection-arc", "Main.ProductIntro"),
+    );
+
+    const catching = progressBrief(runtime, brief, { move: "deflect" });
+    expect(catching.active).toEqual(node("catch-deflection-arc", "Main"));
+    expect(catching.judgments.map((item) => item.question)).toEqual([
+      "user wants pricing",
+    ]);
+    expect(
+      ownedChild(rootTraversal(catching), "Main.ProductIntro")?.state,
+    ).toBe("deflected");
+
+    const routed = progressBrief(runtime, catching, {
+      move: "proceed",
+      judgments: { [catching.judgments[0]!.id]: true },
+    });
+
+    expect(rootTraversal(routed).variables.wantsPricing).toBe(true);
+    expect(routed.active).toEqual(node("catch-deflection-arc", "Main.Pricing"));
+    expect(routed.observations).toHaveLength(1);
+
+    const resumed = progressBrief(runtime, routed, {
+      move: "proceed",
+      observations: {
+        [routed.observations[0]!.id]: {
+          status: "resolved",
+          value: "pricing",
+        },
+      },
+    });
+
+    expect(rootTraversal(resumed).variables.wantsPricing).toBe(false);
+    expect(resumed.active).toEqual(
+      node("catch-deflection-arc", "Main.ProductIntro"),
+    );
+    expect(resumed.observations).toHaveLength(1);
+  });
+
+  it("does not batch instruction frontiers across enter boundaries", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const wantsPricing = new Boolean();
+
+  this.catchDeflection = () => {
+    if (deflection.from(ProductIntro) && judge(\`\${user} wants pricing\`)) {
+      wantsPricing.set(true);
+      return true;
+    }
+    return false;
+  };
+
+  if (wantsPricing === true) {
+    enter(Pricing);
+    wantsPricing.set(false);
+  }
+
+  enter(ProductIntro);
+
+  function ProductIntro() {
+    const topic = new Enum(["unknown", "product"]);
+    topic.observing = \`what product topic does \${user} want\`;
+    observeOrAsk(topic);
+  }
+
+  function Pricing() {
+    \`pricing\`;
+  }
+}
+`);
+
+    const runtime = new Runtime().add(
+      "enter-instruction-boundary-arc",
+      document,
+    );
+    const seeded = runtime.newTraversal(
+      arc("enter-instruction-boundary-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    const catching = progressBrief(runtime, brief, { move: "deflect" });
+    const routed = progressBrief(runtime, catching, {
+      move: "proceed",
+      judgments: { [catching.judgments[0]!.id]: true },
+    });
+
+    expect(routed.active).toEqual(
+      node("enter-instruction-boundary-arc", "Main.Pricing"),
+    );
+    expect(routed.instructions.map((item) => item.text)).toEqual(["pricing"]);
+    expect(rootTraversal(routed).variables.wantsPricing).toBe(true);
+
+    const resumed = progressBrief(runtime, routed, { move: "proceed" });
+
+    expect(rootTraversal(resumed).variables.wantsPricing).toBe(false);
+    expect(resumed.active).toEqual(
+      node("enter-instruction-boundary-arc", "Main.ProductIntro"),
+    );
+  });
+
+  it("catches an imported child deflection and rewalks the importing node", () => {
+    const main = parse(`
+"use arc v2";
+import { Intro } from "intro-arc";
+
+function Main() {
+  const wantsPricing = new Boolean();
+
+  this.catchDeflection = () => {
+    if (deflection.from(Intro)) {
+      wantsPricing.set(true);
+      return true;
+    }
+    return false;
+  };
+
+  if (wantsPricing === true) {
+    enter(Pricing);
+    wantsPricing.set(false);
+  }
+
+  enter(Intro);
+
+  function Pricing() {
+    const priceTopic = new Enum(["unknown", "pricing"]);
+    priceTopic.observing = \`what pricing detail does \${user} want\`;
+    observeOrAsk(priceTopic);
+  }
+}
+`);
+    const intro = parse(`
+"use arc v2";
+
+function Intro() {
+  const topic = new Enum(["unknown", "product"]);
+  topic.observing = \`what product topic does \${user} want\`;
+  observeOrAsk(topic);
+}
+`);
+    const runtime = new Runtime()
+      .add("main-import-catch-arc", main)
+      .add("intro-arc", intro);
+    const seeded = runtime.newTraversal(arc("main-import-catch-arc", "Main"));
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], EMPTY_DIALOG);
+    expect(brief.active).toEqual(node("intro-arc", "Intro"));
+
+    const routed = progressBrief(runtime, brief, { move: "deflect" });
+
+    expect(rootTraversal(routed).state).toBeUndefined();
+    expect(traversalByRef(routed, arc("intro-arc", "Intro"))?.state).toBe(
+      "deflected",
+    );
+    expect(rootTraversal(routed).variables.wantsPricing).toBe(true);
+    expect(routed.active).toEqual(
+      node("main-import-catch-arc", "Main.Pricing"),
+    );
+  });
+
+  it("propagates uncaught imported child deflection to the importing root", () => {
+    const main = parse(`
+"use arc v2";
+import { Intro } from "intro-arc";
+
+function Main() {
+  enter(Intro);
+}
+`);
+    const intro = parse(`
+"use arc v2";
+
+function Intro() {
+  const topic = new Enum(["unknown", "product"]);
+  topic.observing = \`what product topic does \${user} want\`;
+  observeOrAsk(topic);
+}
+`);
+    const runtime = new Runtime()
+      .add("main-import-deflect-arc", main)
+      .add("intro-arc", intro);
+    const seeded = runtime.newTraversal(arc("main-import-deflect-arc", "Main"));
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], EMPTY_DIALOG);
+    const deflected = progressBrief(runtime, brief, { move: "deflect" });
+
+    expect(traversalByRef(deflected, arc("intro-arc", "Intro"))?.state).toBe(
+      "deflected",
+    );
+    expect(rootTraversal(deflected).state).toBe("deflected");
+    expect(rootTraversal(deflected).phase).toBe("suspended");
+  });
+
+  it("catches its own instruction deflection and rewalks itself", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const caught = new Boolean();
+
+  this.catchDeflection = () => {
+    caught.set(true);
+    return true;
+  };
+
+  if (caught === true) {
+    \`caught\`;
+  } else {
+    instructLoop(\`intro\`, {
+      deflectWhen: \`\${user} wants to switch topics\`,
+      resolveWhen: \`\${self} finished intro\`,
+    });
+  }
+}
+`);
+    const runtime = new Runtime().add("self-instruction-catch-arc", document);
+    const seeded = runtime.newTraversal(
+      arc("self-instruction-catch-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], EMPTY_DIALOG);
+    const handback = progressBrief(runtime, brief, { move: "proceed" });
+    const deflect = handback.judgments.find(
+      (item) => item.question === "user wants to switch topics",
+    );
+    expect(deflect).toBeDefined();
+
+    const caught = progressBrief(runtime, handback, {
+      move: "proceed",
+      judgments: { [deflect!.id]: true },
+    });
+
+    expect(rootTraversal(caught).state).toBeUndefined();
+    expect(rootTraversal(caught).variables.caught).toBe(true);
+    expect(caught.instructions.map((item) => item.text)).toEqual(["caught"]);
+  });
+
+  it("runs effects and bubbles when catchDeflection returns false", () => {
+    const document = parse(`
+"use arc v2";
+import Memoir from "host:memoir";
+
+function Main() {
+  this.effects = () => {
+    Memoir.facts.apply(\`parent effect\`);
+  };
+
+  enter(Intro);
+
+  function Intro() {
+    const topic = new Enum(["unknown", "product"]);
+    topic.observing = \`what product topic does \${user} want\`;
+
+    this.catchDeflection = () => {
+      return false;
+    };
+
+    this.effects = () => {
+      Memoir.facts.apply(\`child effect\`);
+    };
+
+    observeOrAsk(topic);
+  }
+}
+`);
+    const runtime = new Runtime().add("catch-false-effects-arc", document);
+    const seeded = runtime.newTraversal(arc("catch-false-effects-arc", "Main"));
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], EMPTY_DIALOG);
+    const deflected = progressBrief(runtime, brief, { move: "deflect" });
+
+    expect(deflected.hostEffects.map((effect) => effect.arguments[0])).toEqual([
+      "child effect",
+      "parent effect",
+    ]);
+    expect(ownedChild(rootTraversal(deflected), "Main.Intro")?.state).toBe(
+      "deflected",
+    );
+    expect(rootTraversal(deflected).state).toBe("deflected");
+  });
+
+  it("does not run effects on an ancestor that catches child deflection", () => {
+    const document = parse(`
+"use arc v2";
+import Memoir from "host:memoir";
+
+function Main() {
+  const caught = new Boolean();
+
+  this.catchDeflection = () => {
+    if (deflection.from(Intro)) {
+      caught.set(true);
+      return true;
+    }
+    return false;
+  };
+
+  this.effects = () => {
+    Memoir.facts.apply(\`parent effect\`);
+  };
+
+  if (caught === true) {
+    \`after catch\`;
+  }
+
+  enter(Intro);
+
+  function Intro() {
+    const topic = new Enum(["unknown", "product"]);
+    topic.observing = \`what product topic does \${user} want\`;
+
+    this.effects = () => {
+      Memoir.facts.apply(\`child effect\`);
+    };
+
+    observeOrAsk(topic);
+  }
+}
+`);
+    const runtime = new Runtime().add("catch-suppresses-effects-arc", document);
+    const seeded = runtime.newTraversal(
+      arc("catch-suppresses-effects-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], EMPTY_DIALOG);
+    const caught = progressBrief(runtime, brief, { move: "deflect" });
+
+    expect(caught.hostEffects.map((effect) => effect.arguments[0])).toEqual([
+      "child effect",
+    ]);
+    expect(rootTraversal(caught).state).toBeUndefined();
+    expect(caught.instructions.map((item) => item.text)).toEqual([
+      "after catch",
+    ]);
+  });
+
+  it("resumes a blocking catchDeflection before deciding whether to catch", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const wantsPricing = new Boolean({
+    observing: \`does \${user} want pricing\`,
+  });
+
+  this.catchDeflection = () => {
+    observe(wantsPricing);
+    if (wantsPricing === true) {
+      return true;
+    }
+    return false;
+  };
+
+  if (wantsPricing === true) {
+    enter(Pricing);
+  }
+
+  enter(Intro);
+
+  function Intro() {
+    const topic = new Enum(["unknown", "product"]);
+    topic.observing = \`what product topic does \${user} want\`;
+    observeOrAsk(topic);
+  }
+
+  function Pricing() {
+    \`pricing\`;
+  }
+}
+`);
+    const runtime = new Runtime().add("blocking-catch-arc", document);
+    const seeded = runtime.newTraversal(arc("blocking-catch-arc", "Main"));
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], EMPTY_DIALOG);
+    const catching = progressBrief(runtime, brief, { move: "deflect" });
+
+    expect(catching.active).toEqual(node("blocking-catch-arc", "Main"));
+    expect(catching.observations).toHaveLength(1);
+    expect(catching.observations[0]).toMatchObject({
+      variable: "wantsPricing",
+      mode: "observe",
+    });
+
+    const routed = progressBrief(runtime, catching, {
+      move: "proceed",
+      observations: {
+        [catching.observations[0]!.id]: {
+          status: "resolved",
+          value: true,
+        },
+      },
+    });
+
+    expect(rootTraversal(routed).state).toBeUndefined();
+    expect(routed.active).toEqual(node("blocking-catch-arc", "Main.Pricing"));
+  });
+
+  it("runs effects after a blocking catchDeflection resumes false", () => {
+    const document = parse(`
+"use arc v2";
+import Memoir from "host:memoir";
+
+function Main() {
+  const shouldCatch = new Boolean({
+    observing: \`should this deflection be caught\`,
+  });
+
+  this.catchDeflection = () => {
+    observe(shouldCatch);
+    return shouldCatch === true;
+  };
+
+  this.effects = () => {
+    Memoir.facts.apply(\`root deflected\`);
+  };
+
+  const topic = new Enum(["unknown", "product"]);
+  topic.observing = \`what topic does \${user} want\`;
+  observeOrAsk(topic);
+}
+`);
+    const runtime = new Runtime().add("blocking-catch-false-arc", document);
+    const seeded = runtime.newTraversal(
+      arc("blocking-catch-false-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], EMPTY_DIALOG);
+    const catching = progressBrief(runtime, brief, { move: "deflect" });
+    const deflected = progressBrief(runtime, catching, {
+      move: "proceed",
+      observations: {
+        [catching.observations[0]!.id]: {
+          status: "resolved",
+          value: false,
+        },
+      },
+    });
+
+    expect(deflected.hostEffects.map((effect) => effect.arguments[0])).toEqual([
+      "root deflected",
+    ]);
+    expect(rootTraversal(deflected).state).toBe("deflected");
+    expect(rootTraversal(deflected).phase).toBe("suspended");
   });
 
   it("runs child deflection effects before blocked ancestor effects", () => {
@@ -1521,33 +2454,6 @@ function Main() {
     expect(rootTraversal(nextBrief).phase).toBe("suspended");
   });
 
-  it("supports defer without mutating the yielded traversal", () => {
-    const document = parse(SOURCE);
-    const runtime = new Runtime().add("metal-arc", document);
-    const triggerBrief = startTrigger(runtime, {
-      lastTurns: [{ role: "user", message: "what music are you into?" }],
-    });
-    const triggerOutcome = runtime.progressTrigger(
-      triggerBrief,
-      {
-        match: arc("metal-arc", "Metal"),
-        judgments: {
-          [triggerBrief.judgments[0]!.id]: true,
-        },
-      },
-      {
-        lastTurns: [{ role: "user", message: "what music are you into?" }],
-      },
-    );
-
-    const brief = runtime.start(triggerOutcome.traversals, { lastTurns: [] });
-    const yielded = JSON.parse(JSON.stringify(brief.traversals));
-    const nextBrief = progressBrief(runtime, brief, { move: "defer" });
-
-    expect(nextBrief.traversals).toEqual(yielded);
-    expect(nextBrief.traversals).not.toBe(brief.traversals);
-  });
-
   it("keeps resolved action state for resumable nodes and drops it for non-resumable ones", () => {
     const resumableDocument = parse(`
 "use arc v2";
@@ -1622,7 +2528,7 @@ function Main() {
       },
     );
     const nonResumableResumed = nonResumableRuntime.start(
-      runtimeAfterAsk(nonResumableRuntime, nonResumableAsk),
+      nonResumableAsk.traversals,
       {
         lastTurns: [{ role: "user", message: "later" }],
       },
@@ -1657,7 +2563,7 @@ function Main() {
     const firstOutcome = runtime.progressTrigger(
       startTrigger(runtime, EMPTY_DIALOG),
       {
-        match: arc("retry-arc", "Main"),
+        preferredMatch: arc("retry-arc", "Main"),
       },
       EMPTY_DIALOG,
     );
@@ -1672,7 +2578,7 @@ function Main() {
 
     const restartedOutcome = runtime.progressTrigger(
       startTrigger(runtime, EMPTY_DIALOG, deflected.traversals),
-      { match: arc("retry-arc", "Main") },
+      { preferredMatch: arc("retry-arc", "Main") },
       EMPTY_DIALOG,
     );
     const restartedBrief = runtime.start(restartedOutcome.traversals, {
@@ -1703,7 +2609,7 @@ function Main() {
     const coveredOutcome = coveredRuntime.progressTrigger(
       startTrigger(coveredRuntime, EMPTY_DIALOG),
       {
-        match: arc("covered-arc", "Main"),
+        preferredMatch: arc("covered-arc", "Main"),
       },
       EMPTY_DIALOG,
     );
@@ -1741,7 +2647,7 @@ function Main() {
         EMPTY_DIALOG,
         completedCoveredBrief.traversals,
       ),
-      { match: arc("covered-arc", "Main") },
+      { preferredMatch: arc("covered-arc", "Main") },
       EMPTY_DIALOG,
     );
     const restartedCoveredBrief = coveredRuntime.start(
@@ -1775,7 +2681,7 @@ function Main() {
     const runtime = new Runtime().add("suspend-reenter-arc", document);
     const firstOutcome = runtime.progressTrigger(
       startTrigger(runtime, EMPTY_DIALOG),
-      { match: arc("suspend-reenter-arc", "Main") },
+      { preferredMatch: arc("suspend-reenter-arc", "Main") },
       EMPTY_DIALOG,
     );
     const firstBrief = runtime.start(firstOutcome.traversals, {
@@ -1789,7 +2695,7 @@ function Main() {
 
     const restarted = runtime.progressTrigger(
       startTrigger(runtime, EMPTY_DIALOG, deflected.traversals),
-      { match: arc("suspend-reenter-arc", "Main") },
+      { preferredMatch: arc("suspend-reenter-arc", "Main") },
       EMPTY_DIALOG,
     );
     const restartedRoot = restarted.traversals.find(
@@ -1811,7 +2717,7 @@ function Main() {
     const triggerOutcome = runtime.progressTrigger(
       triggerBrief,
       {
-        match: arc("metal-arc", "Metal"),
+        preferredMatch: arc("metal-arc", "Metal"),
         judgments: {
           [triggerBrief.judgments[0]!.id]: true,
         },
@@ -2001,7 +2907,7 @@ function Main() {
     expect(afterBrief.instructions.map((item) => item.text)).toEqual(["after"]);
   });
 
-  it("rejects invalid action reports: illegal move, bogus judgment id, bogus observation id", () => {
+  it("returns invalid-report issues for invalid action reports", () => {
     const document = parse(SOURCE);
     const runtime = new Runtime().add("metal-arc", document);
     const triggerBrief = startTrigger(runtime, {
@@ -2010,7 +2916,7 @@ function Main() {
     const triggerOutcome = runtime.progressTrigger(
       triggerBrief,
       {
-        match: arc("metal-arc", "Metal"),
+        preferredMatch: arc("metal-arc", "Metal"),
         judgments: { [triggerBrief.judgments[0]!.id]: true },
       },
       {
@@ -2024,23 +2930,31 @@ function Main() {
     ).not.toThrow();
 
     const brief2 = runtime.start(triggerOutcome.traversals, { lastTurns: [] });
-    expect(() =>
-      progressBrief(runtime, brief2, {
-        move: "proceed",
-        judgments: { "bogus-id": true },
+    const afterBogusJudgment = progressBrief(runtime, brief2, {
+      move: "proceed",
+      judgments: { "bogus-id": true },
+    });
+    expect(afterBogusJudgment.issues).toEqual([
+      expect.objectContaining({
+        kind: "invalid-report",
+        reasonCode: "unknown-judgment-id",
       }),
-    ).toThrow(/Unknown judgment id in action report/);
+    ]);
 
     const brief3 = runtime.start(triggerOutcome.traversals, { lastTurns: [] });
-    expect(() =>
-      progressBrief(runtime, brief3, {
-        move: "proceed",
-        observations: { "bogus-id": { status: "resolved", value: "x" } },
+    const afterBogusObservation = progressBrief(runtime, brief3, {
+      move: "proceed",
+      observations: { "bogus-id": { status: "resolved", value: "x" } },
+    });
+    expect(afterBogusObservation.issues).toEqual([
+      expect.objectContaining({
+        kind: "invalid-report",
+        reasonCode: "unknown-observation-id",
       }),
-    ).toThrow(/Unknown observation id in action report/);
+    ]);
   });
 
-  it("rejects stale host call ids in action reports", () => {
+  it("returns invalid-report for bogus host call ids in action reports", () => {
     const document = parse(`
 "use arc v2";
 
@@ -2058,55 +2972,59 @@ function Main() {
 
     const brief = runtime.start([seeded], { lastTurns: [] });
     expect(brief.hostCalls).toHaveLength(1);
-    const staleId = brief.hostCalls[0]!.id;
-
-    const afterHostCall = progressBrief(runtime, brief, {
+    const retried = progressBrief(runtime, brief, {
       move: "proceed",
-      hostCalls: { [staleId]: true },
+      hostCalls: { "bogus-id": false },
     });
-    expect(afterHostCall.hostCalls).toEqual([]);
-
-    expect(() =>
-      progressBrief(runtime, afterHostCall, {
-        move: "proceed",
-        hostCalls: { [staleId]: false },
+    expect(retried.issues).toEqual([
+      expect.objectContaining({
+        kind: "invalid-report",
+        reasonCode: "unknown-host-call-id",
       }),
-    ).toThrow(/Unknown host call id in action report/);
+    ]);
   });
 
-  it("rejects invalid trigger reports: unknown arc, bogus judgment id", () => {
+  it("returns invalid-report issues for invalid trigger reports", () => {
     const document = parse(SOURCE);
     const runtime = new Runtime().add("metal-arc", document);
     const triggerBrief = startTrigger(runtime, {
       lastTurns: [{ role: "user", message: "music" }],
     });
 
-    expect(() =>
-      runtime.progressTrigger(
-        triggerBrief,
-        {
-          match: arc("nonexistent", "Nope"),
-        },
-        {
-          lastTurns: [{ role: "user", message: "music" }],
-        },
-      ),
-    ).toThrow(/Unknown arc selected in trigger report/);
+    const unknownArc = runtime.progressTrigger(
+      triggerBrief,
+      {
+        preferredMatch: arc("nonexistent", "Nope"),
+      },
+      {
+        lastTurns: [{ role: "user", message: "music" }],
+      },
+    );
+    expect(unknownArc.issues).toEqual([
+      expect.objectContaining({
+        kind: "invalid-report",
+        reasonCode: "unknown-trigger-match",
+      }),
+    ]);
 
-    expect(() =>
-      runtime.progressTrigger(
-        triggerBrief,
-        {
-          judgments: { "bogus-id": true },
-        },
-        {
-          lastTurns: [{ role: "user", message: "music" }],
-        },
-      ),
-    ).toThrow(/Unknown judgment id in trigger report/);
+    const bogusJudgment = runtime.progressTrigger(
+      triggerBrief,
+      {
+        judgments: { "bogus-id": true },
+      },
+      {
+        lastTurns: [{ role: "user", message: "music" }],
+      },
+    );
+    expect(bogusJudgment.issues).toEqual([
+      expect.objectContaining({
+        kind: "invalid-report",
+        reasonCode: "unknown-judgment-id",
+      }),
+    ]);
   });
 
-  it("resolves trigger host calls and rejects unknown trigger host call ids", () => {
+  it("resolves trigger host calls and returns invalid-report for unknown trigger host call ids", () => {
     const document = parse(`
 "use arc v2";
 
@@ -2122,15 +3040,19 @@ function Main() {
     const triggerBrief = startTrigger(runtime, EMPTY_DIALOG);
     expect(triggerBrief.hostCalls).toHaveLength(1);
 
-    expect(() =>
-      runtime.progressTrigger(
-        triggerBrief,
-        {
-          hostCalls: { "bogus-id": true },
-        },
-        EMPTY_DIALOG,
-      ),
-    ).toThrow(/Unknown host call id in trigger report/);
+    const bogus = runtime.progressTrigger(
+      triggerBrief,
+      {
+        hostCalls: { "bogus-id": true },
+      },
+      EMPTY_DIALOG,
+    );
+    expect(bogus.issues).toEqual([
+      expect.objectContaining({
+        kind: "invalid-report",
+        reasonCode: "unknown-host-call-id",
+      }),
+    ]);
 
     const accepted = runtime.progressTrigger(
       triggerBrief,
@@ -2170,6 +3092,250 @@ function Main() {
       "above warm",
       "above cold",
     ]);
+  });
+
+  it("re-walks from the top after set() changes action graph branch reachability", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const ready = new Boolean();
+
+  if (ready !== true) {
+    ready.set(true);
+  } else {
+    \`now ready\`;
+  }
+}
+`);
+    const runtime = new Runtime().add("set-rewalk-arc", document);
+    const seeded = runtime.newTraversal(arc("set-rewalk-arc", "Main"));
+    seeded.phase = "entered";
+    const brief = runtime.start([seeded], EMPTY_DIALOG);
+
+    expect(brief.instructions.map((item) => item.text)).toEqual(["now ready"]);
+    expect(rootTraversal(brief).variables.ready).toBe(true);
+  });
+
+  it("re-walks from the top after observeOrAsk() resolves normally", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const ready = new Boolean();
+
+  if (ready === true) {
+    \`before\`;
+  }
+
+  observeOrAsk(ready);
+
+  if (ready === true) {
+    \`after\`;
+  }
+}
+`);
+    const runtime = new Runtime().add("observe-rewalk-arc", document);
+    const seeded = runtime.newTraversal(arc("observe-rewalk-arc", "Main"));
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], EMPTY_DIALOG);
+    expect(brief.observations).toHaveLength(1);
+
+    const next = progressBrief(runtime, brief, {
+      move: "proceed",
+      observations: {
+        [brief.observations[0]!.id]: {
+          status: "resolved",
+          value: true,
+        },
+      },
+    });
+
+    expect(next.instructions.map((item) => item.text)).toEqual([
+      "before",
+      "after",
+    ]);
+  });
+
+  it("re-evaluates structural if flow after observeOrAsk() re-walks the current SEG", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const ready = new Boolean();
+
+  if (ready === true) {
+    \`before\`;
+  }
+
+  if (true) {
+    observeOrAsk(ready);
+  }
+
+  if (ready === true) {
+    \`after\`;
+  }
+}
+`);
+    const runtime = new Runtime().add("observe-branch-rewalk-arc", document);
+    const seeded = runtime.newTraversal(
+      arc("observe-branch-rewalk-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], EMPTY_DIALOG);
+    expect(brief.observations).toHaveLength(1);
+
+    const next = progressBrief(runtime, brief, {
+      move: "proceed",
+      observations: {
+        [brief.observations[0]!.id]: {
+          status: "resolved",
+          value: true,
+        },
+      },
+    });
+
+    expect(next.instructions.map((item) => item.text)).toEqual([
+      "before",
+      "after",
+    ]);
+  });
+
+  it("re-walks from the top after enter() resolves normally", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const verdict = new Boolean();
+
+  if (verdict === true) {
+    \`before\`;
+  }
+
+  enter(Child, {
+    returns: { verdict },
+  });
+
+  if (verdict === true) {
+    \`after\`;
+  }
+
+  function Child({ returns }) {
+    this.effects = () => {
+      returns.verdict.set(true);
+    };
+  }
+}
+`);
+    const runtime = new Runtime().add("enter-rewalk-arc", document);
+    const seeded = runtime.newTraversal(arc("enter-rewalk-arc", "Main"));
+    seeded.phase = "entered";
+
+    const brief = runtime.start([seeded], EMPTY_DIALOG);
+
+    expect(brief.instructions.map((item) => item.text)).toEqual([
+      "before",
+      "after",
+    ]);
+    expect(rootTraversal(brief).variables.verdict).toBe(true);
+  });
+
+  it("keeps child internal resolution insulated from the caller enter()", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  enter(Child);
+  \`after\`;
+
+  function Child() {
+    const ready = new Boolean({
+      observing: \`is \${user} ready\`,
+    });
+    observeOrAsk(ready);
+    \`child done\`;
+  }
+}
+`);
+    const runtime = new Runtime().add("enter-insulation-arc", document);
+    const seeded = runtime.newTraversal(arc("enter-insulation-arc", "Main"));
+    seeded.phase = "entered";
+
+    const first = runtime.start([seeded], EMPTY_DIALOG);
+    expect(first.active).toEqual(node("enter-insulation-arc", "Main.Child"));
+    expect(first.observations).toHaveLength(1);
+
+    const second = progressBrief(runtime, first, {
+      move: "proceed",
+      observations: {
+        [first.observations[0]!.id]: {
+          status: "resolved",
+          value: true,
+        },
+      },
+    });
+
+    expect(second.instructions.map((item) => item.text)).toEqual([
+      "child done",
+    ]);
+    expect(second.active).toEqual(node("enter-insulation-arc", "Main.Child"));
+
+    const third = progressBrief(runtime, second, { move: "proceed" });
+    expect(third.instructions.map((item) => item.text)).toEqual(["after"]);
+    expect(third.active).toEqual(node("enter-insulation-arc", "Main"));
+  });
+
+  it("re-walks the caller SEG only after enter() resolves, even when the child captures caller variables", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const ready = new Boolean();
+
+  if (ready === true) {
+    \`before\`;
+  }
+
+  enter(Child);
+  \`after\`;
+
+  function Child() {
+    observeOrAsk(ready);
+    \`child done\`;
+  }
+}
+`);
+    const runtime = new Runtime().add("enter-capture-seg-arc", document);
+    const seeded = runtime.newTraversal(arc("enter-capture-seg-arc", "Main"));
+    seeded.phase = "entered";
+
+    const first = runtime.start([seeded], EMPTY_DIALOG);
+    expect(first.active).toEqual(node("enter-capture-seg-arc", "Main.Child"));
+    expect(first.observations).toHaveLength(1);
+
+    const second = progressBrief(runtime, first, {
+      move: "proceed",
+      observations: {
+        [first.observations[0]!.id]: {
+          status: "resolved",
+          value: true,
+        },
+      },
+    });
+
+    expect(rootTraversal(second).variables.ready).toBe(true);
+    expect(second.instructions.map((item) => item.text)).toEqual([
+      "child done",
+      "before",
+    ]);
+    expect(second.active).toEqual(node("enter-capture-seg-arc", "Main"));
+
+    const third = progressBrief(runtime, second, { move: "proceed" });
+
+    expect(third.instructions.map((item) => item.text)).toEqual(["after"]);
+    expect(third.active).toEqual(node("enter-capture-seg-arc", "Main"));
   });
 
   it("commits returns channel values when an entered child reaches COVERED", () => {
@@ -2340,7 +3506,125 @@ function Main() {
     expect(rootTraversal(afterDeflect).phase).toBe("suspended");
   });
 
-  it("fails fast at runtime when args channel keys are not wired by enter()", () => {
+  it("keeps enterLoop() returns transactional until the whole loop resolves", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const stop = new Boolean({
+    observing: \`should the loop stop\`,
+  });
+  const verdict = new Boolean();
+
+  enterLoop(fresh(Child), {
+    resolveWhen: () => {
+      observe(stop);
+      return stop === true;
+    },
+    returns: { verdict },
+  });
+
+  \`after\`;
+
+  function Child({ returns }) {
+    instruct(\`child step\`, {
+      deflectWhen: \`\${user} wants to switch topics\`,
+    });
+
+    this.effects = () => {
+      returns.verdict.set(true);
+    };
+  }
+}
+`);
+    const runtime = new Runtime().add("enter-loop-transaction-arc", document);
+    const seeded = runtime.newTraversal(
+      arc("enter-loop-transaction-arc", "Main"),
+    );
+    seeded.phase = "entered";
+
+    const first = runtime.start([seeded], EMPTY_DIALOG);
+    expect(first.instructions.map((item) => item.text)).toEqual(["child step"]);
+
+    const waitingForStop = progressBrief(runtime, first, {
+      move: "proceed",
+      judgments: {
+        [first.judgments[0]!.id]: false,
+      },
+    });
+    expect(waitingForStop.observations).toHaveLength(1);
+    expect(rootTraversal(waitingForStop).variables.verdict).toBeUndefined();
+
+    const secondIteration = progressBrief(runtime, waitingForStop, {
+      move: "proceed",
+      observations: {
+        [waitingForStop.observations[0]!.id]: {
+          status: "resolved",
+          value: false,
+        },
+      },
+    });
+    expect(secondIteration.instructions.map((item) => item.text)).toEqual([
+      "child step",
+    ]);
+    expect(rootTraversal(secondIteration).variables.verdict).toBeUndefined();
+
+    const secondResolution = progressBrief(runtime, secondIteration, {
+      move: "proceed",
+    });
+    expect(secondResolution.judgments).toHaveLength(1);
+
+    const afterDeflect = progressBrief(runtime, secondResolution, {
+      move: "proceed",
+      judgments: {
+        [secondResolution.judgments[0]!.id]: true,
+      },
+    });
+    expect(rootTraversal(afterDeflect).variables.verdict).toBeUndefined();
+    expect(rootTraversal(afterDeflect).phase).toBe("suspended");
+  });
+
+  it("commits transactional enterLoop() returns only on whole-loop resolution", () => {
+    const document = parse(`
+"use arc v2";
+
+function Main() {
+  const verdict = new Boolean();
+  const stop = new Boolean();
+  stop.set(true);
+
+  enterLoop(fresh(Child), {
+    resolveWhen: () => {
+      return stop === true;
+    },
+    returns: { verdict },
+  });
+
+  \`after\`;
+
+  function Child({ returns }) {
+    instruct(\`child step\`);
+
+    this.effects = () => {
+      returns.verdict.set(true);
+    };
+  }
+}
+`);
+    const runtime = new Runtime().add("enter-loop-commit-arc", document);
+    const seeded = runtime.newTraversal(arc("enter-loop-commit-arc", "Main"));
+    seeded.phase = "entered";
+
+    const first = runtime.start([seeded], EMPTY_DIALOG);
+    const resolved = progressBrief(runtime, first, {
+      move: "proceed",
+    });
+
+    expect(rootTraversal(resolved).variables.verdict).toBe(true);
+    expect(resolved.instructions.map((item) => item.text)).toEqual(["after"]);
+  });
+
+  it("poisons traversal at runtime when args channel keys are not wired by enter()", () => {
     const document = parse(`
 "use arc v2";
 
@@ -2361,12 +3645,17 @@ function Main() {
     const seeded = runtime.newTraversal(arc("enter-missing-args-arc", "Main"));
     seeded.phase = "entered";
 
-    expect(() => runtime.start([seeded], { lastTurns: [] })).toThrow(
-      /Unknown args channel key "ready"/,
-    );
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    expect(rootTraversal(brief).phase).toBe("poisoned");
+    expect(brief.canProgress).toBe(false);
+    expect(brief.issues).toEqual([
+      expect.objectContaining({
+        kind: "poisoned-traversal",
+      }),
+    ]);
   });
 
-  it("fails fast at runtime when args channel keys are read in normal action flow but not wired", () => {
+  it("poisons traversal when args channel keys are read in normal action flow but not wired", () => {
     const document = parse(`
 "use arc v2";
 
@@ -2389,12 +3678,17 @@ function Main() {
     );
     seeded.phase = "entered";
 
-    expect(() => runtime.start([seeded], { lastTurns: [] })).toThrow(
-      /Unknown args channel key "ready"/,
-    );
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    expect(rootTraversal(brief).phase).toBe("poisoned");
+    expect(brief.canProgress).toBe(false);
+    expect(brief.issues).toEqual([
+      expect.objectContaining({
+        kind: "poisoned-traversal",
+      }),
+    ]);
   });
 
-  it("fails fast at runtime when returns channel keys are not wired by enter()", () => {
+  it("poisons traversal when returns channel keys are not wired by enter()", () => {
     const document = parse(`
 "use arc v2";
 
@@ -2416,9 +3710,14 @@ function Main() {
     );
     seeded.phase = "entered";
 
-    expect(() => runtime.start([seeded], { lastTurns: [] })).toThrow(
-      /Unknown return channel key "verdict"/,
-    );
+    const brief = runtime.start([seeded], { lastTurns: [] });
+    expect(rootTraversal(brief).phase).toBe("poisoned");
+    expect(brief.canProgress).toBe(false);
+    expect(brief.issues).toEqual([
+      expect.objectContaining({
+        kind: "poisoned-traversal",
+      }),
+    ]);
   });
 
   it("evaluates regexTest expressions at runtime", () => {

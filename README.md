@@ -23,20 +23,20 @@ LLM-powered interactions vary along two axes: how deep the domain knowledge is, 
 
 An LLM-native application that uses Arc is called a **host**. The host handles all semantic work: calling the LLM, interpreting user messages, delivering content. Arc handles traversal logic and state; the host handles meaning.
 
-An author writes an Arc script as a graph of nodes containing variables, branching logic, triggers, and effects. The host parses the script and runs it turn by turn through a **brief/report** protocol: when the runtime reaches a point requiring semantic judgment — is the user interested? have they mentioned a specific topic? — it yields a **brief** describing what it needs. The host resolves the brief (typically by prompting an LLM) and sends back a **report**. The runtime applies the report and advances.
+An author writes an Arc script as a graph of nodes containing variables, branching logic, triggers, and effects. The host parses the script and advances it through a **brief/report** protocol: when the runtime reaches a point requiring semantic judgment — is the user interested? have they mentioned a specific topic? — it yields a **brief** describing what it needs. The host resolves the brief (typically by prompting an LLM) and sends back a **report**. The runtime applies the report and advances.
 
 This separation keeps Arc scripts declarative and testable while giving the host full control over LLM calls, content presentation, and external integrations.
 
 ### Inside an arc
 
-Each arc is a top-level function in an Arc script — a `.js` file executed by the Arc runtime rather than a standard JavaScript engine. An arc defines a self-contained interaction flow through four parts:
+Each arc is a top-level function in an Arc script. An arc defines a self-contained interaction flow through four parts:
 
 - **Variables** — typed state that persists across turns: enums, booleans, and bounded integers. Each can carry an observation question for the host to evaluate against conversation context.
 - **A trigger** — conditions under which the arc activates: pattern matches on recent messages, semantic checks via `judge()`, enter-count guards.
 - **An action graph** — the sequential body: observations that extract state from conversation, instructions for the host to deliver, conditional branches, and entries into child nodes or imported arcs.
 - **Effects** — post-resolution work: final observations and emitted host effects (e.g., writing to memory, updating external systems).
 
-The runtime walks the action graph top-down each turn, skipping actions resolved in prior turns and stopping at the first unresolved one. This turn-by-turn progression is what makes arcs stateful.
+The runtime walks the action graph top-down on host calls, skipping actions resolved in prior walks and stopping at the first unresolved one. This host-driven progression is what makes arcs stateful.
 
 ## Example
 
@@ -76,3 +76,4 @@ The spec documents cover precise language and runtime details:
 
 - [Arc Scripts](specs/arc-scripts.md)
 - [Arc Runtime API](specs/arc-runtime-api.md)
+- [Internal Semantics](specs/internal-semantics.md)

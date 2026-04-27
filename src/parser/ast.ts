@@ -9,6 +9,7 @@ import type {
   SourceRange,
   ValueExpression,
 } from "../types.js";
+import { parseTarget, type TargetParseContext } from "./targets.js";
 
 export function isExpressionStatement(
   node: acorn.Statement | acorn.ModuleDeclaration,
@@ -255,6 +256,7 @@ export function parseExpression(
   node: acorn.Expression,
   availableHostModules: ReadonlyMap<string, string> = new Map(),
   nextId?: () => number,
+  targetContext?: TargetParseContext,
 ): ValueExpression {
   if (node.type === "LogicalExpression") {
     if (node.operator !== "&&" && node.operator !== "||") {
@@ -263,8 +265,18 @@ export function parseExpression(
     return {
       kind: "logical",
       op: node.operator,
-      left: parseExpression(node.left, availableHostModules, nextId),
-      right: parseExpression(node.right, availableHostModules, nextId),
+      left: parseExpression(
+        node.left,
+        availableHostModules,
+        nextId,
+        targetContext,
+      ),
+      right: parseExpression(
+        node.right,
+        availableHostModules,
+        nextId,
+        targetContext,
+      ),
     };
   }
 
@@ -279,6 +291,7 @@ export function parseExpression(
         node.argument as acorn.Expression,
         availableHostModules,
         nextId,
+        targetContext,
       ),
     };
   }
@@ -291,16 +304,32 @@ export function parseExpression(
         node.left as acorn.Expression,
         availableHostModules,
         nextId,
+        targetContext,
       ),
       right: parseExpression(
         node.right as acorn.Expression,
         availableHostModules,
         nextId,
+        targetContext,
       ),
     };
   }
 
   if (node.type === "CallExpression") {
+    if (isDeflectionFromCall(node)) {
+      if (!targetContext) {
+        throw new Error(
+          "deflection.from(...) is only available inside this.catchDeflection",
+        );
+      }
+      if (node.arguments.length !== 1) {
+        throw new Error("deflection.from() accepts exactly one target");
+      }
+      return {
+        kind: "deflectionFrom",
+        target: parseTarget(node.arguments[0], "deflectionFrom", targetContext),
+      };
+    }
     if (node.callee.type !== "Super") {
       const hostCallTarget = parseHostCallTarget(
         node.callee,
@@ -366,6 +395,17 @@ export function parseExpression(
   }
 
   return expressionToLocalExpression(node, availableHostModules, nextId);
+}
+
+function isDeflectionFromCall(node: acorn.CallExpression): boolean {
+  return (
+    node.callee.type === "MemberExpression" &&
+    !node.callee.computed &&
+    node.callee.object.type === "Identifier" &&
+    node.callee.object.name === "deflection" &&
+    node.callee.property.type === "Identifier" &&
+    node.callee.property.name === "from"
+  );
 }
 
 export function parseHostCallTarget(

@@ -13,12 +13,14 @@ import type {
   NodeRef,
   NodeState,
   PayloadValue,
-  PendingEffects,
+  PrimitiveValue,
   Statement,
   Traversal,
   TriggerStatement,
+  ValueExpression,
 } from "../types.js";
 import {
+  type ActionOutcome,
   applyObserve,
   applySet,
   applySetReturn,
@@ -30,6 +32,7 @@ import {
   truthy,
 } from "./evaluate.js";
 import {
+  arcToNodeRef,
   findTraversalInSet,
   formatRef,
   getEntryForRef,
@@ -37,17 +40,12 @@ import {
   isArcRef,
   isArcTraversal,
   rootRefOf,
-  toNodeRef,
-  toNodeRefParts,
   toPseudoChildRef,
   traversalToNodeRef,
 } from "./refs.js";
 import {
   type Accumulator,
-  type EnterIterationStatus,
-  type EvalResult,
   type RegistryEntry,
-  type RunStatus,
   canBatchInstruction,
   clearActionState,
   clearEvaluatorActionStates,
@@ -60,23 +58,259 @@ import {
   ensureEphemeralTraversal,
   ensureOwnedTraversal,
   enterLoopFrameKey,
+  findEphemeralTraversal,
   getActionState,
   getEvaluatorActionState,
   instructionBatchSignature,
   instructionResolutionFrameKey,
+  isEnteredTraversal,
   isInstructionBatchActive,
-  isNodeState,
   isResolvedActionState,
-  isStopped,
+  isSuspendedArcTraversal,
   makeInstructionId,
   markActionResolved,
   markEvaluatorActionResolved,
   markPendingActionState,
   noteBriefYield,
   replaceEphemeralTraversal,
-  selectActionRootTraversal,
   setActiveTraversal,
 } from "./state.js";
+
+type TerminalTraversalState = Extract<NodeState, "covered" | "skipped">;
+
+type SegOutcome<TResult> =
+  | { status: "done"; value: TResult }
+  | { status: "blocked" }
+  | { status: "deflected"; active: NodeRef };
+
+type WalkResult<TResult> = { status: "rewalk" } | SegOutcome<TResult>;
+
+type LeafStep<TResult> = { status: "advance" } | WalkResult<TResult>;
+
+type TraversalOutcome =
+  | { status: "done"; finalState: TerminalTraversalState }
+  | { status: "blocked" }
+  | { status: "deflected"; active: NodeRef };
+
+type HookOutcome<TResult> = SegOutcome<TResult>;
+
+type EnterActionOutcome =
+  | {
+      status: "resolved";
+      traversal: Traversal;
+      finalState: TerminalTraversalState;
+    }
+  | { status: "blocked"; traversal: Traversal }
+  | { status: "deflected"; traversal: Traversal; active: NodeRef };
+
+function isResultNodeState(
+  result: ActionOutcome<unknown>,
+): result is ActionOutcome<NodeState> {
+  return (
+    result.status === "resolved" &&
+    (result.value === "covered" ||
+      result.value === "deflected" ||
+      result.value === "skipped")
+  );
+}
+
+type SegFrame<TStatement extends { kind: string }> = {
+  statements: readonly TStatement[];
+  index: number;
+  label?: string;
+};
+
+type IfLike<TStatement extends { kind: string }> = TStatement & {
+  kind: "if";
+  test: ValueExpression;
+  consequent: TStatement[];
+  alternate?: TStatement[];
+};
+
+type LabelLike<TStatement extends { kind: string }> = TStatement & {
+  kind: "label";
+  label: string;
+  body: TStatement[];
+};
+
+type BreakLike<TStatement extends { kind: string }> = TStatement & {
+  kind: "break";
+  label: string;
+};
+
+type ReturnLike = {
+  kind: "return";
+  value?: ValueExpression;
+};
+
+type BranchResult<TStatement extends { kind: string }, TResult> =
+  | { status: "branch"; statements: readonly TStatement[] }
+  | SegOutcome<TResult>;
+
+type SegHooks<TStatement extends { kind: string }, TResult> = {
+  doneValue: TResult;
+  evaluateIf: (
+    statement: IfLike<TStatement>,
+  ) => BranchResult<TStatement, TResult>;
+  evaluateReturn?: (statement: ReturnLike) => SegOutcome<TResult>;
+  isResolvedLeaf?: (statement: TStatement) => boolean;
+  stepLeaf: (statement: TStatement) => LeafStep<TResult>;
+};
+
+/**
+ * Runs one smallest enclosing graph (SEG) to a terminal outcome.
+ *
+ * `runSeg(...)` owns the SEG re-walk loop. `walkSeg(...)` performs one
+ * top-down pass; when a briefable action or enter action resolves and requests
+ * re-walk, `runSeg(...)` starts a fresh pass from the SEG root.
+ */
+function runSeg<TStatement extends { kind: string }, TResult>(
+  statements: readonly TStatement[],
+  hooks: SegHooks<TStatement, TResult>,
+): SegOutcome<TResult> {
+  while (true) {
+    const outcome = walkSeg(statements, hooks);
+    if (outcome.status === "rewalk") continue;
+    return outcome;
+  }
+}
+
+/**
+ * Performs one top-down DFS pass through a SEG's structural control flow.
+ *
+ * This walker owns `if` / `label` / `break` sequencing with an explicit stack.
+ * Leaf semantics are delegated through `hooks.stepLeaf(...)`; the walker
+ * itself does not know what Arc leaf statements mean.
+ */
+function walkSeg<TStatement extends { kind: string }, TResult>(
+  statements: readonly TStatement[],
+  hooks: SegHooks<TStatement, TResult>,
+): WalkResult<TResult> {
+  const stack: SegFrame<TStatement>[] = [{ statements, index: 0 }];
+
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1]!;
+    const statement = frame.statements[frame.index];
+
+    if (!statement) {
+      stack.pop();
+      if (stack.length === 0) {
+        return { status: "done", value: hooks.doneValue };
+      }
+      stack[stack.length - 1]!.index += 1;
+      continue;
+    }
+
+    if (statement.kind === "if") {
+      const branch = hooks.evaluateIf(statement as IfLike<TStatement>);
+      if (branch.status !== "branch") return branch;
+      if (branch.statements.length === 0) {
+        frame.index += 1;
+        continue;
+      }
+      stack.push({ statements: branch.statements, index: 0 });
+      continue;
+    }
+
+    if (statement.kind === "label") {
+      const labeled = statement as LabelLike<TStatement>;
+      if (labeled.body.length === 0) {
+        frame.index += 1;
+        continue;
+      }
+      stack.push({
+        statements: labeled.body,
+        index: 0,
+        label: labeled.label,
+      });
+      continue;
+    }
+
+    if (statement.kind === "break") {
+      unwindSegBreak(stack, (statement as BreakLike<TStatement>).label);
+      continue;
+    }
+
+    if (statement.kind === "return") {
+      if (!hooks.evaluateReturn) {
+        throw new Error("Return statements are unsupported in this SEG");
+      }
+      return hooks.evaluateReturn(statement as ReturnLike);
+    }
+
+    if (hooks.isResolvedLeaf?.(statement)) {
+      frame.index += 1;
+      continue;
+    }
+
+    const outcome = hooks.stepLeaf(statement);
+    if (outcome.status === "advance") {
+      frame.index += 1;
+      continue;
+    }
+    return outcome;
+  }
+
+  return { status: "done", value: hooks.doneValue };
+}
+
+function unwindSegBreak<TStatement extends { kind: string }>(
+  stack: SegFrame<TStatement>[],
+  label: string,
+): void {
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    if (frame.label === label) {
+      const parent = stack[stack.length - 1];
+      if (!parent) {
+        throw new Error(`Unhandled break label: ${label}`);
+      }
+      parent.index += 1;
+      return;
+    }
+  }
+
+  throw new Error(`Unhandled break label: ${label}`);
+}
+
+function blockSeg<TResult>(
+  accum: Accumulator,
+  traversal: Traversal,
+): SegOutcome<TResult> {
+  blockTraversal(accum, traversal);
+  return { status: "blocked" };
+}
+
+function deflectSeg<TResult>(traversal: Traversal): SegOutcome<TResult> {
+  const outcome = deflectTraversal(traversal);
+  if (outcome.status !== "deflected") {
+    throw new Error("Expected deflected traversal outcome");
+  }
+  return { status: "deflected", active: outcome.active };
+}
+
+function evaluateIfBranch<TStatement extends { kind: string }, TResult>(
+  statement: IfLike<TStatement>,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): BranchResult<TStatement, TResult> {
+  const result = evaluateValueExpression(
+    statement.test,
+    traversal,
+    node,
+    accum,
+  );
+  if (result.status === "blocked") {
+    return blockSeg(accum, traversal);
+  }
+  return {
+    status: "branch",
+    statements: truthy(result.value)
+      ? statement.consequent
+      : (statement.alternate ?? []),
+  };
+}
 
 export function runTrigger(
   node: Node,
@@ -84,108 +318,75 @@ export function runTrigger(
   accum: Accumulator,
 ): boolean {
   if (!node.trigger) return true;
-  const result = runTriggerStatements(
-    node,
-    traversal,
-    node.trigger,
-    accum,
-    "trigger",
-  );
-  if (result.status === "blocked") return false;
-  clearEvaluatorActionStates(traversal, "trigger");
-  return truthy(result.value);
-}
 
-export function runTriggerStatements(
-  node: Node,
-  traversal: Traversal,
-  statements: TriggerStatement[],
-  accum: Accumulator,
-  frameKey: string,
-): EvalResult {
-  for (const statement of statements) {
-    if (statement.kind === "if") {
-      const result = evaluateValueExpression(
-        statement.test,
-        traversal,
-        node,
-        accum,
-      );
-      if (result.status === "blocked") return blockTraversal(accum, traversal);
-      const branch = truthy(result.value)
-        ? statement.consequent
-        : (statement.alternate ?? []);
-      const branchResult = runTriggerStatements(
-        node,
-        traversal,
-        branch,
-        accum,
-        frameKey,
-      );
-      if (branchResult.status === "blocked") return branchResult;
-      if (truthy(branchResult.value)) return branchResult;
-      continue;
-    }
-
-    if (statement.kind === "return") {
-      if (!statement.value) return { status: "value", value: false };
+  const outcome = runSeg<TriggerStatement, boolean>(node.trigger, {
+    doneValue: false,
+    evaluateIf: (statement) =>
+      evaluateIfBranch(statement, traversal, node, accum),
+    evaluateReturn: (statement) => {
+      if (!statement.value) return { status: "done", value: false };
       const result = evaluateValueExpression(
         statement.value,
         traversal,
         node,
         accum,
       );
-      if (result.status === "blocked") return blockTraversal(accum, traversal);
-      return { status: "value", value: truthy(result.value) };
-    }
-
-    if (
+      if (result.status === "blocked") {
+        return blockSeg(accum, traversal);
+      }
+      return { status: "done", value: truthy(result.value) };
+    },
+    isResolvedLeaf: (statement) =>
+      (statement.kind === "observe" || statement.kind === "set") &&
       isResolvedActionState(
-        getEvaluatorActionState(traversal, frameKey, statement),
-      )
-    ) {
-      continue;
-    }
+        getEvaluatorActionState(traversal, "trigger", statement),
+      ),
+    stepLeaf: (statement) => {
+      if (statement.kind === "observe") {
+        const apply = applyObserve(statement, traversal, node, accum);
+        if (apply.status === "blocked") {
+          return blockSeg(accum, traversal);
+        }
+        markEvaluatorActionResolved(traversal, "trigger", statement);
+        return { status: "rewalk" };
+      }
 
-    if (statement.kind === "observe") {
-      const apply = applyObserve(statement, traversal, node, accum);
-      if (apply.status === "blocked") return blockTraversal(accum, traversal);
-      markEvaluatorActionResolved(traversal, frameKey, statement);
-      continue;
-    }
+      if (statement.kind === "set") {
+        const apply = applySet(statement, traversal, node, accum);
+        if (apply.status === "blocked") {
+          return blockSeg(accum, traversal);
+        }
+        markEvaluatorActionResolved(traversal, "trigger", statement);
+        return { status: "rewalk" };
+      }
+
+      {
+        throw new Error(
+          `Unsupported trigger leaf statement: ${statement.kind}`,
+        );
+      }
+    },
+  });
+  if (outcome.status === "blocked") return false;
+  if (outcome.status === "deflected") {
+    throw new Error("Triggers cannot deflect");
   }
-
-  return { status: "value", value: false };
+  clearEvaluatorActionStates(traversal, "trigger");
+  return truthy(outcome.value);
 }
 
-export function runGuardStatements(
+function runGuardStatements(
   node: Node,
   traversal: Traversal,
   statements: GuardStatement[],
   accum: Accumulator,
-): NodeState | undefined {
-  for (const statement of statements) {
-    if (statement.kind === "if") {
-      const result = evaluateValueExpression(
-        statement.test,
-        traversal,
-        node,
-        accum,
-      );
-      if (result.status === "blocked") {
-        blockTraversal(accum, traversal);
-        return undefined;
-      }
-      const branch = truthy(result.value)
-        ? statement.consequent
-        : (statement.alternate ?? []);
-      const state = runGuardStatements(node, traversal, branch, accum);
-      if (accum.blocked || state) return state;
-      continue;
-    }
-
-    if (statement.kind === "return") {
-      if (!statement.value) return undefined;
+): ActionOutcome<NodeState | undefined> {
+  const outcome = runSeg<GuardStatement, NodeState | undefined>(statements, {
+    doneValue: undefined,
+    evaluateIf: (statement) =>
+      evaluateIfBranch(statement, traversal, node, accum),
+    evaluateReturn: (statement) => {
+      if (!statement.value) return { status: "done", value: undefined };
       const result = evaluateValueExpression(
         statement.value,
         traversal,
@@ -193,29 +394,47 @@ export function runGuardStatements(
         accum,
       );
       if (result.status === "blocked") {
-        blockTraversal(accum, traversal);
-        return undefined;
+        return blockSeg(accum, traversal);
       }
-      return isNodeState(result.value) ? result.value : undefined;
-    }
-
-    if (isResolvedActionState(getActionState(traversal, statement))) continue;
-
-    if (statement.kind === "observe") {
-      const apply = applyObserve(statement, traversal, node, accum);
-      if (apply.status === "blocked") {
-        blockTraversal(accum, traversal);
-        return undefined;
+      return isResultNodeState(result)
+        ? { status: "done", value: result.value }
+        : { status: "done", value: undefined };
+    },
+    isResolvedLeaf: (statement) =>
+      (statement.kind === "observe" || statement.kind === "set") &&
+      isResolvedActionState(getActionState(traversal, statement)),
+    stepLeaf: (statement) => {
+      if (statement.kind === "observe") {
+        const apply = applyObserve(statement, traversal, node, accum);
+        if (apply.status === "blocked") {
+          return blockSeg(accum, traversal);
+        }
+        markActionResolved(traversal, statement);
+        return { status: "rewalk" };
       }
-      markActionResolved(traversal, statement);
-      continue;
-    }
+
+      if (statement.kind === "set") {
+        const apply = applySet(statement, traversal, node, accum);
+        if (apply.status === "blocked") {
+          return blockSeg(accum, traversal);
+        }
+        markActionResolved(traversal, statement);
+        return { status: "rewalk" };
+      }
+
+      throw new Error(`Unsupported guard leaf statement: ${statement.kind}`);
+    },
+  });
+  if (outcome.status === "blocked") {
+    return { status: "blocked" };
   }
-
-  return undefined;
+  if (outcome.status === "deflected") {
+    throw new Error("Guards cannot deflect");
+  }
+  return { status: "resolved", value: outcome.value };
 }
 
-export function runTurn(accum: Accumulator): void {
+export function continueArc(accum: Accumulator): void {
   const rootNode = getNodeForRef(
     accum.entries,
     accum.entry,
@@ -225,175 +444,173 @@ export function runTurn(accum: Accumulator): void {
     throw new Error(
       `Unknown root traversal node: ${formatRef(accum.traversal.ref)}`,
     );
-  if (isArcTraversal(accum.traversal) && accum.traversal.pendingEffects) {
-    const pendingEffects = accum.traversal.pendingEffects;
-    const status = runPendingEffects(accum, pendingEffects);
-    if (status.status !== "done") return;
-    completePendingEffects(accum, pendingEffects);
-    return;
-  }
-  const status = runTraversal(accum.traversal, rootNode, accum, true);
-  if (status.status === "break") {
-    throw new Error(`Unhandled break label: ${status.label}`);
-  }
-  if (status.status === "deflected") {
-    const rootTraversal = accum.traversal;
-    if (!isArcTraversal(rootTraversal) || !rootTraversal.pendingEffects) {
-      throw new Error("Deflected root traversal is missing pending effects");
-    }
-    const pendingEffects = rootTraversal.pendingEffects;
-    const pendingStatus = runPendingEffects(accum, pendingEffects);
-    if (pendingStatus.status !== "done") return;
-    completePendingEffects(accum, pendingEffects);
-    return;
-  }
-  if (status.status !== "done") return;
-  accum.traversal.state = "covered";
-  if (isArcTraversal(accum.traversal)) {
-    accum.traversal.phase = "completed";
-  }
+  runTraversal(accum.traversal, rootNode, accum, true);
 }
 
-export function runTraversal(
+function runTraversal(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
   isRoot = false,
-): RunStatus {
-  setActiveTraversal(accum, traversal);
+): TraversalOutcome {
+  restart: while (true) {
+    setActiveTraversal(accum, traversal);
 
-  if (!isRoot) {
-    if (traversal.state === "covered" || traversal.state === "skipped") {
-      return { status: "done" };
+    if (traversal.finalizing) {
+      const finalized = continueFinalizingTraversal(traversal, node, accum);
+      if (finalized.status === "caught") continue restart;
+      return finalized;
     }
-    if (node.guard) {
-      const guardState = runGuardStatements(node, traversal, node.guard, accum);
-      if (accum.blocked) return { status: "blocked" };
-      if (guardState) {
-        traversal.state = guardState;
-        return { status: "done" };
+
+    if (!isRoot) {
+      if (traversal.state === "covered" || traversal.state === "skipped") {
+        return { status: "done", finalState: traversal.state };
+      }
+      if (node.guard) {
+        const guardResult = runGuardStatements(
+          node,
+          traversal,
+          node.guard,
+          accum,
+        );
+        if (guardResult.status === "blocked") {
+          return { status: "blocked" };
+        }
+        if (
+          guardResult.value === "covered" ||
+          guardResult.value === "skipped"
+        ) {
+          traversal.state = guardResult.value;
+          return { status: "done", finalState: guardResult.value };
+        }
+        if (guardResult.value === "deflected") {
+          throw new Error(
+            "Returning State.DEFLECTED from a guard is unsupported yet",
+          );
+        }
+        traversal.state = undefined;
       }
     }
+
+    const outcome = runSeg<Statement, void>(node.statements, {
+      doneValue: undefined,
+      evaluateIf: (statement) =>
+        evaluateIfBranch(statement, traversal, node, accum),
+      isResolvedLeaf: (statement) => isResolvedActionLeaf(traversal, statement),
+      stepLeaf: (statement) =>
+        stepActionLeaf(traversal, node, statement as ActionStatement, accum),
+    });
+
+    if (outcome.status === "blocked") {
+      return { status: "blocked" };
+    }
+    if (outcome.status === "deflected") {
+      traversal.finalizing = {
+        reason: "deflected",
+        active: outcome.active,
+        phase: "catch",
+      };
+      continue restart;
+    }
+
+    if (isInstructionBatchActive(accum, traversal)) {
+      return blockTraversal(accum, traversal);
+    }
+
+    traversal.finalizing = {
+      reason: "covered",
+      active: traversalToNodeRef(traversal),
+      phase: "effects",
+    };
+  }
+}
+
+function continueFinalizingTraversal(
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): TraversalOutcome | { status: "caught" } {
+  const finalizing = traversal.finalizing;
+  if (!finalizing) {
+    throw new Error("Traversal is not finalizing");
   }
 
-  for (let index = 0; index < node.statements.length; index++) {
-    const statement = node.statements[index];
-    if (!statement) continue;
-    const status = runStatement(traversal, node, statement, accum);
-    if (status.status !== "done") return status;
-  }
-
-  if (isInstructionBatchActive(accum, traversal)) {
-    return { status: "yielded" };
+  if (finalizing.reason === "deflected" && finalizing.phase === "catch") {
+    const caught = evaluateCatchDeflection(traversal, node, accum);
+    if (caught.status === "blocked") return { status: "blocked" };
+    if (caught.value) {
+      traversal.finalizing = undefined;
+      return { status: "caught" };
+    }
+    traversal.state = "deflected";
+    traversal.finalizing = { ...finalizing, phase: "effects" };
   }
 
   const effects = runEffects(traversal, node, accum);
   if (effects.status !== "done") return effects;
 
-  traversal.state = "covered";
+  traversal.finalizing = undefined;
+  traversal.state = finalizing.reason;
   if (isArcTraversal(traversal)) {
-    traversal.phase = "completed";
+    traversal.phase =
+      finalizing.reason === "covered" ? "completed" : "suspended";
   }
-  return { status: "done" };
+  if (finalizing.reason === "deflected") {
+    return { status: "deflected", active: finalizing.active };
+  }
+  return { status: "done", finalState: "covered" };
 }
 
-export function runStatementBlock(
+function isResolvedActionLeaf(
   traversal: Traversal,
-  node: Node,
-  statements: Statement[],
-  accum: Accumulator,
-): RunStatus {
-  for (const statement of statements) {
-    const status = runStatement(traversal, node, statement, accum);
-    if (status.status !== "done") return status;
-  }
-  return { status: "done" };
-}
-
-export function runStatement(
-  traversal: Traversal,
-  node: Node,
   statement: Statement,
-  accum: Accumulator,
-): RunStatus {
-  if (statement.kind === "if") {
-    const result = evaluateValueExpression(
-      statement.test,
-      traversal,
-      node,
-      accum,
-    );
-    if (result.status === "blocked") {
-      if (isInstructionBatchActive(accum, traversal)) {
-        return { status: "yielded" };
-      }
-      return blockTraversal(accum, traversal);
-    }
-    const branch = truthy(result.value)
-      ? statement.consequent
-      : (statement.alternate ?? []);
-    return runStatementBlock(traversal, node, branch, accum);
+): boolean {
+  if (
+    statement.kind !== "observe" &&
+    statement.kind !== "observeOrAsk" &&
+    statement.kind !== "set" &&
+    statement.kind !== "set-return" &&
+    statement.kind !== "instruction" &&
+    statement.kind !== "enter-node" &&
+    statement.kind !== "enter-loop"
+  ) {
+    return false;
   }
-
-  if (statement.kind === "label") {
-    const status = runStatementBlock(traversal, node, statement.body, accum);
-    if (status.status === "break" && status.label === statement.label) {
-      return { status: "done" };
-    }
-    return status;
-  }
-
-  if (statement.kind === "break") {
-    return { status: "break", label: statement.label };
-  }
-
-  return runAction(traversal, node, statement, accum);
+  return isResolvedActionState(getActionState(traversal, statement));
 }
 
-export function runAction(
+function stepActionLeaf(
   traversal: Traversal,
   node: Node,
   statement: ActionStatement,
   accum: Accumulator,
-): RunStatus {
-  if (isResolvedActionState(getActionState(traversal, statement))) {
-    return { status: "done" };
-  }
-
-  if (
-    statement.kind === "instruction" &&
-    isInstructionBatchActive(accum, traversal) &&
-    !canBatchInstruction(accum, statement)
-  ) {
-    return { status: "yielded" };
-  }
-
+): LeafStep<void> {
   if (
     isInstructionBatchActive(accum, traversal) &&
     statement.kind !== "instruction"
   ) {
-    return { status: "yielded" };
+    return blockSeg(accum, traversal);
   }
 
   if (statement.kind === "observe" || statement.kind === "observeOrAsk") {
-    const status = applyObserve(statement, traversal, node, accum);
-    if (status.status === "blocked") return blockTraversal(accum, traversal);
+    const outcome = applyObserve(statement, traversal, node, accum);
+    if (outcome.status === "blocked") return blockSeg(accum, traversal);
     markActionResolved(traversal, statement);
-    return { status: "done" };
+    return { status: "rewalk" };
   }
 
   if (statement.kind === "set") {
     const apply = applySet(statement, traversal, node, accum);
-    if (apply.status === "blocked") return blockTraversal(accum, traversal);
+    if (apply.status === "blocked") return blockSeg(accum, traversal);
     markActionResolved(traversal, statement);
-    return { status: "done" };
+    return { status: "rewalk" };
   }
 
   if (statement.kind === "set-return") {
     const apply = applySetReturn(statement, traversal, node, accum);
-    if (apply.status === "blocked") return blockTraversal(accum, traversal);
+    if (apply.status === "blocked") return blockSeg(accum, traversal);
     markActionResolved(traversal, statement);
-    return { status: "done" };
+    return { status: "rewalk" };
   }
 
   if (statement.kind === "instruction") {
@@ -408,7 +625,7 @@ export function runAction(
     return runEnterLoopAction(traversal, node, statement, accum);
   }
 
-  return { status: "done" };
+  throw new Error("Unsupported action leaf statement");
 }
 
 function runEnterNodeAction(
@@ -416,7 +633,7 @@ function runEnterNodeAction(
   node: Node,
   statement: Extract<ActionStatement, { kind: "enter-node" }>,
   accum: Accumulator,
-): RunStatus {
+): LeafStep<void> {
   const target = resolveEnterTarget(accum, traversal, node, statement);
   if (!target) {
     throw new Error(
@@ -426,18 +643,21 @@ function runEnterNodeAction(
 
   const result = runEnterIteration(traversal, node, statement, target, accum);
   if (result.status === "blocked") {
-    return result;
+    return { status: "blocked" };
   }
-  if (result.status === "deflected" || result.status === "yielded") {
-    return result;
+  if (result.status === "deflected") {
+    return { status: "deflected", active: result.active };
   }
   if (result.finalState === "covered") {
     commitEnterReturnChannels(result.traversal, accum);
   }
   if (result.finalState === "covered" || result.finalState === "skipped") {
     markActionResolved(traversal, statement);
+    return { status: "rewalk" };
   }
-  return { status: "done" };
+  throw new Error(
+    `Enter action resolved without terminal child state: ${statement.target.identifier}`,
+  );
 }
 
 function runEnterLoopAction(
@@ -445,7 +665,7 @@ function runEnterLoopAction(
   node: Node,
   statement: Extract<ActionStatement, { kind: "enter-loop" }>,
   accum: Accumulator,
-): RunStatus {
+): LeafStep<void> {
   const target = resolveEnterTarget(accum, traversal, node, statement);
   if (!target) {
     throw new Error(
@@ -453,47 +673,77 @@ function runEnterLoopAction(
     );
   }
 
-  while (true) {
+  const existingState = getActionState(traversal, statement);
+  const stagedReturns =
+    existingState?.status === "pending" && existingState.stagedReturns
+      ? { ...existingState.stagedReturns }
+      : {};
+  const phase =
+    existingState?.status === "pending" &&
+    existingState.enterLoopPhase === "resolveWhen"
+      ? "resolveWhen"
+      : "target";
+  const loopState = {
+    phase,
+    stagedReturns,
+  };
+
+  restart: while (true) {
+    if (loopState.phase === "resolveWhen") {
+      const resolution = evaluateResolutionFunction(
+        statement.resolveWhen,
+        traversal,
+        node,
+        accum,
+        enterLoopFrameKey(statement),
+      );
+      if (resolution.status === "blocked") {
+        persistPendingEnterLoopState(
+          traversal,
+          statement,
+          "resolveWhen",
+          loopState.stagedReturns,
+        );
+        return blockSeg(accum, traversal);
+      }
+      clearEvaluatorActionStates(traversal, enterLoopFrameKey(statement));
+      if (truthy(resolution.value)) {
+        commitEnterReturnChannels(
+          currentEnterLoopTargetTraversal(traversal, target, accum),
+          accum,
+          loopState.stagedReturns,
+        );
+        markActionResolved(traversal, statement);
+        return { status: "rewalk" };
+      }
+      prepareNextEnterLoopIteration(traversal, target, accum);
+      loopState.phase = "target";
+      continue restart;
+    }
+
     const result = runEnterIteration(traversal, node, statement, target, accum);
     if (result.status === "blocked") {
-      return result;
+      persistPendingEnterLoopState(
+        traversal,
+        statement,
+        "target",
+        loopState.stagedReturns,
+      );
+      return { status: "blocked" };
     }
-    if (result.status === "deflected" || result.status === "yielded") {
-      return result;
+    if (result.status === "deflected") {
+      clearActionState(traversal, statement.id);
+      return { status: "deflected", active: result.active };
     }
     if (result.finalState === "covered") {
-      commitEnterReturnChannels(result.traversal, accum);
-    }
-
-    const resolution = evaluateResolutionFunction(
-      statement.resolveWhen,
-      traversal,
-      node,
-      accum,
-      enterLoopFrameKey(statement),
-    );
-    if (resolution.status === "blocked") {
-      return blockTraversal(accum, traversal);
-    }
-    clearEvaluatorActionStates(traversal, enterLoopFrameKey(statement));
-    if (truthy(resolution.value)) {
-      markActionResolved(traversal, statement);
-      return { status: "done" };
-    }
-
-    if (target.kind === "pseudo-owned") {
-      replaceEphemeralTraversal(
-        traversal,
-        target.ref,
-        createFreshNodeTraversal(target.ref, target.node, 0),
+      Object.assign(
+        loopState.stagedReturns,
+        result.traversal.enterChannels.stagedReturns,
       );
-      continue;
+      result.traversal.enterChannels.stagedReturns = {};
     }
-
-    restartTraversalForEntry(
-      result.traversal,
-      target.kind === "referenced" ? target.entry.root : target.node,
-    );
+    loopState.phase = "resolveWhen";
+    continue restart;
   }
 }
 
@@ -506,7 +756,7 @@ function runEnterIteration(
     | { kind: "referenced"; ref: ArcRef; entry: RegistryEntry }
     | { kind: "pseudo-owned"; ref: NodeRef; node: Node },
   accum: Accumulator,
-): EnterIterationStatus {
+): EnterActionOutcome {
   if (target.kind === "referenced") {
     if (!callerTraversal.refChildren.some((item) => item === target.ref)) {
       callerTraversal.refChildren.push(target.ref);
@@ -517,6 +767,11 @@ function runEnterIteration(
       target.entry.root,
       rootRefOf(callerTraversal.ref),
     );
+    prepareTraversalForEntry(
+      referencedTraversal,
+      target.entry.root,
+      statement.target,
+    );
     applyEnterChannels(
       callerTraversal,
       callerNode,
@@ -524,20 +779,20 @@ function runEnterIteration(
       referencedTraversal,
       accum,
     );
-    const status = runTraversal(
+    const outcome = runTraversal(
       referencedTraversal,
       target.entry.root,
       accum,
       false,
     );
-    return toEnterIterationStatus(status, referencedTraversal);
+    return toEnterActionOutcome(outcome, referencedTraversal);
   }
 
   const childTraversal =
     target.kind === "owned"
       ? ensureOwnedTraversal(accum, target.ref, target.node)
       : ensureEphemeralTraversal(callerTraversal, target.ref, target.node);
-  prepareChildTraversalForEntry(childTraversal, target.node);
+  prepareTraversalForEntry(childTraversal, target.node, statement.target);
   applyEnterChannels(
     callerTraversal,
     callerNode,
@@ -546,8 +801,8 @@ function runEnterIteration(
     accum,
   );
 
-  const childStatus = runTraversal(childTraversal, target.node, accum, false);
-  return toEnterIterationStatus(childStatus, childTraversal);
+  const childOutcome = runTraversal(childTraversal, target.node, accum, false);
+  return toEnterActionOutcome(childOutcome, childTraversal);
 }
 
 function runInstructionAction(
@@ -555,8 +810,31 @@ function runInstructionAction(
   node: Node,
   statement: InstructionAction,
   accum: Accumulator,
-): RunStatus {
+): LeafStep<void> {
+  if (
+    isInstructionBatchActive(accum, traversal) &&
+    !canBatchInstruction(accum, statement)
+  ) {
+    return blockSeg(accum, traversal);
+  }
+
   const actionState = getActionState(traversal, statement);
+  const instructionId = makeInstructionId(
+    accum.entry.arc,
+    traversal,
+    statement.id,
+  );
+  if (
+    accum.phase === "plan" &&
+    actionState?.status === "pending" &&
+    accum.yieldedInstructionIds.has(instructionId)
+  ) {
+    noteBriefYield(accum, traversal);
+    accum.instructionBatchNode ??= traversalToNodeRef(traversal);
+    accum.instructionBatchSignature ??= instructionBatchSignature(statement);
+    return blockSeg(accum, traversal);
+  }
+
   if (actionState?.status !== "pending") {
     const postcheck =
       accum.phase === "plan"
@@ -564,7 +842,7 @@ function runInstructionAction(
         : undefined;
     emitInstruction(statement, traversal, node, accum, "apply", postcheck);
     markPendingActionState(traversal, statement.id, statement.kind);
-    return { status: "done" };
+    return { status: "advance" };
   }
 
   const judgmentStart = accum.judgments.length;
@@ -578,7 +856,7 @@ function runInstructionAction(
         accum,
         instructionResolutionFrameKey(statement, "deflectWhen"),
       )
-    : ({ status: "value", value: false } satisfies EvalResult);
+    : ({ status: "resolved", value: false } satisfies ActionOutcome<boolean>);
   const resolveResult = evaluateInstructionResolution(
     statement,
     traversal,
@@ -587,7 +865,7 @@ function runInstructionAction(
   );
   if (deflectResult.status !== "blocked" && truthy(deflectResult.value)) {
     clearActionState(traversal, statement.id);
-    return deflectTraversal(accum, traversal);
+    return deflectSeg(traversal);
   }
   if (
     deflectResult.status === "blocked" ||
@@ -603,15 +881,15 @@ function runInstructionAction(
           )
         : undefined;
     emitInstruction(statement, traversal, node, accum, "postcheck", postcheck);
-    return blockTraversal(accum, traversal);
+    return { status: "advance" };
   }
   if (truthy(resolveResult.value)) {
     markActionResolved(traversal, statement);
-    return { status: "done" };
+    return { status: "rewalk" };
   }
 
   emitInstruction(statement, traversal, node, accum, "apply");
-  return { status: "done" };
+  return { status: "advance" };
 }
 
 function evaluateInstructionResolution(
@@ -619,9 +897,9 @@ function evaluateInstructionResolution(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): EvalResult {
+): ActionOutcome<boolean> {
   if (!statement.resolveWhen) {
-    return { status: "value", value: statement.mode === "once" };
+    return { status: "resolved", value: statement.mode === "once" };
   }
   return evaluateResolutionFunction(
     statement.resolveWhen,
@@ -630,6 +908,34 @@ function evaluateInstructionResolution(
     accum,
     instructionResolutionFrameKey(statement, "resolveWhen"),
   );
+}
+
+function evaluateCatchDeflection(
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): ActionOutcome<boolean> {
+  if (!node.catchDeflection || !traversal.finalizing) {
+    return { status: "resolved", value: false };
+  }
+
+  const previous = accum.deflectionActive;
+  accum.deflectionActive = traversal.finalizing.active;
+  try {
+    return evaluateResolutionFunction(
+      node.catchDeflection,
+      traversal,
+      node,
+      accum,
+      catchDeflectionFrameKey(traversal.finalizing.active),
+    );
+  } finally {
+    accum.deflectionActive = previous;
+  }
+}
+
+function catchDeflectionFrameKey(active: NodeRef): string {
+  return `catch-deflection:${active}`;
 }
 
 function collectInstructionPostcheck(
@@ -706,110 +1012,104 @@ export function evaluateResolutionFunction(
   node: Node,
   accum: Accumulator,
   frameKey: string,
-): EvalResult {
-  const result = evaluateResolutionStatements(
-    statements,
-    traversal,
-    node,
-    accum,
-    frameKey,
-  );
-  if (result.status !== "blocked") {
-    clearEvaluatorActionStates(traversal, frameKey);
-  }
-  return result;
-}
-
-function evaluateResolutionStatements(
-  statements: TriggerStatement[],
-  traversal: Traversal,
-  node: Node,
-  accum: Accumulator,
-  frameKey: string,
-): EvalResult {
-  for (const statement of statements) {
-    if (statement.kind === "if") {
-      const test = evaluateValueExpression(
-        statement.test,
-        traversal,
-        node,
-        accum,
-      );
-      if (test.status === "blocked") return test;
-      const branch = truthy(test.value)
-        ? statement.consequent
-        : (statement.alternate ?? []);
-      const branchResult = evaluateResolutionStatements(
-        branch,
-        traversal,
-        node,
-        accum,
-        frameKey,
-      );
-      if (branchResult.status === "blocked") return branchResult;
-      if (truthy(branchResult.value)) return branchResult;
-      continue;
-    }
-
-    if (statement.kind === "return") {
-      if (!statement.value) return { status: "value", value: false };
+): ActionOutcome<boolean> {
+  const outcome = runSeg<TriggerStatement, boolean>(statements, {
+    doneValue: false,
+    evaluateIf: (statement) =>
+      evaluateIfBranch(statement, traversal, node, accum),
+    evaluateReturn: (statement) => {
+      if (!statement.value) return { status: "done", value: false };
       const result = evaluateValueExpression(
         statement.value,
         traversal,
         node,
         accum,
       );
-      if (result.status === "blocked") return result;
-      return { status: "value", value: truthy(result.value) };
-    }
-
-    if (
+      if (result.status === "blocked") {
+        return blockSeg(accum, traversal);
+      }
+      return { status: "done", value: truthy(result.value) };
+    },
+    isResolvedLeaf: (statement) =>
+      (statement.kind === "observe" || statement.kind === "set") &&
       isResolvedActionState(
         getEvaluatorActionState(traversal, frameKey, statement),
-      )
-    ) {
-      continue;
-    }
-    const observeStatus = applyObserve(statement, traversal, node, accum);
-    if (observeStatus.status === "blocked") return observeStatus;
-    markEvaluatorActionResolved(traversal, frameKey, statement);
-  }
+      ),
+    stepLeaf: (statement) => {
+      if (statement.kind === "observe") {
+        const apply = applyObserve(statement, traversal, node, accum);
+        if (apply.status === "blocked") {
+          return blockSeg(accum, traversal);
+        }
+        markEvaluatorActionResolved(traversal, frameKey, statement);
+        return { status: "rewalk" };
+      }
 
-  return { status: "value", value: false };
+      if (statement.kind === "set") {
+        const apply = applySet(statement, traversal, node, accum);
+        if (apply.status === "blocked") {
+          return blockSeg(accum, traversal);
+        }
+        markEvaluatorActionResolved(traversal, frameKey, statement);
+        return { status: "rewalk" };
+      }
+
+      throw new Error(
+        `Unsupported resolution leaf statement: ${statement.kind}`,
+      );
+    },
+  });
+  if (outcome.status === "blocked") {
+    return { status: "blocked" };
+  }
+  if (outcome.status === "deflected") {
+    throw new Error("Resolution functions cannot deflect");
+  }
+  clearEvaluatorActionStates(traversal, frameKey);
+  return { status: "resolved", value: outcome.value };
 }
 
-function deflectTraversal(accum: Accumulator, traversal: Traversal): RunStatus {
+function deflectTraversal(traversal: Traversal): TraversalOutcome {
   const activeRef = traversalToNodeRef(traversal);
-  traversal.state = "deflected";
-
-  const rootTraversal = selectActionRootTraversal(
-    accum.traversals,
-    accum.entry.arc,
-  );
-  rootTraversal.pendingEffects = {
-    reason: "deflected",
-    active: activeRef,
-  };
-
   return { status: "deflected", active: activeRef };
 }
 
-function prepareChildTraversalForEntry(traversal: Traversal, node: Node): void {
+function prepareTraversalForEntry(
+  traversal: Traversal,
+  node: Node,
+  target: { fresh: boolean; reopen: boolean },
+): void {
+  if (traversal.finalizing) {
+    return;
+  }
+
+  if (target.reopen) {
+    reopenTraversalForEntry(traversal, node);
+    return;
+  }
+
   if (traversal.enterCount === 0) {
     resetTraversalForEntry(traversal, node, 1);
     return;
   }
 
-  if (
-    (isArcTraversal(traversal) && isStopped(traversal)) ||
-    traversal.state === "deflected"
-  ) {
+  if (traversal.state === "deflected" || isSuspendedArcTraversal(traversal)) {
     resetTraversalForEntry(traversal, node, traversal.enterCount + 1);
   }
 }
 
 function restartTraversalForEntry(traversal: Traversal, node: Node): void {
-  resetTraversalForEntry(traversal, node, traversal.enterCount + 1, true);
+  resetTraversalForEntry(traversal, node, traversal.enterCount + 1);
+}
+
+function reopenTraversalForEntry(traversal: Traversal, node: Node): void {
+  if (traversal.enterCount > 0 && isEnteredTraversal(traversal)) {
+    return;
+  }
+
+  const nextEnterCount =
+    traversal.enterCount === 0 ? 1 : traversal.enterCount + 1;
+  resetTraversalForEntry(traversal, node, nextEnterCount, true);
 }
 
 function resolveEnterTarget(
@@ -942,9 +1242,10 @@ function sameEnterChannelLinks(
 function commitEnterReturnChannels(
   traversal: Traversal,
   accum: Accumulator,
+  stagedReturns = traversal.enterChannels.stagedReturns,
 ): void {
   const channelState = traversal.enterChannels;
-  for (const [key, value] of Object.entries(channelState.stagedReturns)) {
+  for (const [key, value] of Object.entries(stagedReturns)) {
     const callerVarRef = channelState.returns[key];
     if (!callerVarRef) {
       throw new Error(
@@ -965,6 +1266,84 @@ function commitEnterReturnChannels(
   channelState.stagedReturns = {};
 }
 
+function persistPendingEnterLoopState(
+  traversal: Traversal,
+  statement: Extract<ActionStatement, { kind: "enter-loop" }>,
+  phase: "target" | "resolveWhen",
+  stagedReturns: Record<string, PrimitiveValue>,
+): void {
+  if (phase === "target" && Object.keys(stagedReturns).length === 0) {
+    clearActionState(traversal, statement.id);
+    return;
+  }
+  markPendingActionState(traversal, statement.id, statement.kind, {
+    enterLoopPhase: phase,
+    stagedReturns,
+  });
+}
+
+function prepareNextEnterLoopIteration(
+  traversal: Traversal,
+  target:
+    | { kind: "owned"; ref: NodeRef; node: Node }
+    | { kind: "referenced"; ref: ArcRef; entry: RegistryEntry }
+    | { kind: "pseudo-owned"; ref: NodeRef; node: Node },
+  accum: Accumulator,
+): void {
+  if (target.kind === "pseudo-owned") {
+    replaceEphemeralTraversal(
+      traversal,
+      target.ref,
+      createFreshNodeTraversal(target.ref, target.node),
+    );
+    return;
+  }
+
+  if (target.kind === "referenced") {
+    const nextTraversal = ensureReferencedTraversal(
+      accum,
+      target.ref,
+      target.entry.root,
+      rootRefOf(traversal.ref),
+    );
+    restartTraversalForEntry(nextTraversal, target.entry.root);
+    return;
+  }
+
+  const nextTraversal = ensureOwnedTraversal(accum, target.ref, target.node);
+  restartTraversalForEntry(nextTraversal, target.node);
+}
+
+function currentEnterLoopTargetTraversal(
+  traversal: Traversal,
+  target:
+    | { kind: "owned"; ref: NodeRef; node: Node }
+    | { kind: "referenced"; ref: ArcRef; entry: RegistryEntry }
+    | { kind: "pseudo-owned"; ref: NodeRef; node: Node },
+  accum: Accumulator,
+): Traversal {
+  if (target.kind === "pseudo-owned") {
+    const existing = findEphemeralTraversal(traversal, target.ref);
+    if (!existing) {
+      throw new Error(
+        `Current enterLoop target traversal not found: ${formatRef(target.ref)}`,
+      );
+    }
+    return existing;
+  }
+
+  const existing = findTraversalInSet(
+    accum.traversals,
+    target.kind === "referenced" ? arcToNodeRef(target.ref) : target.ref,
+  );
+  if (!existing) {
+    throw new Error(
+      `Current enterLoop target traversal not found: ${formatRef(target.ref)}`,
+    );
+  }
+  return existing;
+}
+
 function ensureReferencedTraversal(
   accum: Accumulator,
   ref: ArcRef,
@@ -973,132 +1352,66 @@ function ensureReferencedTraversal(
 ): ArcTraversal {
   let traversal = accum.traversals.find((item) => item.ref === ref);
   if (!traversal) {
-    traversal = createFreshArcTraversal(ref, root, 1, returnTo);
+    traversal = createFreshArcTraversal(ref, root, returnTo);
     accum.traversals.push(traversal);
   }
   traversal.returnTo = returnTo;
   return traversal;
 }
 
-function runPendingEffects(
-  accum: Accumulator,
-  pendingEffects: PendingEffects,
-): RunStatus {
-  for (const ref of deflectionEffectRefs(pendingEffects.active)) {
-    const traversal = findTraversalInSet(accum.traversals, ref);
-    if (!traversal) {
-      throw new Error(`Pending effects traversal not found: ${formatRef(ref)}`);
-    }
-
-    const entry = getEntryForRef(accum.entries, ref);
-    const node = entry ? getNodeForRef(accum.entries, entry, ref) : undefined;
-    if (!node) {
-      throw new Error(`Pending effects node not found: ${formatRef(ref)}`);
-    }
-
-    accum.active = ref;
-    const status = runEffects(traversal, node, accum);
-    if (status.status === "blocked") return status;
-  }
-  return { status: "done" };
-}
-
-function completePendingEffects(
-  accum: Accumulator,
-  pendingEffects: PendingEffects,
-): void {
-  const activeTraversal = findTraversalInSet(
-    accum.traversals,
-    pendingEffects.active,
-  );
-  if (!activeTraversal) {
-    throw new Error(
-      `Pending effects active traversal not found: ${formatRef(pendingEffects.active)}`,
-    );
-  }
-  if (isArcTraversal(activeTraversal)) {
-    activeTraversal.phase = "suspended";
-  }
-  if (!isArcTraversal(accum.traversal)) {
-    throw new Error("Pending effects can only finalize an arc traversal");
-  }
-  accum.traversal.pendingEffects = undefined;
-  accum.traversal.phase = "suspended";
-}
-
-function deflectionEffectRefs(active: NodeRef): NodeRef[] {
-  const { source, path } = toNodeRefParts(active);
-  const refs: NodeRef[] = [];
-  for (let length = path.length; length >= 1; length--) {
-    refs.push(toNodeRef(source, path.slice(0, length)));
-  }
-  return refs;
-}
-
 function runEffects(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): RunStatus {
-  if (!node.effects) return { status: "done" };
-  return runEffectStatements(traversal, node, node.effects, accum);
-}
+): HookOutcome<void> {
+  if (!node.effects) return { status: "done", value: undefined };
 
-function runEffectStatements(
-  traversal: Traversal,
-  node: Node,
-  statements: EffectStatement[],
-  accum: Accumulator,
-): RunStatus {
-  for (const statement of statements) {
-    if (statement.kind === "if") {
-      const result = evaluateValueExpression(
-        statement.test,
-        traversal,
-        node,
-        accum,
-      );
-      if (result.status === "blocked") return { status: "blocked" };
-      const branch = truthy(result.value)
-        ? statement.consequent
-        : (statement.alternate ?? []);
-      const status = runEffectStatements(traversal, node, branch, accum);
-      if (status.status === "blocked") return status;
-      continue;
-    }
+  const outcome = runSeg<EffectStatement, void>(node.effects, {
+    doneValue: undefined,
+    evaluateIf: (statement) =>
+      evaluateIfBranch(statement, traversal, node, accum),
+    isResolvedLeaf: (statement) =>
+      statement.kind !== "if" &&
+      statement.kind !== "label" &&
+      statement.kind !== "break" &&
+      isResolvedActionState(getActionState(traversal, statement)),
+    stepLeaf: (statement) => {
+      if (statement.kind === "observe") {
+        const apply = applyObserve(statement, traversal, node, accum);
+        if (apply.status === "blocked") return blockSeg(accum, traversal);
+        markActionResolved(traversal, statement);
+        return { status: "rewalk" };
+      }
 
-    if (isResolvedActionState(getActionState(traversal, statement))) continue;
+      if (statement.kind === "set") {
+        const apply = applySet(statement, traversal, node, accum);
+        if (apply.status === "blocked") return blockSeg(accum, traversal);
+        markActionResolved(traversal, statement);
+        return { status: "rewalk" };
+      }
 
-    if (statement.kind === "observe") {
-      const apply = applyObserve(statement, traversal, node, accum);
-      if (apply.status === "blocked") return apply;
+      if (statement.kind === "set-return") {
+        const apply = applySetReturn(statement, traversal, node, accum);
+        if (apply.status === "blocked") return blockSeg(accum, traversal);
+        markActionResolved(traversal, statement);
+        return { status: "rewalk" };
+      }
+
+      if (statement.kind !== "host-call") {
+        throw new Error("Unsupported effects leaf statement");
+      }
+
+      const effect = renderHostEffect(statement, traversal, node, accum);
+      const key = hostEffectDedupKey(traversal, statement.id, effect);
+      if (!traversal.appliedHostCallKeys.includes(key)) {
+        traversal.appliedHostCallKeys.push(key);
+        accum.hostEffects.push(effect);
+      }
       markActionResolved(traversal, statement);
-      continue;
-    }
-
-    if (statement.kind === "set") {
-      const apply = applySet(statement, traversal, node, accum);
-      if (apply.status === "blocked") return apply;
-      markActionResolved(traversal, statement);
-      continue;
-    }
-
-    if (statement.kind === "set-return") {
-      const apply = applySetReturn(statement, traversal, node, accum);
-      if (apply.status === "blocked") return apply;
-      markActionResolved(traversal, statement);
-      continue;
-    }
-
-    const effect = renderHostEffect(statement, traversal, node, accum);
-    const key = hostEffectDedupKey(traversal, statement.id, effect);
-    if (!traversal.appliedHostCallKeys.includes(key)) {
-      traversal.appliedHostCallKeys.push(key);
-      accum.hostEffects.push(effect);
-    }
-    markActionResolved(traversal, statement);
-  }
-  return { status: "done" };
+      return { status: "rewalk" };
+    },
+  });
+  return outcome;
 }
 
 function emitInstruction(
@@ -1131,40 +1444,40 @@ function blockTraversal(
   return { status: "blocked" };
 }
 
-function toEnterIterationStatus(
-  status: RunStatus,
+function toEnterActionOutcome(
+  outcome: TraversalOutcome,
   traversal: Traversal,
-): EnterIterationStatus {
-  if (status.status === "blocked") {
+): EnterActionOutcome {
+  if (outcome.status === "done") {
+    return {
+      status: "resolved",
+      traversal,
+      finalState: outcome.finalState,
+    };
+  }
+  if (outcome.status === "blocked") {
     return { status: "blocked", traversal };
   }
-  if (status.status === "yielded") {
-    return { status: "yielded", traversal };
+  if (outcome.status === "deflected") {
+    return { status: "deflected", traversal, active: outcome.active };
   }
-  if (status.status === "deflected") {
-    return { status: "deflected", traversal, active: status.active };
-  }
-  return {
-    status: "done",
-    traversal,
-    finalState: traversal.state,
-  };
+  throw new Error(`Unexpected enter iteration outcome: ${outcome}`);
 }
 
 function resetTraversalForEntry(
   traversal: Traversal,
   node: Node,
   nextEnterCount: number,
-  clearPendingEffects = false,
+  forceClearFrame = false,
 ): void {
   traversal.enterCount = nextEnterCount;
   traversal.state = undefined;
+  traversal.finalizing = undefined;
   traversal.enterChannels = createEmptyEnterChannelState();
   if (isArcTraversal(traversal)) {
     traversal.phase = "entered";
-    if (clearPendingEffects) traversal.pendingEffects = undefined;
   }
-  if (!node.resumable) clearFrame(traversal);
+  if (forceClearFrame || !node.resumable) clearFrame(traversal);
 }
 
 function hostEffectDedupKey(

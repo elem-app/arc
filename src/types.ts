@@ -25,6 +25,34 @@ export type ValidationIssue = {
   loc?: SourceRange;
 };
 
+/** Host-visible runtime issue surfaced while advancing from the previous yield. */
+export type RuntimeIssue =
+  | {
+      kind: "poisoned-traversal";
+      arc: ArcRef;
+      active: NodeRef;
+      source?: SourceRange;
+      reasonCode?: string;
+      reason?: string;
+    }
+  | {
+      kind: "invalid-report";
+      reasonCode?: string;
+      reason?: string;
+    }
+  | {
+      kind: "invalid-item";
+      briefId: BriefId;
+      reasonCode?: string;
+      reason?: string;
+    }
+  | {
+      kind: "ambiguous-match";
+      matchableArcs: ArcRef[];
+      reasonCode?: string;
+      reason?: string;
+    };
+
 // Source / IR Types
 
 /**
@@ -35,6 +63,7 @@ export type LocalExpression =
   | { kind: "ref"; name: "user" | "self" }
   | { kind: "variable"; name: string }
   | { kind: "channel"; namespace: "args" | "returns"; key: string }
+  | { kind: "deflectionFrom"; target: EnterTarget }
   | { kind: "scope"; name: "lastUserMessage" | "lastTurns"; count?: number }
   | { kind: "enterCount" }
   | { kind: "nodeState"; identifier: string };
@@ -190,6 +219,7 @@ export type EnterTarget = {
   identifier: string;
   imported: boolean;
   fresh: boolean;
+  reopen: boolean;
 };
 
 /**
@@ -280,11 +310,17 @@ export type Statement =
   | LabelStatement
   | BreakStatement;
 
-/** Statement subset allowed inside `this.trigger`. */
-export type TriggerStatement =
+/** Statement subset allowed inside boolean-style hooks. */
+export type HookStatement =
   | ObserveAction
-  | TriggerIfStatement
-  | { kind: "return"; value?: ValueExpression; loc?: SourceRange };
+  | SetAction
+  | HookIfStatement
+  | HookLabelStatement
+  | HookBreakStatement
+  | HookReturnStatement;
+
+/** Statement subset allowed inside `this.trigger`. */
+export type TriggerStatement = HookStatement;
 
 /**
  * Instruction resolution logic uses the same constrained statement subset as
@@ -293,28 +329,41 @@ export type TriggerStatement =
 export type ResolutionStatement = TriggerStatement;
 
 /** Conditional inside trigger functions. */
-export type TriggerIfStatement = {
+export type HookIfStatement = {
   kind: "if";
   test: ValueExpression;
-  consequent: TriggerStatement[];
-  alternate?: TriggerStatement[];
+  consequent: HookStatement[];
+  alternate?: HookStatement[];
   loc?: SourceRange;
 };
 
 /** Statement subset allowed inside `this.guard`. */
-export type GuardStatement =
-  | ObserveAction
-  | GuardIfStatement
-  | { kind: "return"; value?: ValueExpression; loc?: SourceRange };
+export type GuardStatement = HookStatement;
 
-/** Conditional inside guard functions. */
-export type GuardIfStatement = {
-  kind: "if";
-  test: ValueExpression;
-  consequent: GuardStatement[];
-  alternate?: GuardStatement[];
+/** Labeled block inside hook functions. */
+export type HookLabelStatement = {
+  kind: "label";
+  label: string;
+  body: HookStatement[];
   loc?: SourceRange;
 };
+
+/** Labeled break inside hook functions. */
+export type HookBreakStatement = {
+  kind: "break";
+  label: string;
+  loc?: SourceRange;
+};
+
+/** Return statement inside hook functions. */
+export type HookReturnStatement = {
+  kind: "return";
+  value?: ValueExpression;
+  loc?: SourceRange;
+};
+
+/** Statement subset allowed inside `this.catchDeflection`. */
+export type CatchDeflectionStatement = HookStatement;
 
 /** Host module imported by an Arc document. */
 export type HostModuleBinding = {
@@ -351,7 +400,24 @@ export type EffectStatement =
   | SetAction
   | SetReturnAction
   | HostEffectStatement
-  | EffectIfStatement;
+  | EffectIfStatement
+  | EffectLabelStatement
+  | EffectBreakStatement;
+
+/** Labeled block inside `this.effects`. */
+export type EffectLabelStatement = {
+  kind: "label";
+  label: string;
+  body: EffectStatement[];
+  loc?: SourceRange;
+};
+
+/** Labeled break inside `this.effects`. */
+export type EffectBreakStatement = {
+  kind: "break";
+  label: string;
+  loc?: SourceRange;
+};
 
 /** Synthetic alias used only for `fresh(...)` pseudo-child definition lookup. */
 export type FreshNodeAlias = {
@@ -382,6 +448,7 @@ export type Node = {
   imports: string[];
   trigger?: TriggerStatement[];
   deflectWhen?: ResolutionStatement[];
+  catchDeflection?: CatchDeflectionStatement[];
   guard?: GuardStatement[];
   effects?: EffectStatement[];
   loc?: SourceRange;
@@ -440,6 +507,12 @@ export type NodeState = "covered" | "deflected" | "skipped";
 export type ActionState = {
   kind: ActionStatement["kind"] | HostEffectStatement["kind"];
   status: "pending" | "resolved";
+  // Temporary enterLoop-specific state tracking. These fields currently let
+  // the loop action persist transactional return candidates and its pending
+  // step across handbacks. A later refactor may give enterLoop its own frame
+  // instead of storing this on generic ActionState.
+  stagedReturns?: Record<string, PrimitiveValue>;
+  enterLoopPhase?: "target" | "resolveWhen";
 };
 
 /**
@@ -473,6 +546,12 @@ export type EnterChannelState = {
   stagedReturns: Record<string, PrimitiveValue>;
 };
 
+export type TraversalFinalizing = {
+  reason: "covered" | "deflected";
+  active: NodeRef;
+  phase: "catch" | "effects";
+};
+
 /**
  * Shared serializable runtime state for both arcs and owned child nodes.
  */
@@ -482,6 +561,8 @@ export type TraversalBase<TRef extends ArcRef | NodeRef> = {
   enterCount: number;
   /** Coarse authored node outcome visible as `State.*` in expressions. */
   state?: NodeState;
+  /** Internal terminal work that must finish before `state` is exposed. */
+  finalizing?: TraversalFinalizing;
   /** Variable values declared by this node only. */
   variables: Record<string, PrimitiveValue | undefined>;
   /** Per-action resolution state for this node only. */
@@ -512,20 +593,14 @@ export type NodeTraversal = TraversalBase<NodeRef>;
  * - `entered`: actively being worked.
  * - `completed`: all nodes covered.
  * - `suspended`: entered but left before completing.
+ * - `poisoned`: progression failed due to an authored runtime error.
  */
 // TODO: add compatDate/version metadata for runtime/API upgrades, then enforce
 // on-demand migration policy (migrate only traversals that are re-entered).
 // Placement (ArcTraversal vs ArcTraversalSet) is still an open design choice.
 export type ArcTraversal = TraversalBase<ArcRef> & {
   returnTo: ArcRef | null;
-  phase: "dormant" | "entered" | "completed" | "suspended";
-  pendingEffects?: PendingEffects;
-};
-
-/** Deferred effect finalization that must complete before an arc stops. */
-export type PendingEffects = {
-  reason: "deflected";
-  active: NodeRef;
+  phase: "dormant" | "entered" | "completed" | "suspended" | "poisoned";
 };
 
 export type Traversal = ArcTraversal | NodeTraversal;
@@ -659,26 +734,15 @@ export type HostCallBrief = {
 /**
  * Trigger brief report returned by the host.
  *
- * `match` names the selected arc, if any. Judgments and observations are keyed
- * by ids from the originating `TriggerBrief`.
+ * `preferredMatch` expresses the host's preferred arc when multiple trigger
+ * candidates may eventually match. Judgments and observations are keyed by ids
+ * from the originating `TriggerBrief`.
  */
 export type TriggerReport = {
-  match?: ArcRef;
+  preferredMatch?: ArcRef;
   judgments?: Record<BriefId, boolean>;
   observations?: Record<BriefId, ObservationReport>;
   hostCalls?: Record<BriefId, PayloadValue>;
-};
-
-/**
- * Trigger runtime outcome after accepting a trigger report.
- *
- * `traversals` is the next persisted traversal set. When a trigger matched,
- * `matched` identifies the arc ready for normal action-brief probing. Look up
- * the traversal from `traversals` by ref if needed.
- */
-export type TriggerOutcome = {
-  matched?: ArcRef;
-  traversals: ArcTraversalSet;
 };
 
 /**
@@ -692,10 +756,16 @@ export type TriggerOutcome = {
  * currently known state, before any additional host reports are
  * accepted.
  *
+ * `matched` identifies the selected arc once trigger stage has resolved to a
+ * single activation.
+ *
  * Hosts may inspect this object freely, but must treat it as immutable and
  * pass the same object instance back to `Runtime.progressTrigger(...)`.
  */
 export type TriggerBrief = {
+  matched?: ArcRef;
+  traversals: ArcTraversalSet;
+  issues: RuntimeIssue[];
   judgments: JudgmentBrief[];
   observations: ObservationBrief[];
   hostCalls: HostCallBrief[];
@@ -706,11 +776,10 @@ export type TriggerBrief = {
  * Allowed high-level moves for one action brief.
  *
  * - `proceed`: report semantic results and continue traversal
- * - `defer`: leave traversal unchanged for this turn
  * - `deflect`: mark the active node as intentionally deflected. This move is
  *   only available when `allowedMoves` includes it for the current frontier.
  */
-export type ActionMove = "proceed" | "defer" | "deflect";
+export type ActionMove = "proceed" | "deflect";
 
 /**
  * Structured brief issued by arc traversal when delegation is needed.
@@ -741,6 +810,8 @@ export type ActionBrief = {
   active: NodeRef;
   /** Whether the root traversal for this brief can still advance. */
   canProgress: boolean;
+  /** Protocol or authored-execution issues surfaced after the previous yield. */
+  issues: RuntimeIssue[];
   /** Pending host-backed value requests produced before this yield. */
   hostCalls: HostCallBrief[];
   /** Append-only host effects produced before this yield. */

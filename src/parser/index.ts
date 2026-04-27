@@ -3,9 +3,9 @@ import { parse as acornParse } from "acorn";
 
 import type {
   BreakStatement,
+  CatchDeflectionStatement,
   Document,
   EffectStatement,
-  EnterTarget,
   GuardStatement,
   HostCallArgument,
   HostEffectStatement,
@@ -52,6 +52,7 @@ import {
   parseHostCallTarget,
   parseTemplateLiteral,
 } from "./ast.js";
+import { parseTarget } from "./targets.js";
 
 const HOST_MODULE_SOURCE_PREFIX = "host:";
 
@@ -235,6 +236,8 @@ function parseNode(
   let guidance: SemanticString | undefined;
   let trigger: TriggerStatement[] | undefined;
   let deflectWhen: ResolutionStatement[] | undefined;
+  let catchDeflection: CatchDeflectionStatement[] | undefined;
+  let catchDeflectionBody: acorn.Statement[] | undefined;
   let guard: GuardStatement[] | undefined;
   let effects: EffectStatement[] | undefined;
   const handledStatements = new Set<acorn.Statement>();
@@ -329,6 +332,16 @@ function parseNode(
       handledStatements.add(statement);
       continue;
     }
+    if (thisProperty === "catchDeflection") {
+      if (expression.right.type !== "ArrowFunctionExpression") {
+        throw new Error("this.catchDeflection must be an arrow function");
+      }
+      const body = getFunctionBody(expression.right);
+      if (!body) throw new Error("this.catchDeflection must be a function");
+      catchDeflectionBody = body;
+      handledStatements.add(statement);
+      continue;
+    }
     if (thisProperty === "guard") {
       if (expression.right.type !== "ArrowFunctionExpression") {
         throw new Error("this.guard must be an arrow function");
@@ -377,6 +390,15 @@ function parseNode(
     ...visibleVariableNames,
     ...variables.map((entry) => entry.name),
   ]);
+  if (catchDeflectionBody) {
+    catchDeflection = parseCatchDeflectionStatements(
+      catchDeflectionBody,
+      nextActionId,
+      availableHostModules,
+      availableImports,
+      nextVisibleNodeNames,
+    );
+  }
   const children = [...childFunctions.values()].map((child) =>
     parseNode(
       child,
@@ -415,6 +437,7 @@ function parseNode(
     imports: [...availableImports],
     trigger,
     deflectWhen,
+    catchDeflection,
     guard,
     effects,
     loc: locOf(fn),
@@ -982,12 +1005,10 @@ function parseEnterCall(
   visibleVariableNames: Set<string>,
   nextActionId: () => number,
 ): Statement {
-  const target = parseEnterTarget(
-    expression.arguments[0],
-    "enter()",
+  const target = parseTarget(expression.arguments[0], "enter", {
     availableImports,
     visibleNodeNames,
-  );
+  });
   if (expression.arguments.length > 2) {
     throw new Error("enter() accepts a target and an optional options object");
   }
@@ -1055,12 +1076,10 @@ function parseEnterLoopCall(
   availableHostModules: Map<string, string>,
   nextActionId: () => number,
 ): Statement {
-  const target = parseEnterTarget(
-    expression.arguments[0],
-    "enterLoop()",
+  const target = parseTarget(expression.arguments[0], "enterLoop", {
     availableImports,
     visibleNodeNames,
-  );
+  });
   if (expression.arguments.length !== 2) {
     throw new Error("enterLoop() accepts a target and one options object");
   }
@@ -1134,67 +1153,6 @@ function parseEnterLoopCall(
   };
 }
 
-function parseEnterTarget(
-  expression: acorn.Expression | acorn.SpreadElement | undefined,
-  label: "enter()" | "enterLoop()",
-  availableImports: Set<string>,
-  visibleNodeNames: Set<string>,
-): EnterTarget {
-  if (!expression || expression.type === "SpreadElement") {
-    throw new Error(`${label} requires a target`);
-  }
-  if (isIdentifier(expression)) {
-    const identifier = expression.name;
-    if (
-      !visibleNodeNames.has(identifier) &&
-      !availableImports.has(identifier)
-    ) {
-      throw new Error(`Unknown node: ${identifier}`);
-    }
-    return {
-      identifier,
-      imported:
-        availableImports.has(identifier) && !visibleNodeNames.has(identifier),
-      fresh: false,
-    };
-  }
-  if (
-    isCallExpression(expression) &&
-    expression.callee.type === "Identifier" &&
-    expression.callee.name === "fresh"
-  ) {
-    if (expression.arguments.length !== 1) {
-      throw new Error(
-        "fresh() accepts exactly one node or imported arc identifier",
-      );
-    }
-    const targetArg = expression.arguments[0];
-    if (
-      !targetArg ||
-      targetArg.type === "SpreadElement" ||
-      !isIdentifier(targetArg)
-    ) {
-      throw new Error("fresh() requires a node or imported arc identifier");
-    }
-    const identifier = targetArg.name;
-    if (
-      !visibleNodeNames.has(identifier) &&
-      !availableImports.has(identifier)
-    ) {
-      throw new Error(`Unknown node: ${identifier}`);
-    }
-    return {
-      identifier,
-      imported:
-        availableImports.has(identifier) && !visibleNodeNames.has(identifier),
-      fresh: true,
-    };
-  }
-  throw new Error(
-    `${label} requires a node/import identifier or fresh(node/import)`,
-  );
-}
-
 function parseEnterChannelMap(
   expression: acorn.Expression,
   label:
@@ -1225,11 +1183,6 @@ function parseEnterChannelMap(
     if (!isIdentifier(property.value)) {
       throw new Error(
         `${label}.${key} must reference a caller variable identifier`,
-      );
-    }
-    if (property.value.name !== key) {
-      throw new Error(
-        `${label}.${key} must use same-name binding (renaming is not supported)`,
       );
     }
     if (!visibleVariableNames.has(property.value.name)) {
@@ -1338,10 +1291,38 @@ function parseTriggerStatements(
   availableHostModules: Map<string, string>,
 ): TriggerStatement[] {
   return statements.flatMap<TriggerStatement>((statement) => {
-    if (isLabeledStatement(statement) || isBreakStatement(statement)) {
-      throw new Error(
-        "Labels and break statements are not allowed in this.trigger",
-      );
+    if (isLabeledStatement(statement)) {
+      if (!isIdentifier(statement.label)) {
+        throw new Error("this.trigger labels must use identifier names");
+      }
+      if (statement.body.type !== "BlockStatement") {
+        throw new Error("this.trigger labels must target a block statement");
+      }
+      return [
+        {
+          kind: "label",
+          label: statement.label.name,
+          body: parseTriggerStatements(
+            statement.body.body,
+            nextActionId,
+            availableHostModules,
+          ),
+          loc: locOf(statement),
+        },
+      ];
+    }
+
+    if (isBreakStatement(statement)) {
+      if (!statement.label || !isIdentifier(statement.label)) {
+        throw new Error("this.trigger break statements must specify a label");
+      }
+      return [
+        {
+          kind: "break",
+          label: statement.label.name,
+          loc: locOf(statement),
+        },
+      ];
     }
 
     if (isIfStatement(statement)) {
@@ -1411,8 +1392,16 @@ function parseTriggerStatements(
       throw new Error("judge() must be used inside an expression");
     }
 
+    const set = parseSetCall(
+      expression,
+      availableHostModules,
+      nextActionId,
+      "action",
+    );
+    if (set?.kind === "set") return [set];
+
     throw new Error(
-      "Unsupported this.trigger call; use observe(), if, and return",
+      "Unsupported this.trigger call; use observe(), variable.set(), if, and return",
     );
   });
 }
@@ -1423,10 +1412,38 @@ function parseGuardStatements(
   availableHostModules: Map<string, string>,
 ): GuardStatement[] {
   return statements.flatMap<GuardStatement>((statement) => {
-    if (isLabeledStatement(statement) || isBreakStatement(statement)) {
-      throw new Error(
-        "Labels and break statements are not allowed in this.guard",
-      );
+    if (isLabeledStatement(statement)) {
+      if (!isIdentifier(statement.label)) {
+        throw new Error("this.guard labels must use identifier names");
+      }
+      if (statement.body.type !== "BlockStatement") {
+        throw new Error("this.guard labels must target a block statement");
+      }
+      return [
+        {
+          kind: "label",
+          label: statement.label.name,
+          body: parseGuardStatements(
+            statement.body.body,
+            nextActionId,
+            availableHostModules,
+          ),
+          loc: locOf(statement),
+        },
+      ];
+    }
+
+    if (isBreakStatement(statement)) {
+      if (!statement.label || !isIdentifier(statement.label)) {
+        throw new Error("this.guard break statements must specify a label");
+      }
+      return [
+        {
+          kind: "break",
+          label: statement.label.name,
+          loc: locOf(statement),
+        },
+      ];
     }
 
     if (isIfStatement(statement)) {
@@ -1496,8 +1513,151 @@ function parseGuardStatements(
       throw new Error("judge() must be used inside an expression");
     }
 
+    const set = parseSetCall(
+      expression,
+      availableHostModules,
+      nextActionId,
+      "action",
+    );
+    if (set?.kind === "set") return [set];
+
     throw new Error(
-      "Unsupported this.guard call; use observe(), if, and return",
+      "Unsupported this.guard call; use observe(), variable.set(), if, and return",
+    );
+  });
+}
+
+function parseCatchDeflectionStatements(
+  statements: acorn.Statement[],
+  nextActionId: () => number,
+  availableHostModules: Map<string, string>,
+  availableImports: Set<string>,
+  visibleNodeNames: Set<string>,
+): CatchDeflectionStatement[] {
+  const parseHookExpression = (expression: acorn.Expression): ValueExpression =>
+    parseExpression(expression, availableHostModules, nextActionId, {
+      availableImports,
+      visibleNodeNames,
+    });
+
+  return statements.flatMap<CatchDeflectionStatement>((statement) => {
+    if (isLabeledStatement(statement)) {
+      if (!isIdentifier(statement.label)) {
+        throw new Error(
+          "this.catchDeflection labels must use identifier names",
+        );
+      }
+      if (statement.body.type !== "BlockStatement") {
+        throw new Error(
+          "this.catchDeflection labels must target a block statement",
+        );
+      }
+      return [
+        {
+          kind: "label",
+          label: statement.label.name,
+          body: parseCatchDeflectionStatements(
+            statement.body.body,
+            nextActionId,
+            availableHostModules,
+            availableImports,
+            visibleNodeNames,
+          ),
+          loc: locOf(statement),
+        },
+      ];
+    }
+
+    if (isBreakStatement(statement)) {
+      if (!statement.label || !isIdentifier(statement.label)) {
+        throw new Error(
+          "this.catchDeflection break statements must specify a label",
+        );
+      }
+      return [
+        {
+          kind: "break",
+          label: statement.label.name,
+          loc: locOf(statement),
+        },
+      ];
+    }
+
+    if (isIfStatement(statement)) {
+      return [
+        {
+          kind: "if",
+          test: parseHookExpression(statement.test),
+          consequent: parseCatchDeflectionStatements(
+            getBlockStatements(statement.consequent),
+            nextActionId,
+            availableHostModules,
+            availableImports,
+            visibleNodeNames,
+          ),
+          alternate: statement.alternate
+            ? parseCatchDeflectionStatements(
+                getBlockStatements(statement.alternate),
+                nextActionId,
+                availableHostModules,
+                availableImports,
+                visibleNodeNames,
+              )
+            : undefined,
+          loc: locOf(statement),
+        },
+      ];
+    }
+
+    if (isReturnStatement(statement)) {
+      return [
+        {
+          kind: "return",
+          value: statement.argument
+            ? parseHookExpression(statement.argument as acorn.Expression)
+            : undefined,
+          loc: locOf(statement),
+        },
+      ];
+    }
+
+    if (!isExpressionStatement(statement)) {
+      throw new Error(
+        `Unsupported this.catchDeflection statement: ${statement.type}`,
+      );
+    }
+    const expression = statement.expression;
+    if (!isCallExpression(expression)) {
+      throw new Error(
+        `Unsupported this.catchDeflection expression statement: ${expression.type}`,
+      );
+    }
+
+    if (
+      expression.callee.type === "Identifier" &&
+      expression.callee.name === "observe"
+    ) {
+      return [
+        parseObserveCall(expression, "observe", nextActionId) as ObserveAction,
+      ];
+    }
+    if (
+      expression.callee.type === "Identifier" &&
+      expression.callee.name === "judge"
+    ) {
+      throw new Error("judge() must be used inside an expression");
+    }
+
+    const set = parseSetCall(
+      expression,
+      availableHostModules,
+      nextActionId,
+      "action",
+    );
+    if (set?.kind === "set") return [set];
+
+    throw new Error(
+      "Unsupported this.catchDeflection call; use observe(), variable.set(), if, and return",
     );
   });
 }
@@ -1537,10 +1697,38 @@ function parseEffectStatements(
   availableHostModules: Map<string, string>,
 ): EffectStatement[] {
   return statements.flatMap<EffectStatement>((statement) => {
-    if (isLabeledStatement(statement) || isBreakStatement(statement)) {
-      throw new Error(
-        "Labels and break statements are not allowed in this.effects",
-      );
+    if (isLabeledStatement(statement)) {
+      if (!isIdentifier(statement.label)) {
+        throw new Error("this.effects labels must use identifier names");
+      }
+      if (statement.body.type !== "BlockStatement") {
+        throw new Error("this.effects labels must target a block statement");
+      }
+      return [
+        {
+          kind: "label",
+          label: statement.label.name,
+          body: parseEffectStatements(
+            statement.body.body,
+            nextActionId,
+            availableHostModules,
+          ),
+          loc: locOf(statement),
+        },
+      ];
+    }
+
+    if (isBreakStatement(statement)) {
+      if (!statement.label || !isIdentifier(statement.label)) {
+        throw new Error("this.effects break statements must specify a label");
+      }
+      return [
+        {
+          kind: "break",
+          label: statement.label.name,
+          loc: locOf(statement),
+        },
+      ];
     }
 
     if (isIfStatement(statement)) {
@@ -1871,7 +2059,8 @@ function validateStatement(
         loc: statement.loc,
       });
     }
-    for (const variable of Object.values(statement.args ?? {})) {
+    const callLabel = statement.kind === "enter-loop" ? "enterLoop" : "enter";
+    for (const [key, variable] of Object.entries(statement.args ?? {})) {
       if (!variables.includes(variable)) {
         issues.push({
           code: "UNKNOWN_VARIABLE",
@@ -1879,12 +2068,26 @@ function validateStatement(
           loc: statement.loc,
         });
       }
+      if (variable !== key) {
+        issues.push({
+          code: "ENTER_CHANNEL_RENAME",
+          message: `${callLabel}().args.${key} must use same-name binding (renaming is not supported)`,
+          loc: statement.loc,
+        });
+      }
     }
-    for (const variable of Object.values(statement.returns ?? {})) {
+    for (const [key, variable] of Object.entries(statement.returns ?? {})) {
       if (!variables.includes(variable)) {
         issues.push({
           code: "UNKNOWN_VARIABLE",
           message: `Unknown variable: ${variable}`,
+          loc: statement.loc,
+        });
+      }
+      if (variable !== key) {
+        issues.push({
+          code: "ENTER_CHANNEL_RENAME",
+          message: `${callLabel}().returns.${key} must use same-name binding (renaming is not supported)`,
           loc: statement.loc,
         });
       }
@@ -1911,15 +2114,44 @@ function validateTriggerStatement(
   variables: string[],
   nodes: string[],
   issues: ValidationIssue[],
+  labels: string[] = [],
 ): void {
   if (statement.kind === "if") {
     validateExpression(statement.test, variables, nodes, issues);
     statement.consequent.forEach((entry) =>
-      validateTriggerStatement(entry, variables, nodes, issues),
+      validateTriggerStatement(entry, variables, nodes, issues, labels),
     );
     statement.alternate?.forEach((entry) =>
-      validateTriggerStatement(entry, variables, nodes, issues),
+      validateTriggerStatement(entry, variables, nodes, issues, labels),
     );
+    return;
+  }
+
+  if (statement.kind === "label") {
+    if (labels.includes(statement.label)) {
+      issues.push({
+        code: "DUPLICATE_LABEL",
+        message: `Duplicate label in scope: ${statement.label}`,
+        loc: statement.loc,
+      });
+    }
+    statement.body.forEach((entry) =>
+      validateTriggerStatement(entry, variables, nodes, issues, [
+        ...labels,
+        statement.label,
+      ]),
+    );
+    return;
+  }
+
+  if (statement.kind === "break") {
+    if (!labels.includes(statement.label)) {
+      issues.push({
+        code: "UNKNOWN_LABEL",
+        message: `Unknown label: ${statement.label}`,
+        loc: statement.loc,
+      });
+    }
     return;
   }
 
@@ -1941,6 +2173,18 @@ function validateTriggerStatement(
     if (statement.question) {
       validateSemanticString(statement.question, variables, nodes, issues);
     }
+    return;
+  }
+
+  if (statement.kind === "set") {
+    if (!variables.includes(statement.variable)) {
+      issues.push({
+        code: "UNKNOWN_VARIABLE",
+        message: `Unknown variable: ${statement.variable}`,
+        loc: statement.loc,
+      });
+    }
+    validateExpression(statement.value, variables, nodes, issues);
     return;
   }
 }
@@ -1950,15 +2194,44 @@ function validateGuardStatement(
   variables: string[],
   nodes: string[],
   issues: ValidationIssue[],
+  labels: string[] = [],
 ): void {
   if (statement.kind === "if") {
     validateExpression(statement.test, variables, nodes, issues);
     statement.consequent.forEach((entry) =>
-      validateGuardStatement(entry, variables, nodes, issues),
+      validateGuardStatement(entry, variables, nodes, issues, labels),
     );
     statement.alternate?.forEach((entry) =>
-      validateGuardStatement(entry, variables, nodes, issues),
+      validateGuardStatement(entry, variables, nodes, issues, labels),
     );
+    return;
+  }
+
+  if (statement.kind === "label") {
+    if (labels.includes(statement.label)) {
+      issues.push({
+        code: "DUPLICATE_LABEL",
+        message: `Duplicate label in scope: ${statement.label}`,
+        loc: statement.loc,
+      });
+    }
+    statement.body.forEach((entry) =>
+      validateGuardStatement(entry, variables, nodes, issues, [
+        ...labels,
+        statement.label,
+      ]),
+    );
+    return;
+  }
+
+  if (statement.kind === "break") {
+    if (!labels.includes(statement.label)) {
+      issues.push({
+        code: "UNKNOWN_LABEL",
+        message: `Unknown label: ${statement.label}`,
+        loc: statement.loc,
+      });
+    }
     return;
   }
 
@@ -1982,6 +2255,18 @@ function validateGuardStatement(
     }
     return;
   }
+
+  if (statement.kind === "set") {
+    if (!variables.includes(statement.variable)) {
+      issues.push({
+        code: "UNKNOWN_VARIABLE",
+        message: `Unknown variable: ${statement.variable}`,
+        loc: statement.loc,
+      });
+    }
+    validateExpression(statement.value, variables, nodes, issues);
+    return;
+  }
 }
 
 function validateEffectStatement(
@@ -1989,15 +2274,44 @@ function validateEffectStatement(
   variables: string[],
   nodes: string[],
   issues: ValidationIssue[],
+  labels: string[] = [],
 ): void {
   if (statement.kind === "if") {
     validateExpression(statement.test, variables, nodes, issues);
     statement.consequent.forEach((entry) =>
-      validateEffectStatement(entry, variables, nodes, issues),
+      validateEffectStatement(entry, variables, nodes, issues, labels),
     );
     statement.alternate?.forEach((entry) =>
-      validateEffectStatement(entry, variables, nodes, issues),
+      validateEffectStatement(entry, variables, nodes, issues, labels),
     );
+    return;
+  }
+
+  if (statement.kind === "label") {
+    if (labels.includes(statement.label)) {
+      issues.push({
+        code: "DUPLICATE_LABEL",
+        message: `Duplicate label in scope: ${statement.label}`,
+        loc: statement.loc,
+      });
+    }
+    statement.body.forEach((entry) =>
+      validateEffectStatement(entry, variables, nodes, issues, [
+        ...labels,
+        statement.label,
+      ]),
+    );
+    return;
+  }
+
+  if (statement.kind === "break") {
+    if (!labels.includes(statement.label)) {
+      issues.push({
+        code: "UNKNOWN_LABEL",
+        message: `Unknown label: ${statement.label}`,
+        loc: statement.loc,
+      });
+    }
     return;
   }
 

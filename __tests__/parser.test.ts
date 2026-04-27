@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { parse } from "../src/parser/index.js";
+import { parse, validate } from "../src/parser/index.js";
+import type { EnterNodeAction } from "../src/types.js";
 
 const ARC_SOURCE = `
 "use arc v2";
@@ -421,19 +422,66 @@ function Bad() {
     ).toThrow(/labels must target a block statement/);
   });
 
-  it("rejects labels and breaks inside effects", () => {
-    expect(() =>
-      parse(`
+  it("parses labeled blocks and labeled break statements in effects", () => {
+    const document = parse(`
 "use arc v2";
-function Bad() {
+function Main() {
   this.effects = () => {
     branch: {
       break branch;
     }
   };
 }
+`);
+
+    expect(document.roots[0]?.effects?.[0]).toMatchObject({
+      kind: "label",
+      label: "branch",
+      body: [{ kind: "break", label: "branch" }],
+    });
+  });
+
+  it("parses catchDeflection with deflection.from(), labels, and set()", () => {
+    const document = parse(`
+"use arc v2";
+function Main() {
+  const wantsPricing = new Boolean();
+
+  this.catchDeflection = () => {
+    branch: {
+      if (deflection.from(ProductIntro)) {
+        wantsPricing.set(true);
+        break branch;
+      }
+    }
+    return wantsPricing === true;
+  };
+
+  enter(ProductIntro);
+
+  function ProductIntro() {}
+}
+`);
+
+    expect(document.roots[0]?.catchDeflection).toMatchObject([
+      { kind: "label", label: "branch" },
+      { kind: "return" },
+    ]);
+  });
+
+  it("rejects non-bare deflection.from() targets", () => {
+    expect(() =>
+      parse(`
+"use arc v2";
+function Main() {
+  this.catchDeflection = () => {
+    return deflection.from(fresh(ProductIntro));
+  };
+
+  function ProductIntro() {}
+}
 `),
-    ).toThrow(/not allowed in this\.effects/);
+    ).toThrow(/deflection\.from\(\) v1 only accepts a bare target/);
   });
 
   it("rejects conditional IML in instruction literals", () => {
@@ -740,6 +788,47 @@ function Main() {
     ]);
   });
 
+  it("parses reopen targets without synthesizing fresh aliases", () => {
+    const document = parse(`
+"use arc v2";
+import { Intro } from "intro-arc";
+
+function Main() {
+  enter(reopen(Child));
+  enterLoop(reopen(Intro), {
+    resolveWhen: () => {
+      return true;
+    },
+  });
+
+  function Child() {
+    \`child\`;
+  }
+}
+`);
+
+    const root = document.roots[0]!;
+    expect(root.statements[0]).toMatchObject({
+      kind: "enter-node",
+      target: {
+        identifier: "Child",
+        imported: false,
+        fresh: false,
+        reopen: true,
+      },
+    });
+    expect(root.statements[1]).toMatchObject({
+      kind: "enter-loop",
+      target: {
+        identifier: "Intro",
+        imported: true,
+        fresh: false,
+        reopen: true,
+      },
+    });
+    expect(root.freshAliases).toEqual([]);
+  });
+
   it("rejects enter() renamed channel bindings", () => {
     expect(() =>
       parse(`
@@ -768,6 +857,29 @@ function Main() {
 }
 `),
     ).toThrow(/same-name binding/);
+  });
+
+  it("surfaces enter() renamed channel bindings as a structured validation issue", () => {
+    const document = parse(`
+"use arc v2";
+function Main() {
+  const ready = new Boolean();
+  enter(Child, { args: { ready } });
+  function Child() {}
+}
+`);
+    const enterAction = document.roots[0]?.statements[0] as EnterNodeAction;
+    enterAction.args = { ready: "renamedReady" };
+
+    const issues = validate(document);
+    expect(issues).toContainEqual(
+      expect.objectContaining({
+        code: "ENTER_CHANNEL_RENAME",
+        message:
+          "enter().args.ready must use same-name binding (renaming is not supported)",
+        loc: enterAction.loc,
+      }),
+    );
   });
 
   it("rejects enter() channel bindings that reference unknown caller variables", () => {
