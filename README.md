@@ -1,37 +1,34 @@
 # Arc
 
-Arc is a scripting language and runtime that gives LLM-native applications structured, stateful interaction flows. It is a pluggable solution for encoding deep, sequence-dependent knowledge into a form an application can traverse reliably.
+Arc is a scripting language and runtime for LLM-native applications that need both deep domain structure and broad continuity across a long-running interaction.
 
 ## Where Arc fits
 
-LLM-powered interactions vary along two axes: how deep the domain knowledge is, and how much each step depends on what came before.
+An LLM can reason deeply about a compact context, or stay broadly aware across a long interaction. As the interaction gets longer and the domain gets richer, competence degrades because the model has to spend attention on both at once. Arc externalizes the structure, so the model does not have to hold the whole tree in context to take the next good step.
 
-|                      | Sequence-independent | Sequence-dependent |
-| -------------------- | -------------------- | ------------------ |
-| **Shallow knowledge** | Free conversation    | Skills             |
-| **Deep knowledge**    | Memory               | **Arc**            |
+Existing scaffolding usually handles one side of this tradeoff well:
 
-**Free conversation** is the baseline — the LLM responds to whatever the user says, drawing on general training knowledge.
+- **Prompts and skills** can encode deep guidance over a short horizon.
+- **Memory** can preserve useful facts across time, but it does not define how an authored experience should progress.
+- **Workflow engines** can preserve process state, but they are not built around semantic conversational frontiers.
 
-**Memory** adds deep, persistent knowledge — facts, preferences, history — and surfaces it when relevant. Each recall stands alone: the system knows the user likes jazz, but there is no structured path through the domain.
+Arc is for applications that need both depth and breadth: deep authored structure, plus coherent progression across many turns, sessions, branches, deflections, and returns.
 
-**Skills** handle ordered sequences of steps (multi-step procedures like "book a flight") where each step is a fixed action with shallow domain knowledge.
-
-**Arc** covers interactions that require both deep domain knowledge and meaningful sequential progression. A wine tasting course that adapts its pacing to what the user already knows. An onboarding flow that branches based on interest signals. A coaching session that tracks what has been covered, what was deflected, and what to revisit.
+That fit shows up in experiences like an adaptive course that changes pace based on what the learner already understands, an AI partner that preserves authored continuity over a relationship, an onboarding flow that branches on interest signals, or a coaching session that tracks what was covered, what was deflected, and what to revisit.
 
 ## How it works
 
-An LLM-native application that uses Arc is called a **host**. The host handles all semantic work: calling the LLM, interpreting user messages, delivering content. Arc handles traversal logic and state; the host handles meaning.
+An LLM-native application that uses Arc is called a **host**. The host handles semantic work: calling the LLM, interpreting user messages, delivering content, and integrating with external systems. Arc handles authored structure, traversal logic, and state. The host handles meaning.
 
-An author writes an Arc script as a graph of nodes containing variables, branching logic, triggers, and effects. The host parses the script and advances it through a **brief/report** protocol: when the runtime reaches a point requiring semantic judgment — is the user interested? have they mentioned a specific topic? — it yields a **brief** describing what it needs. The host resolves the brief (typically by prompting an LLM) and sends back a **report**. The runtime applies the report and advances.
+An author writes an Arc script as a graph of nodes containing cells, branching logic, triggers, and effects. The runtime walks that graph and advances until it reaches work that needs semantic judgment: is the user interested, have they mentioned a specific topic, should this instruction be delivered now. At that point it yields a **brief** describing what it needs. The host resolves the brief, typically by prompting an LLM, and sends back a **report**. The runtime applies the report and continues.
 
-This separation keeps Arc scripts declarative and testable while giving the host full control over LLM calls, content presentation, and external integrations.
+This separation keeps the interaction graph outside the prompt. Arc remembers where the interaction is, what has already been resolved, and which authored paths remain available. The LLM resolves the current semantic frontier instead of carrying the whole structure in context.
 
 ### Inside an arc
 
 Each arc is a top-level function in an Arc script. An arc defines a self-contained interaction flow through four parts:
 
-- **Variables** — typed state that persists across turns: enums, booleans, and bounded integers. Each can carry an observation question for the host to evaluate against conversation context.
+- **Cells** — typed state that persists across turns: enums, booleans, and bounded integers. Each can carry an observation question for the host to evaluate against conversation context.
 - **A trigger** — conditions under which the arc activates: pattern matches on recent messages, semantic checks via `judge()`, enter-count guards.
 - **An action graph** — the sequential body: observations that extract state from conversation, instructions for the host to deliver, conditional branches, and entries into child nodes or imported arcs.
 - **Effects** — post-resolution work: final observations and emitted host effects (e.g., writing to memory, updating external systems).
@@ -41,12 +38,12 @@ The runtime walks the action graph top-down on host calls, skipping actions reso
 ## Example
 
 ```js
-"use arc v2";
+"arc";
 
 function Welcome() {
   this.displayName = "Welcome";
 
-  const interested = new Boolean({
+  const interested = Bool({
     observing: `is ${user} interested in getting started`,
   });
 
@@ -54,9 +51,9 @@ function Welcome() {
     return judge(`${user} is opening the product for the first time`);
   };
 
-  observeOrAsk(interested);
+  $observeOrAsk(interested);
   if (interested) {
-    `Give ${user} a short onboarding introduction.`;
+    $instruct(`Give ${user} a short onboarding introduction.`);
   }
 }
 ```
@@ -74,6 +71,6 @@ This package exposes:
 
 The spec documents cover precise language and runtime details:
 
-- [Arc Scripts](specs/arc-scripts.md)
-- [Arc Runtime API](specs/arc-runtime-api.md)
-- [Internal Semantics](specs/internal-semantics.md)
+- [Arc Scripts](./specs/arc-scripts.md)
+- [Arc Runtime API](./specs/arc-runtime-api.md)
+- [Internal Semantics](./specs/internal-semantics.md)

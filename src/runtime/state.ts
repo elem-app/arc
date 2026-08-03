@@ -1,46 +1,77 @@
 import type {
   ActionBrief,
   ActionState,
+  ActionStateOf,
   ActionStatement,
   ArcRef,
   ArcTraversal,
   ArcTraversalSet,
   BriefId,
+  BriefSiteQualifier,
+  CellTarget,
+  CellValue,
   Dialog,
+  DialogCursor,
   Document,
+  DocumentRewalkPlan,
+  ElementId,
+  EnterChannelLink,
   EnterChannelState,
   HostCallArgument,
   HostCallBrief,
-  HostEffect,
+  HostEffectBrief,
+  HostEffectReport,
   HostEffectStatement,
   InstructionAction,
   InstructionBrief,
   JudgmentBrief,
+  MapActionState,
   Node,
   NodeFrame,
   NodeRef,
   NodeState,
   NodeTraversal,
   ObservationBrief,
+  ObservationGroupBrief,
+  ObservationGroupReport,
   ObservationReport,
+  ObservationValueMeta,
   ObserveAction,
+  ObserveGroupAction,
+  ObserveOrAskAction,
+  ObserveOrAskGroupAction,
   PayloadValue,
+  PendingActionExtras,
+  PinTape,
   PrimitiveValue,
   RuntimeIssue,
+  ScalarSpec,
+  SegId,
+  SegKey,
   SemanticString,
+  SemanticText,
   SetAction,
-  StatementId,
+  StateSnapshot,
+  TransitionStretch,
   Traversal,
   TriggerBrief,
   TriggerReport,
   TriggerStatement,
+  UnsetAction,
   ValueExpression,
 } from "../types.js";
+import { mapMemberSegKey } from "../types.js";
+import { clonePayloadValue, mergeAndClonePayload } from "./payload.js";
+import {
+  clonePinTapes,
+  dropAllPinTapes,
+  dropPinTape,
+  type PinScope,
+} from "./pins.js";
 import {
   arcToNodeRef,
   findTraversalInSet,
   formatRef,
-  getNodeForRef,
   isArcRef,
   isArcTraversal,
   lexicalParentRef,
@@ -52,7 +83,25 @@ export type RegistryEntry = {
   document: Document;
   root: Node;
   importRefs: Record<string, ArcRef>;
+  /**
+   * Static re-walk plan for this entry's document, computed once at registration.
+   * Referenced/imported arcs carry their own entry and therefore their own plan,
+   * so the executor reads the plan from the entry owning a node, not from a
+   * `Runtime` reference.
+   */
+  rewalkPlan?: DocumentRewalkPlan;
 };
+
+/**
+ * The resolved destination of an `$enter(...)` / `$enterLoop(...)`. An `owned`
+ * target is a node in the caller's own document; a `referenced` target is the
+ * root of an imported arc; an `anonymous-copy` target is a blank copy keyed to
+ * the enter statement.
+ */
+export type EnterTarget =
+  | { kind: "owned"; ref: NodeRef; node: Node }
+  | { kind: "referenced"; ref: ArcRef; entry: RegistryEntry }
+  | { kind: "anonymous-copy"; ref: NodeRef; node: Node };
 
 export type Accumulator = {
   entries: ReadonlyMap<ArcRef, RegistryEntry>;
@@ -62,27 +111,94 @@ export type Accumulator = {
   dialog: Dialog;
   phase: "plan" | "apply";
   judgments: JudgmentBrief[];
-  observations: ObservationBrief[];
+  observations: (ObservationBrief | ObservationGroupBrief)[];
   hostCalls: HostCallBrief[];
   instructions: InstructionBrief[];
-  hostEffects: HostEffect[];
+  hostEffects: HostEffectBrief[];
+  hostParams?: PayloadValue;
+  hostParamsActive: boolean;
   blocked: boolean;
+  /**
+   * Latched, not-yet-yielded position changes for this walk. Appended at
+   * genuine traversal entry/exit and flushed by the first transition gate,
+   * which stamps `position` and records the stretch onto the action root as
+   * `pendingTransition`. Inert when `transitionsEnabled` is false (trigger
+   * stage).
+   */
+  transition?: TransitionStretch & { position?: NodeRef };
+  transitionsEnabled: boolean;
+  /** Runtime issues raised mid-walk, merged into the brief by the plan walk. */
+  issues: RuntimeIssue[];
   active?: NodeRef;
+  /** The SEG the walk is currently in, tracked so a block records its `SegId`. */
+  activeSeg: SegId;
   briefActive?: NodeRef;
   instructionBatchNode?: NodeRef;
   instructionBatchSignature?: string;
   judgmentResults: Map<string, boolean>;
   observationResults: Map<string, ObservationReport>;
+  observationGroupResults: Map<string, ObservationGroupReport>;
   hostCallResults: Map<string, PayloadValue>;
-  deflectionActive?: NodeRef;
+  hostEffectResults: Map<string, HostEffectReport>;
   yieldedInstructionIds: Set<BriefId>;
+  /**
+   * The active pin cursor: the current statement's entries on the walking SEG's
+   * pin tape. Opened per statement visit by the SEG executors and saved/
+   * restored around nested SEG walks, so sigil-less evaluations always consult
+   * the tape of the SEG that owns them.
+   */
+  pin?: PinScope;
+  /**
+   * Brief-id qualifier for an inherited hook consultation: the owning
+   * instruction's consultation instance, set while its inherited
+   * `deflectWhen` evaluates. The inherited hook IR is shared across owners
+   * under the `deflectWhen/` scope, so `qualifiedBriefSite` substitutes this
+   * instance for that prefix to keep answers from colliding.
+   */
+  hookInstance?: SegKey;
+  /**
+   * The `$map` member row the walk is currently inside, if any. Callback
+   * element ids are static (`<mapId>/…`) and run once per member, so brief ids,
+   * instruction ids, and pin tapes qualify by the member index. `item` is the
+   * pinned element value for this member and `index` its position, read by
+   * `span.item` / `span.index`. Set by the map driver around each member's
+   * callback SEG.
+   */
+  mapMember?: { mapId: ElementId; index: number; item: PrimitiveValue };
+  /**
+   * The invoke bodies the walk is currently inside, innermost last. Read-set
+   * brackets taken inside a body use that invoke's local plan, and the SEG
+   * restored after an in-body wide action is the invoke SEG rather than the
+   * node body.
+   */
+  invokeContext?: { node: Node; id: ElementId }[];
 };
 
-export type ActionBriefSnapshot = Omit<
-  ActionBrief,
-  "traversals" | "hostEffects"
->;
-export type TriggerBriefSnapshot = TriggerBrief;
+/**
+ * The brief-site prefix substitutions active on the walk: the inherited-hook
+ * consultation instance and the `$map` member row, composed so a callback
+ * element under an inherited hook is qualified by both.
+ */
+export function briefSiteQualifiers(accum: Accumulator): BriefSiteQualifier[] {
+  const qualifiers: BriefSiteQualifier[] = [];
+  if (accum.hookInstance !== undefined) {
+    qualifiers.push({
+      staticPrefix: "deflectWhen/",
+      instanceKey: `${accum.hookInstance}/`,
+    });
+  }
+  if (accum.mapMember !== undefined) {
+    const { mapId, index } = accum.mapMember;
+    qualifiers.push({
+      staticPrefix: `${mapId}/`,
+      instanceKey: `${mapMemberSegKey(mapId, index)}/`,
+    });
+  }
+  return qualifiers;
+}
+
+export type ActionBriefSnapshot = Omit<ActionBrief, "traversals">;
+export type TriggerBriefSnapshot = Omit<TriggerBrief, "deps" | "traversals">;
 
 export type ActionBriefState = {
   entries: ReadonlyMap<ArcRef, RegistryEntry>;
@@ -91,12 +207,28 @@ export type ActionBriefState = {
   snapshot: ActionBriefSnapshot;
 };
 
+/**
+ * One candidate arc's trigger consultation state, carried on the in-memory
+ * trigger brief chain. `tape` is the consultation's pin tape — a retry
+ * round-trip seeks it, so answered judges stay pinned per candidate — and a
+ * terminal `status` keeps its outcome across retries without re-running the
+ * trigger. A fresh `startTrigger(...)` starts new consultations, so none of
+ * this persists in traversal state (a documented exception to the persistence
+ * invariant; per-consultation trigger semantics permits a restart to consult
+ * afresh).
+ */
+export type TriggerCandidateState = {
+  status: "open" | "matched" | "unmatched";
+  tape: PinTape;
+};
+
 export type TriggerBriefState = {
   entries: ReadonlyMap<ArcRef, RegistryEntry>;
   entryByArc: ReadonlyMap<ArcRef, RegistryEntry>;
   traversals: ArcTraversalSet;
   dialog: Dialog;
   priorReport: TriggerReport;
+  candidates: Map<ArcRef, TriggerCandidateState>;
   snapshot: TriggerBriefSnapshot;
 };
 
@@ -107,6 +239,7 @@ export function createAccumulator(
   traversals: ArcTraversalSet,
   dialog: Dialog,
   phase: "plan" | "apply",
+  transitionsEnabled: boolean,
 ): Accumulator {
   return {
     entries,
@@ -120,15 +253,21 @@ export function createAccumulator(
     hostCalls: [],
     instructions: [],
     hostEffects: [],
+    hostParamsActive: false,
     blocked: false,
+    transition: undefined,
+    transitionsEnabled,
+    issues: [],
     active: undefined,
+    activeSeg: { kind: "body" },
     briefActive: undefined,
     instructionBatchNode: undefined,
     instructionBatchSignature: undefined,
     judgmentResults: new Map(),
     observationResults: new Map(),
+    observationGroupResults: new Map(),
     hostCallResults: new Map(),
-    deflectionActive: undefined,
+    hostEffectResults: new Map(),
     yieldedInstructionIds: new Set(),
   };
 }
@@ -137,30 +276,28 @@ export function createEmptyEnterChannelState(): EnterChannelState {
   return { args: {}, returns: {}, stagedReturns: {} };
 }
 
-function createVariableSlots(
-  node: Node,
-): Record<string, PrimitiveValue | undefined> {
-  const variables: Record<string, PrimitiveValue | undefined> = {};
-  for (const variable of node.variables) variables[variable.name] = undefined;
-  return variables;
+function createCellSlots(node: Node): Record<string, CellValue | undefined> {
+  const cells: Record<string, CellValue | undefined> = {};
+  for (const cell of node.cells) {
+    if (cell.type !== "artifact") cells[cell.name] = undefined;
+  }
+  return cells;
 }
 
 function createTraversalFrame(): NodeFrame {
-  return { actionStates: {}, evaluatorActionStates: {} };
+  return { actionStates: {}, evaluatorActionStates: {}, pinTapes: {} };
 }
 
-export function createFreshArcTraversal(
+export function createEmptyArcTraversal(
   arcRef: ArcRef,
   node: Node,
-  returnTo: ArcRef | null = null,
 ): ArcTraversal {
   return {
     ref: arcRef,
-    returnTo,
     phase: "dormant",
     enterCount: 0,
     state: undefined,
-    variables: createVariableSlots(node),
+    cells: createCellSlots(node),
     frame: createTraversalFrame(),
     ownedChildren: [],
     ephemeralChildren: [],
@@ -170,7 +307,7 @@ export function createFreshArcTraversal(
   };
 }
 
-export function createFreshNodeTraversal(
+export function createEmptyNodeTraversal(
   nodeRef: NodeRef,
   node: Node,
 ): NodeTraversal {
@@ -178,7 +315,7 @@ export function createFreshNodeTraversal(
     ref: nodeRef,
     enterCount: 0,
     state: undefined,
-    variables: createVariableSlots(node),
+    cells: createCellSlots(node),
     frame: createTraversalFrame(),
     ownedChildren: [],
     ephemeralChildren: [],
@@ -193,19 +330,24 @@ export function restartTraversal(
   base?: ArcTraversal,
 ): ArcTraversal {
   if (!base) {
-    const fresh = createFreshArcTraversal(entry.arc, entry.root);
-    fresh.phase = "entered";
-    fresh.enterCount = 1;
-    return fresh;
+    const traversal = createEmptyArcTraversal(entry.arc, entry.root);
+    traversal.phase = "entered";
+    traversal.enterCount = 1;
+    return traversal;
   }
   const next = cloneArcTraversal(base);
   next.enterCount += 1;
   next.phase = "entered";
   next.state = undefined;
   next.finalizing = undefined;
-  next.returnTo = null;
+  next.enteredBy = undefined;
+  next.activeFrame = undefined;
+  next.pendingTransition = undefined;
   next.enterChannels = createEmptyEnterChannelState();
-  if (!entry.root.resumable) clearFrame(next);
+  // Re-entry is a rewalk from the SEG top: sigil-less pins release while
+  // resolved `$` slots stay (unless the entry itself is forgetful).
+  dropAllPinTapes(next);
+  if (entry.root.forgetfulEntry) clearFrame(next);
   return next;
 }
 
@@ -220,30 +362,46 @@ export function cloneArcTraversal(traversal: ArcTraversal): ArcTraversal {
   return {
     ...cloneTraversalBase(traversal),
     ref: traversal.ref,
-    returnTo: traversal.returnTo,
     phase: traversal.phase,
+    activeFrame: traversal.activeFrame
+      ? {
+          activeRef: traversal.activeFrame.activeRef,
+          activeSeg: { ...traversal.activeFrame.activeSeg },
+        }
+      : undefined,
+    pendingTransition: traversal.pendingTransition
+      ? {
+          exited: [...traversal.pendingTransition.exited],
+          entered: [...traversal.pendingTransition.entered],
+        }
+      : undefined,
   };
 }
 
 function cloneTraversalBase<T extends Traversal>(traversal: T) {
+  const cells: Record<string, CellValue | undefined> = {};
+  for (const key in traversal.cells) {
+    cells[key] = cloneCellValue(traversal.cells[key]);
+  }
   return {
     enterCount: traversal.enterCount,
     state: traversal.state,
-    finalizing: traversal.finalizing ? { ...traversal.finalizing } : undefined,
-    variables: { ...traversal.variables },
+    finalizing: traversal.finalizing
+      ? traversal.finalizing.reason === "deflected"
+        ? {
+            ...traversal.finalizing,
+            deflection: {
+              ...traversal.finalizing.deflection,
+            },
+          }
+        : { ...traversal.finalizing }
+      : undefined,
+    cells,
     frame: {
       actionStates: Object.fromEntries(
         Object.entries(traversal.frame.actionStates).map(([id, state]) => [
           id,
-          state
-            ? {
-                ...state,
-                stagedReturns: state.stagedReturns
-                  ? { ...state.stagedReturns }
-                  : undefined,
-                enterLoopPhase: state.enterLoopPhase,
-              }
-            : undefined,
+          state ? cloneActionState(state) : undefined,
         ]),
       ),
       evaluatorActionStates: Object.fromEntries(
@@ -261,6 +419,7 @@ function cloneTraversalBase<T extends Traversal>(traversal: T) {
           ],
         ),
       ),
+      pinTapes: clonePinTapes(traversal.frame.pinTapes),
     },
     ownedChildren: traversal.ownedChildren.map((child) =>
       cloneNodeTraversal(child),
@@ -270,18 +429,21 @@ function cloneTraversalBase<T extends Traversal>(traversal: T) {
     ),
     refChildren: [...traversal.refChildren],
     appliedHostCallKeys: [...traversal.appliedHostCallKeys],
+    enteredBy: traversal.enteredBy ? { ...traversal.enteredBy } : undefined,
     enterChannels: {
       args: Object.fromEntries(
-        Object.entries(traversal.enterChannels.args).map(
-          ([key, channelLink]) => [key, { ...channelLink }],
-        ),
+        Object.entries(traversal.enterChannels.args).map(([key, link]) => [
+          key,
+          cloneEnterChannelLink(link),
+        ]),
       ),
       returns: Object.fromEntries(
-        Object.entries(traversal.enterChannels.returns).map(
-          ([key, channelLink]) => [key, { ...channelLink }],
-        ),
+        Object.entries(traversal.enterChannels.returns).map(([key, link]) => [
+          key,
+          cloneEnterChannelLink(link),
+        ]),
       ),
-      stagedReturns: { ...traversal.enterChannels.stagedReturns },
+      stagedReturns: cloneStagedReturns(traversal.enterChannels.stagedReturns),
     },
   };
 }
@@ -290,6 +452,97 @@ export function cloneTraversalSet(
   traversals: ArcTraversalSet,
 ): ArcTraversalSet {
   return traversals.map((traversal) => cloneArcTraversal(traversal));
+}
+
+export function cloneDialogCursor(cursor: DialogCursor): DialogCursor {
+  return {
+    user: cursor.user,
+    self: cursor.self,
+    ...(cursor.view !== undefined ? { view: cursor.view } : {}),
+  };
+}
+
+/** Clones a staged-returns map, deep-cloning each channel value. */
+export function cloneEnterChannelLink(
+  link: EnterChannelLink,
+): EnterChannelLink {
+  return link.kind === "spanValue"
+    ? { kind: "spanValue", value: cloneCellValue(link.value) ?? link.value }
+    : { ...link };
+}
+
+function cloneMapActionState(map: MapActionState): MapActionState {
+  return {
+    pinnedInput: [...map.pinnedInput],
+    results: map.results,
+    nextIndex: map.nextIndex,
+    terminals: [...map.terminals],
+    staged: map.staged ? { ...map.staged } : undefined,
+  };
+}
+
+function cloneStagedReturns(
+  staged: Record<string, CellValue>,
+): Record<string, CellValue> {
+  const cloned: Record<string, CellValue> = {};
+  for (const [key, value] of Object.entries(staged)) {
+    const next = cloneCellValue(value);
+    if (next !== undefined) cloned[key] = next;
+  }
+  return cloned;
+}
+
+export function cloneCellValue(
+  value: CellValue | undefined,
+): CellValue | undefined {
+  // Array values clone as arrays. This branch must precede the object⇒cursor
+  // assumption below: an array is an object, but never a dialog cursor.
+  if (Array.isArray(value)) return [...value];
+  if (value && typeof value === "object") return cloneDialogCursor(value);
+  return value;
+}
+
+/**
+ * Narrows a `CellValue` to a `DialogCursor` by shape. The type guarantees a
+ * cursor is the only object-shaped value, but this guards by shape anyway so a
+ * malformed value from a durable-store round-trip is rejected rather than read
+ * as a cursor with `undefined` fields.
+ */
+function isDialogCursor(value: CellValue): value is DialogCursor {
+  return (
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    typeof value.user === "number" &&
+    typeof value.self === "number" &&
+    (value.view === undefined || typeof value.view === "string")
+  );
+}
+
+/**
+ * Value equality for authored cell values. `undefined` equals `undefined`;
+ * primitives compare by `===`; two `DialogCursor`s compare structurally by their
+ * `user` and `self` cursors; two arrays compare structurally by ordered element
+ * value. Any other object pairing — a cursor vs a non-cursor, an array vs a
+ * non-array, or an unrecognized shape — is treated as unequal, so a re-walk
+ * decision can never under-fire by mistaking distinct values for equal.
+ */
+export function cellValuesEqual(
+  a: CellValue | undefined,
+  b: CellValue | undefined,
+): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+      return false;
+    }
+    return a.every((element, index) => element === b[index]);
+  }
+  if (typeof a === "object" || typeof b === "object") {
+    return isDialogCursor(a) && isDialogCursor(b)
+      ? a.user === b.user && a.self === b.self && a.view === b.view
+      : false;
+  }
+  return a === b;
 }
 
 export function isStopped(traversal: ArcTraversal): boolean {
@@ -320,26 +573,50 @@ export function selectActionRootTraversal(
     );
     if (preferred) return preferred;
   }
-  const root = traversals.find((traversal) => traversal.returnTo === null);
+  // The action root is the arc traversal not owned by an enter action:
+  // referenced/imported arcs and entered children always carry `enteredBy`.
+  // A trigger-outcome set also carries dormant trigger candidates, which are
+  // likewise unowned, so prefer the active (entered) run over them.
+  const unowned = traversals.filter(
+    (traversal) =>
+      isArcTraversal(traversal) && traversal.enteredBy === undefined,
+  );
+  const entered = unowned.find((traversal) => traversal.phase === "entered");
+  if (entered) return entered;
+  const root = unowned[0];
   if (root) return root;
   const first = traversals[0];
   if (!first) throw new Error("Action traversal set is empty");
   return first;
 }
 
-export function cloneDialog(dialog: Dialog): Dialog {
-  return {
-    lastTurns: dialog.lastTurns.map((turn) => ({ ...turn })),
-    names: dialog.names ? { ...dialog.names } : undefined,
-  };
+/**
+ * The arc traversal currently driving action progression, or `undefined` when no
+ * run is active — an unowned root (`enteredBy === undefined`) that is `entered`.
+ * Absence means only dormant trigger candidates remain. Hosts use this to branch
+ * between resuming an action run and probing triggers, so they decide what counts
+ * as the active root through this contract rather than inspecting traversal
+ * `enteredBy` / `phase` internals themselves.
+ */
+export function findActiveRoot(
+  traversals: ArcTraversalSet,
+): ArcTraversal | undefined {
+  return traversals.find(
+    (traversal) =>
+      isArcTraversal(traversal) &&
+      traversal.enteredBy === undefined &&
+      traversal.phase === "entered",
+  );
 }
 
-export function cloneHostEffect(call: HostEffect): HostEffect {
+export function cloneHostEffect(call: HostEffectBrief): HostEffectBrief {
   return {
+    id: call.id,
+    sourceRef: call.sourceRef,
     module: call.module,
     target: [...call.target],
     operation: call.operation,
-    arguments: [...call.arguments],
+    arguments: call.arguments.map((arg) => clonePayloadValue(arg)),
   };
 }
 
@@ -350,7 +627,114 @@ export function cloneHostCallBrief(brief: HostCallBrief): HostCallBrief {
     module: brief.module,
     target: [...brief.target],
     operation: brief.operation,
-    arguments: [...brief.arguments],
+    arguments: brief.arguments.map((arg) => clonePayloadValue(arg)),
+    hostParams: clonePayloadValue(brief.hostParams),
+  };
+}
+
+export function cloneJudgmentBrief(brief: JudgmentBrief): JudgmentBrief {
+  return {
+    id: brief.id,
+    sourceRef: brief.sourceRef,
+    question: cloneSemanticText(brief.question),
+    hostParams: clonePayloadValue(brief.hostParams),
+  };
+}
+
+/**
+ * Clones one action's resolution state, deep-copying the mutable continuation a
+ * kind carries. A pre-snapshot is carried by reference, intentionally: it is
+ * immutable once captured, so sharing it avoids a deep copy of the read-set on
+ * every report.
+ */
+function cloneActionState(state: ActionState): ActionState {
+  switch (state.kind) {
+    case "enter-node":
+    case "enter-loop":
+      return {
+        ...state,
+        stagedReturns: state.stagedReturns
+          ? cloneStagedReturns(state.stagedReturns)
+          : undefined,
+      };
+    case "map":
+      return {
+        ...state,
+        map: state.map ? cloneMapActionState(state.map) : undefined,
+      };
+    default:
+      return { ...state };
+  }
+}
+
+/** Clones a scalar shape, copying the member list an `enum` carries. */
+function cloneScalarSpec(spec: ScalarSpec): ScalarSpec {
+  switch (spec.type) {
+    case "boolean":
+      return { type: "boolean" };
+    case "string":
+      return { type: "string" };
+    case "enum":
+      return { type: "enum", values: [...spec.values] };
+    case "rangedInt":
+      return { type: "rangedInt", min: spec.min, max: spec.max };
+  }
+}
+
+/** Clones observation value metadata, dispatching on the scalar vs array variant. */
+function cloneObservationValueMeta(
+  meta: ObservationValueMeta,
+): ObservationValueMeta {
+  if (meta.type === "array") {
+    return { type: "array", element: cloneScalarSpec(meta.element) };
+  }
+  return cloneScalarSpec(meta);
+}
+
+export function cloneObservationBrief(
+  brief: ObservationBrief,
+): ObservationBrief {
+  return {
+    kind: "observation",
+    id: brief.id,
+    sourceRef: brief.sourceRef,
+    cell: brief.cell,
+    mode: brief.mode,
+    question: cloneSemanticText(brief.question),
+    currentValue: Array.isArray(brief.currentValue)
+      ? [...brief.currentValue]
+      : brief.currentValue,
+    hostParams: clonePayloadValue(brief.hostParams),
+    meta: cloneObservationValueMeta(brief.meta),
+  };
+}
+
+/** Clones an observation brief, dispatching on the single vs grouped variant. */
+export function cloneObservationOrGroupBrief(
+  brief: ObservationBrief | ObservationGroupBrief,
+): ObservationBrief | ObservationGroupBrief {
+  return brief.kind === "observation-group"
+    ? cloneObservationGroupBrief(brief)
+    : cloneObservationBrief(brief);
+}
+
+export function cloneObservationGroupBrief(
+  brief: ObservationGroupBrief,
+): ObservationGroupBrief {
+  return {
+    kind: "observation-group",
+    id: brief.id,
+    sourceRef: brief.sourceRef,
+    mode: brief.mode,
+    hostParams: clonePayloadValue(brief.hostParams),
+    fields: brief.fields.map((field) => ({
+      cell: field.cell,
+      question: cloneSemanticText(field.question),
+      currentValue: Array.isArray(field.currentValue)
+        ? [...field.currentValue]
+        : field.currentValue,
+      meta: cloneObservationValueMeta(field.meta),
+    })),
   };
 }
 
@@ -383,9 +767,15 @@ export function cloneInstructionBrief(
     sourceRef: brief.sourceRef,
     mode: brief.mode,
     phase: brief.phase,
-    text: brief.text,
+    text: cloneSemanticText(brief.text),
+    hostParams: clonePayloadValue(brief.hostParams),
     postcheck: cloneInstructionPostcheck(brief.postcheck),
   };
+}
+
+export function cloneSemanticText(text: SemanticText): SemanticText {
+  if (typeof text === "string") return text;
+  return text.map((part) => ({ ...part }));
 }
 
 export function cloneInstructionPostcheck(
@@ -433,20 +823,39 @@ export function cloneValueExpression(
   switch (expression.kind) {
     case "literal":
       return { kind: "literal", value: expression.value };
-    case "ref":
-      return { kind: "ref", name: expression.name };
-    case "variable":
-      return { kind: "variable", name: expression.name };
+    case "cell":
+      return { kind: "cell", name: expression.name };
+    case "isUnset":
+      return { kind: "isUnset", cell: expression.cell };
     case "channel":
       return {
         kind: "channel",
         namespace: expression.namespace,
         key: expression.key,
       };
-    case "deflectionFrom":
+    case "channelIsUnset":
       return {
-        kind: "deflectionFrom",
+        kind: "channelIsUnset",
+        namespace: expression.namespace,
+        key: expression.key,
+      };
+    case "deflectionEscaped":
+      return {
+        kind: "deflectionEscaped",
         target: { ...expression.target },
+      };
+    case "dialogCursor":
+      return { kind: "dialogCursor" };
+    case "dialogTurnsSince":
+      return {
+        kind: "dialogTurnsSince",
+        metric: expression.metric,
+        receiver: cloneValueExpression(
+          expression.receiver,
+        ) as typeof expression.receiver,
+        baseline: cloneValueExpression(
+          expression.baseline,
+        ) as typeof expression.baseline,
       };
     case "scope":
       return {
@@ -456,8 +865,29 @@ export function cloneValueExpression(
       };
     case "enterCount":
       return { kind: "enterCount" };
+    case "pendingState":
+      return { kind: "pendingState" };
     case "nodeState":
       return { kind: "nodeState", identifier: expression.identifier };
+    case "arrayElementRead":
+      return {
+        kind: "arrayElementRead",
+        array: { ...expression.array },
+        index: cloneValueExpression(
+          expression.index,
+        ) as typeof expression.index,
+      };
+    case "arrayLength":
+      return { kind: "arrayLength", array: { ...expression.array } };
+    case "span":
+      return { kind: "span", owner: expression.owner, key: expression.key };
+    case "arrayLiteral":
+      return {
+        kind: "arrayLiteral",
+        elements: expression.elements.map((element) =>
+          cloneValueExpression(element),
+        ),
+      };
     case "judge":
       return {
         id: expression.id,
@@ -500,11 +930,29 @@ export function cloneValueExpression(
         left: cloneValueExpression(expression.left),
         right: cloneValueExpression(expression.right),
       };
+    case "conditional":
+      return {
+        kind: "conditional",
+        test: cloneValueExpression(expression.test),
+        consequent: cloneValueExpression(expression.consequent),
+        alternate: cloneValueExpression(expression.alternate),
+      };
     case "unary":
       return {
         kind: "unary",
         op: expression.op,
         argument: cloneValueExpression(expression.argument),
+      };
+    case "template-string":
+      return {
+        kind: "template-string",
+        parts: expression.parts.map((part) => {
+          if (part.kind === "text") return { kind: "text", value: part.value };
+          return {
+            kind: "expression",
+            expression: cloneValueExpression(part.expression),
+          };
+        }),
       };
   }
 }
@@ -519,7 +967,7 @@ export function cloneHostCallArgument(arg: HostCallArgument): HostCallArgument {
   if (arg.kind === "array") {
     return {
       kind: "array",
-      value: arg.value.map((entry) => cloneHostCallArgument(entry)),
+      elements: arg.elements.map((entry) => cloneHostCallArgument(entry)),
     };
   }
   return {
@@ -534,32 +982,24 @@ export function cloneHostCallArgument(arg: HostCallArgument): HostCallArgument {
 }
 
 export function cloneSemanticString(semantic: SemanticString): SemanticString {
-  return {
-    kind: "semantic-string",
-    parts: semantic.parts.map((part) =>
-      part.kind === "text"
-        ? { kind: "text", value: part.value }
-        : {
-            kind: "expression",
-            expression: cloneValueExpression(part.expression),
-          },
-    ),
-    loc: semantic.loc,
-  };
-}
+  if (semantic.kind === "literal") {
+    return { kind: "literal", value: semantic.value };
+  }
 
-export function pruneFrames(
-  entries: ReadonlyMap<ArcRef, RegistryEntry>,
-  entry: RegistryEntry,
-  traversal: Traversal,
-): void {
-  const node = getNodeForRef(entries, entry, traversal.ref);
-  if (!node) return;
-  if (!node.resumable) traversal.frame = createTraversalFrame();
-  for (const child of traversal.ownedChildren)
-    pruneFrames(entries, entry, child);
-  for (const child of traversal.ephemeralChildren)
-    pruneFrames(entries, entry, child);
+  return {
+    kind: "template-string",
+    parts: semantic.parts.map((part) => {
+      if (part.kind === "text") return { kind: "text", value: part.value };
+      if (part.kind === "ref") return { kind: "ref", name: part.name };
+      if (part.kind === "hostVar") {
+        return { kind: "hostVar", module: part.module, path: [...part.path] };
+      }
+      return {
+        kind: "expression",
+        expression: cloneValueExpression(part.expression),
+      };
+    }),
+  };
 }
 
 export function upsertTraversal(
@@ -591,7 +1031,7 @@ export function ensureOwnedTraversal(
     (entry) => entry.ref === childRef,
   );
   if (!child) {
-    child = createFreshNodeTraversal(childRef, childNode);
+    child = createEmptyNodeTraversal(childRef, childNode);
     ownerTraversal.ownedChildren.push(child);
   }
   return child;
@@ -631,7 +1071,7 @@ export function ensureEphemeralTraversal(
   return replaceEphemeralTraversal(
     ownerTraversal,
     childRef,
-    createFreshNodeTraversal(childRef, childNode),
+    createEmptyNodeTraversal(childRef, childNode),
   );
 }
 
@@ -653,17 +1093,45 @@ export function resolveTraversalForBrief(
   return found;
 }
 
-export function getActionState(
+export function getActionState<S extends ActionStatement | HostEffectStatement>(
   traversal: Traversal,
-  action: ActionStatement | HostEffectStatement,
-): ActionState | undefined {
-  return traversal.frame.actionStates[action.id];
+  action: S,
+): ActionStateOf<S["kind"]> | undefined {
+  return traversal.frame.actionStates[action.id] as
+    | ActionStateOf<S["kind"]>
+    | undefined;
+}
+
+/**
+ * The bracket snapshot a subtree-opening action persisted, if it holds one.
+ * Reads the field without first narrowing to the kinds that carry it, for the
+ * sites that only have an action id.
+ */
+export function actionPreSnapshot(
+  state: ActionState | undefined,
+): StateSnapshot | undefined {
+  return state && "preSnapshot" in state ? state.preSnapshot : undefined;
+}
+
+/**
+ * The pending `$map` arena for the given map id. The member callback consults it
+ * to stage `span.result`; it exists for the whole span of member execution.
+ */
+export function getMapArena(
+  traversal: Traversal,
+  mapId: ElementId,
+): MapActionState {
+  const state = traversal.frame.actionStates[mapId];
+  if (state?.kind !== "map" || state.status !== "pending" || !state.map) {
+    throw new Error(`No pending $map arena for ${mapId}`);
+  }
+  return state.map;
 }
 
 export function getEvaluatorActionStates(
   traversal: Traversal,
-  scopeKey: string,
-): Record<number, ActionState | undefined> {
+  scopeKey: SegKey,
+): Record<ElementId, ActionState | undefined> {
   traversal.frame.evaluatorActionStates ??= {};
   traversal.frame.evaluatorActionStates[scopeKey] ??= {};
   return traversal.frame.evaluatorActionStates[scopeKey]!;
@@ -671,16 +1139,28 @@ export function getEvaluatorActionStates(
 
 export function getEvaluatorActionState(
   traversal: Traversal,
-  scopeKey: string,
-  action: ObserveAction | SetAction,
+  scopeKey: SegKey,
+  action:
+    | ObserveAction
+    | ObserveOrAskAction
+    | ObserveGroupAction
+    | ObserveOrAskGroupAction
+    | SetAction
+    | UnsetAction,
 ): ActionState | undefined {
   return getEvaluatorActionStates(traversal, scopeKey)[action.id];
 }
 
 export function markEvaluatorActionResolved(
   traversal: Traversal,
-  scopeKey: string,
-  action: ObserveAction | SetAction,
+  scopeKey: SegKey,
+  action:
+    | ObserveAction
+    | ObserveOrAskAction
+    | ObserveGroupAction
+    | ObserveOrAskGroupAction
+    | SetAction
+    | UnsetAction,
 ): void {
   getEvaluatorActionStates(traversal, scopeKey)[action.id] = {
     kind: action.kind,
@@ -690,13 +1170,19 @@ export function markEvaluatorActionResolved(
 
 export function clearEvaluatorActionStates(
   traversal: Traversal,
-  scopeKey: string,
+  scopeKey: SegKey,
 ): void {
   traversal.frame.evaluatorActionStates ??= {};
   delete traversal.frame.evaluatorActionStates[scopeKey];
+  // A hook SEG's pin tape lives and dies with its evaluator scope: the
+  // consultation's pins release exactly when its narrow-leaf marks do.
+  dropPinTape(traversal, scopeKey);
 }
 
-export function clearActionState(traversal: Traversal, actionId: number): void {
+export function clearActionState(
+  traversal: Traversal,
+  actionId: ElementId,
+): void {
   delete traversal.frame.actionStates[actionId];
 }
 
@@ -704,19 +1190,28 @@ export function isResolvedActionState(state: ActionState | undefined): boolean {
   return state?.status === "resolved";
 }
 
+// `ActionState` is discriminated so read sites cannot reach continuation state
+// the kind does not carry. These two setters write a `kind` that is still the
+// whole union, which no single variant accepts, so each asserts the result.
+// Every extra is optional on every variant, so the assertion cannot widen what
+// a caller may store.
+
 export function markResolvedActionState(
   traversal: Traversal,
-  actionId: number,
+  actionId: ElementId,
   kind: ActionState["kind"],
 ): void {
-  traversal.frame.actionStates[actionId] = { kind, status: "resolved" };
+  traversal.frame.actionStates[actionId] = {
+    kind,
+    status: "resolved",
+  } as ActionState;
 }
 
 export function markPendingActionState(
   traversal: Traversal,
-  actionId: number,
+  actionId: ElementId,
   kind: ActionState["kind"],
-  extras?: Pick<ActionState, "stagedReturns" | "enterLoopPhase">,
+  extras?: PendingActionExtras,
 ): void {
   traversal.frame.actionStates[actionId] = {
     kind,
@@ -724,8 +1219,10 @@ export function markPendingActionState(
     stagedReturns: extras?.stagedReturns
       ? { ...extras.stagedReturns }
       : undefined,
-    enterLoopPhase: extras?.enterLoopPhase,
-  };
+    enterPhase: extras?.enterPhase,
+    preSnapshot: extras?.preSnapshot,
+    map: extras?.map,
+  } as ActionState;
 }
 
 export function markActionResolved(
@@ -746,6 +1243,87 @@ export function setActiveTraversal(
   accum.active = traversalToNodeRef(traversal);
 }
 
+/**
+ * Records the current frontier on the action root traversal so the next report
+ * resumes that exact SEG. Stamped at every block, first walk and resume alike.
+ */
+export function recordActiveFrame(accum: Accumulator): void {
+  if (!accum.active) return;
+  const root = selectActionRootTraversal(accum.traversals, accum.entry.arc);
+  root.activeFrame = {
+    activeRef: accum.active,
+    activeSeg: { ...accum.activeSeg },
+  };
+}
+
+/** Appends a genuinely entered traversal to the walk's transition latch. */
+export function latchEnteredTransition(accum: Accumulator, ref: NodeRef): void {
+  if (!accum.transitionsEnabled) return;
+  (accum.transition ??= { exited: [], entered: [] }).entered.push(ref);
+}
+
+/** Appends a genuinely exited traversal to the walk's transition latch. */
+export function latchExitedTransition(accum: Accumulator, ref: NodeRef): void {
+  if (!accum.transitionsEnabled) return;
+  (accum.transition ??= { exited: [], entered: [] }).exited.push(ref);
+}
+
+/** Whether the walk has latched position changes awaiting a transition gate. */
+export function hasPendingTransitionLatch(accum: Accumulator): boolean {
+  return (
+    accum.transitionsEnabled &&
+    accum.transition !== undefined &&
+    (accum.transition.exited.length > 0 || accum.transition.entered.length > 0)
+  );
+}
+
+/**
+ * Flushes the transition latch at the transition block sink, beside the active
+ * frame: stamps `position` — the view coordinate, which may differ from the
+ * frame's resume coordinate — onto the latch for the brief payload, and
+ * persists the stretch (`exited`/`entered`) onto the action root as
+ * `pendingTransition`.
+ */
+export function recordPendingTransition(
+  accum: Accumulator,
+  position: NodeRef,
+): void {
+  const latch = accum.transition;
+  if (!latch) return;
+  latch.position = position;
+  const root = selectActionRootTraversal(accum.traversals, accum.entry.arc);
+  root.pendingTransition = {
+    exited: [...latch.exited],
+    entered: [...latch.entered],
+  };
+}
+
+/** Marks a target traversal as owned by the caller's enter action. */
+export function stampEnteredBy(
+  target: Traversal,
+  callerRef: NodeRef,
+  actionId: ElementId,
+): void {
+  target.enteredBy = { callerRef, actionId };
+}
+
+/**
+ * Clears a target's `enteredBy` marker when it points at the resolved enter
+ * action, called as that enter resolves.
+ */
+export function clearEnteredByForAction(
+  target: Traversal,
+  callerRef: NodeRef,
+  actionId: ElementId,
+): void {
+  if (
+    target.enteredBy?.callerRef === callerRef &&
+    target.enteredBy.actionId === actionId
+  ) {
+    target.enteredBy = undefined;
+  }
+}
+
 export function noteBriefYield(accum: Accumulator, traversal: Traversal): void {
   accum.briefActive ??= traversalToNodeRef(traversal);
 }
@@ -762,10 +1340,16 @@ export function childState(
 }
 
 export function makeBriefId(
-  kind: "observe" | "judge" | "host-call" | "instruction",
+  kind:
+    | "observe"
+    | "observe-group"
+    | "judge"
+    | "host-call"
+    | "host-effect"
+    | "instruction",
   arc: ArcRef,
   traversal: Traversal,
-  actionId: StatementId,
+  actionId: ElementId,
 ): BriefId {
   return `${kind}:[${arc}]:[${traversalToNodeRef(traversal)}]:${actionId}`;
 }
@@ -773,15 +1357,23 @@ export function makeBriefId(
 export function makeObservationId(
   arc: ArcRef,
   traversal: Traversal,
-  actionId: StatementId,
+  actionId: ElementId,
 ): BriefId {
   return makeBriefId("observe", arc, traversal, actionId);
+}
+
+export function makeObservationGroupId(
+  arc: ArcRef,
+  traversal: Traversal,
+  actionId: ElementId,
+): BriefId {
+  return makeBriefId("observe-group", arc, traversal, actionId);
 }
 
 export function makeJudgeId(
   arc: ArcRef,
   traversal: Traversal,
-  actionId: StatementId,
+  actionId: ElementId,
 ): BriefId {
   return makeBriefId("judge", arc, traversal, actionId);
 }
@@ -789,34 +1381,29 @@ export function makeJudgeId(
 export function makeHostCallId(
   arc: ArcRef,
   traversal: Traversal,
-  actionId: StatementId,
+  actionId: ElementId,
 ): BriefId {
   return makeBriefId("host-call", arc, traversal, actionId);
+}
+
+export function makeHostEffectId(
+  arc: ArcRef,
+  traversal: Traversal,
+  actionId: ElementId,
+): BriefId {
+  return makeBriefId("host-effect", arc, traversal, actionId);
 }
 
 export function makeInstructionId(
   arc: ArcRef,
   traversal: Traversal,
-  actionId: StatementId,
+  actionId: ElementId,
 ): BriefId {
   return makeBriefId("instruction", arc, traversal, actionId);
 }
 
 export function dedupeBriefIds(ids: BriefId[]): BriefId[] {
   return [...new Set(ids)];
-}
-
-export function instructionResolutionFrameKey(
-  statement: InstructionAction,
-  kind: "resolveWhen" | "deflectWhen",
-): string {
-  return `instruction:${String(statement.id)}:${kind}`;
-}
-
-export function enterLoopFrameKey(
-  statement: Extract<ActionStatement, { kind: "enter-loop" }>,
-): string {
-  return `enter-loop:${statement.id}`;
 }
 
 export function isInstructionBatchActive(
@@ -828,23 +1415,41 @@ export function isInstructionBatchActive(
 
 export function canBatchInstruction(
   accum: Accumulator,
+  node: Node,
   statement: InstructionAction,
 ): boolean {
   const signature = accum.instructionBatchSignature;
   return (
     signature === undefined ||
-    signature === instructionBatchSignature(statement)
+    signature === instructionBatchSignature(node, statement)
   );
 }
 
 export function instructionBatchSignature(
+  node: Node,
   statement: InstructionAction,
 ): string {
   return JSON.stringify({
     mode: statement.mode,
+    hostParams: normalizePayloadValue(
+      mergeAndClonePayload(node.hostParams, statement.hostParams),
+    ),
     resolveWhen: normalizeResolutionStatements(statement.resolveWhen),
     deflectWhen: normalizeResolutionStatements(statement.deflectWhen),
   });
+}
+
+function normalizePayloadValue(value: PayloadValue): unknown {
+  if (Array.isArray(value))
+    return value.map((item) => normalizePayloadValue(item));
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, normalizePayloadValue(item)]),
+    );
+  }
+  return value;
 }
 
 export function normalizeResolutionStatements(
@@ -893,37 +1498,73 @@ export function normalizeResolutionStatement(
   if (statement.kind === "set") {
     return {
       kind: "set",
-      variable: statement.variable,
+      target: normalizeCellTarget(statement.target),
       value: normalizeValueExpression(statement.value),
+    };
+  }
+  if (statement.kind === "unset") {
+    return {
+      kind: "unset",
+      target: normalizeCellTarget(statement.target),
+    };
+  }
+  if (statement.kind === "observeGroup") {
+    return {
+      kind: "observeGroup",
+      targets: statement.targets.map((target) => normalizeCellTarget(target)),
     };
   }
   return {
     kind: "observe",
-    variable: statement.variable,
-    question: statement.question
-      ? normalizeSemanticString(statement.question)
-      : null,
+    target: normalizeCellTarget(statement.target),
+    question:
+      statement.question !== undefined
+        ? normalizeSemanticString(statement.question)
+        : null,
   };
+}
+
+function normalizeCellTarget(target: CellTarget): unknown {
+  const [root, ...accessors] = target;
+  return [
+    root,
+    ...accessors.map((accessor) => normalizeValueExpression(accessor)),
+  ];
 }
 
 export function normalizeValueExpression(expression: ValueExpression): unknown {
   switch (expression.kind) {
     case "literal":
       return { kind: "literal", value: expression.value };
-    case "ref":
-      return { kind: "ref", name: expression.name };
-    case "variable":
-      return { kind: "variable", name: expression.name };
+    case "cell":
+      return { kind: "cell", name: expression.name };
+    case "isUnset":
+      return { kind: "isUnset", cell: expression.cell };
     case "channel":
       return {
         kind: "channel",
         namespace: expression.namespace,
         key: expression.key,
       };
-    case "deflectionFrom":
+    case "channelIsUnset":
       return {
-        kind: "deflectionFrom",
+        kind: "channelIsUnset",
+        namespace: expression.namespace,
+        key: expression.key,
+      };
+    case "deflectionEscaped":
+      return {
+        kind: "deflectionEscaped",
         target: { ...expression.target },
+      };
+    case "dialogCursor":
+      return { kind: "dialogCursor" };
+    case "dialogTurnsSince":
+      return {
+        kind: "dialogTurnsSince",
+        metric: expression.metric,
+        receiver: normalizeValueExpression(expression.receiver),
+        baseline: normalizeValueExpression(expression.baseline),
       };
     case "scope":
       return {
@@ -933,8 +1574,27 @@ export function normalizeValueExpression(expression: ValueExpression): unknown {
       };
     case "enterCount":
       return { kind: "enterCount" };
+    case "pendingState":
+      return { kind: "pendingState" };
     case "nodeState":
       return { kind: "nodeState", node: expression.identifier };
+    case "arrayElementRead":
+      return {
+        kind: "arrayElementRead",
+        array: { ...expression.array },
+        index: normalizeValueExpression(expression.index),
+      };
+    case "arrayLength":
+      return { kind: "arrayLength", array: { ...expression.array } };
+    case "span":
+      return { kind: "span", owner: expression.owner, key: expression.key };
+    case "arrayLiteral":
+      return {
+        kind: "arrayLiteral",
+        elements: expression.elements.map((element) =>
+          normalizeValueExpression(element),
+        ),
+      };
     case "judge":
       return {
         kind: "judge",
@@ -971,11 +1631,29 @@ export function normalizeValueExpression(expression: ValueExpression): unknown {
         left: normalizeValueExpression(expression.left),
         right: normalizeValueExpression(expression.right),
       };
+    case "conditional":
+      return {
+        kind: "conditional",
+        test: normalizeValueExpression(expression.test),
+        consequent: normalizeValueExpression(expression.consequent),
+        alternate: normalizeValueExpression(expression.alternate),
+      };
     case "unary":
       return {
         kind: "unary",
         op: expression.op,
         argument: normalizeValueExpression(expression.argument),
+      };
+    case "template-string":
+      return {
+        kind: "template-string",
+        parts: expression.parts.map((part) => {
+          if (part.kind === "text") return { kind: "text", value: part.value };
+          return {
+            kind: "expression",
+            expression: normalizeValueExpression(part.expression),
+          };
+        }),
       };
   }
 }
@@ -990,7 +1668,7 @@ export function normalizeHostCallArgument(arg: HostCallArgument): unknown {
   if (arg.kind === "array") {
     return {
       kind: "array",
-      value: arg.value.map((entry) => normalizeHostCallArgument(entry)),
+      elements: arg.elements.map((entry) => normalizeHostCallArgument(entry)),
     };
   }
   return {
@@ -1005,12 +1683,19 @@ export function normalizeHostCallArgument(arg: HostCallArgument): unknown {
 }
 
 export function normalizeSemanticString(semantic: SemanticString): unknown {
-  return semantic.parts.map((part) =>
-    part.kind === "text"
-      ? { kind: "text", value: part.value }
-      : {
-          kind: "expression",
-          expression: normalizeValueExpression(part.expression),
-        },
-  );
+  if (semantic.kind === "literal") {
+    return { kind: "literal", value: semantic.value };
+  }
+
+  return semantic.parts.map((part) => {
+    if (part.kind === "text") return { kind: "text", value: part.value };
+    if (part.kind === "ref") return { kind: "ref", name: part.name };
+    if (part.kind === "hostVar") {
+      return { kind: "hostVar", module: part.module, path: [...part.path] };
+    }
+    return {
+      kind: "expression",
+      expression: normalizeValueExpression(part.expression),
+    };
+  });
 }

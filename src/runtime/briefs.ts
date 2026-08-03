@@ -5,16 +5,34 @@ import type {
   ArcRef,
   ArcTraversal,
   ArcTraversalSet,
+  BriefId,
   Dialog,
-  HostEffect,
+  HostEffectBrief,
+  HostEffectReport,
   InstructionBrief,
   NodeRef,
+  NodeTransition,
   RuntimeIssue,
   TriggerBrief,
   TriggerReport,
 } from "../types.js";
-import { continueArc, runTrigger } from "./execute.js";
-import { arcToNodeRef, formatRef, indexTraversals, rootRefOf } from "./refs.js";
+import { nodeSegKey } from "../types.js";
+import {
+  clearInvokeStateCrossedByDeflection,
+  continueArc,
+  resumeActiveFrame,
+  runTrigger,
+} from "./execute.js";
+import { clonePayloadObject, clonePayloadValue } from "./payload.js";
+import { clonePinTape } from "./pins.js";
+import {
+  arcToNodeRef,
+  formatRef,
+  getEntryForRef,
+  getNodeForRef,
+  indexTraversals,
+  rootRefOf,
+} from "./refs.js";
 import {
   buildAcceptedActionReport,
   buildAcceptedTriggerReport,
@@ -25,18 +43,20 @@ import {
   cloneRuntimeIssue,
   filterObservationReports,
   findUnknownReportIdIssue,
+  runtimeErrorReasonCode,
   type ReportValidation,
 } from "./report-validation.js";
 import {
-  cloneArcTraversal,
+  clearEvaluatorActionStates,
   cloneHostCallBrief,
   cloneHostEffect,
   cloneInstructionBrief,
+  cloneJudgmentBrief,
+  cloneObservationOrGroupBrief,
   cloneTraversalSet,
   createAccumulator,
-  createFreshArcTraversal,
+  createEmptyArcTraversal,
   mergeInstructionBriefs,
-  pruneFrames,
   resolveTraversalForBrief,
   restartTraversal,
   selectActionRootTraversal,
@@ -46,6 +66,7 @@ import {
   type ActionBriefState,
   type RegistryEntry,
   type TriggerBriefSnapshot,
+  type TriggerCandidateState,
 } from "./state.js";
 
 function cloneTriggerBriefSnapshot(
@@ -53,10 +74,9 @@ function cloneTriggerBriefSnapshot(
 ): TriggerBriefSnapshot {
   return {
     matched: plan.matched,
-    traversals: cloneTraversalSet(plan.traversals),
     issues: plan.issues.map(cloneRuntimeIssue),
-    judgments: plan.judgments.map((item) => ({ ...item })),
-    observations: plan.observations.map((item) => ({ ...item })),
+    judgments: plan.judgments.map(cloneJudgmentBrief),
+    observations: plan.observations.map(cloneObservationOrGroupBrief),
     hostCalls: plan.hostCalls.map(cloneHostCallBrief),
     matchableArcs: [...plan.matchableArcs],
   };
@@ -165,77 +185,122 @@ export function validateTriggerReport(
   }
 
   if (report.hostCalls) {
-    accepted.hostCalls = { ...report.hostCalls };
+    accepted.hostCalls = clonePayloadObject(report.hostCalls);
   }
 
   return { accepted, issues, rejected: false };
 }
 
 function finalizeTriggerBrief(
+  entries: ReadonlyMap<ArcRef, RegistryEntry>,
+  traversals: ArcTraversalSet,
   snapshot: TriggerBriefSnapshot,
-  priorReport: TriggerReport = {},
+  priorReport: TriggerReport,
+  candidates: Map<ArcRef, TriggerCandidateState>,
 ): {
   brief: TriggerBrief;
   traversals: ArcTraversalSet;
   priorReport: TriggerReport;
+  candidates: Map<ArcRef, TriggerCandidateState>;
   snapshot: TriggerBriefSnapshot;
 } {
-  const clonedSnapshot = cloneTriggerBriefSnapshot(snapshot);
+  const briefSnapshot = cloneTriggerBriefSnapshot(snapshot);
   return {
-    brief: cloneTriggerBriefSnapshot(clonedSnapshot),
-    traversals: cloneTraversalSet(clonedSnapshot.traversals),
+    brief: {
+      traversals: cloneTraversalSet(traversals),
+      deps: collectTriggerDeps(entries, traversals, snapshot),
+      ...briefSnapshot,
+    },
+    traversals,
     priorReport,
-    snapshot: clonedSnapshot,
+    candidates,
+    snapshot,
   };
 }
 
+function collectTriggerDeps(
+  entries: ReadonlyMap<ArcRef, RegistryEntry>,
+  traversals: ArcTraversalSet,
+  snapshot: TriggerBriefSnapshot,
+): ArcRef[] {
+  const roots = new Set<ArcRef>();
+  if (snapshot.matched) roots.add(snapshot.matched);
+  for (const arc of snapshot.matchableArcs) roots.add(arc);
+  for (const traversal of traversals) roots.add(traversal.ref);
+  for (const item of snapshot.judgments) roots.add(rootRefOf(item.sourceRef));
+  for (const item of snapshot.observations)
+    roots.add(rootRefOf(item.sourceRef));
+  for (const item of snapshot.hostCalls) roots.add(rootRefOf(item.sourceRef));
+  return collectTransitiveArcDeps(entries, roots);
+}
+
+function collectTransitiveArcDeps(
+  entries: ReadonlyMap<ArcRef, RegistryEntry>,
+  roots: Iterable<ArcRef>,
+): ArcRef[] {
+  const deps = new Set<ArcRef>();
+  const visit = (arc: ArcRef): void => {
+    if (deps.has(arc)) return;
+    deps.add(arc);
+    const entry = entries.get(arc);
+    if (!entry) return;
+    for (const imported of Object.values(entry.importRefs)) visit(imported);
+  };
+  for (const root of roots) visit(root);
+  return [...deps];
+}
+
 export function buildRetryTriggerBrief(
+  entries: ReadonlyMap<ArcRef, RegistryEntry>,
+  traversals: ArcTraversalSet,
   snapshot: TriggerBriefSnapshot,
   issues: RuntimeIssue[] = [],
   priorReport: TriggerReport = {},
+  candidates: Map<ArcRef, TriggerCandidateState>,
 ): {
   brief: TriggerBrief;
   traversals: ArcTraversalSet;
   priorReport: TriggerReport;
+  candidates: Map<ArcRef, TriggerCandidateState>;
   snapshot: TriggerBriefSnapshot;
 } {
   return finalizeTriggerBrief(
+    entries,
+    cloneTraversalSet(traversals),
     {
       ...snapshot,
       issues: [...issues],
     },
     priorReport,
+    cloneCandidateStates(candidates),
   );
 }
 
-function mergeTriggerReports(
+/**
+ * Carries the chain's retained `preferredMatch` into the next accepted report.
+ * Result carryover needs no merging: judge and host-call answers live in the
+ * per-candidate consultation tapes, and observation resolutions persist as
+ * cell writes and trigger evaluator marks on the chain's traversal set.
+ */
+function carryTriggerReport(
   prior: TriggerReport,
   next: TriggerReport,
 ): TriggerReport {
   return {
-    preferredMatch: next.preferredMatch,
-    judgments:
-      prior.judgments || next.judgments
-        ? {
-            ...(prior.judgments ?? {}),
-            ...(next.judgments ?? {}),
-          }
-        : undefined,
-    observations:
-      prior.observations || next.observations
-        ? {
-            ...(prior.observations ?? {}),
-            ...(next.observations ?? {}),
-          }
-        : undefined,
-    hostCalls:
-      prior.hostCalls || next.hostCalls
-        ? {
-            ...(prior.hostCalls ?? {}),
-            ...(next.hostCalls ?? {}),
-          }
-        : undefined,
+    ...next,
+    preferredMatch: next.preferredMatch ?? prior.preferredMatch,
   };
+}
+
+function cloneCandidateStates(
+  candidates: ReadonlyMap<ArcRef, TriggerCandidateState>,
+): Map<ArcRef, TriggerCandidateState> {
+  return new Map(
+    [...candidates].map(([arc, state]) => [
+      arc,
+      { status: state.status, tape: clonePinTape(state.tape) },
+    ]),
+  );
 }
 
 export function buildTriggerBrief(
@@ -245,16 +310,25 @@ export function buildTriggerBrief(
   dialog: Dialog,
   report: TriggerReport = {},
   priorReport: TriggerReport = {},
+  priorCandidates?: ReadonlyMap<ArcRef, TriggerCandidateState>,
   leadingIssues: RuntimeIssue[] = [],
 ): {
   brief: TriggerBrief;
   traversals: ArcTraversalSet;
   priorReport: TriggerReport;
+  candidates: Map<ArcRef, TriggerCandidateState>;
   snapshot: TriggerBriefSnapshot;
 } {
-  const acceptedReport = mergeTriggerReports(priorReport, report);
+  const acceptedReport = carryTriggerReport(priorReport, report);
+  // Absent prior candidate state means fresh consultations for every arc (a
+  // new `startTrigger`); present state means a retry round-trip on the same
+  // chain, which seeks each candidate's consultation instead of restarting it.
+  const freshConsultations = priorCandidates === undefined;
+  const candidates = priorCandidates
+    ? cloneCandidateStates(priorCandidates)
+    : new Map<ArcRef, TriggerCandidateState>();
   const nextTraversals = cloneTraversalSet(traversals);
-  const traversalByArc = indexTraversals(traversals);
+  const traversalByArc = indexTraversals(nextTraversals);
   const judgments = [];
   const observations = [];
   const hostCalls = [];
@@ -270,9 +344,26 @@ export function buildTriggerBrief(
     if (existing?.phase === "poisoned") {
       continue;
     }
-    const base = existing
-      ? cloneArcTraversal(existing)
-      : createFreshArcTraversal(entry.arc, entry.root);
+    const base = existing ?? createEmptyArcTraversal(entry.arc, entry.root);
+    const prior = candidates.get(arcKey);
+    if (prior && prior.status !== "open") {
+      // Terminal candidates keep their consultation outcome across retries.
+      if (prior.status === "matched") {
+        matchableArcs.push(arcKey);
+        matchedBases.set(arcKey, { entry, base });
+      }
+      continue;
+    }
+    if (freshConsultations && existing) {
+      // A new consultation releases the previous one's narrow-leaf marks; the
+      // pin state is per-candidate call-state and starts empty below.
+      clearEvaluatorActionStates(base, nodeSegKey("trigger"));
+    }
+    const candidate = prior ?? {
+      status: "open" as const,
+      tape: {},
+    };
+    candidates.set(arcKey, candidate);
     const before = JSON.stringify(base);
     const accum = createAccumulator(
       entries,
@@ -281,15 +372,21 @@ export function buildTriggerBrief(
       [base],
       dialog,
       "plan",
+      // Trigger probing never announces transitions.
+      false,
     );
     applyReportResults(accum, acceptedReport);
     try {
-      const matched = runTrigger(entry.root, base, accum);
+      const matched = runTrigger(entry.root, base, accum, candidate.tape);
       judgments.push(...accum.judgments);
       observations.push(...accum.observations);
       hostCalls.push(...accum.hostCalls);
-      if (existing || before !== JSON.stringify(base)) {
+      issues.push(...accum.issues);
+      if (!existing && before !== JSON.stringify(base)) {
         upsertTraversal(nextTraversals, base);
+      }
+      if (!accum.blocked) {
+        candidate.status = matched ? "matched" : "unmatched";
       }
       if (matched && !accum.blocked) {
         matchableArcs.push(arcKey);
@@ -299,13 +396,14 @@ export function buildTriggerBrief(
       const message = error instanceof Error ? error.message : String(error);
       base.phase = "poisoned";
       base.finalizing = undefined;
-      upsertTraversal(nextTraversals, base);
+      if (!existing) upsertTraversal(nextTraversals, base);
       issues.push(
         buildPoisonedTraversalIssue(
           entry.arc,
           accum.briefActive ?? accum.active ?? arcToNodeRef(entry.arc),
           entry.root.loc,
           message,
+          runtimeErrorReasonCode(error),
         ),
       );
     }
@@ -320,11 +418,15 @@ export function buildTriggerBrief(
   if (matchKey && matchedBases.has(matchKey)) {
     const { entry, base } = matchedBases.get(matchKey)!;
     const seeded = restartTraversal(entry, base);
+    // TODO: Specify whether traversal mutations from non-selected trigger
+    // candidates should remain in the matched outcome. Current behavior
+    // preserves mutations already accumulated in `nextTraversals`.
     upsertTraversal(nextTraversals, seeded);
     return finalizeTriggerBrief(
+      entries,
+      nextTraversals,
       {
         matched: seeded.ref,
-        traversals: nextTraversals,
         issues: [...issues],
         judgments: [],
         observations: [],
@@ -332,6 +434,7 @@ export function buildTriggerBrief(
         matchableArcs: [],
       },
       acceptedReport,
+      candidates,
     );
   }
 
@@ -349,9 +452,10 @@ export function buildTriggerBrief(
   }
 
   return finalizeTriggerBrief(
+    entries,
+    nextTraversals,
     {
       matched: undefined,
-      traversals: nextTraversals,
       issues: [...issues],
       judgments,
       observations,
@@ -359,40 +463,40 @@ export function buildTriggerBrief(
       matchableArcs,
     },
     acceptedReport,
+    candidates,
   );
 }
 
-function finalizeActionBrief(
-  accum: Accumulator,
+function allowedMovesForActionBrief(
+  accum: Pick<Accumulator, "judgments" | "observations" | "hostCalls">,
   traversal: ArcTraversal,
-): ActionBriefSnapshot {
+  instructions: readonly InstructionBrief[],
+  hostEffects: readonly HostEffectBrief[],
+  transition: NodeTransition | undefined,
+): ActionMove[] {
   const allowedMoves = new Set<ActionMove>();
-  if (traversal.phase === "entered") {
-    if (
-      accum.instructions.length > 0 ||
-      accum.judgments.length > 0 ||
-      accum.observations.length > 0 ||
-      accum.hostCalls.length > 0
-    ) {
-      allowedMoves.add("proceed");
-      if (accum.instructions.length === 0) {
-        allowedMoves.add("deflect");
-      }
-    }
-    if (allowedMoves.size === 0) {
-      allowedMoves.add("proceed");
+  if (traversal.phase !== "entered") return [];
+
+  allowedMoves.add("poison");
+  if (transition) {
+    // A transition brief carries no other work; proceed acknowledges it with a
+    // freshly projected dialog. Deflect is never enabled by a transition.
+    allowedMoves.add("proceed");
+    return [...allowedMoves];
+  }
+  if (
+    instructions.length > 0 ||
+    hostEffects.length > 0 ||
+    accum.judgments.length > 0 ||
+    accum.observations.length > 0 ||
+    accum.hostCalls.length > 0
+  ) {
+    allowedMoves.add("proceed");
+    if (instructions.length === 0 && hostEffects.length === 0) {
+      allowedMoves.add("deflect");
     }
   }
-  return {
-    active: accum.briefActive ?? accum.active ?? arcToNodeRef(traversal.ref),
-    canProgress: traversal.phase === "entered",
-    issues: [],
-    judgments: accum.judgments.map((item) => ({ ...item })),
-    observations: accum.observations.map((item) => ({ ...item })),
-    hostCalls: accum.hostCalls.map(cloneHostCallBrief),
-    instructions: accum.instructions.map(cloneInstructionBrief),
-    allowedMoves: [...allowedMoves],
-  };
+  return [...allowedMoves];
 }
 
 export function buildActionBrief(
@@ -400,7 +504,7 @@ export function buildActionBrief(
   entry: RegistryEntry,
   traversals: ArcTraversalSet,
   dialog: Dialog,
-  leadingHostEffects: HostEffect[] = [],
+  leadingHostEffects: HostEffectBrief[] = [],
   leadingInstructions: InstructionBrief[] = [],
   activeHint?: NodeRef,
   leadingIssues: RuntimeIssue[] = [],
@@ -418,59 +522,137 @@ export function buildActionBrief(
     workingTraversals,
     dialog,
     "plan",
+    true,
   );
+  if (workingRoot.pendingTransition) {
+    // An unacknowledged transition seeds the plan walk's latch, so the walk
+    // re-blocks at the same gate — before any work-producing evaluation — and
+    // the brief re-carries the transition. This is what makes transition
+    // briefs exclusive: nothing can be collected ahead of the first gate.
+    accum.transition = {
+      exited: [...workingRoot.pendingTransition.exited],
+      entered: [...workingRoot.pendingTransition.entered],
+    };
+  }
   for (const instruction of leadingInstructions) {
     if (instruction.phase === "apply") {
       accum.yieldedInstructionIds.add(instruction.id);
     }
   }
   if (workingRoot.phase === "entered") {
-    continueArc(accum);
+    if (workingRoot.activeFrame) {
+      // Resume the recorded frontier in plan mode (symmetric with apply), so the
+      // brief is rebuilt by replaying the suspended SEG from its recorded
+      // position, not by re-deriving the arc from its root.
+      resumeActiveFrame(accum);
+    } else {
+      continueArc(accum);
+    }
   } else if (activeHint) {
     accum.active = activeHint;
   }
   for (const traversal of workingTraversals) {
-    const traversalEntry = entries.get(rootRefOf(traversal.ref));
-    if (!traversalEntry) {
+    if (!entries.has(rootRefOf(traversal.ref))) {
       throw new Error(`Unknown arc: ${formatRef(rootRefOf(traversal.ref))}`);
     }
-    pruneFrames(entries, traversalEntry, traversal);
   }
-  const yieldedTraversals = cloneTraversalSet(workingTraversals);
-  const snapshot = cloneActionBriefSnapshot(
-    finalizeActionBrief(
-      accum,
-      selectActionRootTraversal(yieldedTraversals, entry.arc),
-    ),
-  );
+  const actionRoot = selectActionRootTraversal(workingTraversals, entry.arc);
   const instructions = mergeInstructionBriefs(
     leadingInstructions,
-    snapshot.instructions,
+    accum.instructions,
   );
+  const hostEffects = mergeHostEffects(leadingHostEffects, accum.hostEffects);
+  const transition = buildTransitionPayload(entries, entry, accum);
+  if (
+    transition &&
+    (instructions.length > 0 ||
+      hostEffects.length > 0 ||
+      accum.judgments.length > 0 ||
+      accum.observations.length > 0 ||
+      accum.hostCalls.length > 0)
+  ) {
+    // Tripwire for a gate-placement regression: the seeded plan walk blocks at
+    // the first gate, so a transition brief can never have collected work. A
+    // violation would let stale-view work escape; fail loudly instead.
+    throw new Error(
+      "Transition brief exclusivity violated: a transition-bearing brief collected frontier work",
+    );
+  }
+  const snapshot: ActionBriefSnapshot = {
+    active: accum.briefActive ?? accum.active ?? arcToNodeRef(actionRoot.ref),
+    canProgress: actionRoot.phase === "entered",
+    issues: [
+      ...leadingIssues.map(cloneRuntimeIssue),
+      ...accum.issues.map(cloneRuntimeIssue),
+    ],
+    judgments: accum.judgments,
+    observations: accum.observations,
+    hostCalls: accum.hostCalls,
+    hostEffects,
+    instructions,
+    transition,
+    allowedMoves: allowedMovesForActionBrief(
+      accum,
+      actionRoot,
+      instructions,
+      hostEffects,
+      transition,
+    ),
+  };
   return {
     brief: {
-      traversals: yieldedTraversals,
-      hostEffects: [
-        ...leadingHostEffects.map(cloneHostEffect),
-        ...accum.hostEffects.map(cloneHostEffect),
-      ],
-      ...snapshot,
-      issues:
-        leadingIssues.length > 0
-          ? leadingIssues.map(cloneRuntimeIssue)
-          : snapshot.issues,
-      instructions,
+      traversals: cloneTraversalSet(workingTraversals),
+      ...cloneActionBriefSnapshot(snapshot),
     },
-    traversals: cloneTraversalSet(yieldedTraversals),
-    snapshot: cloneActionBriefSnapshot({
-      ...snapshot,
-      issues:
-        leadingIssues.length > 0
-          ? leadingIssues.map(cloneRuntimeIssue)
-          : snapshot.issues,
-      instructions,
-    }),
+    traversals: workingTraversals,
+    snapshot,
   };
+}
+
+/**
+ * Builds the brief's transition payload from the walk's flushed latch:
+ * absent unless a gate stamped `position` this walk. `hostParams` is the position
+ * node's authored `hostParams`, resolved at build time; `null` when the
+ * node declares none.
+ */
+function buildTransitionPayload(
+  entries: ReadonlyMap<ArcRef, RegistryEntry>,
+  entry: RegistryEntry,
+  accum: Accumulator,
+): NodeTransition | undefined {
+  const latch = accum.transition;
+  if (!latch?.position) return undefined;
+  const positionEntry = getEntryForRef(entries, latch.position) ?? entry;
+  const positionNode = getNodeForRef(entries, positionEntry, latch.position);
+  return {
+    exited: [...latch.exited],
+    entered: [...latch.entered],
+    position: latch.position,
+    hostParams:
+      positionNode?.hostParams !== undefined
+        ? clonePayloadValue(positionNode.hostParams)
+        : null,
+  };
+}
+
+/**
+ * Merges effects emitted while applying the prior report with effects
+ * re-briefed by the plan walk. An effect emitted during report application is
+ * still pending when the plan walk re-steps it, so the same id arrives from
+ * both sides; the first (earlier) emission wins.
+ */
+function mergeHostEffects(
+  leading: readonly HostEffectBrief[],
+  planned: readonly HostEffectBrief[],
+): HostEffectBrief[] {
+  const merged: HostEffectBrief[] = [];
+  const seen = new Set<BriefId>();
+  for (const effect of [...leading, ...planned]) {
+    if (seen.has(effect.id)) continue;
+    seen.add(effect.id);
+    merged.push(cloneHostEffect(effect));
+  }
+  return merged;
 }
 
 export function buildPoisonedActionBrief(
@@ -480,6 +662,7 @@ export function buildPoisonedActionBrief(
   dialog: Dialog,
   active: NodeRef,
   error: unknown,
+  reasonCode?: string,
 ): {
   brief: ActionBrief;
   traversals: ArcTraversalSet;
@@ -489,9 +672,16 @@ export function buildPoisonedActionBrief(
   const rootTraversal = selectActionRootTraversal(working, entry.arc);
   rootTraversal.phase = "poisoned";
   rootTraversal.finalizing = undefined;
+  rootTraversal.pendingTransition = undefined;
   const message = error instanceof Error ? error.message : String(error);
   return buildActionBrief(entries, entry, working, dialog, [], [], active, [
-    buildPoisonedTraversalIssue(entry.arc, active, entry.root.loc, message),
+    buildPoisonedTraversalIssue(
+      entry.arc,
+      active,
+      entry.root.loc,
+      message,
+      reasonCode ?? runtimeErrorReasonCode(error),
+    ),
   ]);
 }
 
@@ -502,10 +692,19 @@ function cloneActionBriefSnapshot(
     active: plan.active,
     canProgress: plan.canProgress,
     issues: plan.issues.map(cloneRuntimeIssue),
-    judgments: plan.judgments.map((item) => ({ ...item })),
-    observations: plan.observations.map((item) => ({ ...item })),
+    judgments: plan.judgments.map(cloneJudgmentBrief),
+    observations: plan.observations.map(cloneObservationOrGroupBrief),
     hostCalls: plan.hostCalls.map(cloneHostCallBrief),
+    hostEffects: plan.hostEffects.map(cloneHostEffect),
     instructions: plan.instructions.map(cloneInstructionBrief),
+    transition: plan.transition
+      ? {
+          exited: [...plan.transition.exited],
+          entered: [...plan.transition.entered],
+          position: plan.transition.position,
+          hostParams: clonePayloadValue(plan.transition.hostParams),
+        }
+      : undefined,
     allowedMoves: [...plan.allowedMoves],
   };
 }
@@ -525,6 +724,12 @@ export function validateActionReport(
       ],
       rejected: true,
     };
+  }
+
+  const accepted = buildAcceptedActionReport(report);
+  const issues: RuntimeIssue[] = [];
+  if (report.move === "poison") {
+    return { accepted, issues, rejected: false };
   }
 
   const judgmentIdIssue = findUnknownReportIdIssue(
@@ -569,8 +774,19 @@ export function validateActionReport(
     };
   }
 
-  const accepted = buildAcceptedActionReport(report);
-  const issues: RuntimeIssue[] = [];
+  const hostEffectIdIssue = findUnknownReportIdIssue(
+    "host effect",
+    plan.hostEffects.map((item) => item.id),
+    report.hostEffects,
+    "action report",
+  );
+  if (hostEffectIdIssue) {
+    return {
+      accepted: buildAcceptedActionReport(report),
+      issues: [hostEffectIdIssue],
+      rejected: true,
+    };
+  }
 
   if (report.judgments) {
     const judgments: Record<string, boolean> = {};
@@ -605,7 +821,27 @@ export function validateActionReport(
   }
 
   if (report.hostCalls) {
-    accepted.hostCalls = { ...report.hostCalls };
+    accepted.hostCalls = clonePayloadObject(report.hostCalls);
+  }
+
+  if (report.hostEffects) {
+    const hostEffects: Record<string, HostEffectReport> = {};
+    for (const [id, value] of Object.entries(report.hostEffects)) {
+      if (value?.status !== "applied") {
+        issues.push(
+          buildInvalidItemIssue(
+            id,
+            "host-effect-status",
+            `Invalid host effect report for ${id}: expected status "applied"`,
+          ),
+        );
+        continue;
+      }
+      hostEffects[id] = { status: "applied" };
+    }
+    if (Object.keys(hostEffects).length > 0) {
+      accepted.hostEffects = hostEffects;
+    }
   }
 
   return { accepted, issues, rejected: false };
@@ -617,69 +853,98 @@ export function acceptActionReport(
   report: ActionReport,
 ): {
   traversals: ArcTraversalSet;
-  hostEffects: HostEffect[];
+  hostEffects: HostEffectBrief[];
   instructions: InstructionBrief[];
 } {
   const working = cloneTraversalSet(state.traversals);
   const rootTraversal = selectActionRootTraversal(working, state.entry.arc);
-
-  if (report.move === "deflect") {
-    const activeTraversal = resolveTraversalForBrief(
-      working,
-      state.snapshot.active,
-    );
-    activeTraversal.finalizing = {
-      reason: "deflected",
-      active: state.snapshot.active,
-      phase: "catch",
-    };
-
-    const accum = createAccumulator(
-      state.entries,
-      state.entry,
-      rootTraversal,
-      working,
-      dialog,
-      "apply",
-    );
-    continueArc(accum);
-    return {
-      traversals: working,
-      hostEffects: accum.hostEffects.map(cloneHostEffect),
-      instructions: accum.instructions.map(cloneInstructionBrief),
-    };
-  }
-
+  // An accepted report acknowledges any pending transition: the dialog supplied
+  // with it is the fresh view, and the apply walk starts with an empty latch so
+  // the gate passes.
+  rootTraversal.pendingTransition = undefined;
   const accum = createAccumulator(
     state.entries,
     state.entry,
-    selectActionRootTraversal(working, state.entry.arc),
+    rootTraversal,
     working,
     dialog,
     "apply",
+    true,
   );
+
+  if (report.move === "deflect") {
+    // Deflect the recorded frontier, then resume it: its finalizing routes to
+    // `this.catchDeflection`, and an uncaught deflection bubbles up through the
+    // same enter continuations as a normal completion. A frontier blocked in an
+    // invoke body (or in a hook owned inside one) abandons the open invocation
+    // as the deflection crosses it.
+    const activeRef =
+      rootTraversal.activeFrame?.activeRef ?? state.snapshot.active;
+    const activeTraversal = resolveTraversalForBrief(working, activeRef);
+    const recordedSeg = rootTraversal.activeFrame?.activeSeg;
+    if (recordedSeg && "owner" in recordedSeg) {
+      const entry = state.entries.get(rootRefOf(activeTraversal.ref));
+      const activeNode = entry
+        ? getNodeForRef(state.entries, entry, activeTraversal.ref)
+        : undefined;
+      if (activeNode) {
+        clearInvokeStateCrossedByDeflection(
+          activeTraversal,
+          activeNode,
+          recordedSeg.owner,
+        );
+      }
+    }
+    activeTraversal.finalizing = {
+      reason: "deflected",
+      // Deflection originates at this node's own frontier; it entered nothing,
+      // so `from` stays unset until it propagates up through a parent's enter.
+      deflection: { origin: activeRef },
+      phase: "catch",
+    };
+    rootTraversal.activeFrame = { activeRef, activeSeg: { kind: "catch" } };
+    resumeActiveFrame(accum);
+    return {
+      traversals: working,
+      hostEffects: accum.hostEffects,
+      instructions: accum.instructions,
+    };
+  }
+
   applyReportResults(accum, report);
-  continueArc(accum);
+  resumeActiveFrame(accum);
   return {
     traversals: working,
-    hostEffects: accum.hostEffects.map(cloneHostEffect),
-    instructions: accum.instructions.map(cloneInstructionBrief),
+    hostEffects: accum.hostEffects,
+    instructions: accum.instructions,
   };
 }
 
 function applyReportResults(
   accum: Accumulator,
-  report: Pick<ActionReport, "judgments" | "observations" | "hostCalls">,
+  report: Pick<
+    ActionReport,
+    "judgments" | "observations" | "hostCalls" | "hostEffects"
+  >,
 ): void {
   for (const [id, value] of Object.entries(report.judgments ?? {})) {
     accum.judgmentResults.set(id, value);
   }
   for (const [id, value] of Object.entries(report.observations ?? {})) {
-    if (value) {
+    if (!value) continue;
+    // The observation channel is shared: a grouped result carries `fields`, a
+    // single result carries `status`. Route each to its own result map so the
+    // matching apply reads it back.
+    if ("fields" in value) {
+      accum.observationGroupResults.set(id, value);
+    } else {
       accum.observationResults.set(id, value);
     }
   }
   for (const [id, value] of Object.entries(report.hostCalls ?? {})) {
     accum.hostCallResults.set(id, value);
+  }
+  for (const [id, value] of Object.entries(report.hostEffects ?? {})) {
+    accum.hostEffectResults.set(id, value);
   }
 }

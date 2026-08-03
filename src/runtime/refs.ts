@@ -1,9 +1,9 @@
 import type {
   ArcRef,
   ArcTraversalSet,
+  ElementId,
   Node,
   NodeRef,
-  StatementId,
   Traversal,
 } from "../types.js";
 
@@ -43,7 +43,14 @@ export function toNodeRefParts(ref: NodeRef): {
   };
 }
 
-export function isArcRef(ref: ArcRef | NodeRef): ref is ArcRef {
+/**
+ * Whether a ref string is an arc ref (vs a node ref). Accepts any `string` so it
+ * serves both as a discriminator over a known `ArcRef | NodeRef` and as a
+ * validator for untrusted input (e.g. a ref carried in a host report), keeping
+ * arc's `arc:` ref-format convention owned here rather than reimplemented by
+ * callers.
+ */
+export function isArcRef(ref: string): ref is ArcRef {
   return ref.startsWith("arc:");
 }
 
@@ -70,10 +77,10 @@ export function traversalToNodeRef(traversal: Traversal): NodeRef {
     : traversal.ref;
 }
 
-export function toPseudoChildRef(
+export function toAnonymousCopyRef(
   ownerTraversal: Traversal,
   identifier: string,
-  stmtId: StatementId,
+  stmtId: ElementId,
 ): NodeRef {
   const owner = toNodeRefParts(traversalToNodeRef(ownerTraversal));
   return toNodeRef(owner.source, [...owner.path, `${identifier}#${stmtId}`]);
@@ -135,7 +142,7 @@ export function getNodeForRef(
       continue;
     }
 
-    const alias = currentNode.freshAliases.find(
+    const alias = currentNode.newcopyAliases.find(
       (aliasEntry) => aliasEntry.identifier === part,
     );
     if (!alias) return undefined;

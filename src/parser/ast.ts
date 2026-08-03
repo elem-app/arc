@@ -1,110 +1,31 @@
 import type * as acorn from "acorn";
 
-import type {
-  BinaryOperator,
-  HostCallArgument,
-  LocalExpression,
-  SemanticPart,
-  SemanticString,
-  SourceRange,
-  ValueExpression,
+import {
+  UNSTAMPED_ID,
+  type ArrayReference,
+  type BinaryOperator,
+  type CellTarget,
+  type HostCallArgument,
+  type LocalExpression,
+  type SemanticString,
+  type SourceRange,
+  type TemplateString,
+  type TemplateStringPart,
+  type ValueExpression,
+  type ValueStringPart,
 } from "../types.js";
 import { parseTarget, type TargetParseContext } from "./targets.js";
 
-export function isExpressionStatement(
-  node: acorn.Statement | acorn.ModuleDeclaration,
-): node is acorn.ExpressionStatement {
-  return node.type === "ExpressionStatement";
-}
-
-export function isFunctionDeclaration(
-  node: acorn.Statement | acorn.ModuleDeclaration,
-): node is acorn.FunctionDeclaration {
-  return node.type === "FunctionDeclaration";
-}
-
-export function isVariableDeclaration(
-  node: acorn.Statement | acorn.ModuleDeclaration,
-): node is acorn.VariableDeclaration {
-  return node.type === "VariableDeclaration";
-}
-
-export function isAssignmentExpression(
-  node: acorn.Expression,
-): node is acorn.AssignmentExpression {
-  return node.type === "AssignmentExpression";
-}
-
-export function isMemberExpression(
-  node: acorn.Expression,
-): node is acorn.MemberExpression {
-  return node.type === "MemberExpression";
-}
-
-export function isIdentifier(
-  node: acorn.Node | null | undefined,
-): node is acorn.Identifier {
-  return !!node && node.type === "Identifier";
-}
-
-export function isLiteral(
-  node: acorn.Node | null | undefined,
-): node is acorn.Literal {
-  return !!node && node.type === "Literal";
-}
-
-export function isTemplateLiteral(
-  node: acorn.Node | null | undefined,
-): node is acorn.TemplateLiteral {
-  return !!node && node.type === "TemplateLiteral";
-}
-
-export function isCallExpression(
-  node: acorn.Node | null | undefined,
-): node is acorn.CallExpression {
-  return !!node && node.type === "CallExpression";
-}
-
-export function isNewExpression(
-  node: acorn.Node | null | undefined,
-): node is acorn.NewExpression {
-  return !!node && node.type === "NewExpression";
-}
-
-export function isIfStatement(
-  node: acorn.Statement,
-): node is acorn.IfStatement {
-  return node.type === "IfStatement";
-}
-
-export function isLabeledStatement(
-  node: acorn.Statement,
-): node is acorn.LabeledStatement {
-  return node.type === "LabeledStatement";
-}
-
-export function isBreakStatement(
-  node: acorn.Statement,
-): node is acorn.BreakStatement {
-  return node.type === "BreakStatement";
-}
-
-export function isReturnStatement(
-  node: acorn.Statement,
-): node is acorn.ReturnStatement {
-  return node.type === "ReturnStatement";
-}
-
-export function isImportDeclaration(
-  node: acorn.Statement | acorn.ModuleDeclaration,
-): node is acorn.ImportDeclaration {
-  return node.type === "ImportDeclaration";
-}
+export type ExpressionParseContext = {
+  deflectionTargets?: TargetParseContext;
+  allowPendingState?: boolean;
+};
 
 export function getName(
   node: acorn.Node | null | undefined,
 ): string | undefined {
-  return isIdentifier(node) ? node.name : undefined;
+  if (node?.type !== "Identifier") return undefined;
+  return (node as acorn.Identifier).name;
 }
 
 export function getThisProperty(
@@ -153,6 +74,44 @@ export function getFunctionBody(
   return undefined;
 }
 
+/**
+ * Extracts a hook arrow's body as statements, accepting a concise (expression)
+ * body in addition to a block. A block body returns its statements directly; a
+ * concise body is wrapped as a single statement — a `return <expr>` for
+ * value-returning hooks (`conciseAs: "return"`), or an expression statement for
+ * effect bodies (`conciseAs: "expression"`) — so `() => judge(x)` reads exactly
+ * like `() => { return judge(x); }`. Only an arrow is accepted (every hook is
+ * authored as an arrow, never a `function` expression); a non-arrow node returns
+ * `undefined`, so callers keep their "must be an arrow function" guard.
+ */
+export function getHookBodyStatements(
+  node: acorn.Expression | null | undefined,
+  conciseAs: "return" | "expression",
+): acorn.Statement[] | undefined {
+  if (!node || node.type !== "ArrowFunctionExpression") return undefined;
+  if (node.body.type === "BlockStatement") {
+    return node.body.body;
+  }
+  const expression = node.body;
+  const wrapped =
+    conciseAs === "return"
+      ? {
+          type: "ReturnStatement",
+          argument: expression,
+          start: expression.start,
+          end: expression.end,
+          loc: expression.loc,
+        }
+      : {
+          type: "ExpressionStatement",
+          expression,
+          start: expression.start,
+          end: expression.end,
+          loc: expression.loc,
+        };
+  return [wrapped as unknown as acorn.Statement];
+}
+
 export function getBlockStatements(node: acorn.Statement): acorn.Statement[] {
   return node.type === "BlockStatement" ? node.body : [node];
 }
@@ -160,9 +119,10 @@ export function getBlockStatements(node: acorn.Statement): acorn.Statement[] {
 export function expressionToLocalExpression(
   node: acorn.Expression,
   availableHostModules: ReadonlyMap<string, string> = new Map(),
-  nextId?: () => number,
+  briefable?: boolean,
+  context?: ExpressionParseContext,
 ): LocalExpression {
-  if (isLiteral(node)) {
+  if (node.type === "Literal") {
     const value = node.value;
     if (
       value === null ||
@@ -174,16 +134,35 @@ export function expressionToLocalExpression(
     }
   }
 
-  if (isIdentifier(node)) {
-    if (node.name === "user" || node.name === "self") {
-      return { kind: "ref", name: node.name };
-    }
-    return { kind: "variable", name: node.name };
+  if (node.type === "Identifier") {
+    return { kind: "cell", name: node.name };
   }
 
   if (node.type === "MemberExpression") {
     if (node.computed) {
-      throw new Error("Computed member access is not supported in Arc");
+      // Bracket indexing `items[index]` / `args.items[index]` is an element
+      // read on a cell or typed array channel. Any other computed access stays
+      // rejected.
+      const array = parseArrayReference(
+        node.object as acorn.Expression,
+        availableHostModules,
+      );
+      if (!array) {
+        throw new Error("Computed member access is not supported in Arc");
+      }
+      if (node.property.type === "PrivateIdentifier") {
+        throw new Error("Array index cannot be a private identifier");
+      }
+      return {
+        kind: "arrayElementRead",
+        array,
+        index: expressionToLocalExpression(
+          node.property,
+          availableHostModules,
+          briefable,
+          context,
+        ),
+      };
     }
     if (
       node.object.type === "Identifier" &&
@@ -192,6 +171,14 @@ export function expressionToLocalExpression(
       node.property.name === "lastUserMessage"
     ) {
       return { kind: "scope", name: "lastUserMessage" };
+    }
+    if (
+      node.object.type === "Identifier" &&
+      node.object.name === "Dialog" &&
+      node.property.type === "Identifier" &&
+      node.property.name === "cursor"
+    ) {
+      return { kind: "dialogCursor" };
     }
     if (
       node.object.type === "Identifier" &&
@@ -211,6 +198,16 @@ export function expressionToLocalExpression(
       return { kind: "nodeState", identifier: node.object.name };
     }
     if (
+      node.property.type === "Identifier" &&
+      node.property.name === "length"
+    ) {
+      const array = parseArrayReference(
+        node.object as acorn.Expression,
+        availableHostModules,
+      );
+      if (array) return { kind: "arrayLength", array };
+    }
+    if (
       node.object.type === "Identifier" &&
       (node.object.name === "args" || node.object.name === "returns") &&
       node.property.type === "Identifier"
@@ -220,6 +217,16 @@ export function expressionToLocalExpression(
         namespace: node.object.name,
         key: node.property.name,
       };
+    }
+    // `span.item` / `span.index` read the current `$map` member. The owner is
+    // `map` — the only span owner in v1; other owners join as they land.
+    if (
+      node.object.type === "Identifier" &&
+      node.object.name === "span" &&
+      node.property.type === "Identifier" &&
+      (node.property.name === "item" || node.property.name === "index")
+    ) {
+      return { kind: "span", owner: "map", key: node.property.name };
     }
   }
   if (node.type === "CallExpression") {
@@ -234,7 +241,7 @@ export function expressionToLocalExpression(
       const count =
         arg &&
         arg.type !== "SpreadElement" &&
-        isLiteral(arg) &&
+        arg.type === "Literal" &&
         typeof arg.value === "number"
           ? arg.value
           : undefined;
@@ -247,17 +254,141 @@ export function expressionToLocalExpression(
     if (prop === "enterCount") {
       return { kind: "enterCount" };
     }
+    if (prop === "pendingState") {
+      if (!context?.allowPendingState) {
+        throw new Error(
+          "this.pendingState is only available inside this.effects",
+        );
+      }
+      return { kind: "pendingState" };
+    }
   }
 
   throw new Error(`Unsupported value expression: ${node.type}`);
 }
 
+/**
+ * Parses an action target as one lexical cell root followed by inner-value
+ * accessors. Dot access and a computed string access intentionally normalize to
+ * the same literal accessor; the current target schema decides whether that
+ * accessor is valid for the root value.
+ */
+export function parseCellTarget(
+  node: acorn.Expression,
+  availableHostModules: ReadonlyMap<string, string> = new Map(),
+  context?: ExpressionParseContext,
+): CellTarget {
+  if (node.type === "Identifier") {
+    if (availableHostModules.has(node.name)) {
+      throw new Error(`Cell target cannot use host module ${node.name}`);
+    }
+    return [node.name];
+  }
+  if (node.type !== "MemberExpression" || node.object.type === "Super") {
+    throw new Error("Cell target must start from a cell identifier");
+  }
+
+  const target = parseCellTarget(
+    node.object as acorn.Expression,
+    availableHostModules,
+    context,
+  );
+  if (!node.computed) {
+    if (node.property.type !== "Identifier") {
+      throw new Error("Cell target property must be an identifier");
+    }
+    return [...target, { kind: "literal", value: node.property.name }];
+  }
+  if (node.property.type === "PrivateIdentifier") {
+    throw new Error("Cell target accessor cannot be a private identifier");
+  }
+  return [
+    ...target,
+    expressionToLocalExpression(
+      node.property,
+      availableHostModules,
+      true,
+      context,
+    ),
+  ];
+}
+
+/**
+ * Recognizes the receiver of a bracket index or `.length` read: a bare cell
+ * identifier or a typed array channel projection (`args.items` / `returns.items`).
+ * Returns `undefined` for any other expression, so element and length reads are
+ * admitted only on direct cell or channel references.
+ */
+function parseArrayReference(
+  node: acorn.Expression,
+  availableHostModules: ReadonlyMap<string, string>,
+): ArrayReference | undefined {
+  if (node.type === "Identifier") {
+    // A host-module identifier is not a cell; a computed access on it stays a
+    // rejected dynamic host-member reference, not an element read.
+    if (availableHostModules.has(node.name)) return undefined;
+    return { kind: "cell", name: node.name };
+  }
+  if (
+    node.type === "MemberExpression" &&
+    !node.computed &&
+    node.object.type === "Identifier" &&
+    (node.object.name === "args" || node.object.name === "returns") &&
+    node.property.type === "Identifier"
+  ) {
+    return {
+      kind: "channel",
+      namespace: node.object.name,
+      key: node.property.name,
+    };
+  }
+  return undefined;
+}
+
 export function parseExpression(
   node: acorn.Expression,
   availableHostModules: ReadonlyMap<string, string> = new Map(),
-  nextId?: () => number,
-  targetContext?: TargetParseContext,
+  briefable?: boolean,
+  context?: ExpressionParseContext,
 ): ValueExpression {
+  if (node.type === "TemplateLiteral") {
+    const template = parseTemplateString(
+      node,
+      availableHostModules,
+      briefable,
+      context,
+    );
+
+    // Reject semantic string parts
+    const parts: ValueStringPart[] = [];
+    for (const part of template.parts) {
+      if (part.kind === "ref" || part.kind === "hostVar") {
+        throw new Error(
+          "Template literal contains semantic-only interpolation in value position",
+        );
+      }
+      parts.push(part);
+    }
+    return { kind: "template-string", parts };
+  }
+
+  if (node.type === "ArrayExpression") {
+    return {
+      kind: "arrayLiteral",
+      elements: node.elements.map((element) => {
+        if (!element || element.type === "SpreadElement") {
+          throw new Error("Array literals do not support holes or spread");
+        }
+        return parseExpression(
+          element,
+          availableHostModules,
+          briefable,
+          context,
+        );
+      }),
+    };
+  }
+
   if (node.type === "LogicalExpression") {
     if (node.operator !== "&&" && node.operator !== "||") {
       throw new Error(`Unsupported logical operator: ${node.operator}`);
@@ -268,14 +399,14 @@ export function parseExpression(
       left: parseExpression(
         node.left,
         availableHostModules,
-        nextId,
-        targetContext,
+        briefable,
+        context,
       ),
       right: parseExpression(
         node.right,
         availableHostModules,
-        nextId,
-        targetContext,
+        briefable,
+        context,
       ),
     };
   }
@@ -290,8 +421,8 @@ export function parseExpression(
       argument: parseExpression(
         node.argument as acorn.Expression,
         availableHostModules,
-        nextId,
-        targetContext,
+        briefable,
+        context,
       ),
     };
   }
@@ -303,32 +434,104 @@ export function parseExpression(
       left: parseExpression(
         node.left as acorn.Expression,
         availableHostModules,
-        nextId,
-        targetContext,
+        briefable,
+        context,
       ),
       right: parseExpression(
         node.right as acorn.Expression,
         availableHostModules,
-        nextId,
-        targetContext,
+        briefable,
+        context,
+      ),
+    };
+  }
+
+  if (node.type === "ConditionalExpression") {
+    return {
+      kind: "conditional",
+      test: parseExpression(
+        node.test,
+        availableHostModules,
+        briefable,
+        context,
+      ),
+      consequent: parseExpression(
+        node.consequent,
+        availableHostModules,
+        briefable,
+        context,
+      ),
+      alternate: parseExpression(
+        node.alternate,
+        availableHostModules,
+        briefable,
+        context,
       ),
     };
   }
 
   if (node.type === "CallExpression") {
-    if (isDeflectionFromCall(node)) {
-      if (!targetContext) {
+    if (
+      node.callee.type === "MemberExpression" &&
+      !node.callee.computed &&
+      node.callee.object.type === "Identifier" &&
+      !availableHostModules.has(node.callee.object.name) &&
+      node.callee.property.type === "Identifier" &&
+      node.callee.property.name === "isUnset"
+    ) {
+      if (node.arguments.length !== 0) {
+        throw new Error("cell.isUnset() does not accept arguments");
+      }
+      return {
+        kind: "isUnset",
+        cell: node.callee.object.name,
+      };
+    }
+    // `args.x.isUnset()` / `returns.x.isUnset()` on a typed channel.
+    if (
+      node.callee.type === "MemberExpression" &&
+      !node.callee.computed &&
+      node.callee.object.type === "MemberExpression" &&
+      !node.callee.object.computed &&
+      node.callee.object.object.type === "Identifier" &&
+      (node.callee.object.object.name === "args" ||
+        node.callee.object.object.name === "returns") &&
+      node.callee.object.property.type === "Identifier" &&
+      node.callee.property.type === "Identifier" &&
+      node.callee.property.name === "isUnset"
+    ) {
+      if (node.arguments.length !== 0) {
+        throw new Error("channel.isUnset() does not accept arguments");
+      }
+      return {
+        kind: "channelIsUnset",
+        namespace: node.callee.object.object.name,
+        key: node.callee.object.property.name,
+      };
+    }
+    if (isDeflectionEscapedCall(node)) {
+      if (!context?.deflectionTargets) {
         throw new Error(
-          "deflection.from(...) is only available inside this.catchDeflection",
+          "this.deflection.escaped(...) is only available inside this.catchDeflection or this.effects",
         );
       }
       if (node.arguments.length !== 1) {
-        throw new Error("deflection.from() accepts exactly one target");
+        throw new Error("this.deflection.escaped() accepts exactly one target");
       }
       return {
-        kind: "deflectionFrom",
-        target: parseTarget(node.arguments[0], "deflectionFrom", targetContext),
+        kind: "deflectionEscaped",
+        target: parseTarget(
+          node.arguments[0],
+          "deflectionEscaped",
+          context.deflectionTargets,
+        ),
       };
+    }
+    if (isDialogLastTurnsCall(node)) {
+      return expressionToLocalExpression(node, availableHostModules, briefable);
+    }
+    if (isDialogTurnsSinceCall(node, availableHostModules)) {
+      return parseDialogTurnsSinceCall(node, availableHostModules, briefable);
     }
     if (node.callee.type !== "Super") {
       const hostCallTarget = parseHostCallTarget(
@@ -336,11 +539,18 @@ export function parseExpression(
         availableHostModules,
       );
       if (hostCallTarget) {
-        if (!nextId) {
-          throw new Error("Host call expressions require an id allocator");
+        if (hostCallTarget.operation.startsWith("$")) {
+          throw new Error(
+            "$-prefixed host operations are only valid as host effects inside this.effects",
+          );
+        }
+        if (!briefable) {
+          throw new Error(
+            "Host call expressions are not allowed in this position",
+          );
         }
         return {
-          id: nextId(),
+          id: UNSTAMPED_ID,
           kind: "host-call",
           module: hostCallTarget.module,
           target: hostCallTarget.path,
@@ -349,7 +559,12 @@ export function parseExpression(
             if (arg.type === "SpreadElement") {
               throw new Error("Host calls do not support spread arguments");
             }
-            return parseHostCallArgument(arg);
+            return parseHostCallArgument(
+              arg,
+              availableHostModules,
+              briefable,
+              context,
+            );
           }),
           loc: locOf(node),
         };
@@ -357,16 +572,16 @@ export function parseExpression(
     }
     if (isJudgeCall(node)) {
       const arg = node.arguments[0];
-      if (!arg || arg.type === "SpreadElement" || !isTemplateLiteral(arg)) {
-        throw new Error("judge() expects a template literal");
+      if (!arg || arg.type === "SpreadElement") {
+        throw new Error("judge() expects semantic text");
       }
-      if (!nextId) {
-        throw new Error("judge() requires an id allocator");
+      if (!briefable) {
+        throw new Error("judge() is not allowed in this position");
       }
       return {
-        id: nextId(),
+        id: UNSTAMPED_ID,
         kind: "judge",
-        question: parseTemplateLiteral(arg),
+        question: parseSemanticString(arg, availableHostModules, context),
         loc: locOf(node),
       };
     }
@@ -388,23 +603,32 @@ export function parseExpression(
         target: expressionToLocalExpression(
           target,
           availableHostModules,
-          nextId,
+          briefable,
+          context,
         ),
       };
     }
   }
 
-  return expressionToLocalExpression(node, availableHostModules, nextId);
+  return expressionToLocalExpression(
+    node,
+    availableHostModules,
+    briefable,
+    context,
+  );
 }
 
-function isDeflectionFromCall(node: acorn.CallExpression): boolean {
+function isDeflectionEscapedCall(node: acorn.CallExpression): boolean {
   return (
     node.callee.type === "MemberExpression" &&
     !node.callee.computed &&
-    node.callee.object.type === "Identifier" &&
-    node.callee.object.name === "deflection" &&
+    node.callee.object.type === "MemberExpression" &&
+    !node.callee.object.computed &&
+    node.callee.object.object.type === "ThisExpression" &&
+    node.callee.object.property.type === "Identifier" &&
+    node.callee.object.property.name === "deflection" &&
     node.callee.property.type === "Identifier" &&
-    node.callee.property.name === "from"
+    node.callee.property.name === "escaped"
   );
 }
 
@@ -413,7 +637,8 @@ export function parseHostCallTarget(
   availableHostModules: ReadonlyMap<string, string>,
 ): { module: string; path: string[]; operation: string } | undefined {
   if (expression.type !== "MemberExpression") return undefined;
-  if (expression.computed || expression.property.type !== "Identifier") {
+  const operation = getStaticMemberSegment(expression);
+  if (!operation) {
     throw new Error("Host calls do not support computed member access");
   }
   if (expression.object.type === "Super") {
@@ -427,7 +652,7 @@ export function parseHostCallTarget(
   return {
     module: parent.module,
     path: parent.path,
-    operation: expression.property.name,
+    operation,
   };
 }
 
@@ -435,13 +660,14 @@ function parseHostCallTargetRoot(
   expression: acorn.Expression,
   availableHostModules: ReadonlyMap<string, string>,
 ): { module: string; path: string[] } | undefined {
-  if (isIdentifier(expression)) {
+  if (expression.type === "Identifier") {
     const module = availableHostModules.get(expression.name);
     if (!module) return undefined;
     return { module, path: [] };
   }
   if (expression.type !== "MemberExpression") return undefined;
-  if (expression.computed || expression.property.type !== "Identifier") {
+  const segment = getStaticMemberSegment(expression);
+  if (!segment) {
     throw new Error("Host calls do not support computed member access");
   }
   if (expression.object.type === "Super") {
@@ -454,32 +680,142 @@ function parseHostCallTargetRoot(
   if (!parent) return undefined;
   return {
     module: parent.module,
-    path: [...parent.path, expression.property.name],
+    path: [...parent.path, segment],
   };
 }
 
-function parseHostCallArgument(expression: acorn.Expression): HostCallArgument {
-  if (isTemplateLiteral(expression)) {
-    return { kind: "semantic", value: parseTemplateLiteral(expression) };
+function isDialogLastTurnsCall(node: acorn.CallExpression): boolean {
+  return (
+    node.callee.type === "MemberExpression" &&
+    !node.callee.computed &&
+    node.callee.object.type === "Identifier" &&
+    node.callee.object.name === "Dialog" &&
+    node.callee.property.type === "Identifier" &&
+    node.callee.property.name === "lastTurns"
+  );
+}
+
+/**
+ * Detects a cursor turn-difference method call — `receiver.userTurnsSince(...)`
+ * and its self/total siblings. The receiver must be a cursor value: the live
+ * `Dialog.cursor` accessor or a `Dialog.Cursor` cell (a bare identifier).
+ * A host-module identifier receiver is excluded so host calls keep their path.
+ */
+function isDialogTurnsSinceCall(
+  node: acorn.CallExpression,
+  availableHostModules: ReadonlyMap<string, string>,
+): boolean {
+  if (
+    node.callee.type !== "MemberExpression" ||
+    node.callee.computed ||
+    node.callee.property.type !== "Identifier"
+  ) {
+    return false;
   }
-  if (isLiteral(expression) && typeof expression.value === "string") {
+  const method = node.callee.property.name;
+  if (
+    method !== "userTurnsSince" &&
+    method !== "selfTurnsSince" &&
+    method !== "totalTurnsSince"
+  ) {
+    return false;
+  }
+  const receiver = node.callee.object;
+  if (isDialogCursorAccess(receiver)) return true;
+  return (
+    receiver.type === "Identifier" && !availableHostModules.has(receiver.name)
+  );
+}
+
+function isDialogCursorAccess(node: acorn.Expression | acorn.Super): boolean {
+  return (
+    node.type === "MemberExpression" &&
+    !node.computed &&
+    node.object.type === "Identifier" &&
+    node.object.name === "Dialog" &&
+    node.property.type === "Identifier" &&
+    node.property.name === "cursor"
+  );
+}
+
+function parseDialogTurnsSinceCall(
+  node: acorn.CallExpression,
+  availableHostModules: ReadonlyMap<string, string>,
+  briefable?: boolean,
+): LocalExpression {
+  const callee = node.callee;
+  const operation =
+    callee.type === "MemberExpression" && callee.property.type === "Identifier"
+      ? callee.property.name
+      : undefined;
+  if (
+    operation !== "userTurnsSince" &&
+    operation !== "selfTurnsSince" &&
+    operation !== "totalTurnsSince"
+  ) {
+    throw new Error("Unsupported cursor turn-difference method");
+  }
+  const receiverNode = (callee as acorn.MemberExpression).object;
+  if (receiverNode.type === "Identifier" && receiverNode.name === "Dialog") {
+    throw new Error(
+      `Dialog.${operation}() was replaced by cursor methods; call ${operation}() on a cursor value, e.g. Dialog.cursor.${operation}(startedAt)`,
+    );
+  }
+  if (node.arguments.length !== 1) {
+    throw new Error(`.${operation}() accepts exactly one cursor`);
+  }
+  const arg = node.arguments[0];
+  if (!arg || arg.type === "SpreadElement") {
+    throw new Error(`.${operation}() requires a cursor`);
+  }
+  if (receiverNode.type === "Super") {
+    throw new Error(`.${operation}() has no valid cursor receiver`);
+  }
+  return {
+    kind: "dialogTurnsSince",
+    metric:
+      operation === "userTurnsSince"
+        ? "user"
+        : operation === "selfTurnsSince"
+          ? "self"
+          : "total",
+    receiver: expressionToLocalExpression(
+      receiverNode,
+      availableHostModules,
+      briefable,
+    ),
+    baseline: expressionToLocalExpression(arg, availableHostModules, briefable),
+  };
+}
+
+export function parseHostCallArgument(
+  expression: acorn.Expression,
+  availableHostModules: ReadonlyMap<string, string> = new Map(),
+  briefable?: boolean,
+  context?: ExpressionParseContext,
+): HostCallArgument {
+  if (
+    expression.type === "TemplateLiteral" ||
+    (expression.type === "Literal" && typeof expression.value === "string")
+  ) {
     return {
       kind: "semantic",
-      value: {
-        kind: "semantic-string",
-        parts: [{ kind: "text", value: expression.value }],
-        loc: locOf(expression),
-      },
+      value: parseSemanticString(expression, availableHostModules, context),
     };
   }
   if (expression.type === "ArrayExpression") {
     return {
       kind: "array",
-      value: expression.elements.map((element) => {
+      elements: expression.elements.map((element) => {
         if (!element || element.type === "SpreadElement") {
           throw new Error("Host call arrays do not support holes or spread");
         }
-        return parseHostCallArgument(element);
+        return parseHostCallArgument(
+          element,
+          availableHostModules,
+          briefable,
+          context,
+        );
       }),
     };
   }
@@ -502,14 +838,68 @@ function parseHostCallArgument(expression: acorn.Expression): HostCallArgument {
       if (!key) {
         throw new Error("Host call objects require identifier or string keys");
       }
-      value[key] = parseHostCallArgument(property.value);
+      value[key] = parseHostCallArgument(
+        property.value,
+        availableHostModules,
+        briefable,
+        context,
+      );
     }
     return { kind: "object", value };
   }
+  const value = parseExpression(
+    expression,
+    availableHostModules,
+    briefable,
+    context,
+  );
+  if (containsBriefableExpression(value)) {
+    throw new Error("Host call arguments cannot contain briefable expressions");
+  }
   return {
     kind: "value",
-    value: expressionToLocalExpression(expression),
+    value,
   };
+}
+
+export function containsBriefableExpression(
+  expression: ValueExpression,
+): boolean {
+  switch (expression.kind) {
+    case "judge":
+    case "host-call":
+      return true;
+    case "regexTest":
+      return containsBriefableExpression(expression.target);
+    case "binary":
+    case "logical":
+      return (
+        containsBriefableExpression(expression.left) ||
+        containsBriefableExpression(expression.right)
+      );
+    case "conditional":
+      return (
+        containsBriefableExpression(expression.test) ||
+        containsBriefableExpression(expression.consequent) ||
+        containsBriefableExpression(expression.alternate)
+      );
+    case "unary":
+      return containsBriefableExpression(expression.argument);
+    case "template-string":
+      return expression.parts.some(
+        (part) =>
+          part.kind === "expression" &&
+          containsBriefableExpression(part.expression),
+      );
+    case "arrayElementRead":
+      return containsBriefableExpression(expression.index);
+    case "arrayLiteral":
+      return expression.elements.some((element) =>
+        containsBriefableExpression(element),
+      );
+    default:
+      return false;
+  }
 }
 
 export function isJudgeCall(node: acorn.CallExpression): boolean {
@@ -526,10 +916,13 @@ export function isRegexTest(node: acorn.CallExpression): boolean {
   );
 }
 
-export function parseTemplateLiteral(
+export function parseTemplateString(
   node: acorn.TemplateLiteral,
-): SemanticString {
-  const parts: SemanticPart[] = [];
+  availableHostModules: ReadonlyMap<string, string> = new Map(),
+  briefable?: boolean,
+  context?: ExpressionParseContext,
+): TemplateString {
+  const parts: TemplateStringPart[] = [];
 
   for (let index = 0; index < node.quasis.length; index++) {
     const quasi = node.quasis[index];
@@ -541,16 +934,122 @@ export function parseTemplateLiteral(
 
     const expression = node.expressions[index];
     if (expression) {
+      const participant = matchDialogParticipantReference(expression);
+      if (participant) {
+        parts.push({ kind: "ref", name: participant });
+        continue;
+      }
+      const hostVar = matchHostVarReference(expression, availableHostModules);
+      if (hostVar) {
+        parts.push({
+          kind: "hostVar",
+          module: hostVar.module,
+          path: hostVar.path,
+        });
+        continue;
+      }
       parts.push({
         kind: "expression",
-        expression: parseExpression(expression),
+        expression: parseExpression(
+          expression,
+          availableHostModules,
+          briefable,
+          context,
+        ),
       });
     }
   }
 
   return {
-    kind: "semantic-string",
+    kind: "template-string",
     parts,
-    loc: locOf(node),
   };
+}
+
+function matchDialogParticipantReference(
+  node: acorn.Expression,
+): "user" | "self" | undefined {
+  if (
+    node.type === "Identifier" &&
+    (node.name === "user" || node.name === "self")
+  ) {
+    return node.name;
+  }
+  if (
+    node.type === "MemberExpression" &&
+    !node.computed &&
+    node.object.type === "Identifier" &&
+    node.object.name === "Dialog" &&
+    node.property.type === "Identifier" &&
+    (node.property.name === "user" || node.property.name === "self")
+  ) {
+    return node.property.name;
+  }
+  return undefined;
+}
+
+export function parseSemanticString(
+  node: acorn.Expression,
+  availableHostModules: ReadonlyMap<string, string> = new Map(),
+  context?: ExpressionParseContext,
+): SemanticString {
+  if (node.type === "Literal" && typeof node.value === "string") {
+    return { kind: "literal", value: node.value };
+  }
+  if (node.type === "TemplateLiteral") {
+    return parseTemplateString(node, availableHostModules, undefined, context);
+  }
+  throw new Error("Semantic text must be a string or template literal");
+}
+
+/**
+ * Match a host-module member reference of the form `A.x`, `A["x"]`, or nested
+ * combinations where `A` is a host-module binding. Returns the module name and
+ * member path, or `undefined` when the expression is not a host-module member
+ * reference.
+ */
+export function matchHostVarReference(
+  node: acorn.Expression,
+  availableHostModules: ReadonlyMap<string, string>,
+): { module: string; path: string[] } | undefined {
+  if (node.type !== "MemberExpression") return undefined;
+  return walkHostVarMemberChain(node, availableHostModules);
+}
+
+function walkHostVarMemberChain(
+  node: acorn.Expression,
+  availableHostModules: ReadonlyMap<string, string>,
+): { module: string; path: string[] } | undefined {
+  if (node.type === "Identifier") {
+    const module = availableHostModules.get(node.name);
+    if (!module) return undefined;
+    return { module, path: [] };
+  }
+  if (node.type !== "MemberExpression") return undefined;
+  const segment = getStaticMemberSegment(node);
+  if (!segment) return undefined;
+  if (node.object.type === "Super") return undefined;
+  const parent = walkHostVarMemberChain(node.object, availableHostModules);
+  if (!parent) return undefined;
+  return {
+    module: parent.module,
+    path: [...parent.path, segment],
+  };
+}
+
+function getStaticMemberSegment(
+  node: acorn.MemberExpression,
+): string | undefined {
+  if (!node.computed && node.property.type === "Identifier") {
+    return node.property.name;
+  }
+  if (
+    node.computed &&
+    node.property.type === "Literal" &&
+    typeof node.property.value === "string" &&
+    node.property.value.length > 0
+  ) {
+    return node.property.value;
+  }
+  return undefined;
 }
