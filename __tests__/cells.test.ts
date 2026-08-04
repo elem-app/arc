@@ -83,6 +83,19 @@ function Main() {
         /Arc cell declarations do not support new; use Type\(\.\.\.\) instead/,
       );
     });
+
+    it("rejects a non-cell declarator mixed with a cell declaration", () => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let ready = Bool(), local = 1;
+}
+`),
+      ).toThrow(
+        "Node-body declarations must use supported Arc cell constructors",
+      );
+    });
   });
 
   describe("cell.enum", () => {

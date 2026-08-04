@@ -409,10 +409,10 @@ export function buildTriggerBrief(
     }
   }
 
-  let matchKey = acceptedReport.preferredMatch
-    ? acceptedReport.preferredMatch
-    : undefined;
-  if (!matchKey && matchableArcs.length === 1) {
+  const hasPendingWork =
+    judgments.length > 0 || observations.length > 0 || hostCalls.length > 0;
+  let matchKey = acceptedReport.preferredMatch;
+  if (!matchKey && !hasPendingWork && matchableArcs.length === 1) {
     matchKey = matchableArcs[0];
   }
   if (matchKey && matchedBases.has(matchKey)) {
@@ -438,8 +438,6 @@ export function buildTriggerBrief(
     );
   }
 
-  const hasPendingWork =
-    judgments.length > 0 || observations.length > 0 || hostCalls.length > 0;
   if (matchKey && !hasPendingWork) {
     issues.push(
       buildInvalidReportIssue(

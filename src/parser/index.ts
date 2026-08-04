@@ -155,7 +155,17 @@ export function parse(source: string): Document {
   const rootFunctions: acorn.FunctionDeclaration[] = [];
   const rootNames = new Set<string>();
   for (const statement of program.body) {
-    if (statement.type === "FunctionDeclaration" && statement.id?.name) {
+    if (
+      statement === program.body[0] ||
+      statement.type === "ImportDeclaration"
+    ) {
+      continue;
+    }
+
+    if (statement.type === "FunctionDeclaration") {
+      if (!statement.id?.name) {
+        throw new Error("Root node declarations must be named");
+      }
       if (rootNames.has(statement.id.name)) {
         throw new Error(`Duplicate arc: ${statement.id.name}`);
       }
@@ -170,13 +180,23 @@ export function parse(source: string): Document {
       statement.type === "ExportAllDeclaration"
     ) {
       throw new Error(
-        "Export syntax is not supported; use a plain top-level function declaration",
+        "Export syntax is not supported; declare the root node directly",
       );
     }
+
+    if (statement.type === "VariableDeclaration") {
+      throw new Error(
+        "Document-level cell declarations are not allowed; declare cells directly in a root node body",
+      );
+    }
+
+    throw new Error(
+      "Only imports and root node declarations are allowed at document level",
+    );
   }
 
   if (rootFunctions.length === 0) {
-    throw new Error("No top-level function declarations found");
+    throw new Error("No root node declarations found");
   }
 
   const roots = rootFunctions.map((fn) =>
@@ -355,7 +375,7 @@ function parseNode(
   inheritedDeflectWhen?: ResolutionStatement[],
 ): Node {
   if (!fn.id?.name) {
-    throw new Error("Nodes must use named function declarations");
+    throw new Error("Node declarations must be named");
   }
   if (fn.id.name === "invoke") {
     throw new Error("invoke is a reserved name and cannot name a node");
@@ -387,10 +407,13 @@ function parseNode(
         statement,
         availableHostModules,
       );
-      if (parsedCells.length > 0) {
-        cells.push(...parsedCells);
-        handledStatements.add(statement);
+      if (parsedCells.length !== statement.declarations.length) {
+        throw new Error(
+          "Node-body declarations must use supported Arc cell constructors",
+        );
       }
+      cells.push(...parsedCells);
+      handledStatements.add(statement);
       continue;
     }
 
@@ -1575,7 +1598,7 @@ function parseNodeStatement(
   }
 
   if (statement.type !== "ExpressionStatement") {
-    throw new Error(`Unsupported Arc statement: ${statement.type}`);
+    throw unsupportedArcStatement("an Arc action graph", statement);
   }
   const expression = statement.expression;
   if (expression.type === "AssignmentExpression") {
@@ -1598,6 +1621,39 @@ function parseNodeStatement(
     throw new Error("Unsupported Arc expression statement");
   }
   return [action];
+}
+
+function unsupportedArcStatement(
+  scope:
+    | "an Arc action graph"
+    | "this.trigger"
+    | "this.guard"
+    | "this.catchDeflection"
+    | "this.effects",
+  statement: acorn.Statement,
+): Error {
+  switch (statement.type) {
+    case "VariableDeclaration":
+      return new Error(
+        "Cell declarations are only allowed directly in a node body",
+      );
+    case "FunctionDeclaration":
+      return new Error(
+        "Child node declarations are only allowed directly in a node body",
+      );
+    case "ReturnStatement":
+      return new Error(`\`return\` is not allowed in ${scope}`);
+    case "WhileStatement":
+      return new Error(`\`while\` is not supported in ${scope}`);
+    case "DoWhileStatement":
+      return new Error(`\`do...while\` is not supported in ${scope}`);
+    case "ForStatement":
+    case "ForInStatement":
+    case "ForOfStatement":
+      return new Error(`\`for\` loops are not supported in ${scope}`);
+    default:
+      return new Error(`Unsupported statement in ${scope}`);
+  }
 }
 
 function parseStatementList(
@@ -1957,7 +2013,7 @@ function parseInvokeCall(
   const id = UNSTAMPED_ID;
 
   // The body shares the enclosing node's id space and scope; only its label
-  // scope is independent. Function declarations inside the body stay
+  // scope is independent. Child node declarations inside the body stay
   // unresolvable and are rejected downstream.
   const bodyChildFunctions = new Map<string, acorn.FunctionDeclaration>();
   const bodyHandledStatements = new Set<acorn.Statement>();
@@ -2749,7 +2805,7 @@ function parseTriggerStatements(
     }
 
     if (statement.type !== "ExpressionStatement") {
-      throw new Error(`Unsupported this.trigger statement: ${statement.type}`);
+      throw unsupportedArcStatement("this.trigger", statement);
     }
     const expression = statement.expression;
     if (expression.type !== "CallExpression") {
@@ -2864,7 +2920,7 @@ function parseGuardStatements(
     }
 
     if (statement.type !== "ExpressionStatement") {
-      throw new Error(`Unsupported this.guard statement: ${statement.type}`);
+      throw unsupportedArcStatement("this.guard", statement);
     }
     const expression = statement.expression;
     if (expression.type !== "CallExpression") {
@@ -3003,9 +3059,7 @@ function parseCatchDeflectionStatements(
     }
 
     if (statement.type !== "ExpressionStatement") {
-      throw new Error(
-        `Unsupported this.catchDeflection statement: ${statement.type}`,
-      );
+      throw unsupportedArcStatement("this.catchDeflection", statement);
     }
     const expression = statement.expression;
     if (expression.type !== "CallExpression") {
@@ -3157,7 +3211,7 @@ function parseEffectStatements(
     }
 
     if (statement.type !== "ExpressionStatement") {
-      throw new Error(`Unsupported this.effects statement: ${statement.type}`);
+      throw unsupportedArcStatement("this.effects", statement);
     }
     const expression = statement.expression;
     if (expression.type !== "CallExpression") {

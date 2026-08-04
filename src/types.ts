@@ -1709,12 +1709,17 @@ export type ActionMove = "proceed" | "deflect" | "poison";
  * evaluation may perform `$observe(...)` / `judge(...)` work before any arc is
  * admitted into the main traversal loop.
  *
- * `matchableArcs` contains arcs whose triggers already evaluate true under the
- * currently known state, before any additional host reports are
- * accepted.
+ * `matchableArcs` contains arcs whose trigger consultations have already
+ * evaluated true under the currently known state. It may coexist with pending
+ * `judgments`, `observations`, or `hostCalls` while other candidates remain
+ * open. Without an effective `preferredMatch`, the runtime waits for that work
+ * to settle before implicitly selecting a sole matchable arc.
  *
  * `matched` identifies the selected arc once trigger stage has resolved to a
- * single activation.
+ * single activation. The host may select an arc already listed in
+ * `matchableArcs` by reporting it as `preferredMatch` without answering the
+ * remaining pending work; explicit selection settles immediately and the
+ * resulting matched brief clears the unneeded work.
  *
  * `deps` is the compatibility set for the returned `traversals`. Callers that
  * persist and later feed those traversals back into a runtime must provide Arc
@@ -1847,9 +1852,12 @@ export type ActionPoisonReason = {
 /**
  * Trigger brief report returned by the host.
  *
- * `preferredMatch` expresses the host's preferred arc when multiple trigger
- * candidates may eventually match. Judgments and observations are keyed by ids
- * from the originating `TriggerBrief`.
+ * `preferredMatch` requests one trigger candidate as the match. When it names
+ * an arc already listed in the originating brief's `matchableArcs`, the host
+ * may omit that brief's pending judgments, observations, and host calls, so the
+ * selection settles immediately. A request naming an open candidate remains
+ * pending while its consultation continues. Judgments and observations are
+ * keyed by ids from the originating `TriggerBrief`.
  */
 export type TriggerReport = {
   preferredMatch?: ArcRef;

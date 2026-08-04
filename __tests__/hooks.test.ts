@@ -214,7 +214,7 @@ function Bad() {
   };
 }
 `),
-      ).toThrow(/Unsupported this\.trigger statement: VariableDeclaration/);
+      ).toThrow(/Cell declarations are only allowed directly in a node body/);
 
       expect(() =>
         parse(`
@@ -239,7 +239,7 @@ function Bad() {
   };
 }
 `),
-      ).toThrow(/Unsupported this\.effects statement: WhileStatement/);
+      ).toThrow(/`while` is not supported in this\.effects/);
     });
   });
 
@@ -575,6 +575,322 @@ function Second() {
         arc("single-match-trigger-arc", "First"),
       );
       expect(triggerBrief.matchableArcs).toEqual([]);
+    });
+
+    it("defers implicit auto-selection while another candidate has a pending judgment", () => {
+      const document = parse(`
+"arc";
+
+function Immediate() {
+  this.trigger = () => {
+    return true;
+  };
+}
+
+function Pending() {
+  this.trigger = () => {
+    return judge(\`pending judgment matches\`);
+  };
+}
+`);
+      const source = "trigger-settlement-judgment-arc";
+      const runtime = new Runtime().add(source, document);
+      const immediateRef = arc(source, "Immediate");
+      const pendingRef = arc(source, "Pending");
+
+      const brief = startTrigger(runtime, EMPTY_DIALOG);
+
+      expect(brief.matched).toBeUndefined();
+      expect(brief.matchableArcs).toEqual([immediateRef]);
+      expect(brief.judgments).toHaveLength(1);
+      expect(brief.issues).toEqual([]);
+
+      const unmatched = runtime.progressTrigger(
+        brief,
+        { judgments: { [brief.judgments[0]!.id]: false } },
+        EMPTY_DIALOG,
+      );
+      expect(unmatched.matched).toEqual(immediateRef);
+
+      const ambiguous = runtime.progressTrigger(
+        brief,
+        { judgments: { [brief.judgments[0]!.id]: true } },
+        EMPTY_DIALOG,
+      );
+      expect(ambiguous.matched).toBeUndefined();
+      expect(ambiguous.matchableArcs).toEqual([immediateRef, pendingRef]);
+      expect(ambiguous.issues).toEqual([
+        expect.objectContaining({
+          kind: "ambiguous-match",
+          matchableArcs: [immediateRef, pendingRef],
+        }),
+      ]);
+    });
+
+    it("defers implicit auto-selection while another candidate has a pending observation", () => {
+      const document = parse(`
+"arc";
+
+function Immediate() {
+  this.trigger = () => {
+    return true;
+  };
+}
+
+function Pending() {
+  let ready = Bool();
+  ready.observing = \`pending observation matches\`;
+
+  this.trigger = () => {
+    $observe(ready);
+    return ready == true;
+  };
+}
+`);
+      const source = "trigger-settlement-observation-arc";
+      const runtime = new Runtime().add(source, document);
+      const immediateRef = arc(source, "Immediate");
+      const pendingRef = arc(source, "Pending");
+
+      const brief = startTrigger(runtime, EMPTY_DIALOG);
+
+      expect(brief.matched).toBeUndefined();
+      expect(brief.matchableArcs).toEqual([immediateRef]);
+      expect(brief.observations).toHaveLength(1);
+      expect(brief.issues).toEqual([]);
+
+      const unmatched = runtime.progressTrigger(
+        brief,
+        {
+          observations: {
+            [brief.observations[0]!.id]: { status: "resolved", value: false },
+          },
+        },
+        EMPTY_DIALOG,
+      );
+      expect(unmatched.matched).toEqual(immediateRef);
+
+      const ambiguous = runtime.progressTrigger(
+        brief,
+        {
+          observations: {
+            [brief.observations[0]!.id]: { status: "resolved", value: true },
+          },
+        },
+        EMPTY_DIALOG,
+      );
+      expect(ambiguous.matched).toBeUndefined();
+      expect(ambiguous.matchableArcs).toEqual([immediateRef, pendingRef]);
+      expect(ambiguous.issues).toEqual([
+        expect.objectContaining({
+          kind: "ambiguous-match",
+          matchableArcs: [immediateRef, pendingRef],
+        }),
+      ]);
+    });
+
+    it("defers implicit auto-selection while another candidate has a pending host call", () => {
+      const document = parse(`
+"arc";
+
+import Gate from "host:gate";
+
+function Immediate() {
+  this.trigger = () => {
+    return true;
+  };
+}
+
+function Pending() {
+  this.trigger = () => {
+    return Gate.ready();
+  };
+}
+`);
+      const source = "trigger-settlement-host-call-arc";
+      const runtime = new Runtime().add(source, document);
+      const immediateRef = arc(source, "Immediate");
+      const pendingRef = arc(source, "Pending");
+
+      const brief = startTrigger(runtime, EMPTY_DIALOG);
+
+      expect(brief.matched).toBeUndefined();
+      expect(brief.matchableArcs).toEqual([immediateRef]);
+      expect(brief.hostCalls).toHaveLength(1);
+      expect(brief.issues).toEqual([]);
+
+      const unmatched = runtime.progressTrigger(
+        brief,
+        { hostCalls: { [brief.hostCalls[0]!.id]: false } },
+        EMPTY_DIALOG,
+      );
+      expect(unmatched.matched).toEqual(immediateRef);
+
+      const ambiguous = runtime.progressTrigger(
+        brief,
+        { hostCalls: { [brief.hostCalls[0]!.id]: true } },
+        EMPTY_DIALOG,
+      );
+      expect(ambiguous.matched).toBeUndefined();
+      expect(ambiguous.matchableArcs).toEqual([immediateRef, pendingRef]);
+      expect(ambiguous.issues).toEqual([
+        expect.objectContaining({
+          kind: "ambiguous-match",
+          matchableArcs: [immediateRef, pendingRef],
+        }),
+      ]);
+    });
+
+    it("an explicit matchable preferredMatch settles despite other pending trigger work", () => {
+      const document = parse(`
+"arc";
+
+function Immediate() {
+  this.trigger = () => {
+    return true;
+  };
+}
+
+function Pending() {
+  this.trigger = () => {
+    return judge(\`pending preferred-match work\`);
+  };
+}
+`);
+      const source = "trigger-settlement-preferred-arc";
+      const runtime = new Runtime().add(source, document);
+      const immediateRef = arc(source, "Immediate");
+
+      const brief = startTrigger(runtime, EMPTY_DIALOG);
+      expect(brief.matchableArcs).toEqual([immediateRef]);
+      expect(brief.judgments).toHaveLength(1);
+
+      const selected = runtime.progressTrigger(
+        brief,
+        { preferredMatch: immediateRef },
+        EMPTY_DIALOG,
+      );
+
+      expect(selected.matched).toEqual(immediateRef);
+      expect(selected.matchableArcs).toEqual([]);
+      expect(selected.judgments).toEqual([]);
+      expect(selected.observations).toEqual([]);
+      expect(selected.hostCalls).toEqual([]);
+    });
+
+    it("returns trigger-match-not-matchable when a retained preferredMatch settles unmatched beside one match", () => {
+      const document = parse(`
+"arc";
+
+function Immediate() {
+  this.trigger = () => {
+    return true;
+  };
+}
+
+function Pending() {
+  this.trigger = () => {
+    return judge(\`pending committed match\`);
+  };
+}
+`);
+      const source = "trigger-settlement-preferred-unmatched-arc";
+      const runtime = new Runtime().add(source, document);
+      const immediateRef = arc(source, "Immediate");
+      const pendingRef = arc(source, "Pending");
+
+      const first = startTrigger(runtime, EMPTY_DIALOG);
+      expect(first.matchableArcs).toEqual([immediateRef]);
+      expect(first.judgments).toHaveLength(1);
+
+      const waiting = runtime.progressTrigger(
+        first,
+        { preferredMatch: pendingRef },
+        EMPTY_DIALOG,
+      );
+      expect(waiting.matched).toBeUndefined();
+      expect(waiting.matchableArcs).toEqual([immediateRef]);
+      expect(waiting.judgments).toHaveLength(1);
+      expect(waiting.issues).toEqual([]);
+
+      const failed = runtime.progressTrigger(
+        waiting,
+        { judgments: { [waiting.judgments[0]!.id]: false } },
+        EMPTY_DIALOG,
+      );
+
+      expect(failed.matched).toBeUndefined();
+      expect(failed.matchableArcs).toEqual([immediateRef]);
+      expect(failed.judgments).toEqual([]);
+      expect(failed.observations).toEqual([]);
+      expect(failed.hostCalls).toEqual([]);
+      expect(failed.issues).toEqual([
+        expect.objectContaining({
+          kind: "invalid-report",
+          reasonCode: "trigger-match-not-matchable",
+        }),
+      ]);
+    });
+
+    it("returns trigger-match-not-matchable instead of ambiguity when a retained preferredMatch settles unmatched beside multiple matches", () => {
+      const document = parse(`
+"arc";
+
+function First() {
+  this.trigger = () => {
+    return true;
+  };
+}
+
+function Second() {
+  this.trigger = () => {
+    return true;
+  };
+}
+
+function Pending() {
+  this.trigger = () => {
+    return judge(\`pending committed match among alternatives\`);
+  };
+}
+`);
+      const source = "trigger-settlement-preferred-unmatched-ambiguous-arc";
+      const runtime = new Runtime().add(source, document);
+      const firstRef = arc(source, "First");
+      const secondRef = arc(source, "Second");
+      const pendingRef = arc(source, "Pending");
+
+      const first = startTrigger(runtime, EMPTY_DIALOG);
+      expect(first.matchableArcs).toEqual([firstRef, secondRef]);
+      expect(first.judgments).toHaveLength(1);
+      expect(first.issues).toEqual([]);
+
+      const waiting = runtime.progressTrigger(
+        first,
+        { preferredMatch: pendingRef },
+        EMPTY_DIALOG,
+      );
+      expect(waiting.matchableArcs).toEqual([firstRef, secondRef]);
+      expect(waiting.judgments).toHaveLength(1);
+      expect(waiting.issues).toEqual([]);
+
+      const failed = runtime.progressTrigger(
+        waiting,
+        { judgments: { [waiting.judgments[0]!.id]: false } },
+        EMPTY_DIALOG,
+      );
+
+      expect(failed.matched).toBeUndefined();
+      expect(failed.matchableArcs).toEqual([firstRef, secondRef]);
+      expect(failed.judgments).toEqual([]);
+      expect(failed.observations).toEqual([]);
+      expect(failed.hostCalls).toEqual([]);
+      expect(failed.issues).toEqual([
+        expect.objectContaining({
+          kind: "invalid-report",
+          reasonCode: "trigger-match-not-matchable",
+        }),
+      ]);
     });
 
     it("returns ambiguous-match until a later trigger report names a preferred match", () => {

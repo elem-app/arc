@@ -1119,12 +1119,12 @@ function Main() {
       [
         "return",
         "invoke(() => { return; })",
-        /Unsupported Arc statement: ReturnStatement/,
+        /`return` is not allowed in an Arc action graph/,
       ],
       [
         "cell declaration",
         "invoke(() => { let k = Bool(); })",
-        /Unsupported Arc statement: VariableDeclaration/,
+        /Cell declarations are only allowed directly in a node body/,
       ],
       [
         "this.guidance assignment",
@@ -1137,9 +1137,9 @@ function Main() {
         /Unsupported Arc assignment/,
       ],
       [
-        "function declaration",
+        "child node declaration",
         "invoke(() => { function Inner() {} })",
-        /Unsupported Arc statement: FunctionDeclaration/,
+        /Child node declarations are only allowed directly in a node body/,
       ],
     ])("rejects %s in the body", (_label, body, pattern) => {
       expect(() =>

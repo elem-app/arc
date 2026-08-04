@@ -131,6 +131,55 @@ describe("node structure and config", () => {
       });
     });
 
+    it("hoists direct cell declarations across node-body statement order", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  ready.$set(true);
+
+  function Child() {}
+
+  let ready = Bool();
+}
+`);
+
+      const root = document.roots[0]!;
+      expect(root.cells).toMatchObject([{ name: "ready", type: "boolean" }]);
+      expect(root.statements).toMatchObject([
+        {
+          kind: "set",
+          target: ["ready"],
+          value: { kind: "literal", value: true },
+        },
+      ]);
+      expect(root.children).toMatchObject([{ identifier: "Child" }]);
+
+      const runtime = new Runtime().add("late-cell-declaration-arc", document);
+      const seeded = runtime.newTraversal(
+        arc("late-cell-declaration-arc", "Main"),
+      );
+      seeded.phase = "entered";
+
+      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      expect(rootTraversal(brief).cells.ready).toBe(true);
+    });
+
+    it.each([
+      ["if action branch", "if (true) { let ready = Bool(); }"],
+      ["label action body", "work: { let ready = Bool(); }"],
+    ])("rejects a cell declaration nested in an %s", (_scope, body) => {
+      expect(() =>
+        parse(`
+"arc";
+
+function Main() {
+  ${body}
+}
+`),
+      ).toThrow("Cell declarations are only allowed directly in a node body");
+    });
+
     it("assigns structural element ids scoped by SEG", () => {
       const document = parse(`
 "arc";

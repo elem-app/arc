@@ -792,6 +792,64 @@ function Eager() {
       expect(matched.matched).toEqual(arc("pin-trigger-gated-arc", "Gated"));
     });
 
+    it("does not rerun a terminal match while another trigger candidate remains open", () => {
+      const source = "pin-trigger-terminal-match-arc";
+      const runtime = new Runtime().add(
+        source,
+        parse(`
+"arc";
+
+function Terminal() {
+  this.trigger = () => {
+    return judge(\`terminal candidate ready\`);
+  };
+}
+
+function Open() {
+  this.trigger = () => {
+    return judge(\`open candidate ready\`);
+  };
+}
+`),
+      );
+
+      const first = startTrigger(runtime, EMPTY_DIALOG);
+      const terminalJudgment = first.judgments.find(
+        (item) =>
+          renderSemanticTextForTest(item.question) ===
+          "terminal candidate ready",
+      )!;
+
+      const second = runtime.progressTrigger(
+        first,
+        { judgments: { [terminalJudgment.id]: true } },
+        EMPTY_DIALOG,
+      );
+
+      expect(second.matched).toBeUndefined();
+      expect(second.matchableArcs).toEqual([arc(source, "Terminal")]);
+      expect(
+        second.judgments.map((item) =>
+          renderSemanticTextForTest(item.question),
+        ),
+      ).toEqual(["open candidate ready"]);
+
+      const third = runtime.progressTrigger(second, {}, EMPTY_DIALOG);
+
+      expect(third.matched).toBeUndefined();
+      expect(third.matchableArcs).toEqual([arc(source, "Terminal")]);
+      expect(
+        third.judgments.map((item) => renderSemanticTextForTest(item.question)),
+      ).toEqual(["open candidate ready"]);
+
+      const selected = runtime.progressTrigger(
+        third,
+        { judgments: { [third.judgments[0]!.id]: false } },
+        EMPTY_DIALOG,
+      );
+      expect(selected.matched).toEqual(arc(source, "Terminal"));
+    });
+
     it("a fresh startTrigger starts new consultations", () => {
       const runtime = new Runtime().add(
         "pin-trigger-fresh-arc",

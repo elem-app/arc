@@ -42,6 +42,34 @@ function Second() {
       ]);
       expect(document.roots[1]?.displayName).toBe("Second Root");
     });
+
+    it("rejects a document-level cell declaration instead of discarding it", () => {
+      expect(() =>
+        parse(`
+"arc";
+
+let ready = Bool();
+
+function Main() {}
+`),
+      ).toThrow(
+        "Document-level cell declarations are not allowed; declare cells directly in a root node body",
+      );
+    });
+
+    it("rejects other statements at document level", () => {
+      expect(() =>
+        parse(`
+"arc";
+
+$instruct(\`outside a node\`);
+
+function Main() {}
+`),
+      ).toThrow(
+        "Only imports and root node declarations are allowed at document level",
+      );
+    });
   });
 
   describe("doc.arc-imports", () => {
@@ -87,7 +115,7 @@ function Bad() {
       expect(() => parse(source)).toThrow(/does not support default imports/);
     });
 
-    it("uses plain top-level function declarations for arcs and rejects export syntax", () => {
+    it("uses direct root node declarations and rejects export syntax", () => {
       const document = parse(`
 "arc";
 function Helper() {

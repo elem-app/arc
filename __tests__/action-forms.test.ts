@@ -958,7 +958,7 @@ function Bad() {
     $instruct(\`nope\`);  }
 }
 `),
-      ).toThrow(/Unsupported Arc statement: WhileStatement/);
+      ).toThrow("`while` is not supported in an Arc action graph");
 
       expect(() =>
         parse(`
@@ -976,7 +976,9 @@ function Bad() {
   const local = 1;
 }
 `),
-      ).toThrow(/Unsupported Arc statement: VariableDeclaration/);
+      ).toThrow(
+        "Node-body declarations must use supported Arc cell constructors",
+      );
     });
   });
 

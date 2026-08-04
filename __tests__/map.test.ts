@@ -877,6 +877,12 @@ function Main() {
       ).toThrow(/MAP_NESTED/);
     });
 
+    it("rejects a cell declaration in a $map callback", () => {
+      expect(() =>
+        parse(mapSource(`nums.$map(() => { let local = Bool(); });`)),
+      ).toThrow("Cell declarations are only allowed directly in a node body");
+    });
+
     it("rejects a non-newcopy enter target in the callback", () => {
       expect(() =>
         parse(
