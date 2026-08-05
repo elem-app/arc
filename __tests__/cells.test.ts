@@ -14,6 +14,7 @@ import { Runtime } from "../src/runtime/index.js";
 import type { Dialog, SetAction } from "../src/types.js";
 import { nodeSegKey } from "../src/types.js";
 import {
+  appliedInstructions,
   arc,
   EMPTY_DIALOG,
   progressBrief,
@@ -123,10 +124,12 @@ function Main() {
 
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
 
-      expect(brief.instructions.map((item) => item.text)).toEqual([
-        "within",
-        "not cold",
-      ]);
+      expect(brief.instructions.map((item) => item.text)).toEqual(["within"]);
+      const next = progressBrief(runtime, brief, {
+        move: "proceed",
+        instructions: appliedInstructions(brief),
+      });
+      expect(next.instructions.map((item) => item.text)).toEqual(["not cold"]);
     });
 
     it("compares enum values by ordinal position, not lexicographic order", () => {
@@ -232,6 +235,12 @@ function Main() {
 
       expect(brief.instructions.map((item) => item.text)).toEqual([
         "above warm",
+      ]);
+      const next = progressBrief(runtime, brief, {
+        move: "proceed",
+        instructions: appliedInstructions(brief),
+      });
+      expect(next.instructions.map((item) => item.text)).toEqual([
         "above cold",
       ]);
     });
@@ -780,7 +789,10 @@ function Main() {
       const first = startRun(runtime, [seeded], EMPTY_DIALOG);
       expect(first.instructions.map((item) => item.text)).toEqual(["unset"]);
 
-      const second = progressBrief(runtime, first, { move: "proceed" });
+      const second = progressBrief(runtime, first, {
+        move: "proceed",
+        instructions: appliedInstructions(first),
+      });
       expect(second.instructions.map((item) => item.text)).toEqual(["defined"]);
       expect(rootTraversal(second).cells).toMatchObject({
         ready: false,

@@ -1,6 +1,6 @@
 # Arc Runtime API
 
-The runtime executes parsed Arc scripts together with a **host**. It traverses action graphs, manages traversal state, and yields structured briefs when it needs host involvement. The host carries out semantic work — LLM calls, cell extraction, instruction delivery — and reports back. The runtime never calls an LLM or performs any semantic resolution itself.
+The runtime executes parsed Arc scripts together with a **host**. It traverses action graphs, manages traversal state, and yields structured briefs when it needs host involvement. The host carries out semantic work — LLM calls, cell extraction, instruction following — and reports back. The runtime never calls an LLM or performs any semantic resolution itself.
 
 ## Mental Model
 
@@ -101,7 +101,7 @@ On re-entry with `this.forgetfulEntry = true`, or on entry via `forgetful(Refere
 
 The runtime communicates with the host exclusively through briefs and reports. When the runtime reaches a point requiring host involvement, it yields a **brief** describing the pending work and carrying contextual information. The host resolves the pending items, chooses a move, and sends back a **report**. The runtime uses the report to advance.
 
-Briefs also carry information the host may use at its discretion — traversal snapshots, instructions to deliver, host effects to apply. Hosts must treat brief objects as immutable:
+Briefs also carry information the host may use at its discretion — traversal snapshots, instructions to follow, host effects to apply. Hosts must treat brief objects as immutable:
 
 - Do not mutate brief fields in place.
 - Do not reconstruct or clone a brief and pass the copy back.
@@ -132,13 +132,14 @@ Batching:
 - Instruction actions batch only when their effective merged `hostParams`, mode, `resolveWhen`, and `deflectWhen` match.
 - Entering a child with `$enter(ReferenceName)`, returning to a caller, or beginning `this.effects` ends an instruction batch.
 - An action brief never mixes instructions from different node bodies.
+- The protocol does not promise whether separately reachable instruction actions share a brief. Hosts must handle every presented item without depending on a particular instruction batch size.
 
 Resume:
 
 - After a brief/report round, traversal seeks the suspended frontier: it lands back on the frontier without re-asking work answered earlier in the same walk.
 - Pending instructions continue to surface in follow-up `ActionBrief`s while they remain unresolved; a repeated instruction brief may carry the same instruction text with a different instruction `phase` and a different `postcheck` frontier as resolution work progresses.
 
-### `TriggerBrief`
+### `TriggerBrief` and `TriggerReport`
 
 `TriggerBrief` is what the runtime yields during the trigger stage. It carries the persisted trigger traversal state, unresolved semantic work from trigger bodies, and the set of arcs that are currently matchable. Trigger stage ends when `matched` is set.
 
@@ -167,8 +168,6 @@ type TriggerBrief = {
 };
 ```
 
-### `TriggerReport`
-
 `TriggerReport` is what the host sends back after inspecting a trigger brief. It includes resolved work items and may name a preferred arc when multiple trigger candidates may match.
 
 ```typescript
@@ -188,7 +187,7 @@ type TriggerReport = {
 };
 ```
 
-### `ActionBrief`
+### `ActionBrief` and `ActionReport`
 
 `ActionBrief` is what the runtime yields during the action stage. It describes the current traversal state, pending work items, and any instructions or host effects that surfaced during this walk.
 
@@ -223,18 +222,15 @@ type ActionBrief = {
 };
 ```
 
-### `ActionReport`
-
-`ActionReport` is what the host sends back after inspecting an action brief. It includes resolved work items and a move that tells the runtime what to do next.
+`ActionReport` is what the host sends back after inspecting an action brief. It includes itemized results and a move that tells the runtime what to do next.
 
 ```typescript
 type ActionReport = {
   /**
-   * "proceed" — host hands control back and requests traversal progression.
+   * "proceed" — host submits this report and requests traversal progression.
    *   This is host-driven and does not imply exactly one new user/assistant
-   *   message since the prior brief. For instruction frontiers, this hands the
-   *   current instruction frontier back according to the semantics of its
-   *   `mode`.
+   *   message since the prior brief. It does not imply that any instruction was
+   *   applied; application is reported per instruction id below.
    * "deflect" — user changed topic; the active node becomes deflected and is
    *   eligible for re-entry. Pending effects still run. Only available when
    *   `allowedMoves` includes it: a brief whose pending work is semantic —
@@ -251,6 +247,8 @@ type ActionReport = {
     reasonCode?: string;
     reason?: string;
   };
+  /** Instructions the host actually applied, keyed by apply-phase brief id. */
+  instructions?: Record<BriefId, InstructionReport>;
   /** Resolved boolean checks, keyed by brief id. */
   judgments?: Record<BriefId, boolean>;
   /**
@@ -295,7 +293,7 @@ A transition brief is **exclusive**: it carries no judgments, observations, host
 
 Transitions surface only during the action stage; trigger probing evaluates against the single projection of the activating inbound and never announces position changes.
 
-### Work Item Briefs
+### Work Items
 
 #### Semantic Text
 
@@ -317,7 +315,7 @@ Artifact paths are logical paths relative to the host's workspace for the curren
 
 Host variables are authored as direct member references on a `host:*` import inside a template literal, such as `${Audience.supervisor}` or `${Audience["group"].supervisor}` for `import Audience from "host:audience"`. The runtime emits `{ kind: "hostVar", module: "audience", path: ["supervisor"] }` or a longer `path` for nested references, and does not resolve the reference further. Hosts decide whether a host variable renders as text, selects an audience, maps to another runtime object, or is rejected as unsupported.
 
-#### `JudgmentBrief`
+#### Judgments
 
 `JudgmentBrief` represents a request by the runtime to answer a boolean question — from a `judge()` call in the arc source. The host evaluates the question against conversation context and reports `true` or `false`.
 
@@ -334,7 +332,7 @@ type JudgmentBrief = {
 };
 ```
 
-#### `ObservationBrief`
+#### Observations and Observation Groups
 
 `ObservationBrief` represents a request by the runtime to extract a cell target's value — from an `$observe()` or `$observeOrAsk()` call. The target may be a whole cell or a concrete array element selected by the authored target expression. The host infers the value from conversation context using the provided question and the target leaf's type definition. When `mode` is `"observeOrAsk"`, the host may ask the user directly instead of inferring.
 
@@ -393,8 +391,6 @@ type ObservationReport = {
 };
 ```
 
-#### `ObservationGroupBrief`
-
 `ObservationGroupBrief` represents a request to extract several cells together — from an `$observe({ ... })` or `$observeOrAsk({ ... })` call. It shares the `observations` channel with `ObservationBrief`; the two are distinguished by `kind`. Sharing the channel means a host that iterates `observations` is forced to handle the group variant rather than silently leaving it unresolved (which would deadlock the arc). The host infers the whole set in one inference and reports every field in one report. The group is one resolved-once action: the runtime applies the report as a unit and keeps no per-field progress.
 
 ```typescript
@@ -438,7 +434,7 @@ type ObservationGroupReport = {
 
 When every field is `resolved` or `unknown`, the runtime writes all `resolved` values together and resolves the group. When any field is `needs-user`, the group re-emits and nothing is written.
 
-#### `HostCallBrief`
+#### Host Calls and Host Effects
 
 `HostCallBrief` represents a request by the runtime to get a value from a host module — from an expression-position host call like `Dice.roll(20)` or `Dice["tables"].roll(20)`. The runtime is blocked until the host reports a value. Built-in `Dialog` snapshot and cursor helpers are resolved locally by the runtime and do not emit host calls.
 
@@ -461,9 +457,7 @@ type HostCallBrief = {
 };
 ```
 
-#### `HostEffectBrief`
-
-`HostEffectBrief` represents a statement-position host call emitted from a node's `this.effects` body — the runtime does not execute it; the host does, and reports back. An unreported effect keeps its node unfinished and its terminal state unset: the run cannot cover or deflect that node or continue into later nodes, and every subsequent brief re-surfaces the effect under the same id until the host reports it or rejects the frontier with `move: "poison"`. Inside the effects body, `this.pendingState` derives the eventual covered or deflected outcome from persisted finalizing state. During deflected effects, `this.deflection.escaped(Target)` compares the persisted entry-target `from` node, which is unset for the node's own frontier deflection; using it during covered effects poisons the traversal. Other briefable work from the same effects body may surface alongside the effect on the same brief; work from later nodes cannot.
+`HostEffectBrief` represents a statement-position host call emitted from a node's `this.effects` body — the runtime does not execute it; the host does, and reports back. An unreported effect keeps its node unfinished and its terminal state unset: the run cannot cover or deflect that node or continue into later nodes, and every subsequent brief re-surfaces the effect under the same id until the host reports it or rejects the frontier with `move: "poison"`. Other briefable work from the same effects body may surface alongside the effect on the same brief; work from later nodes cannot.
 
 Authored host-effect targets may use dot segments or static string-literal bracket segments. The runtime emits the same `module`, `target`, and `operation` shape either way.
 
@@ -495,7 +489,7 @@ type HostEffectReport = {
 };
 ```
 
-#### `InstructionBrief`
+#### Instructions
 
 `InstructionBrief` represents text that the arc sends to the host from `$instructLoop(...)` and `$instruct(...)` actions in the action graph. Hosts typically use it as guidance for LLM generation and decide how (or whether) to surface it to the user.
 
@@ -538,35 +532,38 @@ type InstructionPostcheck = {
 };
 ```
 
-`postcheck` is not the full authored resolution logic. It includes only the check ids that are currently pending in this brief. Later briefs for the same instruction may expose a different `postcheck` frontier.
+`postcheck` is not the full authored resolution logic. It includes only the check ids that are currently pending in this brief. Later briefs for the same instruction may expose a different `postcheck` frontier. An answered check does not re-pose within the same decision cycle: a hook that settles while the other hook is still open keeps its answers, so follow-up briefs carry only the open hook's checks until the instruction resolves, deflects, or returns to `apply` for a fresh cycle.
 
-#### Host Treatment of `InstructionBrief`
+After an instruction is applied, the host should report back:
+
+```typescript
+type InstructionReport = {
+  status: "applied";
+};
+```
 
 Instruction handback is intentionally different from value-style actions. For value-style actions, the host reports values and runtime advances from those values.
 
 For instructions, the host should:
 
 1. Respect instruction `mode` in host logic.
-   - `once`: the host is expected to report back **only after** the instruction has been fully applied downstream. How the host establishes that is outside the runtime's concern; the runtime does not independently verify completed application. Set for `$instruct()`s.
+   - `once`: the runtime resolves the instruction only after the host reports that instruction id as `status: "applied"`. How the host establishes application is outside the runtime's concern. Set for `$instruct()`s.
    - `persistent`: the instruction remains pending until its authored `resolveWhen` resolves true. Set for `$instructLoop()`s.
 2. Respect instruction `phase` in the current brief.
    - `apply`: treat the instruction as guidance currently in effect.
    - `postcheck`: the instruction is still pending, but this brief is focused on resolving follow-up checks rather than treating it as a fresh instruction presentation.
    - Typical progression is: first reach emits `phase: "apply"`; follow-up briefs while primarily checking conditions emit `phase: "postcheck"`; after a non-terminal check cycle the same instruction may return to `phase: "apply"`.
-3. Report any available values for `postcheck` ids in the same brief (`judgments` / `observations` / `hostCalls`).
-4. Expect no `move: "deflect"` on an instruction brief: a pending instruction suppresses it in both the `apply` and `postcheck` phases.
-   - Finish the current instruction application window. Deflection is reported at the next frontier where `allowedMoves` exposes `move: "deflect"`.
+3. For each `phase: "apply"` instruction actually performed, report `instructions[id]: { status: "applied" }`. Omitted ids remain unconfirmed and stay in `apply`; when a brief contains multiple instructions, it may therefore be acknowledged partially. A `postcheck` instruction has already been applied for its current cycle and must not be reported applied again.
+4. Independently report any available values for `postcheck` ids in the same brief (`judgments` / `observations` / `hostCalls`). Application and postcheck evidence may arrive separately or in the same report.
+5. Expect no explicit `move: "deflect"` on an instruction brief: a pending instruction suppresses that move in both phases. An authored `deflectWhen` is different: the runtime evaluates its reported semantic evidence and may deflect the traversal even when the host has not yet reported the instruction applied.
 
-Runtime then derives instruction outcome from authored conditions:
+Runtime then derives instruction outcome from authored conditions. Each `$instruct`, and each `$instructLoop` iteration, is one lap collecting two evidences, each banked once settled: the deflect evidence (`deflectWhen`) and the finished evidence (application for a one-shot, `resolveWhen` for a loop).
 
-1. Evaluate `deflectWhen` first.
-2. Then evaluate `resolveWhen`.
-3. Else remain pending.
+1. A deflect evidence that settles true decides the lap immediately, honoring the finished evidence collected up to the same handback: a finished lap stays resolved through the deflection, an unfinished one re-presents after the deflection is handled.
+2. With both evidences in and no deflection, a finished lap resolves — for a loop, a true `resolveWhen` resolves the whole action and a false one starts a fresh lap with fresh evidence.
+3. Else the lap waits for its open evidence. An unapplied instruction stays in `apply`; an applied instruction with unresolved checks stays in `postcheck`.
 
-Hosts can handle this in either style:
-
-- **Aggressive batching:** deliver instruction and resolve postcheck ids in the same handback.
-- **Incremental handback:** apply instruction first, then hand back later with values as they become available.
+The two report channels impose no ordering. A host may report application first, postcheck evidence first, or both together; each settled evidence banks for the lap and its checks do not re-pose.
 
 If values are still missing, runtime returns the next action brief directly. That brief may include the same instruction again with `phase: "postcheck"`, or with `phase: "apply"` if the instruction has come back into effect after a non-terminal check cycle.
 
@@ -713,6 +710,6 @@ A typical host turn:
    1. Persist `brief.traversals`.
    1. Inspect instructions and pending work items.
    1. Host chooses when to hand control back (after 0/1/N conversation rounds).
-   1. Resolve any available judgments/observations/hostCalls/hostEffects and call `progress(brief, { move, judgments, observations, hostCalls, hostEffects }, latestDialog)`. Unresolved work re-surfaces on later briefs under the same ids. Report `move: "poison"` instead if the host cannot accept the frontier contract or fails a resolution fatally.
+   1. Resolve any available judgments/observations/hostCalls/hostEffects, report each instruction actually applied under `instructions[id]`, and call `progress(brief, { move, instructions, judgments, observations, hostCalls, hostEffects }, latestDialog)`. Unresolved or unreported work re-surfaces on later briefs under the same ids. Report `move: "poison"` instead if the host cannot accept the frontier contract or fails a resolution fatally.
    1. `progress(...)` returns a new action brief.
    1. Repeat from b as needed until traversal cannot progress.

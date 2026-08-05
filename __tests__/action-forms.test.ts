@@ -15,11 +15,12 @@ import {
   createEmptyArcTraversal,
   type RegistryEntry,
 } from "../src/runtime/state.js";
-import type { Dialog } from "../src/types.js";
+import type { ArcTraversalSet, Dialog } from "../src/types.js";
 import {
   EMPTY_DIALOG,
   METAL_SOURCE,
   appliedHostEffects,
+  appliedInstructions,
   arc,
   groupObservation,
   node,
@@ -432,10 +433,12 @@ function Main() {
         },
       });
 
-      expect(next.instructions.map((item) => item.text)).toEqual([
-        "before",
-        "after",
-      ]);
+      expect(next.instructions.map((item) => item.text)).toEqual(["before"]);
+      const after = progressBrief(runtime, next, {
+        move: "proceed",
+        instructions: appliedInstructions(next),
+      });
+      expect(after.instructions.map((item) => item.text)).toEqual(["after"]);
     });
 
     it("re-evaluates structural if flow after $observeOrAsk() re-walks the current SEG", () => {
@@ -478,10 +481,12 @@ function Main() {
         },
       });
 
-      expect(next.instructions.map((item) => item.text)).toEqual([
-        "before",
-        "after",
-      ]);
+      expect(next.instructions.map((item) => item.text)).toEqual(["before"]);
+      const after = progressBrief(runtime, next, {
+        move: "proceed",
+        instructions: appliedInstructions(next),
+      });
+      expect(after.instructions.map((item) => item.text)).toEqual(["after"]);
     });
 
     it("records needs-user/proceed flow against the active owned child", () => {
@@ -551,6 +556,7 @@ function Main() {
 
       const completed = progressBrief(runtime, afterProceed, {
         move: "proceed",
+        instructions: appliedInstructions(afterProceed),
       });
       expect(completed.canProgress).toBe(false);
       expect(rootTraversal(completed).phase).toBe("completed");
@@ -630,13 +636,16 @@ function Main() {
       ]);
       expect(brief.allowedMoves).toEqual(["poison", "proceed"]);
 
-      const afterProceed = progressBrief(runtime, brief, { move: "proceed" });
+      const afterProceed = progressBrief(runtime, brief, {
+        move: "proceed",
+        instructions: appliedInstructions(brief),
+      });
       expect(afterProceed.instructions).toEqual([]);
       expect(afterProceed.canProgress).toBe(false);
       expect(rootTraversal(afterProceed).phase).toBe("completed");
     });
 
-    it("resolves instruct implicitly after handback", () => {
+    it("resolves a one-shot instruction only after its application report", () => {
       const document = parse(`
 "arc";
 
@@ -654,13 +663,88 @@ function Main() {
       });
       expect(brief.instructions.map((item) => item.text)).toEqual([
         "Mention this once.",
-        "after",
       ]);
       expect(brief.judgments).toEqual([]);
 
-      const resolved = progressBrief(runtime, brief, { move: "proceed" });
-      expect(resolved.instructions).toEqual([]);
-      expect(resolved.canProgress).toBe(false);
+      const unacknowledged = progressBrief(runtime, brief, { move: "proceed" });
+      expect(unacknowledged.instructions).toEqual(brief.instructions);
+
+      const resolved = progressBrief(runtime, unacknowledged, {
+        move: "proceed",
+        instructions: appliedInstructions(unacknowledged),
+      });
+      expect(resolved.instructions.map((item) => item.text)).toEqual(["after"]);
+
+      const completed = progressBrief(runtime, resolved, {
+        move: "proceed",
+        instructions: appliedInstructions(resolved),
+      });
+      expect(completed.instructions).toEqual([]);
+      expect(completed.canProgress).toBe(false);
+    });
+
+    it("keeps an applied one-shot resolved through a same-handback deflection", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  this.catchDeflection = () => true;
+  $instruct(\`Say it.\`, { deflectWhen: \`user changed topic\` });
+}
+`);
+      const runtime = new Runtime().add(
+        "instruct-lap-deflect-applied-arc",
+        document,
+      );
+      const seeded = runtime.newTraversal(
+        arc("instruct-lap-deflect-applied-arc", "Main"),
+      );
+      seeded.phase = "entered";
+      const issued = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const check = issued.instructions[0]!.postcheck!.judgmentIds[0]!;
+
+      // The lap short-circuits on the deflection but honors the application
+      // evidence from the same handback: the one-shot stays resolved, so the
+      // catch rewalk completes the node instead of re-presenting it.
+      const caught = progressBrief(runtime, issued, {
+        move: "proceed",
+        instructions: appliedInstructions(issued),
+        judgments: { [check]: true },
+      });
+      expect(caught.instructions).toEqual([]);
+      expect(rootTraversal(caught).phase).toBe("completed");
+    });
+
+    it("re-presents an unapplied one-shot after its deflection is caught", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  this.catchDeflection = () => true;
+  $instruct(\`Say it.\`, { deflectWhen: \`user changed topic\` });
+}
+`);
+      const runtime = new Runtime().add(
+        "instruct-lap-deflect-unapplied-arc",
+        document,
+      );
+      const seeded = runtime.newTraversal(
+        arc("instruct-lap-deflect-unapplied-arc", "Main"),
+      );
+      seeded.phase = "entered";
+      const issued = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const check = issued.instructions[0]!.postcheck!.judgmentIds[0]!;
+
+      // No finished evidence at the short-circuit: the lap ends unfinished and
+      // the catch rewalk starts a fresh lap, re-presenting the instruction.
+      const caught = progressBrief(runtime, issued, {
+        move: "proceed",
+        judgments: { [check]: true },
+      });
+      expect(caught.instructions).toMatchObject([
+        { text: "Say it.", phase: "apply" },
+      ]);
+      expect(rootTraversal(caught).phase).toBe("entered");
     });
   });
 
@@ -774,7 +858,189 @@ function Main() {
       expect(rootTraversal(nextBrief).phase).toBe("suspended");
     });
 
-    it("re-emits resolution observe after terminal false clears function frame", () => {
+    it("banks a settled resolveWhen while deflectWhen stays open", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  $instructLoop(\`Carry it.\`, {
+    deflectWhen: \`user left the topic\`,
+    resolveWhen: \`topic is covered\`,
+  });
+}
+`);
+      const runtime = new Runtime().add("loop-bank-resolve-arc", document);
+      const seeded = runtime.newTraversal(arc("loop-bank-resolve-arc", "Main"));
+      seeded.phase = "entered";
+      const issued = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const questionOf = (id: string) => {
+        const item = issued.judgments.find((judgment) => judgment.id === id);
+        return item ? renderSemanticTextForTest(item.question) : undefined;
+      };
+      const checks = issued.instructions[0]!.postcheck!.judgmentIds;
+      const resolveId = checks.find(
+        (id) => questionOf(id) === "topic is covered",
+      )!;
+      const deflectId = checks.find(
+        (id) => questionOf(id) === "user left the topic",
+      )!;
+
+      // The settled resolveWhen keeps its consultation: the next brief poses
+      // only the open deflect check, never re-asking the answered question.
+      const waiting = progressBrief(runtime, issued, {
+        move: "proceed",
+        judgments: { [resolveId]: true },
+      });
+      expect(waiting.judgments.map((item) => item.id)).toEqual([deflectId]);
+      expect(waiting.instructions[0]!.postcheck?.judgmentIds).toEqual([
+        deflectId,
+      ]);
+
+      // The banked true is read at the decision: deflect settles false and the
+      // loop resolves without the resolve question ever re-posing.
+      const resolved = progressBrief(runtime, waiting, {
+        move: "proceed",
+        judgments: { [deflectId]: false },
+      });
+      expect(resolved.instructions).toEqual([]);
+      expect(rootTraversal(resolved).phase).toBe("completed");
+    });
+
+    it("banks a settled deflectWhen while resolveWhen stays open", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  $instructLoop(\`Carry it.\`, {
+    deflectWhen: \`user left the topic\`,
+    resolveWhen: \`topic is covered\`,
+  });
+}
+`);
+      const runtime = new Runtime().add("loop-bank-deflect-arc", document);
+      const seeded = runtime.newTraversal(arc("loop-bank-deflect-arc", "Main"));
+      seeded.phase = "entered";
+      const issued = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const questionOf = (id: string) => {
+        const item = issued.judgments.find((judgment) => judgment.id === id);
+        return item ? renderSemanticTextForTest(item.question) : undefined;
+      };
+      const checks = issued.instructions[0]!.postcheck!.judgmentIds;
+      const resolveId = checks.find(
+        (id) => questionOf(id) === "topic is covered",
+      )!;
+      const deflectId = checks.find(
+        (id) => questionOf(id) === "user left the topic",
+      )!;
+
+      const waiting = progressBrief(runtime, issued, {
+        move: "proceed",
+        judgments: { [deflectId]: false },
+      });
+      expect(waiting.judgments.map((item) => item.id)).toEqual([resolveId]);
+
+      const resolved = progressBrief(runtime, waiting, {
+        move: "proceed",
+        judgments: { [resolveId]: true },
+      });
+      expect(resolved.instructions).toEqual([]);
+      expect(rootTraversal(resolved).phase).toBe("completed");
+    });
+
+    it("restores a banked resolveWhen consultation onto a fresh runtime", () => {
+      const source = `
+"arc";
+
+function Main() {
+  $instructLoop(\`Carry it.\`, {
+    deflectWhen: \`user left the topic\`,
+    resolveWhen: \`topic is covered\`,
+  });
+}
+`;
+      const first = new Runtime().add("loop-bank-restore-arc", parse(source));
+      const seeded = first.newTraversal(arc("loop-bank-restore-arc", "Main"));
+      seeded.phase = "entered";
+      const issued = startRun(first, [seeded], EMPTY_DIALOG);
+      const questionOf = (id: string) => {
+        const item = issued.judgments.find((judgment) => judgment.id === id);
+        return item ? renderSemanticTextForTest(item.question) : undefined;
+      };
+      const checks = issued.instructions[0]!.postcheck!.judgmentIds;
+      const resolveId = checks.find(
+        (id) => questionOf(id) === "topic is covered",
+      )!;
+      const deflectId = checks.find(
+        (id) => questionOf(id) === "user left the topic",
+      )!;
+      const waiting = progressBrief(first, issued, {
+        move: "proceed",
+        judgments: { [resolveId]: true },
+      });
+
+      const second = new Runtime().add("loop-bank-restore-arc", parse(source));
+      const restored = startRun(
+        second,
+        JSON.parse(JSON.stringify(waiting.traversals)) as ArcTraversalSet,
+        EMPTY_DIALOG,
+      );
+      expect(restored.judgments.map((item) => item.id)).toEqual([deflectId]);
+
+      const resolved = progressBrief(second, restored, {
+        move: "proceed",
+        judgments: { [deflectId]: false },
+      });
+      expect(resolved.instructions).toEqual([]);
+      expect(rootTraversal(resolved).phase).toBe("completed");
+    });
+
+    it("resolves the loop when a banked resolveWhen meets a later deflection", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  this.catchDeflection = () => true;
+  $instructLoop(\`Carry it.\`, {
+    deflectWhen: \`user left the topic\`,
+    resolveWhen: \`topic is covered\`,
+  });
+}
+`);
+      const runtime = new Runtime().add("loop-bank-deflected-arc", document);
+      const seeded = runtime.newTraversal(
+        arc("loop-bank-deflected-arc", "Main"),
+      );
+      seeded.phase = "entered";
+      const issued = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const questionOf = (id: string) => {
+        const item = issued.judgments.find((judgment) => judgment.id === id);
+        return item ? renderSemanticTextForTest(item.question) : undefined;
+      };
+      const checks = issued.instructions[0]!.postcheck!.judgmentIds;
+      const resolveId = checks.find(
+        (id) => questionOf(id) === "topic is covered",
+      )!;
+      const deflectId = checks.find(
+        (id) => questionOf(id) === "user left the topic",
+      )!;
+
+      const waiting = progressBrief(runtime, issued, {
+        move: "proceed",
+        judgments: { [resolveId]: true },
+      });
+
+      // The lap short-circuits on the deflection but honors the banked
+      // finished evidence: the loop stays resolved, so the catch rewalk
+      // completes the node instead of re-presenting it.
+      const caught = progressBrief(runtime, waiting, {
+        move: "proceed",
+        judgments: { [deflectId]: true },
+      });
+      expect(caught.instructions).toEqual([]);
+      expect(rootTraversal(caught).phase).toBe("completed");
+    });
+
+    it("re-emits resolution observe when terminal false repeats the instruction", () => {
       const document = parse(`
 "arc";
 
@@ -810,7 +1076,12 @@ function Main() {
           [brief.observations[0]!.id]: { status: "unknown" },
         },
       });
-      expect(afterUnknown.observations).toHaveLength(0);
+      expect(afterUnknown.observations).toHaveLength(1);
+      expect(
+        renderSemanticTextForTest(
+          singleObservation(afterUnknown.observations[0]).question,
+        ),
+      ).toEqual("is self ready");
       expect(afterUnknown.instructions).toMatchObject([
         {
           text: "Carry the topic.",
@@ -820,6 +1091,7 @@ function Main() {
 
       const nextBrief = progressBrief(runtime, afterUnknown, {
         move: "proceed",
+        instructions: appliedInstructions(afterUnknown),
       });
       expect(nextBrief.observations).toHaveLength(1);
       expect(
@@ -1248,7 +1520,10 @@ function Main() {
         "Rolled 17; lucky score 88.",
       ]);
 
-      const emitted = progressBrief(runtime, third, { move: "proceed" });
+      const emitted = progressBrief(runtime, third, {
+        move: "proceed",
+        instructions: appliedInstructions(third),
+      });
 
       expect(emitted.hostEffects).toEqual([
         {

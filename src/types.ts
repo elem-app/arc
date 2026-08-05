@@ -1194,9 +1194,24 @@ type SubtreeBracket = {
   preSnapshot?: StateSnapshot;
 };
 
+/**
+ * Persisted continuation for a pending instruction: the host-facing phase plus
+ * the current lap's banked hook evidence. A lap — one `$instruct` pendency or
+ * one `$instructLoop` iteration — collects each hook's settled outcome once;
+ * a hook that settles while its sibling evidence is still open banks its value
+ * here so later briefs re-pose only the open checks. A new lap starts with no
+ * banked evidence.
+ */
+type InstructionContinuation = {
+  instructionPhase: "apply" | "postcheck";
+  deflectWhenOutcome?: boolean;
+  resolveWhenOutcome?: boolean;
+};
+
 /** Continuation fields a caller may hand to a newly pending action state. */
 export type PendingActionExtras = EnterContinuation &
-  SubtreeBracket & { map?: MapActionState };
+  SubtreeBracket &
+  Partial<InstructionContinuation> & { map?: MapActionState };
 
 /** Every action kind that can hold resolution state on a node frame. */
 export type ActionStateKind =
@@ -1226,7 +1241,9 @@ export type ActionState =
   | ({ kind: "enter-loop"; status: ActionStatus } & EnterContinuation &
       SubtreeBracket)
   | ({ kind: "invoke"; status: ActionStatus } & SubtreeBracket)
-  | ({ kind: "instruction"; status: ActionStatus } & SubtreeBracket)
+  | ({ kind: "instruction"; status: "pending" } & SubtreeBracket &
+      InstructionContinuation)
+  | { kind: "instruction"; status: "resolved" }
   | ({
       kind: "map";
       status: ActionStatus;
@@ -1832,6 +1849,12 @@ export type ObservationGroupReport = {
   fields: Record<string, ObservationReport>;
 };
 
+/** Outcome for one instruction application reported back by the host. */
+export type InstructionReport = {
+  /** The host applied this instruction during the current application window. */
+  status: "applied";
+};
+
 /**
  * Outcome for one host effect reported back by the host.
  *
@@ -1876,6 +1899,7 @@ export type TriggerReport = {
 export type ActionReport = {
   move: ActionMove;
   poisonReason?: ActionPoisonReason;
+  instructions?: Record<BriefId, InstructionReport>;
   judgments?: Record<BriefId, boolean>;
   observations?: Record<BriefId, ObservationReport | ObservationGroupReport>;
   hostCalls?: Record<BriefId, PayloadValue>;

@@ -13,6 +13,7 @@ import { Runtime } from "../src/runtime/index.js";
 import type { ArcTraversalSet, Dialog } from "../src/types.js";
 import { nodeSegKey } from "../src/types.js";
 import {
+  appliedInstructions,
   arc,
   EMPTY_DIALOG,
   progressBrief,
@@ -468,7 +469,7 @@ function Main() {
         parse(`
 "arc";
 function Main() {
-  const cursor = Dialog.Handle();
+  let cursor = Dialog.Handle();
 }
 `),
       ).toThrow(/Unsupported Dialog cell type: Handle/);
@@ -625,7 +626,10 @@ function Main() {
       const second = progressBrief(
         runtime,
         first,
-        { move: "proceed" },
+        {
+          move: "proceed",
+          instructions: appliedInstructions(first),
+        },
         { cursor: { user: 2, self: 0 }, lastTurns: [] },
       );
       expect(rootTraversal(second).cells.endedAt).toEqual({
@@ -922,10 +926,17 @@ function Main() {
         { cursor: { user: 2, self: 0 }, lastTurns: [], view: "reviewer" },
       );
       expect(after.issues).toEqual([]);
-      expect(after.instructions.map((item) => item.text)).toEqual([
-        "work",
-        "enough",
-      ]);
+      expect(after.instructions.map((item) => item.text)).toEqual(["work"]);
+      const enough = progressBrief(
+        runtime,
+        after,
+        {
+          move: "proceed",
+          instructions: appliedInstructions(after),
+        },
+        { cursor: { user: 2, self: 0 }, lastTurns: [], view: "reviewer" },
+      );
+      expect(enough.instructions.map((item) => item.text)).toEqual(["enough"]);
     });
 
     it("treats unstamped cursors and unstamped dialogs as the default view", () => {
@@ -945,10 +956,17 @@ function Main() {
         { cursor: { user: 2, self: 0 }, lastTurns: [] },
       );
       expect(after.issues).toEqual([]);
-      expect(after.instructions.map((item) => item.text)).toEqual([
-        "work",
-        "enough",
-      ]);
+      expect(after.instructions.map((item) => item.text)).toEqual(["work"]);
+      const enough = progressBrief(
+        runtime,
+        after,
+        {
+          move: "proceed",
+          instructions: appliedInstructions(after),
+        },
+        { cursor: { user: 2, self: 0 }, lastTurns: [] },
+      );
+      expect(enough.instructions.map((item) => item.text)).toEqual(["enough"]);
     });
 
     it("poisons a cross-view comparison with a reason naming both views", () => {

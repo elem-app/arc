@@ -14,6 +14,7 @@ import { Runtime } from "../src/runtime/index.js";
 import type { ArcTraversalSet } from "../src/types.js";
 import {
   appliedHostEffects,
+  appliedInstructions,
   arc,
   EMPTY_DIALOG,
   ownedChild,
@@ -200,7 +201,7 @@ function Main() {
       expect(rootTraversal(brief).cells.seen).toBe(true);
     });
 
-    it("runs the callback for every member, once each", () => {
+    it("runs each member exactly once and waits for its instruction application", () => {
       const { runtime, brief } = run(
         `
 "arc";
@@ -216,17 +217,44 @@ function Main() {
         "map-for-each-per-member-arc",
       );
 
-      expect(brief.instructions.map((item) => item.text)).toEqual([
-        "member 0",
-        "member 1",
-        "member 2",
-        "done",
-      ]);
-      const done = progressBrief(runtime, brief, { move: "proceed" });
+      expect(brief.instructions.map((item) => item.text)).toEqual(["member 0"]);
+      const firstId = brief.instructions[0]!.id;
 
-      // The one batch has exactly one callback instruction for each index before
-      // the tail, and handback emits none again. A skipped or repeated member
-      // changes the host-visible sequence.
+      const repeated = progressBrief(runtime, brief, { move: "proceed" });
+      expect(repeated.instructions.map((item) => item.text)).toEqual([
+        "member 0",
+      ]);
+      expect(repeated.instructions[0]!.id).toBe(firstId);
+
+      const afterFirst = progressBrief(runtime, repeated, {
+        move: "proceed",
+        instructions: appliedInstructions(repeated),
+      });
+      expect(afterFirst.instructions.map((item) => item.text)).toEqual([
+        "member 1",
+      ]);
+
+      const afterSecond = progressBrief(runtime, afterFirst, {
+        move: "proceed",
+        instructions: appliedInstructions(afterFirst),
+      });
+      expect(afterSecond.instructions.map((item) => item.text)).toEqual([
+        "member 2",
+      ]);
+
+      const tail = progressBrief(runtime, afterSecond, {
+        move: "proceed",
+        instructions: appliedInstructions(afterSecond),
+      });
+      expect(tail.instructions.map((item) => item.text)).toEqual(["done"]);
+
+      const done = progressBrief(runtime, tail, {
+        move: "proceed",
+        instructions: appliedInstructions(tail),
+      });
+
+      // The map exposes one live member at a time, and the tail stays behind
+      // the map until every member has acknowledged its instruction.
       expect(done.instructions).toEqual([]);
     });
   });
@@ -321,7 +349,10 @@ function Main() {
       expect(brief.instructions.map((item) => item.text)).toEqual([
         "member ran",
       ]);
-      const later = progressBrief(runtime, brief, { move: "proceed" });
+      const later = progressBrief(runtime, brief, {
+        move: "proceed",
+        instructions: appliedInstructions(brief),
+      });
       expect(later.instructions).toEqual([]);
       expect(later.judgments).toHaveLength(1);
 
@@ -666,6 +697,90 @@ function Main() {
       // member from that staged value rather than losing it.
       expect(rootTraversal(done).cells.out).toEqual(["kept"]);
     });
+
+    // Partial batch acknowledgement is dormant while instruction batching is
+    // disabled. The surrounding member-resume cases cover serial instructions.
+    it.skip("keeps partial instruction acknowledgement inside the current member", () => {
+      const { runtime, brief } = run(
+        `
+"arc";
+function Main() {
+  let nums = Array(Str());
+  nums.$set(["a", "b"]);
+  nums.$map(() => {
+    $instruct(\`first \${span.index}\`);
+    $instruct(\`second \${span.index}\`);
+  });
+}
+`,
+        "map-member-partial-instruction-ack-arc",
+      );
+
+      expect(brief.instructions.map((item) => item.text)).toEqual([
+        "first 0",
+        "second 0",
+      ]);
+      const [firstId, secondId] = brief.instructions.map((item) => item.id);
+
+      const partial = progressBrief(runtime, brief, {
+        move: "proceed",
+        instructions: appliedInstructions(brief, [secondId!]),
+      });
+
+      // Member 0 remains the frontier until its omitted instruction resolves;
+      // member 1 cannot reuse and clear the callback's action slots yet.
+      expect(partial.instructions.map((item) => item.text)).toEqual([
+        "first 0",
+      ]);
+      expect(partial.instructions[0]!.id).toBe(firstId);
+
+      const nextMember = progressBrief(runtime, partial, {
+        move: "proceed",
+        instructions: appliedInstructions(partial),
+      });
+      expect(nextMember.instructions.map((item) => item.text)).toEqual([
+        "first 1",
+        "second 1",
+      ]);
+    });
+
+    it("preserves an inherited instruction hook while the member awaits application", () => {
+      const { runtime, brief } = run(
+        `
+"arc";
+function Main() {
+  this.deflectWhen = \`stop this member\`;
+  let nums = Array(Str());
+  nums.$set(["a"]);
+  nums.$map(() => {
+    $instruct(\`member instruction\`);
+  });
+  $instruct(\`done\`);
+}
+`,
+        "map-member-inherited-hook-arc",
+      );
+
+      const instruction = brief.instructions[0]!;
+      const hookId = instruction.postcheck!.judgmentIds[0]!;
+      const waiting = progressBrief(runtime, brief, {
+        move: "proceed",
+        judgments: { [hookId]: false },
+      });
+
+      // The settled node hook is banked on this member's instruction while its
+      // independent application evidence remains open.
+      expect(waiting.instructions.map((item) => item.id)).toEqual([
+        instruction.id,
+      ]);
+      expect(waiting.judgments).toEqual([]);
+
+      const tail = progressBrief(runtime, waiting, {
+        move: "proceed",
+        instructions: appliedInstructions(waiting),
+      });
+      expect(tail.instructions.map((item) => item.text)).toEqual(["done"]);
+    });
   });
 
   describe("map.json-restart", () => {
@@ -802,6 +917,42 @@ function Main() {
 
       // The staged output survived serialization in the arena, not just in
       // memory.
+      expect(rootTraversal(done).cells.out).toEqual(["kept"]);
+    });
+
+    it("preserves a staged result while an instruction awaits application across a JSON round-trip", () => {
+      const { runtime, brief } = run(
+        `
+"arc";
+function Main() {
+  let nums = Array(Str());
+  let out = Array(Str());
+  nums.$set(["kept"]);
+  nums.$map(() => {
+    span.result.$set(span.item);
+    $instruct(\`apply member\`);
+  }, out);
+}
+`,
+        "map-json-instruction-ack-arc",
+      );
+
+      expect(rootTraversal(brief).cells.out).toBeUndefined();
+      const instructionId = brief.instructions[0]!.id;
+      const revived = JSON.parse(
+        JSON.stringify(brief.traversals),
+      ) as ArcTraversalSet;
+      const revivedBrief = runtime.start(revived, EMPTY_DIALOG);
+
+      expect(revivedBrief.instructions.map((item) => item.id)).toEqual([
+        instructionId,
+      ]);
+      expect(rootTraversal(revivedBrief).cells.out).toBeUndefined();
+
+      const done = progressBrief(runtime, revivedBrief, {
+        move: "proceed",
+        instructions: appliedInstructions(revivedBrief),
+      });
       expect(rootTraversal(done).cells.out).toEqual(["kept"]);
     });
   });

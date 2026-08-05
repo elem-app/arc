@@ -31,6 +31,7 @@ import {
   EMPTY_DIALOG,
   METAL_SOURCE,
   appliedHostEffects,
+  appliedInstructions,
   arc,
   node,
   payloadArray,
@@ -363,7 +364,10 @@ function Main() {
       brief.traversals[0]!.phase = "poisoned";
       brief.instructions[0]!.text = "mutated";
 
-      const next = progressBrief(runtime, brief, { move: "proceed" });
+      const next = progressBrief(runtime, brief, {
+        move: "proceed",
+        instructions: appliedInstructions(brief),
+      });
 
       expect(next.instructions.map((item) => item.text)).toEqual(["second"]);
       expect(rootTraversal(next).phase).toBe("entered");
@@ -502,6 +506,91 @@ function Main() {
   });
 
   describe("proto.report-validation", () => {
+    it("validates instruction application reports by id, status, and phase", () => {
+      const onceDocument = parse(`
+"arc";
+
+function Main() {
+  $instruct(\`A\`);
+}
+`);
+      const onceRuntime = new Runtime().add(
+        "instruction-report-validation-arc",
+        onceDocument,
+      );
+      const onceSeeded = onceRuntime.newTraversal(
+        arc("instruction-report-validation-arc", "Main"),
+      );
+      onceSeeded.phase = "entered";
+      const issued = startRun(onceRuntime, [onceSeeded], EMPTY_DIALOG);
+
+      const unknown = progressBrief(onceRuntime, issued, {
+        move: "proceed",
+        instructions: { "instruction:unknown": { status: "applied" } },
+      });
+      expect(unknown.issues).toEqual([
+        expect.objectContaining({
+          kind: "invalid-report",
+          reasonCode: "unknown-instruction-id",
+        }),
+      ]);
+      expect(unknown.instructions).toEqual(issued.instructions);
+
+      const invalidStatus = progressBrief(onceRuntime, unknown, {
+        move: "proceed",
+        instructions: {
+          [unknown.instructions[0]!.id]: {
+            status: "resolved",
+          } as unknown as { status: "applied" },
+        },
+      });
+      expect(invalidStatus.issues).toEqual([
+        expect.objectContaining({
+          kind: "invalid-item",
+          briefId: unknown.instructions[0]!.id,
+          reasonCode: "instruction-status",
+        }),
+      ]);
+      expect(invalidStatus.instructions).toEqual(issued.instructions);
+
+      const loopDocument = parse(`
+"arc";
+
+function Main() {
+  $instructLoop(\`A\`, { resolveWhen: \`is A done\` });
+}
+`);
+      const loopRuntime = new Runtime().add(
+        "instruction-phase-validation-arc",
+        loopDocument,
+      );
+      const loopSeeded = loopRuntime.newTraversal(
+        arc("instruction-phase-validation-arc", "Main"),
+      );
+      loopSeeded.phase = "entered";
+      const apply = startRun(loopRuntime, [loopSeeded], EMPTY_DIALOG);
+      const postcheck = progressBrief(loopRuntime, apply, {
+        move: "proceed",
+        instructions: appliedInstructions(apply),
+      });
+      expect(postcheck.instructions[0]?.phase).toBe("postcheck");
+
+      const invalidPhase = progressBrief(loopRuntime, postcheck, {
+        move: "proceed",
+        instructions: {
+          [postcheck.instructions[0]!.id]: { status: "applied" },
+        },
+      });
+      expect(invalidPhase.issues).toEqual([
+        expect.objectContaining({
+          kind: "invalid-item",
+          briefId: postcheck.instructions[0]!.id,
+          reasonCode: "instruction-phase",
+        }),
+      ]);
+      expect(invalidPhase.instructions[0]?.phase).toBe("postcheck");
+    });
+
     it("returns invalid-report issues for invalid action reports", () => {
       const document = parse(METAL_SOURCE);
       const runtime = new Runtime().add("metal-arc", document);
@@ -636,7 +725,216 @@ function Main() {
     });
   });
 
-  describe("proto.batching", () => {
+  // Instruction batching is intentionally disabled. Keep these cases nearby
+  // as optimization coverage if Arc reintroduces batching later.
+  describe.skip("proto.batching", () => {
+    it("acknowledges batched instructions independently by brief id", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  $instruct(\`A\`);
+  $instruct(\`B\`);
+}
+`);
+      const runtime = new Runtime().add(
+        "partial-instruction-batch-arc",
+        document,
+      );
+      const seeded = runtime.newTraversal(
+        arc("partial-instruction-batch-arc", "Main"),
+      );
+      seeded.phase = "entered";
+      const issued = startRun(runtime, [seeded], EMPTY_DIALOG);
+      expect(issued.instructions.map((item) => item.text)).toEqual(["A", "B"]);
+
+      const partial = progressBrief(runtime, issued, {
+        move: "proceed",
+        instructions: appliedInstructions(issued, [issued.instructions[1]!.id]),
+      });
+      expect(partial.instructions.map((item) => item.text)).toEqual(["A"]);
+
+      const unreported = progressBrief(runtime, partial, { move: "proceed" });
+      expect(unreported.instructions).toEqual(partial.instructions);
+
+      const completed = progressBrief(runtime, unreported, {
+        move: "proceed",
+        instructions: appliedInstructions(unreported),
+      });
+      expect(completed.instructions).toEqual([]);
+      expect(rootTraversal(completed).phase).toBe("completed");
+    });
+
+    it("processes every reported owner in a hook-bearing instruction batch", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  $instruct(\`A\`, { deflectWhen: \`should this instruction deflect\` });
+  $instruct(\`B\`, { deflectWhen: \`should this instruction deflect\` });
+}
+`);
+      const runtime = new Runtime().add("hook-instruction-batch-arc", document);
+
+      const partialSeeded = runtime.newTraversal(
+        arc("hook-instruction-batch-arc", "Main"),
+      );
+      partialSeeded.phase = "entered";
+      const issued = startRun(runtime, [partialSeeded], EMPTY_DIALOG);
+      expect(issued.instructions.map((item) => item.text)).toEqual(["A", "B"]);
+      const aCheck = issued.instructions[0]!.postcheck!.judgmentIds[0]!;
+      const bCheck = issued.instructions[1]!.postcheck!.judgmentIds[0]!;
+
+      const partial = progressBrief(runtime, issued, {
+        move: "proceed",
+        instructions: appliedInstructions(issued, [issued.instructions[0]!.id]),
+        judgments: { [aCheck]: false, [bCheck]: false },
+      });
+      expect(partial.instructions.map((item) => item.text)).toEqual(["B"]);
+
+      const deflectSeeded = runtime.newTraversal(
+        arc("hook-instruction-batch-arc", "Main"),
+      );
+      deflectSeeded.phase = "entered";
+      const issuedAgain = startRun(runtime, [deflectSeeded], EMPTY_DIALOG);
+      const firstCheck =
+        issuedAgain.instructions[0]!.postcheck!.judgmentIds[0]!;
+      const secondCheck =
+        issuedAgain.instructions[1]!.postcheck!.judgmentIds[0]!;
+      const deflected = progressBrief(runtime, issuedAgain, {
+        move: "proceed",
+        judgments: { [firstCheck]: true, [secondCheck]: false },
+      });
+      expect(rootTraversal(deflected)).toMatchObject({
+        phase: "suspended",
+        state: "deflected",
+      });
+    });
+
+    it("visits every owner of a batch that blocks before a trailing statement", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  let flag = Bool();
+  $instruct(\`A\`, { deflectWhen: \`should this instruction deflect\` });
+  $instruct(\`B\`, { deflectWhen: \`should this instruction deflect\` });
+  flag.$set(true);
+}
+`);
+      const runtime = new Runtime().add("mid-body-batch-arc", document);
+      const seeded = runtime.newTraversal(arc("mid-body-batch-arc", "Main"));
+      seeded.phase = "entered";
+      const issued = startRun(runtime, [seeded], EMPTY_DIALOG);
+      expect(issued.instructions.map((item) => item.text)).toEqual(["A", "B"]);
+      const aCheck = issued.instructions[0]!.postcheck!.judgmentIds[0]!;
+      const bCheck = issued.instructions[1]!.postcheck!.judgmentIds[0]!;
+
+      // Applying only the first owner resolves it and re-presents the second:
+      // the batch head, not the last blocked hook, is the resume authority.
+      const partial = progressBrief(runtime, issued, {
+        move: "proceed",
+        instructions: appliedInstructions(issued, [issued.instructions[0]!.id]),
+        judgments: { [aCheck]: false, [bCheck]: false },
+      });
+      expect(partial.instructions.map((item) => item.text)).toEqual(["B"]);
+      expect(rootTraversal(partial).phase).toBe("entered");
+    });
+
+    it("re-presents the first owner when only the last of a mid-body batch is applied", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  let flag = Bool();
+  $instruct(\`A\`, { deflectWhen: \`should this instruction deflect\` });
+  $instruct(\`B\`, { deflectWhen: \`should this instruction deflect\` });
+  flag.$set(true);
+}
+`);
+      const runtime = new Runtime().add("mid-body-batch-tail-arc", document);
+      const seeded = runtime.newTraversal(
+        arc("mid-body-batch-tail-arc", "Main"),
+      );
+      seeded.phase = "entered";
+      const issued = startRun(runtime, [seeded], EMPTY_DIALOG);
+      expect(issued.instructions.map((item) => item.text)).toEqual(["A", "B"]);
+      const aCheck = issued.instructions[0]!.postcheck!.judgmentIds[0]!;
+      const bCheck = issued.instructions[1]!.postcheck!.judgmentIds[0]!;
+
+      // Applying only the last owner must not complete the node past the
+      // still-unapplied first owner.
+      const partial = progressBrief(runtime, issued, {
+        move: "proceed",
+        instructions: appliedInstructions(issued, [issued.instructions[1]!.id]),
+        judgments: { [aCheck]: false, [bCheck]: false },
+      });
+      expect(partial.instructions.map((item) => item.text)).toEqual(["A"]);
+      expect(rootTraversal(partial).phase).toBe("entered");
+
+      // The re-presented owner's deflect evidence is banked for its lap: no
+      // check re-poses, and completing needs only the application.
+      expect(partial.judgments).toEqual([]);
+      const completed = progressBrief(runtime, partial, {
+        move: "proceed",
+        instructions: appliedInstructions(partial),
+      });
+      expect(completed.instructions).toEqual([]);
+      expect(rootTraversal(completed).phase).toBe("completed");
+    });
+
+    it("re-presents the outer owners when only the middle of a batch is applied", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  let flag = Bool();
+  $instruct(\`A\`, { deflectWhen: \`should this instruction deflect\` });
+  $instruct(\`B\`, { deflectWhen: \`should this instruction deflect\` });
+  $instruct(\`C\`, { deflectWhen: \`should this instruction deflect\` });
+  flag.$set(true);
+}
+`);
+      const runtime = new Runtime().add("mid-owner-batch-arc", document);
+      const seeded = runtime.newTraversal(arc("mid-owner-batch-arc", "Main"));
+      seeded.phase = "entered";
+      const issued = startRun(runtime, [seeded], EMPTY_DIALOG);
+      expect(issued.instructions.map((item) => item.text)).toEqual([
+        "A",
+        "B",
+        "C",
+      ]);
+      const checks = Object.fromEntries(
+        issued.instructions.map((item) => [
+          item.postcheck!.judgmentIds[0]!,
+          false,
+        ]),
+      );
+
+      const partial = progressBrief(runtime, issued, {
+        move: "proceed",
+        instructions: appliedInstructions(issued, [issued.instructions[1]!.id]),
+        judgments: checks,
+      });
+      expect(
+        partial.instructions.map((item) => [item.text, item.phase]),
+      ).toEqual([
+        ["A", "apply"],
+        ["C", "apply"],
+      ]);
+      expect(rootTraversal(partial).phase).toBe("entered");
+
+      // Both re-presented owners hold banked deflect evidence: no checks
+      // re-pose, and completing needs only the applications.
+      expect(partial.judgments).toEqual([]);
+      const completed = progressBrief(runtime, partial, {
+        move: "proceed",
+        instructions: appliedInstructions(partial),
+      });
+      expect(completed.instructions).toEqual([]);
+      expect(rootTraversal(completed).phase).toBe("completed");
+    });
+
     it("does not batch instructions with different host params", () => {
       const document = parse(`
 "arc";
@@ -665,7 +963,10 @@ function Main() {
         { text: "First.", hostParams: { consumer: { id: "first" } } },
       ]);
 
-      const next = progressBrief(runtime, brief, { move: "proceed" });
+      const next = progressBrief(runtime, brief, {
+        move: "proceed",
+        instructions: appliedInstructions(brief),
+      });
       expect(next.instructions).toMatchObject([
         {
           text: "Second.",
@@ -784,7 +1085,10 @@ function Main() {
       expect(routed.instructions.map((item) => item.text)).toEqual(["pricing"]);
       expect(rootTraversal(routed).cells.wantsPricing).toBe(true);
 
-      const resumed = progressBrief(runtime, routed, { move: "proceed" });
+      const resumed = progressBrief(runtime, routed, {
+        move: "proceed",
+        instructions: appliedInstructions(routed),
+      });
 
       expect(rootTraversal(resumed).cells.wantsPricing).toBe(false);
       expect(resumed.active).toEqual(
@@ -824,6 +1128,7 @@ function Main() {
 
       const parentBrief = progressBrief(runtime, childBrief, {
         move: "proceed",
+        instructions: appliedInstructions(childBrief),
       });
       expect(parentBrief.active).toEqual(
         node("return-batch-boundary-arc", "Main"),
@@ -862,6 +1167,7 @@ function Main() {
 
       const effectsBrief = progressBrief(runtime, instructionBrief, {
         move: "proceed",
+        instructions: appliedInstructions(instructionBrief),
       });
       expect(effectsBrief.instructions).toEqual([]);
       expect(effectsBrief.hostEffects).toMatchObject([
@@ -1025,6 +1331,7 @@ function Main() {
 
       const afterReady = progressBrief(runtime, brief, {
         move: "proceed",
+        instructions: appliedInstructions(brief),
         observations: {
           [brief.observations[0]!.id]: {
             status: "resolved",
@@ -1049,6 +1356,55 @@ function Main() {
           renderSemanticTextForTest(item.question),
         ),
       ).toEqual(["self covered the topic enough"]);
+    });
+
+    it("evaluates deflection independently of instruction application", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  $instruct(\`A\`, { deflectWhen: \`should A deflect\` });
+}
+`);
+      const runtime = new Runtime().add(
+        "instruction-deflection-order-arc",
+        document,
+      );
+
+      const firstSeeded = runtime.newTraversal(
+        arc("instruction-deflection-order-arc", "Main"),
+      );
+      firstSeeded.phase = "entered";
+      const issued = startRun(runtime, [firstSeeded], EMPTY_DIALOG);
+      const stillApply = progressBrief(runtime, issued, {
+        move: "proceed",
+        judgments: { [issued.judgments[0]!.id]: false },
+      });
+      expect(stillApply.instructions).toMatchObject([
+        { text: "A", phase: "apply" },
+      ]);
+      // The lap banked the false deflect evidence: the answered check does not
+      // re-pose while the application is still awaited.
+      expect(stillApply.judgments).toEqual([]);
+
+      const completedTogether = progressBrief(runtime, stillApply, {
+        move: "proceed",
+        instructions: appliedInstructions(stillApply),
+      });
+      expect(completedTogether.instructions).toEqual([]);
+      expect(rootTraversal(completedTogether).phase).toBe("completed");
+
+      const secondSeeded = runtime.newTraversal(
+        arc("instruction-deflection-order-arc", "Main"),
+      );
+      secondSeeded.phase = "entered";
+      const issuedAgain = startRun(runtime, [secondSeeded], EMPTY_DIALOG);
+      const deflectedBeforeApplication = progressBrief(runtime, issuedAgain, {
+        move: "proceed",
+        judgments: { [issuedAgain.judgments[0]!.id]: true },
+      });
+      expect(deflectedBeforeApplication.instructions).toEqual([]);
+      expect(rootTraversal(deflectedBeforeApplication).phase).toBe("suspended");
     });
 
     it("includes host-call resolution probes in instruction postcheck ids", () => {
@@ -1123,7 +1479,10 @@ function Main() {
       });
       expect(brief.allowedMoves).toEqual(["poison", "proceed"]);
 
-      const afterHandback = progressBrief(runtime, brief, { move: "proceed" });
+      const afterHandback = progressBrief(runtime, brief, {
+        move: "proceed",
+        instructions: appliedInstructions(brief),
+      });
       expect(afterHandback.instructions).toMatchObject([
         {
           text: "Carry the topic.",
@@ -1151,6 +1510,7 @@ function Main() {
 
       const resolutionBrief = progressBrief(runtime, afterFalse, {
         move: "proceed",
+        instructions: appliedInstructions(afterFalse),
       });
       expect(resolutionBrief.issues).toEqual([]);
       expect(resolutionBrief.instructions).toMatchObject([
@@ -1465,10 +1825,7 @@ function Main() {
       const once = progressBrief(runtime, first, report);
       const twice = progressBrief(runtime, first, report);
 
-      expect(once.instructions.map((item) => item.text)).toEqual([
-        "ready now",
-        "confirmed",
-      ]);
+      expect(once.instructions.map((item) => item.text)).toEqual(["ready now"]);
       expect(twice.instructions.map((item) => item.text)).toEqual(
         once.instructions.map((item) => item.text),
       );
@@ -1550,7 +1907,10 @@ function Main() {
       expect(answered.instructions.map((item) => item.text)).toEqual([
         "child after",
       ]);
-      const finished = progressBrief(second, answered, { move: "proceed" });
+      const finished = progressBrief(second, answered, {
+        move: "proceed",
+        instructions: appliedInstructions(answered),
+      });
       expect(finished.instructions.map((item) => item.text)).toEqual(["done"]);
     });
 
@@ -1734,7 +2094,89 @@ function Main() {
       });
     });
 
-    it("a fresh runtime resumes an instruction blocked in its resolveWhen hook", () => {
+    it("keeps a one-shot instruction pending across restart and rejected reports until application", () => {
+      const source = `
+"arc";
+
+function Main() {
+  $instruct(\`A\`);
+}
+`;
+      const first = new Runtime().add("pending-once-arc", parse(source));
+      const seeded = first.newTraversal(arc("pending-once-arc", "Main"));
+      seeded.phase = "entered";
+      const issued = startRun(first, [seeded], EMPTY_DIALOG);
+      expect(issued.instructions).toMatchObject([
+        { text: "A", mode: "once", phase: "apply" },
+      ]);
+
+      const second = new Runtime().add("pending-once-arc", parse(source));
+      const restored = startRun(
+        second,
+        JSON.parse(JSON.stringify(issued.traversals)) as ArcTraversalSet,
+        EMPTY_DIALOG,
+      );
+      expect(restored.instructions).toEqual(issued.instructions);
+      expect(restored.canProgress).toBe(true);
+
+      const rejected = progressBrief(second, restored, { move: "deflect" });
+      expect(rejected.issues).toEqual([
+        expect.objectContaining({
+          kind: "invalid-report",
+          reasonCode: "illegal-move",
+        }),
+      ]);
+      expect(rejected.instructions).toEqual(issued.instructions);
+
+      const third = new Runtime().add("pending-once-arc", parse(source));
+      const reissued = startRun(
+        third,
+        JSON.parse(JSON.stringify(rejected.traversals)) as ArcTraversalSet,
+        EMPTY_DIALOG,
+      );
+      expect(reissued.instructions).toEqual(issued.instructions);
+
+      const applied = progressBrief(third, reissued, {
+        move: "proceed",
+        instructions: appliedInstructions(reissued),
+      });
+      expect(applied.instructions).toEqual([]);
+      expect(applied.canProgress).toBe(false);
+      expect(rootTraversal(applied).phase).toBe("completed");
+    });
+
+    it.skip("re-yields an entire unacknowledged instruction batch after JSON restore", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  $instruct(\`A\`);
+  $instruct(\`B\`);
+}
+`);
+      const first = new Runtime().add("pending-batch-arc", document);
+      const seeded = first.newTraversal(arc("pending-batch-arc", "Main"));
+      seeded.phase = "entered";
+      const issued = startRun(first, [seeded], EMPTY_DIALOG);
+      expect(issued.instructions.map((item) => item.text)).toEqual(["A", "B"]);
+
+      const second = new Runtime().add("pending-batch-arc", document);
+      const restored = startRun(
+        second,
+        JSON.parse(JSON.stringify(issued.traversals)) as ArcTraversalSet,
+        EMPTY_DIALOG,
+      );
+      expect(restored.instructions).toEqual(issued.instructions);
+
+      const applied = progressBrief(second, restored, {
+        move: "proceed",
+        instructions: appliedInstructions(restored),
+      });
+      expect(applied.instructions).toEqual([]);
+      expect(rootTraversal(applied).phase).toBe("completed");
+    });
+
+    it("preserves pending instruction apply and postcheck phases across fresh runtimes", () => {
       const document = parse(`
 "arc";
 
@@ -1750,20 +2192,50 @@ function Main() {
       seeded.phase = "entered";
       const firstBrief = startRun(first, [seeded], EMPTY_DIALOG);
       expect(firstBrief.instructions.map((item) => item.text)).toEqual(["A"]);
+      expect(firstBrief.instructions[0]?.phase).toBe("apply");
       expect(firstBrief.judgments).toHaveLength(1);
 
-      // A brand-new runtime reconstructs the pending instruction and its attached
-      // resolveWhen postcheck purely from the persisted traversal set.
       const resumed = new Runtime().add("n17-arc", document);
       const resumedBrief = startRun(
         resumed,
-        firstBrief.traversals,
+        JSON.parse(JSON.stringify(firstBrief.traversals)) as ArcTraversalSet,
         EMPTY_DIALOG,
       );
       expect(resumedBrief.instructions.map((item) => item.text)).toEqual(["A"]);
+      expect(resumedBrief.instructions[0]?.phase).toBe("apply");
       expect(resumedBrief.judgments).toHaveLength(1);
       expect(resumedBrief.instructions[0]!.postcheck?.judgmentIds).toEqual([
         resumedBrief.judgments[0]!.id,
+      ]);
+
+      const postcheck = progressBrief(resumed, resumedBrief, {
+        move: "proceed",
+        instructions: appliedInstructions(resumedBrief),
+      });
+      expect(postcheck.instructions).toMatchObject([
+        { text: "A", phase: "postcheck" },
+      ]);
+      expect(postcheck.judgments).toHaveLength(1);
+
+      const finalRuntime = new Runtime().add("n17-arc", document);
+      const restoredPostcheck = startRun(
+        finalRuntime,
+        JSON.parse(JSON.stringify(postcheck.traversals)) as ArcTraversalSet,
+        EMPTY_DIALOG,
+      );
+      expect(restoredPostcheck.instructions).toMatchObject([
+        { text: "A", phase: "postcheck" },
+      ]);
+      expect(restoredPostcheck.judgments.map((item) => item.id)).toEqual([
+        postcheck.judgments[0]!.id,
+      ]);
+
+      const resolved = progressBrief(finalRuntime, restoredPostcheck, {
+        move: "proceed",
+        judgments: { [restoredPostcheck.judgments[0]!.id]: true },
+      });
+      expect(resolved.instructions).toMatchObject([
+        { text: "B", phase: "apply" },
       ]);
     });
 

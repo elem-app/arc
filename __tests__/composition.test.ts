@@ -12,6 +12,7 @@ import { parse, validate } from "../src/parser/index.js";
 import { Runtime } from "../src/runtime/index.js";
 import type { EnterNodeAction } from "../src/types.js";
 import {
+  appliedInstructions,
   arc,
   EMPTY_DIALOG,
   ephemeralChild,
@@ -180,6 +181,7 @@ function Intro() {
 
       const secondBrief = progressBrief(runtime, firstBrief, {
         move: "proceed",
+        instructions: appliedInstructions(firstBrief),
       });
       expect(secondBrief.instructions.map((item) => item.text)).toEqual([
         "import covered",
@@ -232,7 +234,10 @@ function Topic() {
         "topic done",
       ]);
 
-      const atMain = progressBrief(runtime, atTopicDone, { move: "proceed" });
+      const atMain = progressBrief(runtime, atTopicDone, {
+        move: "proceed",
+        instructions: appliedInstructions(atTopicDone),
+      });
       expect(atMain.instructions.map((item) => item.text)).toEqual([
         "main tail",
       ]);
@@ -330,6 +335,7 @@ function Main() {
 
       const secondBrief = progressBrief(runtime, firstBrief, {
         move: "proceed",
+        instructions: appliedInstructions(firstBrief),
       });
       expect(secondBrief.instructions.map((item) => item.text)).toEqual([
         "forgetful entry skipped",
@@ -489,6 +495,7 @@ function Intro() {
 
       const secondBrief = progressBrief(runtime, firstBrief, {
         move: "proceed",
+        instructions: appliedInstructions(firstBrief),
       });
       expect(secondBrief.instructions.map((item) => item.text)).toEqual([
         "done",
@@ -535,7 +542,10 @@ function Main() {
       expect(first.instructions.map((item) => item.text)).toEqual([
         "inner intro",
       ]);
-      const observing = progressBrief(runtime, first, { move: "proceed" });
+      const observing = progressBrief(runtime, first, {
+        move: "proceed",
+        instructions: appliedInstructions(first),
+      });
       expect(singleObservations(observing).map((item) => item.cell)).toEqual([
         "topic",
       ]);
@@ -606,7 +616,11 @@ function Main() {
       expect(intro.instructions.map((item) => item.text)).toEqual([
         "child intro",
       ]);
-      const exit = runtime.progress(intro, { move: "proceed" }, EMPTY_DIALOG);
+      const exit = runtime.progress(
+        intro,
+        { move: "proceed", instructions: appliedInstructions(intro) },
+        EMPTY_DIALOG,
+      );
       expect(exit.transition).toBeDefined();
       const observing = runtime.progress(
         exit,
@@ -702,6 +716,7 @@ function Main() {
 
       const waitingForStop = progressBrief(runtime, first, {
         move: "proceed",
+        instructions: appliedInstructions(first),
         judgments: {
           [first.judgments[0]!.id]: false,
         },
@@ -725,6 +740,7 @@ function Main() {
 
       const secondResolution = progressBrief(runtime, secondIteration, {
         move: "proceed",
+        instructions: appliedInstructions(secondIteration),
       });
       expect(secondResolution.judgments).toHaveLength(1);
 
@@ -771,6 +787,7 @@ function Main() {
       const first = startRun(runtime, [seeded], EMPTY_DIALOG);
       const resolved = progressBrief(runtime, first, {
         move: "proceed",
+        instructions: appliedInstructions(first),
       });
 
       expect(rootTraversal(resolved).cells.verdict).toBe(true);
@@ -1022,7 +1039,10 @@ function Main() {
       expect(first.instructions.map((item) => item.text)).toEqual(["intro"]);
 
       // Child covers (effects set `seen` on the ephemeral); the loop asks `stop`.
-      const askStop1 = progressBrief(runtime, first, { move: "proceed" });
+      const askStop1 = progressBrief(runtime, first, {
+        move: "proceed",
+        instructions: appliedInstructions(first),
+      });
       expect(askStop1.observations).toHaveLength(1);
 
       // resolveWhen false -> iteration 2 replaces the covered Child with a newcopy
@@ -1036,7 +1056,10 @@ function Main() {
       expect(second.instructions.map((item) => item.text)).toEqual(["intro"]);
 
       // Stop the loop and fall through to the tail.
-      const askStop2 = progressBrief(runtime, second, { move: "proceed" });
+      const askStop2 = progressBrief(runtime, second, {
+        move: "proceed",
+        instructions: appliedInstructions(second),
+      });
       const done = progressBrief(runtime, askStop2, {
         move: "proceed",
         observations: {
@@ -1119,21 +1142,29 @@ function Main() {
 
       const secondBrief = progressBrief(runtime, firstBrief, {
         move: "proceed",
+        instructions: appliedInstructions(firstBrief),
       });
       const child = ownedChild(rootTraversal(secondBrief), "Main.Child");
       expect(child?.enterCount).toBe(2);
       expect(child?.cells.seen).toBe(true);
       expect(secondBrief.instructions.map((item) => item.text)).toEqual([
         "intro",
-        "again",
       ]);
       const thirdBrief = progressBrief(runtime, secondBrief, {
         move: "proceed",
+        instructions: appliedInstructions(secondBrief),
       });
       expect(thirdBrief.instructions.map((item) => item.text)).toEqual([
+        "again",
+      ]);
+      const fourthBrief = progressBrief(runtime, thirdBrief, {
+        move: "proceed",
+        instructions: appliedInstructions(thirdBrief),
+      });
+      expect(fourthBrief.instructions.map((item) => item.text)).toEqual([
         "done",
       ]);
-      expect(ownedChild(rootTraversal(thirdBrief), "Main.Child")?.state).toBe(
+      expect(ownedChild(rootTraversal(fourthBrief), "Main.Child")?.state).toBe(
         "covered",
       );
     });
@@ -1177,6 +1208,7 @@ function Intro() {
 
       const secondBrief = progressBrief(runtime, firstBrief, {
         move: "proceed",
+        instructions: appliedInstructions(firstBrief),
       });
       const imported = secondBrief.traversals.find(
         (traversal) => traversal.ref === arc("intro-arc", "Intro"),
@@ -1185,13 +1217,20 @@ function Intro() {
       expect(imported?.cells.seen).toBe(true);
       expect(secondBrief.instructions.map((item) => item.text)).toEqual([
         "intro",
-        "again",
       ]);
 
       const thirdBrief = progressBrief(runtime, secondBrief, {
         move: "proceed",
+        instructions: appliedInstructions(secondBrief),
       });
       expect(thirdBrief.instructions.map((item) => item.text)).toEqual([
+        "again",
+      ]);
+      const fourthBrief = progressBrief(runtime, thirdBrief, {
+        move: "proceed",
+        instructions: appliedInstructions(thirdBrief),
+      });
+      expect(fourthBrief.instructions.map((item) => item.text)).toEqual([
         "done",
       ]);
     });
@@ -1229,20 +1268,28 @@ function Main() {
       // First iteration covers; the loop hook judges false, so a second
       // iteration starts a forgetful entry of the canonical child: `seen`
       // survives, and the frame resets.
-      const afterFirst = progressBrief(runtime, first, { move: "proceed" });
+      const afterFirst = progressBrief(runtime, first, {
+        move: "proceed",
+        instructions: appliedInstructions(first),
+      });
       expect(afterFirst.judgments).toHaveLength(1);
       const second = progressBrief(runtime, afterFirst, {
         move: "proceed",
         judgments: { [afterFirst.judgments[0]!.id]: false },
       });
-      expect(second.instructions.map((item) => item.text)).toEqual([
-        "intro",
-        "again",
-      ]);
+      expect(second.instructions.map((item) => item.text)).toEqual(["intro"]);
       const child = ownedChild(rootTraversal(second), "Main.Child");
       expect(child?.enterCount).toBe(2);
 
-      const afterSecond = progressBrief(runtime, second, { move: "proceed" });
+      const again = progressBrief(runtime, second, {
+        move: "proceed",
+        instructions: appliedInstructions(second),
+      });
+      expect(again.instructions.map((item) => item.text)).toEqual(["again"]);
+      const afterSecond = progressBrief(runtime, again, {
+        move: "proceed",
+        instructions: appliedInstructions(again),
+      });
       expect(afterSecond.judgments).toHaveLength(1);
       const resolved = progressBrief(runtime, afterSecond, {
         move: "proceed",
@@ -1361,6 +1408,12 @@ function Main() {
 
       expect(brief.instructions.map((item) => item.text)).toEqual([
         "go branch",
+      ]);
+      const next = progressBrief(runtime, brief, {
+        move: "proceed",
+        instructions: appliedInstructions(brief),
+      });
+      expect(next.instructions.map((item) => item.text)).toEqual([
         "ready branch",
       ]);
     });

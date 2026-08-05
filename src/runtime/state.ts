@@ -135,12 +135,18 @@ export type Accumulator = {
   briefActive?: NodeRef;
   instructionBatchNode?: NodeRef;
   instructionBatchSignature?: string;
+  /** First emitted instruction owner in the current batch. */
+  instructionBatchResumeSeg?: Extract<
+    SegId,
+    { kind: "resolveWhen" | "deflectWhen" }
+  >;
+  /** Apply-phase instruction ids confirmed by the report being consumed. */
+  instructionApplications: Set<BriefId>;
   judgmentResults: Map<string, boolean>;
   observationResults: Map<string, ObservationReport>;
   observationGroupResults: Map<string, ObservationGroupReport>;
   hostCallResults: Map<string, PayloadValue>;
   hostEffectResults: Map<string, HostEffectReport>;
-  yieldedInstructionIds: Set<BriefId>;
   /**
    * The active pin cursor: the current statement's entries on the walking SEG's
    * pin tape. Opened per statement visit by the SEG executors and saved/
@@ -263,12 +269,13 @@ export function createAccumulator(
     briefActive: undefined,
     instructionBatchNode: undefined,
     instructionBatchSignature: undefined,
+    instructionBatchResumeSeg: undefined,
+    instructionApplications: new Set(),
     judgmentResults: new Map(),
     observationResults: new Map(),
     observationGroupResults: new Map(),
     hostCallResults: new Map(),
     hostEffectResults: new Map(),
-    yieldedInstructionIds: new Set(),
   };
 }
 
@@ -1221,6 +1228,9 @@ export function markPendingActionState(
       : undefined,
     enterPhase: extras?.enterPhase,
     preSnapshot: extras?.preSnapshot,
+    instructionPhase: extras?.instructionPhase,
+    deflectWhenOutcome: extras?.deflectWhenOutcome,
+    resolveWhenOutcome: extras?.resolveWhenOutcome,
     map: extras?.map,
   } as ActionState;
 }
@@ -1413,16 +1423,27 @@ export function isInstructionBatchActive(
   return accum.instructionBatchNode === traversalToNodeRef(traversal);
 }
 
+// TODO: the previous batching condition is too generous and hooks with side
+// effects can be batched but the desired semantics of batched hooks is under-
+// specified
 export function canBatchInstruction(
   accum: Accumulator,
   node: Node,
   statement: InstructionAction,
 ): boolean {
-  const signature = accum.instructionBatchSignature;
-  return (
-    signature === undefined ||
-    signature === instructionBatchSignature(node, statement)
-  );
+  // Instruction batching is intentionally dormant. Keep the surrounding
+  // runtime batch-shaped so hosts remain free to accept multi-item briefs and
+  // this optimization can be restored without changing the protocol.
+  //
+  // const signature = accum.instructionBatchSignature;
+  // return (
+  //   signature === undefined ||
+  //   signature === instructionBatchSignature(node, statement)
+  // );
+  void accum;
+  void node;
+  void statement;
+  return false;
 }
 
 export function instructionBatchSignature(

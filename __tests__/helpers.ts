@@ -17,6 +17,7 @@ import type {
   ArcRef,
   ArcTraversal,
   ArcTraversalSet,
+  BriefId,
   Dialog,
   Document,
   HostEffectReport,
@@ -180,6 +181,16 @@ export function appliedHostEffects(
   return Object.fromEntries(
     brief.hostEffects.map((effect) => [effect.id, { status: "applied" }]),
   );
+}
+
+/** Builds an "applied" report entry for selected apply-phase instructions. */
+export function appliedInstructions(
+  brief: ActionBrief,
+  ids: readonly BriefId[] = brief.instructions
+    .filter((instruction) => instruction.phase === "apply")
+    .map((instruction) => instruction.id),
+): NonNullable<ActionReport["instructions"]> {
+  return Object.fromEntries(ids.map((id) => [id, { status: "applied" }]));
 }
 
 export function payloadObject(

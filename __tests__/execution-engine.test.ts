@@ -15,6 +15,7 @@ import type { SegFrame } from "../src/runtime/seg.js";
 import type { ElementId, Statement } from "../src/types.js";
 import {
   appliedHostEffects,
+  appliedInstructions,
   arc,
   EMPTY_DIALOG,
   METAL_SOURCE,
@@ -310,6 +311,12 @@ function Main() {
       // the child re-walks, reaching the gated `child ready`.
       expect(brief.instructions.map((item) => item.text)).toEqual([
         "child ready",
+      ]);
+      const tail = progressBrief(runtime, brief, {
+        move: "proceed",
+        instructions: appliedInstructions(brief),
+      });
+      expect(tail.instructions.map((item) => item.text)).toEqual([
         "child tail",
       ]);
     });
@@ -384,11 +391,13 @@ function Main() {
 
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
 
-      expect(brief.instructions.map((item) => item.text)).toEqual([
-        "before",
-        "after",
-      ]);
+      expect(brief.instructions.map((item) => item.text)).toEqual(["before"]);
       expect(rootTraversal(brief).cells.verdict).toBe(true);
+      const after = progressBrief(runtime, brief, {
+        move: "proceed",
+        instructions: appliedInstructions(brief),
+      });
+      expect(after.instructions.map((item) => item.text)).toEqual(["after"]);
     });
 
     it("resumes after a blocking enter whose returns change the caller", () => {
@@ -1184,11 +1193,17 @@ function Main() {
 
       // Each subsequent step covers the current node and returns control to the
       // next ancestor, surfacing its tail only as control reaches it.
-      const atA = progressBrief(runtime, atB, { move: "proceed" });
+      const atA = progressBrief(runtime, atB, {
+        move: "proceed",
+        instructions: appliedInstructions(atB),
+      });
       expect(atA.instructions.map((item) => item.text)).toEqual(["a tail"]);
       expect(atA.active).toEqual(node("deep-nesting-arc", "Main.A"));
 
-      const atMain = progressBrief(runtime, atA, { move: "proceed" });
+      const atMain = progressBrief(runtime, atA, {
+        move: "proceed",
+        instructions: appliedInstructions(atA),
+      });
       expect(atMain.instructions.map((item) => item.text)).toEqual([
         "main tail",
       ]);
@@ -1237,7 +1252,7 @@ function Main() {
       expect(rootTraversal(first).cells.ready).toBeUndefined();
 
       // Resolving the child commits `ready=true`; the enter resolves and the
-      // caller re-walks, so the gated `before` and `after` both surface.
+      // caller re-walks, so the gated `before` surfaces first.
       const second = progressBrief(runtime, first, {
         move: "proceed",
         observations: {
@@ -1246,10 +1261,12 @@ function Main() {
       });
 
       expect(rootTraversal(second).cells.ready).toBe(true);
-      expect(second.instructions.map((item) => item.text)).toEqual([
-        "before",
-        "after",
-      ]);
+      expect(second.instructions.map((item) => item.text)).toEqual(["before"]);
+      const after = progressBrief(runtime, second, {
+        move: "proceed",
+        instructions: appliedInstructions(second),
+      });
+      expect(after.instructions.map((item) => item.text)).toEqual(["after"]);
     });
 
     it("a pending instruction isolates its hook mutation until it resolves", () => {
@@ -1331,7 +1348,10 @@ function Main() {
       ]);
       expect(second.active).toEqual(node("enter-insulation-arc", "Main.Child"));
 
-      const third = progressBrief(runtime, second, { move: "proceed" });
+      const third = progressBrief(runtime, second, {
+        move: "proceed",
+        instructions: appliedInstructions(second),
+      });
       expect(third.instructions.map((item) => item.text)).toEqual(["after"]);
       expect(third.active).toEqual(node("enter-insulation-arc", "Main"));
     });
@@ -1386,15 +1406,18 @@ function Main() {
 
       // Proceeding resolves the child's instruction → the child covers → the enter
       // resolves atomically → the caller re-walks with the enter already resolved
-      // (and skipped). `before` (gated on `ready`) and `after` are both reachable
-      // and batch into one brief, since a skipped enter performs no control
-      // transfer and so does not split the instruction batch.
-      const third = progressBrief(runtime, second, { move: "proceed" });
-      expect(third.instructions.map((item) => item.text)).toEqual([
-        "before",
-        "after",
-      ]);
+      // (and skipped). `before` (gated on `ready`) surfaces first.
+      const third = progressBrief(runtime, second, {
+        move: "proceed",
+        instructions: appliedInstructions(second),
+      });
+      expect(third.instructions.map((item) => item.text)).toEqual(["before"]);
       expect(third.active).toEqual(node("enter-capture-seg-arc", "Main"));
+      const fourth = progressBrief(runtime, third, {
+        move: "proceed",
+        instructions: appliedInstructions(third),
+      });
+      expect(fourth.instructions.map((item) => item.text)).toEqual(["after"]);
     });
   });
 
@@ -1858,6 +1881,7 @@ function Main() {
         firstCoveredBrief,
         {
           move: "proceed",
+          instructions: appliedInstructions(firstCoveredBrief),
         },
       );
 
@@ -1870,6 +1894,7 @@ function Main() {
         secondCoveredBrief,
         {
           move: "proceed",
+          instructions: appliedInstructions(secondCoveredBrief),
         },
       );
 

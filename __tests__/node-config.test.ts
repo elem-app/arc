@@ -14,6 +14,7 @@ import { Runtime } from "../src/runtime/index.js";
 import type { ArcTraversalSet } from "../src/types.js";
 import {
   EMPTY_DIALOG,
+  appliedInstructions,
   arc,
   node,
   ownedChild,
@@ -411,6 +412,7 @@ function Main() {
         retainedFrameInitial,
         {
           move: "proceed",
+          instructions: appliedInstructions(retainedFrameInitial),
         },
       );
       const retainedFrameResumed = startRun(
@@ -459,6 +461,7 @@ function Main() {
         forgetfulEntryInitial,
         {
           move: "proceed",
+          instructions: appliedInstructions(forgetfulEntryInitial),
         },
       );
       const forgetfulEntryResumed = startRun(
@@ -783,7 +786,10 @@ function Main() {
         },
       });
 
-      const next = progressBrief(runtime, brief, { move: "proceed" });
+      const next = progressBrief(runtime, brief, {
+        move: "proceed",
+        instructions: appliedInstructions(brief),
+      });
       expect(next.instructions.map((item) => item.text)).toEqual([
         "No params.",
       ]);

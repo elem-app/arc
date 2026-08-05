@@ -13,6 +13,7 @@ import { Runtime } from "../src/runtime/index.js";
 import type { Dialog } from "../src/types.js";
 import {
   appliedHostEffects,
+  appliedInstructions,
   arc,
   EMPTY_DIALOG,
   node,
@@ -250,7 +251,11 @@ function Main() {
 
       // The covered iteration's exit yields before resolveWhen evaluates; the
       // acknowledging dialog is what the hook sees.
-      const exit = runtime.progress(work, { move: "proceed" }, EMPTY_DIALOG);
+      const exit = runtime.progress(
+        work,
+        { move: "proceed", instructions: appliedInstructions(work) },
+        EMPTY_DIALOG,
+      );
       expect(exit.transition?.exited).toHaveLength(1);
       expect(exit.transition?.position).toBe(
         node("transition-loop-arc", "Main"),
@@ -303,7 +308,11 @@ function Main() {
 
       // The child's declared effects surface only after its work resolves, on a
       // transition-free brief, and hold the frontier until applied.
-      const effects = runtime.progress(work, { move: "proceed" }, EMPTY_DIALOG);
+      const effects = runtime.progress(
+        work,
+        { move: "proceed", instructions: appliedInstructions(work) },
+        EMPTY_DIALOG,
+      );
       expect(effects.transition).toBeUndefined();
       expect(effects.hostEffects).toHaveLength(1);
 

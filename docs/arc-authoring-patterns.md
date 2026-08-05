@@ -10,7 +10,7 @@ Arc execution is split between two parties that never share a vocabulary.
 
 The **runtime** owns control structure: nodes, the action-graph walk, node state and node frames, deflection, and control transfer through `$enter(...)`. None of this is visible to whatever resolves your semantic work.
 
-The **host** owns meaning. It is the LLM or worker that resolves `judge(...)` questions, extracts observations, and delivers instructions, reasoning from the conversation and the text you wrote. The runtime does hand it some structured context — the cell being observed, an enum's allowed values, the current value, your host params — but it carries no model of your control structure: not why the work was emitted, how nodes route, or what a deflection is.
+The **host** owns meaning. It is the LLM or worker that resolves `judge(...)` questions, extracts observations, and follows instructions, reasoning from the conversation and the text you wrote. The runtime does hand it some structured context — the cell being observed, an enum's allowed values, the current value, your host params — but it carries no model of your control structure: not why the work was emitted, how nodes route, or what a deflection is.
 
 The natural-language channel you author for that worker is **semantic text**: the text in `$instruct(...)` / `$instructLoop(...)`, `judge(...)`, the question for `$observe(...)` / `$observeOrAsk(...)`, `this.guidance`, `this.deflectWhen`, a `resolveWhen` / `deflectWhen` written as text, and interpolations inside host calls. This is the prose the worker reads and acts on. Your control structure — the `if` conditions, `.state` checks, deflection, and the graph walk itself — never crosses: the worker sees the work, never the reason it was emitted.
 
@@ -22,7 +22,7 @@ Arc borrows from JavaScript's two function-definition syntaxes — `function` an
 
 | Form | Invocation | Internal memory |
 | --- | --- | --- |
-| `function` (node) | `enter` resolves once, then skipped | Frame progress is retained by default; `this.forgetfulEntry = true` clears it at the next entry |
+| `function` (node) | `$enter` resolves once, then skipped | Frame progress is retained by default; `this.forgetfulEntry = true` clears it at the next entry |
 | arrow (hook/`invoke`/`$map` callback) | Runs in full every time it is reached | None — a fresh reach re-derives its whole body |
 
 The visible consequence for `judge(...)` and other question-asking calls: an answer lives for the entry that asked it. It is asked once there, however many turns that entry spans, and asked again when the node is entered afresh or a hook consultation starts, where the question renders against the state current then.
@@ -60,11 +60,6 @@ The same rule governs the other semantic-text sites:
 if (judge(`this node should be caught and re-entered`)) { ... }
 // Prefer: a judgment about the conversation.
 if (judge(`${user} wants to come back to pricing`)) { ... }
-
-// Avoid: guidance written in control terms.
-this.guidance = `deflect if the user leaves the SEG`;
-// Prefer: guidance about delivery.
-this.guidance = `casual mention, don't push`;
 ```
 
 A quick test: strip the script away and hand the text plus the transcript to a stranger. If they could answer the question or carry out the instruction, the text lives on the right side of the boundary. If they could not, it names something only the script knows.

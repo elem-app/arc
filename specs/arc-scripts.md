@@ -267,7 +267,7 @@ Arc never interprets these keys. Which ones are meaningful, and what they select
 
 #### Instructions
 
-Instruction actions are authored guidance that the runtime hands to the host. Unlike value-style actions, reaching an instruction does not immediately block on a single required value. Instead, the runtime first emits guidance, then derives the instruction outcome from authored `deflectWhen` / `resolveWhen` logic over subsequent handbacks.
+Instruction actions are authored guidance that the runtime hands to the host. Instruction application and authored `deflectWhen` / `resolveWhen` checks are independent report channels: a host may report either one first or both together.
 
 Arc supports three instruction forms:
 
@@ -303,12 +303,11 @@ Authoring rules:
 
 Execution semantics:
 
-1. When traversal first reaches an instruction, the runtime emits the instruction text and marks the action pending.
-2. While the instruction is pending, the runtime evaluates `deflectWhen` first, then `resolveWhen`.
-3. If `deflectWhen` becomes true, the traversal is deflected.
-4. If `resolveWhen` becomes true, the instruction action resolves and traversal continues.
-5. Otherwise the instruction remains pending and continues to apply on later handbacks.
-6. `$instruct(...)` resolves implicitly when the host reports back, unless it is deflected.
+1. The runtime emits an instruction text along with its `deflectWhen` and `resolveWhen` frontier.
+2. The host reports the instruction's application and/or semantic results needed by the checks.
+3. The runtime evaluates `deflectWhen` if possible, followed by `resolveWhen`.
+4. If `deflectWhen` becomes true, the traversal deflects.
+5. Prior to `deflectWhen` resolution, or after `deflectWhen` becomes false, `$instruct` resolves when application is reported, and `$instructLoop` resolves when `resolveWhen` becomes true.
 
 Only the currently reachable semantic checks from `deflectWhen` / `resolveWhen` surface in a given brief. See [arc-runtime-api.md](./arc-runtime-api.md) for the `InstructionBrief` and `postcheck` protocol.
 
@@ -402,8 +401,8 @@ Different actions and expressions resolve as follows:
 | `$observe(cell)` | Resolves after the host reports an observation result. A `resolved` result writes the reported value. An `unknown` result consumes the action and preserves any existing value. Prior `$set(...)` writes provide the observation's current value; they do not resolve the `$observe(...)` action. |
 | `$observeOrAsk(cell)` | Resolves after the host reports a concrete value. |
 | `$observe({ ... })` / `$observeOrAsk({ ... })` | Resolves after the host reports results for every field in one report. All `resolved` fields are written together; `unknown` fields are skipped. A grouped `$observeOrAsk` whose report leaves any field pending re-emits the whole group and writes nothing. See [Grouped Observation](#grouped-observation). |
-| `$instruct(...)` | Resolves on the host handback unless its effective `deflectWhen` deflects first. |
-| `$instructLoop(...)` | Resolves when its `resolveWhen` evaluates true. While pending, the runtime checks `deflectWhen` before `resolveWhen` on each handback. |
+| `$instruct(...)` | Resolves after its per-id application report unless its effective `deflectWhen` deflects first. |
+| `$instructLoop(...)` | Resolves when its `resolveWhen` evaluates true. While pending, the runtime checks reported `deflectWhen` evidence, `resolveWhen` evidence, and application reporting independently. |
 | `$enter(Target)` | Resolves when the target traversal reaches `State.COVERED` or `State.SKIPPED`. Covered targets commit staged `returns`; skipped targets resolve without committing staged `returns`. |
 | `$enterLoop(Target, { resolveWhen, ... })` | Resolves after a covered or skipped target iteration when the caller-side `resolveWhen` evaluates true. Otherwise the loop action remains pending or starts another target iteration. |
 | `judge(...)` and expression-position host calls | These are value dependencies, not standalone statement actions. A host report supplies the value. |

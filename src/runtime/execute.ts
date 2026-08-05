@@ -2,6 +2,7 @@ import type {
   ActionStatement,
   ArcRef,
   ArcTraversal,
+  BriefId,
   CatchDeflectionStatement,
   CellValue,
   DeflectionContext,
@@ -194,7 +195,9 @@ function isHookSeg(
 }
 
 /** The hook SEG identity for a pending instruction blocked on its hook. */
-function instructionHookSeg(statement: InstructionAction): SegId {
+function instructionHookSeg(
+  statement: InstructionAction,
+): Extract<SegId, { kind: "resolveWhen" | "deflectWhen" }> {
   return statement.resolveWhen
     ? { kind: "resolveWhen", owner: statement.id }
     : { kind: "deflectWhen", owner: statement.id };
@@ -1715,6 +1718,14 @@ function runMapMember(
     accum.mapMember = previousMember;
   }
   if (outcome.status !== "done") return outcome;
+  if (isInstructionBatchActive(accum, traversal)) {
+    // A callback walk may reach its end after emitting a compatible instruction
+    // batch, but emission does not resolve those actions. Keep this member's
+    // arena row, action state, and tape live until the batch is acknowledged;
+    // only then may the driver terminalize it and advance to the next member.
+    accum.activeSeg = { kind: "mapMember", owner: statement.id, index };
+    return blockSeg(accum, traversal);
+  }
 
   const staged = arena.staged;
   if (statement.results !== undefined) {
@@ -1824,31 +1835,52 @@ function runInstructionAction(
     traversal,
     qualifiedBriefSite(briefSiteQualifiers(accum), statement.id),
   );
-  if (
-    accum.phase === "plan" &&
-    actionState?.status === "pending" &&
-    accum.yieldedInstructionIds.has(instructionId)
-  ) {
-    noteBriefYield(accum, traversal);
-    accum.instructionBatchNode ??= traversalToNodeRef(traversal);
-    accum.instructionBatchSignature ??= instructionBatchSignature(
-      node,
-      statement,
-    );
-    return blockSeg(accum, traversal);
-  }
 
   if (actionState?.status !== "pending") {
     return emitPendingInstruction(traversal, node, statement, accum);
   }
 
-  return stepResolvedInstruction(
+  if (!actionState.instructionPhase) {
+    throw new Error(
+      `Pending instruction ${instructionId} is missing its persisted phase`,
+    );
+  }
+
+  const newlyApplied = consumeInstructionApplication(accum, instructionId);
+  if (newlyApplied || accum.phase === "apply") {
+    return stepReportedInstruction(
+      traversal,
+      node,
+      statement,
+      accum,
+      actionState.preSnapshot,
+      actionState.instructionPhase,
+      newlyApplied || actionState.instructionPhase === "postcheck",
+      actionState.deflectWhenOutcome,
+      actionState.resolveWhenOutcome,
+    );
+  }
+
+  return surfacePendingInstruction(
     traversal,
     node,
     statement,
     accum,
     actionState.preSnapshot,
+    actionState.instructionPhase,
+    actionState.deflectWhenOutcome,
+    actionState.resolveWhenOutcome,
   );
+}
+
+/** Consumes one durable application report for this exact instruction owner. */
+function consumeInstructionApplication(
+  accum: Accumulator,
+  instructionId: BriefId,
+): boolean {
+  if (!accum.instructionApplications.has(instructionId)) return false;
+  accum.instructionApplications.delete(instructionId);
+  return true;
 }
 
 /**
@@ -1878,55 +1910,129 @@ function emitPendingInstruction(
   emitInstruction(statement, traversal, node, accum, "apply", postcheck);
   markPendingActionState(traversal, statement.id, statement.kind, {
     preSnapshot,
+    instructionPhase: "apply",
   });
   return { status: "advance" };
 }
 
 /**
- * Steps a pending instruction whose report has arrived: evaluates its hooks,
- * then deflects, stays blocked, resolves (gated re-walk), or re-applies.
+ * Re-surfaces an instruction with no newly consumable application report.
+ * Planning may reconstruct its reachable postcheck, but never advances its
+ * outcome. The lap's banked hook evidence carries through unchanged, and its
+ * banked hooks pose no checks.
  */
-function stepResolvedInstruction(
+function surfacePendingInstruction(
   traversal: Traversal,
   node: Node,
   statement: InstructionAction,
   accum: Accumulator,
   preSnapshot: StateSnapshot | undefined,
+  phase: InstructionBrief["phase"],
+  bankedDeflect: boolean | undefined,
+  bankedResolve: boolean | undefined,
+): LeafStep<void> {
+  let postcheck: InstructionPostcheck | undefined;
+  if (accum.phase === "plan") {
+    accum.activeSeg = instructionHookSeg(statement);
+    postcheck = collectInstructionPostcheck(
+      statement,
+      traversal,
+      node,
+      accum,
+      bankedDeflect,
+      bankedResolve,
+    );
+    if (!postcheck) accum.activeSeg = { kind: "body" };
+  }
+  markPendingActionState(traversal, statement.id, statement.kind, {
+    preSnapshot,
+    instructionPhase: phase,
+    deflectWhenOutcome: bankedDeflect,
+    resolveWhenOutcome: bankedResolve,
+  });
+  emitInstruction(statement, traversal, node, accum, phase, postcheck);
+  return { status: "advance" };
+}
+
+/**
+ * Applies one accepted report to a pending instruction, driving its current
+ * lap. A lap collects two evidences, each banked once settled: the deflect
+ * evidence (`deflectWhen`) and the finished evidence (application for a
+ * one-shot, `resolveWhen` for a loop). A true deflect evidence short-circuits
+ * the lap immediately, honoring the finished evidence collected so far; with
+ * both evidences in and no deflection, a finished-true lap resolves the action
+ * and a finished-false loop lap starts a fresh lap with no banked evidence.
+ */
+function stepReportedInstruction(
+  traversal: Traversal,
+  node: Node,
+  statement: InstructionAction,
+  accum: Accumulator,
+  preSnapshot: StateSnapshot | undefined,
+  instructionPhase: InstructionBrief["phase"],
+  applicationConfirmed: boolean,
+  bankedDeflect: boolean | undefined,
+  bankedResolve: boolean | undefined,
 ): LeafStep<void> {
   const judgmentStart = accum.judgments.length;
   const observationStart = accum.observations.length;
   const hostCallStart = accum.hostCalls.length;
-  // Evaluate the resolution hooks under the hook SEG so a block records the hook
+  // Evaluate the open hooks under the hook SEG so a block records the hook
   // and the next report resumes it owner-first, before the enclosing body.
+  // Banked evidence substitutes for its hook without re-evaluating it.
   accum.activeSeg = instructionHookSeg(statement);
   const { deflectResult, resolveResult } = withInstructionHostParams(
     statement,
     node,
     accum,
     () => ({
-      deflectResult: statement.deflectWhen
-        ? evaluateDeflectWhenHook(statement, traversal, node, accum)
-        : ({
-            status: "resolved",
-            value: false,
-          } satisfies ActionOutcome<boolean>),
-      resolveResult: evaluateInstructionResolution(
-        statement,
-        traversal,
-        node,
-        accum,
-      ),
+      deflectResult:
+        bankedDeflect !== undefined
+          ? ({
+              status: "resolved",
+              value: bankedDeflect,
+            } satisfies ActionOutcome<boolean>)
+          : statement.deflectWhen
+            ? evaluateDeflectWhenHook(statement, traversal, node, accum)
+            : ({
+                status: "resolved",
+                value: false,
+              } satisfies ActionOutcome<boolean>),
+      resolveResult:
+        bankedResolve !== undefined
+          ? ({
+              status: "resolved",
+              value: bankedResolve,
+            } satisfies ActionOutcome<boolean>)
+          : evaluateInstructionResolution(
+              statement,
+              traversal,
+              node,
+              accum,
+              applicationConfirmed,
+            ),
     }),
   );
   if (deflectResult.status !== "blocked" && truthy(deflectResult.value)) {
     accum.activeSeg = { kind: "body" };
-    clearActionState(traversal, statement.id);
+    // The lap short-circuits on deflection, honoring the finished evidence
+    // collected up to this handback: a finished lap stays resolved through the
+    // deflection, an unfinished one re-presents fresh after a catch or
+    // re-entry.
+    if (resolveResult.status !== "blocked" && truthy(resolveResult.value)) {
+      markActionResolved(traversal, statement);
+    } else {
+      clearActionState(traversal, statement.id);
+    }
     return deflectSeg(traversal);
   }
   if (
     deflectResult.status === "blocked" ||
     resolveResult.status === "blocked"
   ) {
+    const nextPhase: InstructionBrief["phase"] = applicationConfirmed
+      ? "postcheck"
+      : instructionPhase;
     const postcheck =
       accum.phase === "plan"
         ? instructionPostcheckFromAccum(
@@ -1936,7 +2042,21 @@ function stepResolvedInstruction(
             hostCallStart,
           )
         : undefined;
-    emitInstruction(statement, traversal, node, accum, "postcheck", postcheck);
+    emitInstruction(statement, traversal, node, accum, nextPhase, postcheck);
+    markPendingActionState(traversal, statement.id, statement.kind, {
+      preSnapshot,
+      instructionPhase: nextPhase,
+      deflectWhenOutcome:
+        bankedDeflect ??
+        (deflectResult.status !== "blocked" && statement.deflectWhen
+          ? truthy(deflectResult.value)
+          : undefined),
+      resolveWhenOutcome:
+        bankedResolve ??
+        (resolveResult.status !== "blocked" && statement.resolveWhen
+          ? truthy(resolveResult.value)
+          : undefined),
+    });
     // Hook still blocked: leave the hook SEG active so the enclosing block
     // records it as the frontier.
     return { status: "advance" };
@@ -1953,6 +2073,11 @@ function stepResolvedInstruction(
     return readSetRewalkStep(preSnapshot, traversal, node, accum);
   }
 
+  // Finished-false loop lap: start a fresh lap with no banked evidence.
+  markPendingActionState(traversal, statement.id, statement.kind, {
+    preSnapshot,
+    instructionPhase: "apply",
+  });
   emitInstruction(statement, traversal, node, accum, "apply");
   return { status: "advance" };
 }
@@ -1962,9 +2087,15 @@ function evaluateInstructionResolution(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
+  applicationConfirmed: boolean,
 ): ActionOutcome<boolean> {
   if (!statement.resolveWhen) {
-    return { status: "resolved", value: statement.mode === "once" };
+    // A one-shot's finished evidence is its application: open until the host
+    // reports it applied, never settled false — an unapplied one-shot waits
+    // rather than deciding a lap.
+    return applicationConfirmed
+      ? { status: "resolved", value: statement.mode === "once" }
+      : { status: "blocked" };
   }
   return evaluateBooleanHook(
     statement.resolveWhen,
@@ -2035,16 +2166,19 @@ function collectInstructionPostcheck(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
+  bankedDeflect?: boolean,
+  bankedResolve?: boolean,
 ): InstructionPostcheck | undefined {
   const judgmentStart = accum.judgments.length;
   const observationStart = accum.observations.length;
   const hostCallStart = accum.hostCalls.length;
 
+  // A hook whose lap evidence is already banked poses no checks.
   withInstructionHostParams(statement, node, accum, () => {
-    if (statement.deflectWhen) {
+    if (statement.deflectWhen && bankedDeflect === undefined) {
       evaluateDeflectWhenHook(statement, traversal, node, accum);
     }
-    if (statement.resolveWhen) {
+    if (statement.resolveWhen && bankedResolve === undefined) {
       evaluateBooleanHook(
         statement.resolveWhen,
         traversal,
@@ -2628,6 +2762,7 @@ function emitInstruction(
     node,
     statement,
   );
+  accum.instructionBatchResumeSeg ??= instructionHookSeg(statement);
   accum.instructions.push({
     id: makeInstructionId(
       accum.entry.arc,

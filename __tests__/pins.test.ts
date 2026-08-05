@@ -21,6 +21,7 @@ import {
 import type { ArcTraversalSet, Dialog } from "../src/types.js";
 import { nodeSegKey } from "../src/types.js";
 import {
+  appliedInstructions,
   arc,
   EMPTY_DIALOG,
   progressBrief,
@@ -142,7 +143,10 @@ function Main() {
       expect(fourth.judgments).toHaveLength(0);
       expect(fourth.instructions.map((item) => item.text)).toEqual(["done"]);
 
-      const done = progressBrief(runtime, fourth, { move: "proceed" });
+      const done = progressBrief(runtime, fourth, {
+        move: "proceed",
+        instructions: appliedInstructions(fourth),
+      });
       expect(rootTraversal(done).phase).toBe("completed");
     });
 
@@ -261,10 +265,12 @@ function Main() {
         judgments: { [second.judgments[0]!.id]: true },
       });
       expect(third.judgments).toHaveLength(0);
-      expect(third.instructions.map((item) => item.text)).toEqual([
-        "both",
-        "after",
-      ]);
+      expect(third.instructions.map((item) => item.text)).toEqual(["both"]);
+      const fourth = progressBrief(runtime, third, {
+        move: "proceed",
+        instructions: appliedInstructions(third),
+      });
+      expect(fourth.instructions.map((item) => item.text)).toEqual(["after"]);
     });
 
     it("a judge-or-host-call condition keeps the pinned false while the host call blocks", () => {
@@ -301,10 +307,12 @@ function Main() {
         move: "proceed",
         hostCalls: { [second.hostCalls[0]!.id]: "ok" },
       });
-      expect(third.instructions.map((item) => item.text)).toEqual([
-        "in",
-        "out",
-      ]);
+      expect(third.instructions.map((item) => item.text)).toEqual(["in"]);
+      const fourth = progressBrief(runtime, third, {
+        move: "proceed",
+        instructions: appliedInstructions(third),
+      });
+      expect(fourth.instructions.map((item) => item.text)).toEqual(["out"]);
     });
 
     it("a judge inside a resolved $set value is skipped with its statement", () => {
@@ -502,6 +510,7 @@ function Main() {
       // the child's cell): the outer pin still holds through the bubble-up.
       const observing = progressBrief(runtime, childWorked, {
         move: "proceed",
+        instructions: appliedInstructions(childWorked),
       });
       expect(observing.judgments).toHaveLength(0);
       expect(observing.observations).toHaveLength(1);
@@ -561,10 +570,17 @@ function Main() {
         later,
       );
       expect(second.judgments).toHaveLength(0);
-      expect(second.instructions.map((item) => item.text)).toEqual([
-        "gone",
-        "tail",
-      ]);
+      expect(second.instructions.map((item) => item.text)).toEqual(["gone"]);
+      const third = progressBrief(
+        runtime,
+        second,
+        {
+          move: "proceed",
+          instructions: appliedInstructions(second),
+        },
+        later,
+      );
+      expect(third.instructions.map((item) => item.text)).toEqual(["tail"]);
     });
   });
 
@@ -636,29 +652,34 @@ function Main() {
       seeded.phase = "entered";
 
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
-      expect(brief.instructions.map((item) => item.text)).toEqual([
-        "one",
-        "two",
-      ]);
-
-      // The shared inherited hook renders the same question, but each owner
-      // qualifies its brief identity: two distinct ids, never a collision.
+      expect(brief.instructions.map((item) => item.text)).toEqual(["one"]);
       expect(
         brief.judgments.map((item) => renderSemanticTextForTest(item.question)),
-      ).toEqual(["user wants to stop", "user wants to stop"]);
-      const [firstId, secondId] = brief.judgments.map((item) => item.id);
-      expect(firstId).not.toEqual(secondId);
-      const postcheckIds = brief.instructions.map(
-        (item) => item.postcheck?.judgmentIds,
-      );
-      expect(postcheckIds).toEqual([[firstId], [secondId]]);
+      ).toEqual(["user wants to stop"]);
+      const firstId = brief.judgments[0]!.id;
+      expect(brief.instructions[0]!.postcheck?.judgmentIds).toEqual([firstId]);
 
-      // The answers route by owner: a deflect answered on the second
-      // instruction's own id deflects the node. (Before owner qualification,
-      // one shared id answered every owner's question at once.)
-      const deflected = progressBrief(runtime, brief, {
+      const second = progressBrief(runtime, brief, {
         move: "proceed",
-        judgments: { [firstId!]: false, [secondId!]: true },
+        instructions: appliedInstructions(brief),
+        judgments: { [firstId]: false },
+      });
+      expect(second.instructions.map((item) => item.text)).toEqual(["two"]);
+      expect(
+        second.judgments.map((item) =>
+          renderSemanticTextForTest(item.question),
+        ),
+      ).toEqual(["user wants to stop"]);
+      const secondId = second.judgments[0]!.id;
+      expect(firstId).not.toEqual(secondId);
+      expect(second.instructions[0]!.postcheck?.judgmentIds).toEqual([
+        secondId,
+      ]);
+
+      // The second owner's answer routes by its own id and deflects the node.
+      const deflected = progressBrief(runtime, second, {
+        move: "proceed",
+        judgments: { [secondId]: true },
       });
       expect(rootTraversal(deflected).phase).toBe("suspended");
       expect(rootTraversal(deflected).state).toBe("deflected");

@@ -9,6 +9,7 @@ import { traversalToNodeRef } from "./refs.js";
 import { runtimeError } from "./report-validation.js";
 import {
   type Accumulator,
+  isInstructionBatchActive,
   recordActiveFrame,
   setActiveTraversal,
 } from "./state.js";
@@ -291,6 +292,15 @@ export function blockTraversal(
   traversal: Traversal,
 ): { status: "blocked" } {
   setActiveTraversal(accum, traversal);
+  // An active batch owns this node's frontier: record its first emitted owner,
+  // wherever the walk blocked, so resume visits every batch member in owner
+  // order instead of losing earlier report items behind the last blocked hook.
+  if (
+    isInstructionBatchActive(accum, traversal) &&
+    accum.instructionBatchResumeSeg
+  ) {
+    accum.activeSeg = { ...accum.instructionBatchResumeSeg };
+  }
   recordActiveFrame(accum);
   accum.blocked = true;
   return { status: "blocked" };

@@ -13,6 +13,7 @@ import { Runtime, toNodeRefParts } from "../src/runtime/index.js";
 import type { Document, ElementId, Statement } from "../src/types.js";
 import {
   EMPTY_DIALOG,
+  appliedInstructions,
   arc,
   ephemeralChild,
   progressBrief,
@@ -184,10 +185,18 @@ function Main() {
 
       // The caller's document was not stamped.
       expect(document.roots[0]!.statements[0]!.id).toBe("");
-      // Inherited copies stamped under the static `deflectWhen/` scope, and
-      // brief identity qualified per owning instruction.
-      expect(brief.judgments.map((item) => item.id)).toEqual([
+      // Inherited copies stamp under the static `deflectWhen/` scope, and each
+      // serially exposed owner still qualifies its own brief identity.
+      const firstId = brief.judgments[0]!.id;
+      expect(firstId).toBe(
         "judge:[arc:elemid-handbuilt-arc:Main]:[node:elemid-handbuilt-arc:Main]:body/0/deflectWhen/0~0",
+      );
+      const next = progressBrief(runtime, brief, {
+        move: "proceed",
+        instructions: appliedInstructions(brief),
+        judgments: { [firstId]: false },
+      });
+      expect(next.judgments.map((item) => item.id)).toEqual([
         "judge:[arc:elemid-handbuilt-arc:Main]:[node:elemid-handbuilt-arc:Main]:body/1/deflectWhen/0~0",
       ]);
     });
@@ -238,7 +247,10 @@ function Main() {
         "Child#body/0/0c/0",
       ]);
 
-      const done = progressBrief(runtime, brief, { move: "proceed" });
+      const done = progressBrief(runtime, brief, {
+        move: "proceed",
+        instructions: appliedInstructions(brief),
+      });
       expect(rootTraversal(done).state).toBe("covered");
     });
 

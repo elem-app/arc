@@ -10,6 +10,7 @@ import type {
   HostEffectBrief,
   HostEffectReport,
   InstructionBrief,
+  InstructionReport,
   NodeRef,
   NodeTransition,
   RuntimeIssue,
@@ -503,7 +504,6 @@ export function buildActionBrief(
   traversals: ArcTraversalSet,
   dialog: Dialog,
   leadingHostEffects: HostEffectBrief[] = [],
-  leadingInstructions: InstructionBrief[] = [],
   activeHint?: NodeRef,
   leadingIssues: RuntimeIssue[] = [],
 ): {
@@ -532,11 +532,6 @@ export function buildActionBrief(
       entered: [...workingRoot.pendingTransition.entered],
     };
   }
-  for (const instruction of leadingInstructions) {
-    if (instruction.phase === "apply") {
-      accum.yieldedInstructionIds.add(instruction.id);
-    }
-  }
   if (workingRoot.phase === "entered") {
     if (workingRoot.activeFrame) {
       // Resume the recorded frontier in plan mode (symmetric with apply), so the
@@ -555,10 +550,7 @@ export function buildActionBrief(
     }
   }
   const actionRoot = selectActionRootTraversal(workingTraversals, entry.arc);
-  const instructions = mergeInstructionBriefs(
-    leadingInstructions,
-    accum.instructions,
-  );
+  const instructions = mergeInstructionBriefs(accum.instructions);
   const hostEffects = mergeHostEffects(leadingHostEffects, accum.hostEffects);
   const transition = buildTransitionPayload(entries, entry, accum);
   if (
@@ -672,7 +664,7 @@ export function buildPoisonedActionBrief(
   rootTraversal.finalizing = undefined;
   rootTraversal.pendingTransition = undefined;
   const message = error instanceof Error ? error.message : String(error);
-  return buildActionBrief(entries, entry, working, dialog, [], [], active, [
+  return buildActionBrief(entries, entry, working, dialog, [], active, [
     buildPoisonedTraversalIssue(
       entry.arc,
       active,
@@ -728,6 +720,20 @@ export function validateActionReport(
   const issues: RuntimeIssue[] = [];
   if (report.move === "poison") {
     return { accepted, issues, rejected: false };
+  }
+
+  const instructionIdIssue = findUnknownReportIdIssue(
+    "instruction",
+    plan.instructions.map((item) => item.id),
+    report.instructions,
+    "action report",
+  );
+  if (instructionIdIssue) {
+    return {
+      accepted: buildAcceptedActionReport(report),
+      issues: [instructionIdIssue],
+      rejected: true,
+    };
   }
 
   const judgmentIdIssue = findUnknownReportIdIssue(
@@ -806,6 +812,40 @@ export function validateActionReport(
     }
   }
 
+  if (report.instructions) {
+    const instructions: Record<string, InstructionReport> = {};
+    const instructionsById = new Map(
+      plan.instructions.map((item) => [item.id, item]),
+    );
+    for (const [id, value] of Object.entries(report.instructions)) {
+      const instruction = instructionsById.get(id);
+      if (instruction?.phase !== "apply") {
+        issues.push(
+          buildInvalidItemIssue(
+            id,
+            "instruction-phase",
+            `Invalid instruction report for ${id}: only an apply-phase instruction can be reported applied`,
+          ),
+        );
+        continue;
+      }
+      if (value?.status !== "applied") {
+        issues.push(
+          buildInvalidItemIssue(
+            id,
+            "instruction-status",
+            `Invalid instruction report for ${id}: expected status "applied"`,
+          ),
+        );
+        continue;
+      }
+      instructions[id] = { status: "applied" };
+    }
+    if (Object.keys(instructions).length > 0) {
+      accepted.instructions = instructions;
+    }
+  }
+
   if (report.observations) {
     const result = filterObservationReports(
       plan.observations,
@@ -852,7 +892,6 @@ export function acceptActionReport(
 ): {
   traversals: ArcTraversalSet;
   hostEffects: HostEffectBrief[];
-  instructions: InstructionBrief[];
 } {
   const working = cloneTraversalSet(state.traversals);
   const rootTraversal = selectActionRootTraversal(working, state.entry.arc);
@@ -905,16 +944,17 @@ export function acceptActionReport(
     return {
       traversals: working,
       hostEffects: accum.hostEffects,
-      instructions: accum.instructions,
     };
   }
 
+  for (const id of Object.keys(report.instructions ?? {})) {
+    accum.instructionApplications.add(id);
+  }
   applyReportResults(accum, report);
   resumeActiveFrame(accum);
   return {
     traversals: working,
     hostEffects: accum.hostEffects,
-    instructions: accum.instructions,
   };
 }
 

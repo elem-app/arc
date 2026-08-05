@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import { parse, validate } from "../src/parser/index.js";
 import { Runtime } from "../src/runtime/index.js";
 import {
+  appliedInstructions,
   arc,
   EMPTY_DIALOG,
   node,
@@ -293,6 +294,7 @@ function Main() {
 
       const afterBrief = progressBrief(runtime, branchBrief, {
         move: "proceed",
+        instructions: appliedInstructions(branchBrief),
       });
 
       expect(afterBrief.instructions.map((item) => item.text)).toEqual([
@@ -332,6 +334,7 @@ function Main() {
 
       const afterBrief = progressBrief(runtime, branchBrief, {
         move: "proceed",
+        instructions: appliedInstructions(branchBrief),
       });
 
       expect(afterBrief.instructions.map((item) => item.text)).toEqual([
@@ -367,7 +370,10 @@ function Main() {
 
       expect(brief.instructions.map((item) => item.text)).toEqual(["inner"]);
 
-      const afterBrief = progressBrief(runtime, brief, { move: "proceed" });
+      const afterBrief = progressBrief(runtime, brief, {
+        move: "proceed",
+        instructions: appliedInstructions(brief),
+      });
 
       expect(afterBrief.instructions.map((item) => item.text)).toEqual([
         "after",
@@ -575,13 +581,17 @@ function Main() {
         "first enabled pass",
       ]);
 
-      const disabled = progressBrief(runtime, first, { move: "proceed" });
+      const disabled = progressBrief(runtime, first, {
+        move: "proceed",
+        instructions: appliedInstructions(first),
+      });
       expect(disabled.instructions.map((item) => item.text)).toEqual([
         "disabled pass",
       ]);
 
       const enabledAgain = progressBrief(runtime, disabled, {
         move: "proceed",
+        instructions: appliedInstructions(disabled),
       });
       expect(enabledAgain.instructions.map((item) => item.text)).toEqual([
         "second enabled pass",
