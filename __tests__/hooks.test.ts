@@ -8,21 +8,24 @@
 import { describe, expect, it } from "vitest";
 
 import { parse } from "../src/parser/index.js";
-import { Runtime } from "../src/runtime/index.js";
-import type { Dialog } from "../src/types.js";
+import type { Dialog } from "../src/types/index.js";
 import {
-  EMPTY_DIALOG,
-  METAL_SOURCE,
+  actionProgress,
   appliedHostEffects,
   appliedInstructions,
   arc,
+  EMPTY_DIALOG,
+  METAL_SOURCE,
   node,
   ownedChild,
   progressBrief,
+  progressTerminal,
   renderSemanticTextForTest,
   rootTraversal,
+  TestRuntime as Runtime,
   singleObservations,
   startRun,
+  startTerminal,
   startTrigger,
   withExperimentalRewalk,
 } from "./helpers.js";
@@ -31,7 +34,7 @@ describe("hooks", () => {
   describe("hook.trigger-eval", () => {
     it("builds a trigger brief and yields an owned child as the active traversal", () => {
       const document = parse(METAL_SOURCE);
-      const runtime = new Runtime().add("metal-arc", document);
+      const runtime = new Runtime().add("metal-arc", document).init();
       const dialog: Dialog = {
         cursor: { user: 0, self: 0 },
         lastTurns: [{ role: "user", message: "what music are you into?" }],
@@ -92,7 +95,9 @@ function Main() {
   };
 }
 `);
-      const runtime = new Runtime().add("trigger-frame-reset-arc", document);
+      const runtime = new Runtime()
+        .add("trigger-frame-reset-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("trigger-frame-reset-arc", "Main"),
       );
@@ -133,11 +138,11 @@ import Dice from "host:rng";
 
 function Main() {
   this.trigger = () => {
-    return Dice.roll(20);
+    return Dice.roll(20) > 10;
   };
 }
 `);
-      const runtime = new Runtime().add("trigger-host-id-arc", document);
+      const runtime = new Runtime().add("trigger-host-id-arc", document).init();
       const triggerBrief = startTrigger(runtime, EMPTY_DIALOG);
       expect(triggerBrief.hostCalls).toHaveLength(1);
 
@@ -158,7 +163,7 @@ function Main() {
       const accepted = runtime.progressTrigger(
         triggerBrief,
         {
-          hostCalls: { [triggerBrief.hostCalls[0]!.id]: true },
+          hostCalls: { [triggerBrief.hostCalls[0]!.id]: 11 },
         },
         EMPTY_DIALOG,
       );
@@ -178,7 +183,7 @@ function Main() {
   };
 }
 `);
-      const runtime = new Runtime().add("trigger-dialog-arc", document);
+      const runtime = new Runtime().add("trigger-dialog-arc", document).init();
       const firstDialog: Dialog = {
         cursor: { user: 0, self: 0 },
         lastTurns: [{ role: "user", message: "hello" }],
@@ -262,7 +267,7 @@ function Main() {
   };
 }
 `);
-      const runtime = new Runtime().add("trigger-arc", document);
+      const runtime = new Runtime().add("trigger-arc", document).init();
       const dialog: Dialog = {
         cursor: { user: 0, self: 0 },
         lastTurns: [{ role: "user", message: "let's talk about music" }],
@@ -302,7 +307,7 @@ function Main() {
   };
 }
 `);
-      const runtime = new Runtime().add("trigger-arc", document);
+      const runtime = new Runtime().add("trigger-arc", document).init();
       const dialog: Dialog = {
         cursor: { user: 0, self: 0 },
         lastTurns: [{ role: "user", message: "hello there" }],
@@ -351,7 +356,7 @@ function Main() {
   };
 }
 `);
-      const runtime = new Runtime().add("trigger-arc", document);
+      const runtime = new Runtime().add("trigger-arc", document).init();
 
       const firstDialog: Dialog = {
         cursor: { user: 0, self: 0 },
@@ -438,7 +443,8 @@ function Second() {
 `);
       const runtime = new Runtime()
         .add("first-observe-arc", first)
-        .add("second-observe-arc", second);
+        .add("second-observe-arc", second)
+        .init();
 
       const triggerBrief = startTrigger(runtime, EMPTY_DIALOG);
       const outcome = runtime.progressTrigger(
@@ -502,7 +508,8 @@ function Shared() {
       const runtime = new Runtime()
         .add("main-dependency-arc", main)
         .add("intro-arc", intro)
-        .add("shared-arc", shared);
+        .add("shared-arc", shared)
+        .init();
 
       expect(runtime.startTrigger([], EMPTY_DIALOG).deps).toEqual([
         arc("main-dependency-arc", "Main"),
@@ -532,7 +539,8 @@ function Second() {
 `);
       const runtime = new Runtime()
         .add("first-arc", first)
-        .add("second-arc", second);
+        .add("second-arc", second)
+        .init();
 
       const triggerBrief = startTrigger(runtime, EMPTY_DIALOG);
       const outcome = runtime.progressTrigger(triggerBrief, {}, EMPTY_DIALOG);
@@ -569,7 +577,9 @@ function Second() {
   };
 }
 `);
-      const runtime = new Runtime().add("single-match-trigger-arc", document);
+      const runtime = new Runtime()
+        .add("single-match-trigger-arc", document)
+        .init();
       const triggerBrief = startTrigger(runtime, EMPTY_DIALOG);
 
       expect(triggerBrief.matched).toEqual(
@@ -595,7 +605,7 @@ function Pending() {
 }
 `);
       const source = "trigger-settlement-judgment-arc";
-      const runtime = new Runtime().add(source, document);
+      const runtime = new Runtime().add(source, document).init();
       const immediateRef = arc(source, "Immediate");
       const pendingRef = arc(source, "Pending");
 
@@ -649,7 +659,7 @@ function Pending() {
 }
 `);
       const source = "trigger-settlement-observation-arc";
-      const runtime = new Runtime().add(source, document);
+      const runtime = new Runtime().add(source, document).init();
       const immediateRef = arc(source, "Immediate");
       const pendingRef = arc(source, "Pending");
 
@@ -709,7 +719,7 @@ function Pending() {
 }
 `);
       const source = "trigger-settlement-host-call-arc";
-      const runtime = new Runtime().add(source, document);
+      const runtime = new Runtime().add(source, document).init();
       const immediateRef = arc(source, "Immediate");
       const pendingRef = arc(source, "Pending");
 
@@ -759,7 +769,7 @@ function Pending() {
 }
 `);
       const source = "trigger-settlement-preferred-arc";
-      const runtime = new Runtime().add(source, document);
+      const runtime = new Runtime().add(source, document).init();
       const immediateRef = arc(source, "Immediate");
 
       const brief = startTrigger(runtime, EMPTY_DIALOG);
@@ -796,7 +806,7 @@ function Pending() {
 }
 `);
       const source = "trigger-settlement-preferred-unmatched-arc";
-      const runtime = new Runtime().add(source, document);
+      const runtime = new Runtime().add(source, document).init();
       const immediateRef = arc(source, "Immediate");
       const pendingRef = arc(source, "Pending");
 
@@ -856,7 +866,7 @@ function Pending() {
 }
 `);
       const source = "trigger-settlement-preferred-unmatched-ambiguous-arc";
-      const runtime = new Runtime().add(source, document);
+      const runtime = new Runtime().add(source, document).init();
       const firstRef = arc(source, "First");
       const secondRef = arc(source, "Second");
       const pendingRef = arc(source, "Pending");
@@ -915,7 +925,8 @@ function Second() {
 `);
       const runtime = new Runtime()
         .add("ambiguous-first-arc", first)
-        .add("ambiguous-second-arc", second);
+        .add("ambiguous-second-arc", second)
+        .init();
 
       const brief = startTrigger(runtime, EMPTY_DIALOG);
 
@@ -980,7 +991,8 @@ function Second() {
 `);
       const runtime = new Runtime()
         .add("fanout-first-arc", first)
-        .add("fanout-second-arc", second);
+        .add("fanout-second-arc", second)
+        .init();
 
       const firstRef = arc("fanout-first-arc", "First");
       const secondRef = arc("fanout-second-arc", "Second");
@@ -1055,7 +1067,7 @@ function Main() {
 `),
         "Main",
       );
-      const runtime = new Runtime().add("nested-trigger-arc", document);
+      const runtime = new Runtime().add("nested-trigger-arc", document).init();
       const dialog: Dialog = {
         cursor: { user: 0, self: 0 },
         lastTurns: [{ role: "user", message: "let's talk about records" }],
@@ -1210,7 +1222,9 @@ function Main() {
   });
 }
 `);
-      const runtime = new Runtime().add("instruction-deflect-arc", document);
+      const runtime = new Runtime()
+        .add("instruction-deflect-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("instruction-deflect-arc", "Main"),
       );
@@ -1233,7 +1247,7 @@ function Main() {
         "self covered the topic enough",
       ]);
 
-      const deflected = progressBrief(runtime, resolutionBrief, {
+      const deflected = progressTerminal(runtime, resolutionBrief, {
         move: "proceed",
         judgments: {
           [resolutionBrief.judgments[0]!.id]: true,
@@ -1257,7 +1271,9 @@ function Main() {
   });
 }
 `);
-      const runtime = new Runtime().add("inherited-deflect-arc", document);
+      const runtime = new Runtime()
+        .add("inherited-deflect-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("inherited-deflect-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1299,7 +1315,9 @@ function Main() {
   });
   $instruct(\`after\`);}
 `);
-      const runtime = new Runtime().add("instruction-batched-arc", document);
+      const runtime = new Runtime()
+        .add("instruction-batched-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("instruction-batched-arc", "Main"),
       );
@@ -1504,7 +1522,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("self-instruction-catch-arc", document);
+      const runtime = new Runtime()
+        .add("self-instruction-catch-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("self-instruction-catch-arc", "Main"),
       );
@@ -1559,14 +1579,16 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("nested-deflection-from-arc", document);
+      const runtime = new Runtime()
+        .add("nested-deflection-from-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("nested-deflection-from-arc", "Main"),
       );
       seeded.phase = "entered";
 
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
-      const caught = progressBrief(runtime, brief, { move: "deflect" });
+      const caught = progressTerminal(runtime, brief, { move: "deflect" });
 
       expect(rootTraversal(caught).cells.caught).toBe(true);
       expect(rootTraversal(caught).state).toBe("covered");
@@ -1602,7 +1624,7 @@ function Main() {
   });
 }
 `);
-      const runtime = new Runtime().add("self-isfrom-arc", document);
+      const runtime = new Runtime().add("self-isfrom-arc", document).init();
       const seeded = runtime.newTraversal(arc("self-isfrom-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1640,12 +1662,12 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("newcopy-isfrom-arc", document);
+      const runtime = new Runtime().add("newcopy-isfrom-arc", document).init();
       const seeded = runtime.newTraversal(arc("newcopy-isfrom-arc", "Main"));
       seeded.phase = "entered";
 
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
-      const caught = progressBrief(runtime, brief, { move: "deflect" });
+      const caught = progressTerminal(runtime, brief, { move: "deflect" });
 
       // The anonymous copy resolves back to the canonical Child the author named,
       // so escaped(Child) matches and Main catches.
@@ -1681,7 +1703,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("catch-false-effects-arc", document);
+      const runtime = new Runtime()
+        .add("catch-false-effects-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("catch-false-effects-arc", "Main"),
       );
@@ -1715,12 +1739,12 @@ function Main() {
         finalizing: { reason: "deflected", phase: "effects" },
       });
 
-      const deflected = progressBrief(runtime, parentEffects, {
+      const deflected = progressTerminal(runtime, parentEffects, {
         move: "proceed",
         hostEffects: appliedHostEffects(parentEffects),
       });
 
-      expect(deflected.hostEffects).toEqual([]);
+      expect("hostEffects" in deflected).toBe(false);
       expect(rootTraversal(deflected).state).toBe("deflected");
     });
 
@@ -1757,7 +1781,7 @@ function Main() {
     $instruct(\`pricing\`);  }
 }
 `);
-      const runtime = new Runtime().add("blocking-catch-arc", document);
+      const runtime = new Runtime().add("blocking-catch-arc", document).init();
       const seeded = runtime.newTraversal(arc("blocking-catch-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1827,7 +1851,9 @@ function Main() {
 `),
         "Main",
       );
-      const runtime = new Runtime().add("observe-or-ask-catch-arc", document);
+      const runtime = new Runtime()
+        .add("observe-or-ask-catch-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("observe-or-ask-catch-arc", "Main"),
       );
@@ -1927,10 +1953,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add(
-        "observe-or-ask-catch-false-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("observe-or-ask-catch-false-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("observe-or-ask-catch-false-arc", "Main"),
       );
@@ -1974,12 +1999,12 @@ function Main() {
       ]);
       expect(rootTraversal(emitted).phase).toBe("entered");
 
-      const deflected = progressBrief(runtime, emitted, {
+      const deflected = progressTerminal(runtime, emitted, {
         move: "proceed",
         hostEffects: appliedHostEffects(emitted),
       });
 
-      expect(deflected.hostEffects).toEqual([]);
+      expect("hostEffects" in deflected).toBe(false);
       expect(rootTraversal(deflected).state).toBe("deflected");
       expect(rootTraversal(deflected).phase).toBe("suspended");
     });
@@ -2008,7 +2033,9 @@ function Main() {
   $observeOrAsk(topic);
 }
 `);
-      const runtime = new Runtime().add("blocking-catch-false-arc", document);
+      const runtime = new Runtime()
+        .add("blocking-catch-false-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("blocking-catch-false-arc", "Main"),
       );
@@ -2031,12 +2058,12 @@ function Main() {
       ).toEqual(["root deflected"]);
       expect(rootTraversal(deflected).phase).toBe("entered");
 
-      const suspended = progressBrief(runtime, deflected, {
+      const suspended = progressTerminal(runtime, deflected, {
         move: "proceed",
         hostEffects: appliedHostEffects(deflected),
       });
 
-      expect(suspended.hostEffects).toEqual([]);
+      expect("hostEffects" in suspended).toBe(false);
       expect(rootTraversal(suspended).state).toBe("deflected");
       expect(rootTraversal(suspended).phase).toBe("suspended");
     });
@@ -2066,7 +2093,9 @@ function Main() {
     $instruct(\`child work\`);  }
 }
 `);
-      const runtime = new Runtime().add("transition-entry-arc", document);
+      const runtime = new Runtime()
+        .add("transition-entry-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("transition-entry-arc", "Main"));
       seeded.phase = "entered";
       return { runtime, seeded };
@@ -2088,7 +2117,7 @@ function Main() {
     $instruct(\`optional\`);  }
 }
 `);
-      const runtime = new Runtime().add("guard-semantic-arc", document);
+      const runtime = new Runtime().add("guard-semantic-arc", document).init();
       const seeded = runtime.newTraversal(arc("guard-semantic-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], {
@@ -2125,13 +2154,13 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("guard-deflect-arc", document);
+      const runtime = new Runtime().add("guard-deflect-arc", document).init();
       const seeded = runtime.newTraversal(arc("guard-deflect-arc", "Main"));
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
-      expect(brief.instructions).toEqual([]);
+      expect("instructions" in brief).toBe(false);
       expect(rootTraversal(brief).state).toBe("deflected");
       expect(rootTraversal(brief).phase).toBe("suspended");
     });
@@ -2152,7 +2181,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("guard-cover-arc", document);
+      const runtime = new Runtime().add("guard-cover-arc", document).init();
       const seeded = runtime.newTraversal(arc("guard-cover-arc", "Main"));
       seeded.phase = "entered";
 
@@ -2191,7 +2220,9 @@ function Main() {
     $instruct(\`child\`);  }
 }
 `);
-      const runtime = new Runtime().add("forgetful-skipped-arc", document);
+      const runtime = new Runtime()
+        .add("forgetful-skipped-arc", document)
+        .init();
       const traversal = runtime.newTraversal(
         arc("forgetful-skipped-arc", "Main"),
       );
@@ -2219,12 +2250,14 @@ function Main() {
 
     it("evaluates the entered node's guard against the acknowledging dialog", () => {
       const { runtime, seeded } = guardedChildRuntime();
-      const transition = runtime.start([seeded], EMPTY_DIALOG);
+      const transition = actionProgress(runtime.start([seeded], EMPTY_DIALOG));
       expect(transition.transition).toBeDefined();
 
       // The ack dialog satisfies the guard even though the dialog that produced
       // the transition would not have.
-      const work = runtime.progress(transition, { move: "proceed" }, GO_DIALOG);
+      const work = actionProgress(
+        runtime.progress(transition, { move: "proceed" }, GO_DIALOG),
+      );
       expect(work.transition).toBeUndefined();
       expect(work.instructions.map((item) => item.text)).toEqual([
         "child work",
@@ -2233,14 +2266,12 @@ function Main() {
 
     it("skips the entered node when the acknowledging dialog fails its guard", () => {
       const { runtime, seeded } = guardedChildRuntime();
-      const transition = runtime.start([seeded], EMPTY_DIALOG);
+      const transition = actionProgress(runtime.start([seeded], EMPTY_DIALOG));
 
       // Guard skips under the (empty) ack dialog; the child's exit is the next
       // transition, and Main continues past it only after that acknowledgment.
-      const exit = runtime.progress(
-        transition,
-        { move: "proceed" },
-        EMPTY_DIALOG,
+      const exit = actionProgress(
+        runtime.progress(transition, { move: "proceed" }, EMPTY_DIALOG),
       );
       expect(exit.transition?.exited).toEqual([
         node("transition-entry-arc", "Main.Child"),
@@ -2248,9 +2279,11 @@ function Main() {
       expect(exit.transition?.position).toBe(
         node("transition-entry-arc", "Main"),
       );
-      expect(exit.transition?.hostParams).toBe(null);
+      expect(exit.transition?.hostParams).toBeUndefined();
 
-      const after = runtime.progress(exit, { move: "proceed" }, EMPTY_DIALOG);
+      const after = actionProgress(
+        runtime.progress(exit, { move: "proceed" }, EMPTY_DIALOG),
+      );
       expect(after.instructions.map((item) => item.text)).toEqual([
         "after child",
       ]);
@@ -2271,12 +2304,13 @@ function Main() {
     outcome.$set(this.pendingState);
     Memoir.facts.$apply(
       \`pending: \${this.pendingState}; stored: \${outcome}\`,
-      { pending: this.pendingState, nested: [this.pendingState] },
     );
   };
 }
 `);
-      const runtime = new Runtime().add("covered-pending-state-arc", document);
+      const runtime = new Runtime()
+        .add("covered-pending-state-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("covered-pending-state-arc", "Main"),
       );
@@ -2292,12 +2326,8 @@ function Main() {
       expect(
         renderSemanticTextForTest(effects.hostEffects[0]!.arguments[0]!),
       ).toBe("pending: covered; stored: covered");
-      expect(effects.hostEffects[0]!.arguments[1]).toEqual({
-        pending: "covered",
-        nested: ["covered"],
-      });
 
-      const completed = progressBrief(runtime, effects, {
+      const completed = progressTerminal(runtime, effects, {
         move: "proceed",
         hostEffects: appliedHostEffects(effects),
       });
@@ -2326,10 +2356,9 @@ function Main() {
   $observeOrAsk(ready);
 }
 `);
-      const runtime = new Runtime().add(
-        "deflected-pending-state-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("deflected-pending-state-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("deflected-pending-state-arc", "Main"),
       );
@@ -2360,7 +2389,7 @@ function Main() {
         renderSemanticTextForTest(effects.hostEffects[0]!.arguments[0]!),
       ).toBe("pending: deflected");
 
-      const suspended = progressBrief(runtime, effects, {
+      const suspended = progressTerminal(runtime, effects, {
         move: "proceed",
         hostEffects: appliedHostEffects(effects),
       });
@@ -2395,7 +2424,7 @@ function Main() {
 }
 `);
 
-      const runtime = new Runtime().add("effects-arc", document);
+      const runtime = new Runtime().add("effects-arc", document).init();
       const seeded = runtime.newTraversal(arc("effects-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], {
@@ -2427,12 +2456,12 @@ function Main() {
       ).toBe("user likes metal");
       expect(rootTraversal(nextBrief).phase).toBe("entered");
 
-      const completed = progressBrief(runtime, nextBrief, {
+      const completed = progressTerminal(runtime, nextBrief, {
         move: "proceed",
         hostEffects: appliedHostEffects(nextBrief),
       });
 
-      expect(completed.hostEffects).toEqual([]);
+      expect("hostEffects" in completed).toBe(false);
       expect(rootTraversal(completed).phase).toBe("completed");
     });
 
@@ -2458,7 +2487,7 @@ function Main() {
 }
 `);
 
-      const runtime = new Runtime().add("deflect-effects-arc", document);
+      const runtime = new Runtime().add("deflect-effects-arc", document).init();
       const seeded = runtime.newTraversal(arc("deflect-effects-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], {
@@ -2483,12 +2512,12 @@ function Main() {
       });
       expect(rootTraversal(nextBrief).phase).toBe("entered");
 
-      const suspended = progressBrief(runtime, nextBrief, {
+      const suspended = progressTerminal(runtime, nextBrief, {
         move: "proceed",
         hostEffects: appliedHostEffects(nextBrief),
       });
 
-      expect(suspended.hostEffects).toEqual([]);
+      expect("hostEffects" in suspended).toBe(false);
       expect(rootTraversal(suspended).state).toBe("deflected");
       expect(rootTraversal(suspended).phase).toBe("suspended");
     });
@@ -2518,10 +2547,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add(
-        "effects-pending-deflection-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("effects-pending-deflection-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("effects-pending-deflection-arc", "Main"),
       );
@@ -2562,16 +2590,15 @@ function Main() {
   function Child() {}
 }
 `);
-      const runtime = new Runtime().add(
-        "covered-pending-deflection-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("covered-pending-deflection-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("covered-pending-deflection-arc", "Main"),
       );
       seeded.phase = "entered";
 
-      const poisoned = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const poisoned = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(poisoned.issues).toHaveLength(1);
       expect(poisoned.issues[0]).toMatchObject({
@@ -2618,10 +2645,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add(
-        "catch-suppresses-effects-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("catch-suppresses-effects-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("catch-suppresses-effects-arc", "Main"),
       );
@@ -2673,10 +2699,9 @@ function Main() {
 }
 `);
 
-      const runtime = new Runtime().add(
-        "deflect-observe-effects-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("deflect-observe-effects-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("deflect-observe-effects-arc", "Main"),
       );
@@ -2724,12 +2749,12 @@ function Main() {
       expect(nextBrief.canProgress).toBe(true);
       expect(rootTraversal(nextBrief).phase).toBe("entered");
 
-      const suspended = progressBrief(runtime, nextBrief, {
+      const suspended = progressTerminal(runtime, nextBrief, {
         move: "proceed",
         hostEffects: appliedHostEffects(nextBrief),
       });
 
-      expect(suspended.hostEffects).toEqual([]);
+      expect("hostEffects" in suspended).toBe(false);
       expect(suspended.canProgress).toBe(false);
       expect(rootTraversal(suspended).phase).toBe("suspended");
     });
@@ -2766,7 +2791,9 @@ function Main() {
   };
 }
 `);
-      const runtime = new Runtime().add("idempotent-effects-arc", document);
+      const runtime = new Runtime()
+        .add("idempotent-effects-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("idempotent-effects-arc", "Main"),
       );
@@ -2821,7 +2848,7 @@ function Main() {
   };
 }
 `);
-      const runtime = new Runtime().add("n8-arc", document);
+      const runtime = new Runtime().add("n8-arc", document).init();
       const seeded = runtime.newTraversal(arc("n8-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -2837,12 +2864,12 @@ function Main() {
       expect(unreported.hostEffects).toEqual(brief.hostEffects);
       expect(rootTraversal(unreported).phase).toBe("entered");
 
-      const confirmed = progressBrief(runtime, unreported, {
+      const confirmed = progressTerminal(runtime, unreported, {
         move: "proceed",
         hostEffects: appliedHostEffects(unreported),
       });
 
-      expect(confirmed.hostEffects).toEqual([]);
+      expect("hostEffects" in confirmed).toBe(false);
       expect(rootTraversal(confirmed).phase).toBe("completed");
     });
 
@@ -2858,7 +2885,7 @@ function Main() {
   };
 }
 `);
-      const runtime = new Runtime().add("n8b-arc", document);
+      const runtime = new Runtime().add("n8b-arc", document).init();
       const seeded = runtime.newTraversal(arc("n8b-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -2867,7 +2894,7 @@ function Main() {
       expect(brief.allowedMoves).toEqual(["poison", "proceed"]);
       expect(rootTraversal(brief).phase).toBe("entered");
 
-      const poisoned = progressBrief(runtime, brief, {
+      const poisoned = progressTerminal(runtime, brief, {
         move: "poison",
         poisonReason: {
           reasonCode: "unsupported-host-effect",
@@ -2876,8 +2903,8 @@ function Main() {
       });
 
       expect(rootTraversal(poisoned).phase).toBe("poisoned");
-      expect(poisoned.hostEffects).toEqual([]);
-      expect(poisoned.allowedMoves).toEqual([]);
+      expect("hostEffects" in poisoned).toBe(false);
+      expect("allowedMoves" in poisoned).toBe(false);
       expect(poisoned.issues).toEqual([
         expect.objectContaining({
           kind: "poisoned-traversal",
@@ -2908,7 +2935,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("n8c-arc", document);
+      const runtime = new Runtime().add("n8c-arc", document).init();
       const seeded = runtime.newTraversal(arc("n8c-arc", "Main"));
       seeded.phase = "entered";
       const effectBrief = startRun(runtime, [seeded], EMPTY_DIALOG);

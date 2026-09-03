@@ -1,46 +1,41 @@
-import type { PayloadValue } from "../types.js";
+/** Deep-clones plain Arc data without applying numeric canonicalization. */
+export function clonePreservingNumbers<T>(value: T): T {
+  return clonePreservingNumbersAt(value, "$");
+}
 
-export function clonePayloadValue(value: PayloadValue): PayloadValue {
-  if (Array.isArray(value)) return value.map((item) => clonePayloadValue(item));
+function clonePreservingNumbersAt<T>(value: T, path: string): T {
+  if (Array.isArray(value)) {
+    return value.map((item, index) =>
+      clonePreservingNumbersAt(item, `${path}[${index}]`),
+    ) as T;
+  }
   if (value !== null && typeof value === "object") {
-    return clonePayloadObject(value);
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        clonePreservingNumbersAt(item, `${path}[${JSON.stringify(key)}]`),
+      ]),
+    ) as T;
   }
   return value;
 }
 
-export function clonePayloadObject(
-  value: Record<string, PayloadValue>,
-): Record<string, PayloadValue> {
-  return Object.fromEntries(
-    Object.entries(value).map(([key, item]) => [key, clonePayloadValue(item)]),
-  );
-}
-
-/**
- * Returns a cloned payload where `override` takes precedence over `base`.
- *
- * If `override` is `undefined`, it is treated as absent and the cloned `base`
- * value is returned. If both values are plain payload objects, their fields are
- * shallow-merged and fields from `override` replace fields from `base`. If
- * either value is not a plain payload object, the cloned `override` value is
- * returned.
- */
-export function mergeAndClonePayload(
-  base: PayloadValue,
-  override: PayloadValue,
-): PayloadValue {
-  if (override === undefined) return clonePayloadValue(base);
-  if (isPayloadObject(base) && isPayloadObject(override)) {
-    return {
-      ...clonePayloadObject(base),
-      ...clonePayloadObject(override),
-    };
+/** Canonicalizes negative zero throughout a mutable plain Arc data graph. */
+export function canonicalizeNegativeZeroInPlace(value: unknown): void {
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index++) {
+      const item = value[index];
+      if (typeof item === "number" && Object.is(item, -0)) value[index] = 0;
+      else canonicalizeNegativeZeroInPlace(item);
+    }
+    return;
   }
-  return clonePayloadValue(override);
-}
-
-function isPayloadObject(
-  value: PayloadValue,
-): value is Record<string, PayloadValue> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+  if (value !== null && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    for (const key of Object.keys(object)) {
+      const item = object[key];
+      if (typeof item === "number" && Object.is(item, -0)) object[key] = 0;
+      else canonicalizeNegativeZeroInPlace(item);
+    }
+  }
 }

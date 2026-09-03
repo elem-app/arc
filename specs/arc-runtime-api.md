@@ -16,6 +16,28 @@ There is only one active arc being traversed at a time.
 
 After the action graph resolves, the node's effects block runs. Effects may require additional resolution rounds. Once effects finish, any emitted host effects are surfaced in a brief for the host to handle.
 
+## Payload Values
+
+`PayloadValue` is the recursively serializable carrier for values crossing the Arc–host boundary: values supplied by the host that become visible to Arc, and values produced by Arc that become visible to the host. It is a directional TypeScript guarantee, not a complete encoding of every authored cell or operation constraint.
+
+```typescript
+type PayloadValue =
+  | string
+  | number
+  | boolean
+  | undefined
+  | PayloadValue[]
+  | StructValue;
+
+type StructValue = {
+  readonly [key: string]: PayloadValue;
+};
+```
+
+A top-level payload may be a string, number, boolean, `undefined`, an Artifact value, or an array or object recursively composed from payload values. Nested values must be defined; arrays must be dense ordinary data arrays without accessors or extra properties; objects must be plain or null-prototype data objects without accessors or symbols. String keys, including `$`-prefixed keys, are admitted.
+
+An Artifact value has the exact transport shape `{ path: string }`. Use `createArtifactValue(path)` to validate and construct one, and `isArtifactValue(value)` to validate an unknown value when the surrounding operation or declaration already requires an Artifact. The shape carries no global runtime tag: an unconstrained `{ path: "x" }` payload remains an ordinary struct. Artifact cells, channels, constructors, and interpolations require that exact shape. The registered document spec remains authoritative for persisted cell values.
+
 ## Traversal State
 
 Traversal state is the persistent, serializable representation of an arc's progress. It lets the runtime resume walks from where it left off across turns, sessions, and process restarts.
@@ -26,7 +48,7 @@ An **arc traversal** represents the full state of one arc: its lifecycle phase, 
 
 A **node traversal** represents the state of a single node within an arc. For owned children (nested function declarations), traversal data is stored inline under the parent. For imported arcs entered via a parent arc, each gets its own arc traversal managed directly by the runtime.
 
-Runtime instances are purely in-memory. The host is responsible for persisting traversal state between turns — a serverless handler, for example, can spin up a fresh runtime, register the same documents, and resume any session from its own storage.
+Runtime instances are purely in-memory. The host is responsible for persisting traversal state between turns — a serverless handler, for example, can spin up a fresh runtime, add and initialize the same documents, and resume any session from its own storage.
 
 ### Lifecycle Phases
 
@@ -52,29 +74,33 @@ In both cases the runtime sets the traversal `phase` to `"poisoned"` and surface
 
 What poison terminates depends on the stage:
 
-- **Action stage.** Poison ends the active root. `start()` or `progress()` returns a brief with the root `"poisoned"`, `canProgress: false`, and no further moves or work items.
+- **Action stage.** Poison ends the active Arc. `start()`, `enterArc()`, or `progress()` returns a `TerminalBrief` with `outcome: "poisoned"`, the poisoned Arc's `ArcRef`, and no moves or work items.
 - **Trigger stage.** A poisoned candidate is contained. Only that arc's traversal is poisoned; probing continues for the other arcs, and the poisoned arc is barred from future trigger matching.
 
 The stable causes for runtime-initiated poison are:
 
 | `reasonCode` | Runtime condition |
 | --- | --- |
-| `invalid-cell-assignment` | A `$set()` value is absent, has the wrong primitive type, or targets a cell kind that cannot be assigned; `$unset()` also reaches this case when its target cannot be unset, including Artifact cells. Reading an unset cell into `$set()` reaches this case because the resulting value is `undefined`. |
+| `invalid-cell-assignment` | A `$set()` value is absent or has the wrong cell shape, or `$unset()` reaches an invalid target. |
 | `invalid-cell-target` | A cell target attempts to access through a scalar or exceeds the runtime's supported target depth. Validated documents should normally prevent this. |
-| `invalid-array-index` | An array read or cell-target accessor resolves to a value that is not a non-negative integer. |
+| `invalid-array-index` | An array read or cell-target accessor resolves to a value that is not a non-negative JavaScript safe integer. |
 | `array-index-out-of-range` | An array read or cell-target accessor resolves to an index outside the existing array bounds. An index equal to the array length does not append. |
 | `invalid-array-operation` | Runtime evaluation attempts an array read, target access, element write, or map operation against a value that is not an array. Validated documents should normally prevent this. |
-| `cell-out-of-range` | A value written to `RangedInt` falls outside its declared inclusive bounds. |
 | `invalid-enum-value` | A value written to `Enum` is not one of its declared values. |
 | `unknown-cell` | Runtime evaluation cannot resolve the cell targeted by `$set()`, `$unset()`, `$observe()`, or an internal write. Validated documents should normally prevent this. |
 | `invalid-observation-target` | Runtime evaluation reaches `$observe()`, `$observeOrAsk()`, or a grouped `$observe({ ... })` field with a non-observable cell such as `Dialog.Cursor`. Validated documents should normally prevent this. |
 | `unknown-channel-key` | An `args.*` or `returns.*` key is read or written but the caller's `$enter()` did not wire that key. |
 | `invalid-channel-binding` | A wired channel points to a caller cell or owner traversal that no longer exists. |
-| `invalid-return-value` | A `returns.*.$set()` host-call result is not a primitive value that can be committed to a caller cell. |
-| `invalid-template-interpolation` | An evaluated interpolation in a value or semantic template resolves to an unset value; value templates also reject non-primitive values. |
-| `unset-value` | An unset value is evaluated as a boolean or emitted as a concrete host-call value argument. Comparisons may consume unset values without poisoning: equality and ordering return `false`, except inequality returns `true`, whenever either operand is unset. |
-| `invalid-artifact-path` | A rendered artifact path is blocked, empty, absolute, or contains `.` or `..` segments. |
-| `invalid-dialog-cursor` | `Dialog.cursor`, a stored cursor, a cursor assignment, or a `*TurnsSince()` operand does not have a valid cursor shape. |
+| `invalid-return-value` | A `returns.*.$set()` value has the wrong value shape, or violates an `Index()` channel's non-negative-safe-integer refinement. |
+| `invalid-artifact-value` | A value used under Artifact authority does not have the exact valid `{ path: string }` shape; nested array failures include the first invalid member path. |
+| `invalid-artifact-operation` | Runtime evaluation receives an Artifact in ordering, regex, or another unsupported operation. Artifact equality and inequality are supported. |
+| `non-numeric-arithmetic-operand` | A dynamically supplied arithmetic operand is not a number. The reason identifies the operator, operand position, and runtime value kind. |
+| `non-numeric-is-finite-argument` | A dynamically supplied `Num.isFinite(...)` argument is not a number. |
+| `non-finite-number` | Authored execution tries to use `NaN` or an infinity where a finite number is required. |
+| `invalid-template-interpolation` | A value or semantic template attempts to interpolate an unset or unsupported value. |
+| `unset-value` | An unset value is used where a concrete value is required. Comparisons may consume ordinary unset values without poisoning: equality and ordering return `false`, except inequality returns `true`, whenever either operand is unset. |
+| `invalid-artifact-path` | An Artifact initializer or factory receives an empty or absolute path or one containing a `.` or `..` segment. |
+| `invalid-dialog-cursor` | `Dialog.cursor`, a stored cursor, a cursor write, or a `*TurnsSince()` operand does not have a valid cursor shape. |
 | `cross-view-comparison` | A cursor difference compares coordinates stamped with different dialog views; the issue reason names both views. |
 | `cursor-moved-backwards` | A live `Dialog.cursor` is behind a stored cursor from the same view. |
 | `other-runtime-error` | An exception reaches the advancement boundary without a recognized cause-specific code. |
@@ -91,7 +117,7 @@ Canonical node state is addressable from Arc source through `ReferenceName.state
 
 An `invoke(() => { ... })` body runs inline in its enclosing node, so a brief emitted from inside one carries the enclosing node's ref. Match reports to briefs by id rather than interpreting the ref.
 
-An `arr.$map(callback, results?)` callback runs inline the same way: work a member emits directly carries the enclosing node's ref, while an `$enter(newcopy(...))` inside the callback briefs under the entered copy. Members run one at a time, so at most one member's work reaches any brief, and each member's brief ids are qualified by its index. The pending map state persists with the traversal set, so a blocked member resumes across brief/report rounds and across a process restart.
+An `arr.$map(callback, results?)` callback runs inline the same way: work a member emits directly carries the enclosing node's ref, while an `$enter(newcopy(...))` inside the callback briefs under the entered copy. Members run one at a time, so at most one member's work reaches any brief, and each member's brief ids are qualified by its index. The pending map state deep-clones its stored values and persists with the traversal set, so a blocked member resumes across brief/report rounds and across a process restart.
 
 **Node frame** is the internal resolution map — which individual actions within the node have been resolved. When a `$` action resolves, the frame records it so subsequent runs of the node bypass it. The frame is bookkeeping that the action graph author never sees directly.
 
@@ -187,9 +213,9 @@ type TriggerReport = {
 };
 ```
 
-### `ActionBrief` and `ActionReport`
+### `ActionBrief`
 
-`ActionBrief` is what the runtime yields during the action stage. It describes the current traversal state, pending work items, and any instructions or host effects that surfaced during this walk.
+`ActionBrief` is the reportable frontier the runtime yields during the action stage. Action-stage entrypoints return `ActionBrief | TerminalBrief`, without naming that union, and hosts narrow the output through `canProgress`.
 
 ```typescript
 type ActionBrief = {
@@ -197,8 +223,8 @@ type ActionBrief = {
   traversals: ArcTraversalSet;
   /** The node currently being worked on. */
   active: NodeRef;
-  /** Whether the runtime can advance further. */
-  canProgress: boolean;
+  /** This is a reportable frontier accepted by Runtime.progress. */
+  canProgress: true;
   /** Protocol or authored-execution issues surfaced while advancing from the previous yield. */
   issues: RuntimeIssue[];
   /** Pending boolean checks. */
@@ -221,6 +247,31 @@ type ActionBrief = {
   allowedMoves: ActionMove[];
 };
 ```
+
+### `TerminalBrief`
+
+`TerminalBrief` is the non-reportable output returned when the action root stops.
+
+```typescript
+type TerminalBrief = {
+  /** Updated traversal state after terminal settlement. */
+  traversals: ArcTraversalSet;
+  /** This output cannot be submitted to Runtime.progress. */
+  canProgress: false;
+  /** Registered root whose action stage stopped. */
+  root: ArcRef;
+  /** Terminal outcome of that root. */
+  outcome: "covered" | "deflected" | "poisoned";
+  /** Committed root returns, when a covered root declares return channels. */
+  returns?: Record<string, CellValue>;
+  /** Structured issues carried by terminal settlement. */
+  issues: RuntimeIssue[];
+};
+```
+
+`TerminalBrief` has no `active`, work arrays, `transition`, or `allowedMoves`. A covered root with declared returns exposes cloned values for the keys it actually staged, including `{}` when it staged none. `returns` is absent when the root declares no return channels and for deflected or poisoned outcomes. `root` identifies the action root when `traversals` also contains other roots.
+
+### `ActionReport`
 
 `ActionReport` is what the host sends back after inspecting an action brief. It includes itemized results and a move that tells the runtime what to do next.
 
@@ -280,7 +331,7 @@ type NodeTransition = {
   entered: NodeRef[];
   /** The node evaluation continues at. */
   position: NodeRef;
-  /** The position node's authored hostParams; null when it declares none. */
+  /** The position node's authored hostParams; `undefined` when it declares none. */
   hostParams: PayloadValue;
 };
 ```
@@ -311,7 +362,7 @@ type SemanticTextPart =
 
 If a rendered semantic text contains no deferred mentions, the runtime may return it as a plain string. If it contains `user`, `self`, an artifact mention, or a host-variable mention, the runtime returns parts. The host is responsible for rendering those parts into the concrete text, file paths, URLs, routing metadata, or prompt conventions used by the agent harness it is driving.
 
-Artifact paths are logical paths relative to the host's workspace for the current Arc run. If an artifact was declared with a value-template path, the runtime evaluates that template when the artifact mention is rendered and emits the resulting logical path. The runtime does not open files, resolve those paths against the host filesystem, or translate them into agent tool calls.
+Artifact semantic parts carry logical workspace-relative paths. The runtime does not open files or resolve those paths against the host filesystem.
 
 Host variables are authored as direct member references on a `host:*` import inside a template literal, such as `${Audience.supervisor}` or `${Audience["group"].supervisor}` for `import Audience from "host:audience"`. The runtime emits `{ kind: "hostVar", module: "audience", path: ["supervisor"] }` or a longer `path` for nested references, and does not resolve the reference further. Hosts decide whether a host variable renders as text, selects an audience, maps to another runtime object, or is rejected as unsupported.
 
@@ -351,19 +402,19 @@ type ObservationBrief = {
   /** Rendered semantic observation question from arc source. */
   question: SemanticText;
   /** Current target-leaf value, if any. */
-  currentValue?: PrimitiveValue | ArrayValue;
+  currentValue?: PrimitiveValue | PrimitiveArrayValue;
   /** Semantic metadata for this work item. */
   hostParams: PayloadValue;
   /** Target-leaf type metadata for host-side validation/UI. */
   meta: ObservationValueMeta;
 };
 
-type ScalarObservationMeta = {
-  type: "enum" | "boolean" | "rangedInt" | "string";
-  values?: string[];
-  min?: number;
-  max?: number;
-};
+type ScalarObservationMeta =
+  | { type: "boolean" }
+  | { type: "string" }
+  | { type: "enum"; values: string[] }
+  | { type: "rangedInt"; min: number; max: number }
+  | { type: "number"; min?: number; max?: number };
 
 type ObservationValueMeta =
   | ScalarObservationMeta
@@ -372,6 +423,13 @@ type ObservationValueMeta =
       element: ScalarObservationMeta;
     };
 ```
+
+The numeric observation metadata variants are:
+
+- `type: "number"` accepts a finite number within optional inclusive `min` and `max` bounds.
+- `type: "rangedInt"` accepts a JavaScript safe integer within the required inclusive `min` and `max` bounds.
+
+For either numeric variant, negative zero is accepted and subsequently represented as zero. These rules apply to scalar observations, every element of an array observation, array-element observations, and every numeric field of a grouped observation. An item whose value has the wrong type, is non-finite, or does not satisfy the integer shape is rejected as an `invalid-item` with `reasonCode: "observation-type"`. A numeric value outside the inclusive bounds is rejected as an `invalid-item` with `reasonCode: "observation-range"`. A rejected single item remains unresolved; a rejected grouped item writes nothing and re-emits as a group. `currentValue` is informational and may lie outside the metadata bounds; the bounds constrain the new report.
 
 The host reports the outcome as an `ObservationReport`:
 
@@ -387,7 +445,7 @@ type ObservationReport = {
    */
   status: "resolved" | "unknown" | "needs-user";
   /** The reported value. */
-  value?: PrimitiveValue | ArrayValue;
+  value?: PrimitiveValue | PrimitiveArrayValue;
 };
 ```
 
@@ -415,7 +473,7 @@ type ObservationGroupField = {
   /** Rendered semantic observation question from the cell's `observing`. */
   question: SemanticText;
   /** Current value, if any. */
-  currentValue?: PrimitiveValue | ArrayValue;
+  currentValue?: PrimitiveValue | PrimitiveArrayValue;
   /** Cell type metadata for host-side validation/UI. */
   meta: ObservationValueMeta;
 };
@@ -457,6 +515,12 @@ type HostCallBrief = {
 };
 ```
 
+The runtime resolves the call's `module + target + operation` path through its injected host-module registry. The operation must declare a result, and its rendered arguments must pass the declared parameter specs before the brief is emitted. Static document analysis rejects provably incompatible operands; concrete admission still checks every emitted value, including Enum membership, finite numbers, Artifact paths, recursive arrays, tuples, and `SemanticText`. If argument admission fails, the traversal poisons with `invalid-host-argument` and no invalid call is emitted.
+
+A host-call report first passes transport sanitation. Only top-level `undefined` is admitted; every nested value must satisfy the durable payload-shape rules above, and every number must be finite. A report item containing a non-finite number is rejected as an `invalid-item` with `reasonCode: "host-call-non-finite-number"`; a malformed recursive shape uses `invalid-struct-value`. It then passes concrete admission against the operation's declared result. A mismatch is rejected as an `invalid-item` with `reasonCode: "host-call-result-type"`. Top-level `undefined` is an explicit unset result and is accepted independently of the result spec. Each invalid item is removed from the accepted report subset, valid siblings remain accepted, and the rejected host call reappears under the same id. Negative zero is accepted and subsequently represented as zero.
+
+Artifact interpretation follows the resolved result spec. A `{ path: "x" }` result is admitted only where that spec supplies Artifact authority, including through an array element; the same payload reported for `Str()` is a result mismatch. No payload object shape selects Artifact semantics by itself.
+
 `HostEffectBrief` represents a statement-position host call emitted from a node's `this.effects` body — the runtime does not execute it; the host does, and reports back. An unreported effect keeps its node unfinished and its terminal state unset: the run cannot cover or deflect that node or continue into later nodes, and every subsequent brief re-surfaces the effect under the same id until the host reports it or rejects the frontier with `move: "poison"`. Other briefable work from the same effects body may surface alongside the effect on the same brief; work from later nodes cannot.
 
 Authored host-effect targets may use dot segments or static string-literal bracket segments. The runtime emits the same `module`, `target`, and `operation` shape either way.
@@ -478,7 +542,9 @@ type HostEffectBrief = {
 };
 ```
 
-Each effect statement is emitted once — re-briefs of a still-unreported effect reuse its id, so the host can deduplicate deliveries by id.
+The runtime resolves and admits host-effect arguments through the same operation declaration used for calls. An operation need not declare a result to be used as an effect, and an effect discards any declared result. If any effect argument in one effects batch fails concrete admission, the runtime emits none of that batch. Each admitted effect statement is emitted once — re-briefs of a still-unreported effect reuse its id, so the host can deduplicate deliveries by id. `operation` is always unsigiled; the `$`-sigil before a host effect's operation name in Arc source exists only in the authored Arc spelling.
+
+Every `PayloadValue` emitted in a host-call brief, instruction or observation `hostParams`, or host-effect brief contains only finite numbers, including inside arrays and objects. Negative zero is represented as ordinary zero.
 
 The host reports a handled effect as a `HostEffectReport`:
 
@@ -606,7 +672,7 @@ type DialogCursor = {
 
 `lastTurns` contains Arc-visible `user` and `self` turns only. Hidden reasoning, tool calls, tool results, retries, streaming chunks, and background agent work are not dialog turns unless the host explicitly projects them into visible `user` or `self` turns.
 
-`cursor.user` and `cursor.self` are opaque numeric coordinates for the scoped visible dialog. Their absolute values have no portable meaning. The runtime accepts only non-negative safe integer coordinates.
+`cursor.user` and `cursor.self` are opaque numeric coordinates for the scoped visible dialog. Their absolute values have no portable meaning. The runtime accepts only non-negative JavaScript safe integer coordinates.
 
 `Dialog.view` names the projection this dialog was taken from. The runtime treats it as an opaque identity token and only compares views for equality, so the host chooses both the token and the rule that maps positions to it. What the runtime relies on is that the same projection always carries the same token — for the life of the run and across restarts, since stored cursors keep their stamp. For its default projection the host omits `view`: absence is the canonical spelling of the default view, not a distinct state. When the runtime reads `Dialog.cursor`, it stamps the resulting cursor with the dialog's `view`, and the stamp travels with stored cursor cells through persistence.
 
@@ -625,13 +691,43 @@ If the host windows `lastTurns`, it must still compute `cursor` from the full sc
 
 ### Registration
 
-**`add(source, document)`** — register a document. `source` is the filename stem (e.g. `"heavy-metal"`). The runtime treats `document` as public IR: it snapshots the document, validates the snapshot, then atomically registers each root function as an arc. It throws without changing the runtime on duplicate sources, duplicate arc refs, or validation issues. Mutating the caller's `document` after registration does not change registered runtime behavior.
+Runtime construction accepts the complete host-module declaration environment and has a collecting phase followed by an initialized phase:
+
+```typescript
+type RuntimeOptions = {
+  hostModules?: ReadonlyMap<string, HostModuleSpec>;
+};
+
+const runtime = new Runtime({ hostModules });
+```
+
+`HostModuleSpec` is normalized data. Host developers may construct it with [`hmd.define()`](../docs/host-module-declarations.md) from the `arc/host-utils` entry point. The runtime receives only the normalized registry, validates and privately clones the supplied registry at construction; omitting `hostModules` means an empty definitive registry.
+
+Documents may be added in any Arc import order while collecting. Execution APIs require successful initialization; successful initialization seals the runtime against further additions.
+
+Expected document and registry incoherence is reported through `RuntimeRegistrationError`. The error's `operation` is `"add"` or `"init"`, and its `issues` contains every independently discoverable structured registration issue from that call. Its message includes every issue code and message for ordinary logging; callers that present or classify failures should consume `issues` rather than parse the message. Caller misuse and impossible internal invariants remain ordinary immediate errors.
+
+**`add(source, document)`** — validate, privately snapshot, and collect one document. `source` is the filename stem (e.g. `"heavy-metal"`). Collection does not mutate the caller's object, and later caller mutation does not change runtime behavior.
+
+Document intake uses this exact order:
+
+1. Analyze the raw caller graph before cloning. Only `ELEMENT_ID` issues are provisionally ignored; every other issue rejects the add. Raw graph validation rejects accessors, symbol or non-enumerable fields, sparse or decorated arrays, custom prototypes, cycles, and unsupported values before cloning could erase them.
+2. Clone the accepted graph while preserving numeric values exactly, including the sign of zero.
+3. Stamp canonical element IDs on the private clone, so valid hand-built IR may omit them without mutating the caller's graph.
+4. Analyze the stamped private clone again under the runtime's definitive host-module registry and reject every issue. The runtime retains this analysis's rewalk plan.
+5. Canonicalize negative zero in the private clone only after the second analysis succeeds, then collect every root atomically.
+
+If raw analysis finds issues, `add()` reports all non-`ELEMENT_ID` issues together and does not clone. Environment-free analysis treats a host call without declaration evidence as dynamic; this preserves raw public-IR validation without guessing a host environment. If the stamped private analysis finds issues, it reports all of them together and does not collect. The definitive pass requires every imported host module and action path, exact operation arity, compatible parameter operands, a declared result for value calls, and compatibility between that result and all consumers. The second pass runs only after raw validation succeeds because malformed descriptors, cycles, and other invalid graph shapes cannot safely cross the clone boundary. Duplicate sources, duplicate Arc refs, and validation failures collect nothing from that call. `add()` performs every document-local and host-environment check, but it does not require imported Arc documents to have been added yet.
+
+**`init()`** — resolve and validate the complete prospective registry. Initialization resolves every import and imported node-entry endpoint, then walks imported bindings with the caller's lexical cells, current node signature, and enclosing `$map` receiver/result element specs. Args bindings are checked provider-to-receiver; returns bindings are checked declared-return-to-local-receiver. It collects unresolved imports and every independently checkable undeclared, unresolved, or incompatible binding. A binding dependent on an unresolved import is skipped rather than reported as a cascade. Issues are returned in canonical source/position/binding order, independent of document-add order, and one `RuntimeRegistrationError` reports the complete result.
+
+Initialization commits atomically. A failed `init()` leaves the runtime collecting and retryable, so the caller may add a missing document and call `init()` again. A successful call commits the resolved registry, enables execution, and rejects later `add()` calls. Calling `init()` again on an initialized runtime returns that runtime unchanged.
 
 **`has(arc)`** — check whether an arc is registered.
 
 **`newTraversalSet()`** — create an empty traversal set for a fresh trigger or action session.
 
-**`newTraversal(arc)`** — create a fresh arc traversal in the `"dormant"` phase with `enterCount = 0`.
+**`newTraversal(arc)`** — after initialization, create a fresh arc traversal in the `"dormant"` phase with `enterCount = 0`.
 
 ### Trigger Stage
 
@@ -663,13 +759,17 @@ After all candidate consultations settle, when multiple arcs are matchable and n
 
 ### Action Stage
 
-**`start(traversals, dialog)`** → `ActionBrief`
+**`start(traversals, dialog)`** → `ActionBrief | TerminalBrief`
 
-Begins the action stage. There should be exactly one active traversal in the `"entered"` phase. In most cases, just use the traversal set in the latest `TriggerBrief` once `matched` is set.
+Begins or reconstructs runtime work for an existing action traversal. There must be exactly one root traversal in the `"entered"` phase. In a trigger-driven run, use the traversal set in the latest `TriggerBrief` once `matched` is set. An in-progress direct Arc entry is resumed on a fresh runtime by adding compatible documents, calling `init()`, and then calling `start(savedTraversals, dialog)`; `enterArc` is not called again.
 
-**`progress(brief, report, dialog)`** → `ActionBrief`
+**`enterArc(arc, dialog, options?)`** → `ActionBrief | TerminalBrief`
 
-Accepts an action report and returns the next brief.
+Freshly enters one registered Arc without evaluating its trigger or creating traversals for other Arcs. The entered traversal has `enterCount: 1`, and the runtime executes the Arc's action graph until it yields an `ActionBrief` or stops with a `TerminalBrief`. `options.args` supplies its `args.*` channels by value: supplied keys must be declared and each value must satisfy its `ChannelSpec`; unknown keys and incompatible values throw as caller errors before action execution. Accepted values are deep-cloned and canonicalized, omitted declared args remain unset, and local initializers run after args installation and before the body.
+
+**`progress(brief, report, dialog)`** → `ActionBrief | TerminalBrief`
+
+Accepts an `ActionBrief` and action report, then returns the next action frontier or terminal output. A `TerminalBrief` is never accepted by `progress`.
 
 `dialog` is the current conversation snapshot at the time the host hands control back to Arc. It may be newer than the dialog that produced `brief`, and it must be projected for the current position — a transition brief announces when that position changes.
 
@@ -677,7 +777,7 @@ Accepts an action report and returns the next brief.
 
 When the report is accepted and execution continues normally, `progress(...)` returns the next action frontier for the active root.
 
-When `report.move` is `"poison"`, or when authored execution fails during advancement, `progress(...)` returns a terminal `ActionBrief` with the root traversal in the `"poisoned"` phase.
+When the action root stops, the action-stage call returns `TerminalBrief` with its explicit `root` and `outcome`. Covered roots expose cloned committed root returns according to the rules above. Deflection and poison expose no returns. When `report.move` is `"poison"`, or when authored execution fails during advancement, the terminal outcome is `"poisoned"` and `issues` carries the structured failure.
 
 When report validation fails, `progress(...)` returns an `ActionBrief` with `issues`. For issues with `kind: "invalid-report"`, the runtime rejects the report as a whole, applies no changes, and re-yields the same frontier. For issues with `kind: "invalid-item"`, the runtime applies the valid subset of reported results and re-yields only the rejected work items.
 
@@ -706,10 +806,7 @@ A typical host turn:
    1. Once `brief.matched` is set, proceed to action stage.
 
 3. Action stage (if an arc is active):
-   1. `start(traversals, dialog)` → action brief.
+   1. `start(traversals, dialog)` → `ActionBrief | TerminalBrief`.
    1. Persist `brief.traversals`.
-   1. Inspect instructions and pending work items.
-   1. Host chooses when to hand control back (after 0/1/N conversation rounds).
-   1. Resolve any available judgments/observations/hostCalls/hostEffects, report each instruction actually applied under `instructions[id]`, and call `progress(brief, { move, instructions, judgments, observations, hostCalls, hostEffects }, latestDialog)`. Unresolved or unreported work re-surfaces on later briefs under the same ids. Report `move: "poison"` instead if the host cannot accept the frontier contract or fails a resolution fatally.
-   1. `progress(...)` returns a new action brief.
-   1. Repeat from b as needed until traversal cannot progress.
+   1. While `brief.canProgress`, inspect its instructions and pending work, choose when to hand control back, resolve available items, and call `progress(brief, { move, instructions, judgments, observations, hostCalls, hostEffects }, latestDialog)`. Unresolved or unreported work re-surfaces on later `ActionBrief`s under the same ids. Report `move: "poison"` instead if the host cannot accept the frontier contract or fails a resolution fatally. Persist each returned `brief.traversals`.
+   1. When `canProgress` is false, settle from `brief.root`, `brief.outcome`, `brief.returns`, and `brief.issues`.

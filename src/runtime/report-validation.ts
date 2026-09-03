@@ -1,19 +1,33 @@
+import { admitValue, resolveHostOperation } from "../spec/resolution.js";
 import type {
   ActionPoisonReason,
   ActionReport,
-  ArcRef,
-  ArrayValue,
-  NodeRef,
+  HostCallBrief,
   ObservationBrief,
   ObservationGroupBrief,
   ObservationGroupReport,
   ObservationReport,
-  PrimitiveValue,
-  RuntimeIssue,
   ScalarObservationMeta,
-  SourceRange,
   TriggerReport,
-} from "../types.js";
+} from "../types/host-interaction.js";
+import type { SourceRange } from "../types/parser.js";
+import type { ArcRef, NodeRef, RuntimeIssue } from "../types/runtime.js";
+import type {
+  HostModuleSpec,
+  ObservableCellSpec,
+  ScalarValueSpec,
+} from "../types/spec.js";
+import type {
+  PayloadValue,
+  PrimitiveArrayValue,
+  PrimitiveValue,
+} from "../types/value.js";
+import {
+  clonePayloadValue,
+  cloneWithCanonicalNumbers,
+  firstInvalidPayloadValue,
+  firstNonFiniteNumberPath,
+} from "../value-utils.js";
 
 export type ReportValidation<TReport> = {
   accepted: TReport;
@@ -197,6 +211,93 @@ export function filterObservationReports(
   };
 }
 
+export function filterHostCallResults(provided: Record<string, PayloadValue>): {
+  accepted?: Record<string, PayloadValue>;
+  issues: RuntimeIssue[];
+} {
+  const accepted: Record<string, PayloadValue> = {};
+  const issues: RuntimeIssue[] = [];
+  for (const [id, value] of Object.entries(provided)) {
+    const payloadIssue = firstInvalidPayloadValue(value);
+    if (payloadIssue) {
+      issues.push(
+        buildInvalidItemIssue(
+          id,
+          payloadIssue.code,
+          `Invalid host call result for ${id} at ${payloadIssue.path}: ${payloadIssue.detail}`,
+        ),
+      );
+      continue;
+    }
+    const path = firstNonFiniteNumberPath(value);
+    if (path !== undefined) {
+      issues.push(
+        buildInvalidItemIssue(
+          id,
+          "host-call-non-finite-number",
+          `Invalid host call result for ${id}: non-finite number at ${path}`,
+        ),
+      );
+      continue;
+    }
+    accepted[id] = clonePayloadValue(cloneWithCanonicalNumbers(value));
+  }
+  return {
+    accepted: Object.keys(accepted).length > 0 ? accepted : undefined,
+    issues,
+  };
+}
+
+/** Applies declared result specs to the transport-valid host-call subset. */
+export function admitHostCallResults(
+  calls: readonly HostCallBrief[],
+  values: Readonly<Record<string, PayloadValue>>,
+  modules: ReadonlyMap<string, HostModuleSpec>,
+): {
+  accepted?: Record<string, PayloadValue>;
+  issues: RuntimeIssue[];
+} {
+  const callsById = new Map(calls.map((call) => [call.id, call]));
+  const accepted: Record<string, PayloadValue> = {};
+  const issues: RuntimeIssue[] = [];
+
+  for (const [id, value] of Object.entries(values)) {
+    const call = callsById.get(id);
+    if (!call) continue;
+    const path = [call.module, ...call.target, call.operation].join(".");
+    const resolution = resolveHostOperation(modules, call);
+    if (
+      resolution.kind === "unresolved" ||
+      resolution.operation.returns === undefined
+    ) {
+      throw new Error(
+        `Registered host call ${path} no longer resolves to an operation with a result`,
+      );
+    }
+    if (value === undefined) {
+      accepted[id] = undefined;
+      continue;
+    }
+    const admission = admitValue(resolution.operation.returns, value);
+    if (!admission.admitted) {
+      issues.push(
+        buildInvalidItemIssue(
+          id,
+          "host-call-result-type",
+          `Invalid result for host operation ${path} at ${admission.violation.path}: ${admission.violation.detail}`,
+        ),
+      );
+      continue;
+    }
+    accepted[id] = value;
+  }
+
+  return {
+    accepted: Object.keys(accepted).length > 0 ? accepted : undefined,
+    issues,
+  };
+}
+
 /** Validates one single-observation report entry. */
 function validateSingleReportEntry(
   observation: ObservationBrief,
@@ -247,7 +348,9 @@ function validateSingleReportEntry(
     return {
       report: {
         status: "resolved",
-        value: report.value as PrimitiveValue | ArrayValue,
+        value: cloneWithCanonicalNumbers(
+          report.value as PrimitiveValue | PrimitiveArrayValue,
+        ),
       },
     };
   }
@@ -277,55 +380,143 @@ function observationValueFault(
   meta: ObservationBrief["meta"],
   value: unknown,
 ): { code: string; detail: string } | undefined {
-  if (meta.type === "array") {
-    if (!Array.isArray(value)) {
-      return { code: "observation-type", detail: "expected an array" };
-    }
-    // All-or-nothing: the whole list is rejected on the first bad element, so a
-    // partial write can never land.
-    for (const element of value) {
-      const fault = scalarObservationValueFault(meta.element, element);
-      if (fault) return fault;
+  const metaFault = observationMetaFault(meta);
+  if (metaFault) return metaFault;
+
+  const admission = admitValue(observationSpec(meta), value);
+  if (!admission.admitted) {
+    return observationAdmissionFault(meta, admission.violation.code);
+  }
+
+  if (meta.type !== "array") {
+    return scalarObservationConstraintFault(meta, value);
+  }
+  // All-or-nothing: validate every observation-only element constraint before
+  // the group or scalar observation can write any part of the list.
+  for (const element of value as PrimitiveArrayValue) {
+    const fault = scalarObservationConstraintFault(meta.element, element);
+    if (fault) return fault;
+  }
+  return undefined;
+}
+
+function observationSpec(meta: ObservationBrief["meta"]): ObservableCellSpec {
+  return meta.type === "array"
+    ? { type: "array", element: scalarObservationSpec(meta.element) }
+    : scalarObservationSpec(meta);
+}
+
+function scalarObservationSpec(meta: ScalarObservationMeta): ScalarValueSpec {
+  switch (meta.type) {
+    case "boolean":
+      return { type: "boolean" };
+    case "string":
+      return { type: "string" };
+    case "enum":
+      return { type: "enum", values: meta.values };
+    case "rangedInt":
+    case "number":
+      return { type: "number" };
+  }
+}
+
+function observationMetaFault(
+  meta: ObservationBrief["meta"],
+): { code: string; detail: string } | undefined {
+  return meta.type === "array"
+    ? scalarObservationMetaFault(meta.element)
+    : scalarObservationMetaFault(meta);
+}
+
+function scalarObservationMetaFault(
+  meta: ScalarObservationMeta,
+): { code: string; detail: string } | undefined {
+  if (meta.type === "rangedInt") {
+    if (
+      !Number.isSafeInteger(meta.min) ||
+      !Number.isSafeInteger(meta.max) ||
+      meta.min > meta.max
+    ) {
+      return {
+        code: "observation-type",
+        detail: "invalid integer observation metadata",
+      };
     }
     return undefined;
   }
-  return scalarObservationValueFault(meta, value);
+  if (meta.type === "number") {
+    if (
+      (meta.min !== undefined && !Number.isFinite(meta.min)) ||
+      (meta.max !== undefined && !Number.isFinite(meta.max)) ||
+      (meta.min !== undefined && meta.max !== undefined && meta.min > meta.max)
+    ) {
+      return {
+        code: "observation-type",
+        detail: "invalid numeric observation metadata",
+      };
+    }
+  }
+  return undefined;
 }
 
-/** Checks one scalar reported value against a scalar observation meta. */
-function scalarObservationValueFault(
+function observationAdmissionFault(
+  meta: ObservationBrief["meta"],
+  code: string,
+): { code: string; detail: string } {
+  const scalar = meta.type === "array" ? meta.element : meta;
+  if (code === "invalid-array") {
+    return { code: "observation-type", detail: "expected an array" };
+  }
+  if (code === "invalid-enum") {
+    return {
+      code: "observation-enum",
+      detail: `expected one of ${scalar.type === "enum" ? scalar.values.join(", ") : "the declared variants"}`,
+    };
+  }
+  switch (scalar.type) {
+    case "boolean":
+      return { code: "observation-type", detail: "expected boolean" };
+    case "string":
+      return { code: "observation-type", detail: "expected string" };
+    case "enum":
+      return {
+        code: "observation-enum",
+        detail: `expected one of ${scalar.values.join(", ")}`,
+      };
+    case "rangedInt":
+      return { code: "observation-type", detail: "expected integer" };
+    case "number":
+      return {
+        code: "observation-type",
+        detail: "expected a finite number",
+      };
+  }
+}
+
+/** Applies only the observation-specific constraint after base spec admission. */
+function scalarObservationConstraintFault(
   meta: ScalarObservationMeta,
   value: unknown,
 ): { code: string; detail: string } | undefined {
-  if (meta.type === "boolean") {
-    if (typeof value !== "boolean")
-      return { code: "observation-type", detail: "expected boolean" };
-    return undefined;
-  }
-  if (meta.type === "string") {
-    if (typeof value !== "string")
-      return { code: "observation-type", detail: "expected string" };
-    return undefined;
-  }
   if (meta.type === "rangedInt") {
-    if (!Number.isInteger(value))
+    if (!Number.isSafeInteger(value)) {
       return { code: "observation-type", detail: "expected integer" };
+    }
     const numericValue = value as number;
-    if (
-      (meta.min !== undefined && numericValue < meta.min) ||
-      (meta.max !== undefined && numericValue > meta.max)
-    ) {
+    if (numericValue < meta.min || numericValue > meta.max) {
       return {
         code: "observation-range",
         detail: `${numericValue} is outside ${meta.min}..${meta.max}`,
       };
     }
-    return undefined;
-  }
-  if (typeof value !== "string" || !meta.values?.includes(value)) {
+  } else if (
+    meta.type === "number" &&
+    ((meta.min !== undefined && (value as number) < meta.min) ||
+      (meta.max !== undefined && (value as number) > meta.max))
+  ) {
     return {
-      code: "observation-enum",
-      detail: `expected one of ${meta.values?.join(", ")}`,
+      code: "observation-range",
+      detail: `${value as number} is outside the observation bounds`,
     };
   }
   return undefined;
@@ -432,7 +623,9 @@ function collectGroupFields(
       }
       fields[field.cell] = {
         status: "resolved",
-        value: report.value as PrimitiveValue | ArrayValue,
+        value: cloneWithCanonicalNumbers(
+          report.value as PrimitiveValue | PrimitiveArrayValue,
+        ),
       };
       continue;
     }

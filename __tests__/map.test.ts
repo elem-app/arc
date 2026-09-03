@@ -10,17 +10,20 @@
 import { describe, expect, it } from "vitest";
 
 import { parse } from "../src/parser/index.js";
-import { Runtime } from "../src/runtime/index.js";
-import type { ArcTraversalSet } from "../src/types.js";
+import type { ArcTraversalSet, MapActionState } from "../src/types/index.js";
 import {
+  actionProgress,
   appliedHostEffects,
   appliedInstructions,
   arc,
   EMPTY_DIALOG,
   ownedChild,
   progressBrief,
+  progressTerminal,
   rootTraversal,
+  TestRuntime as Runtime,
   startRun,
+  startTerminal,
   withExperimentalRewalk,
 } from "./helpers.js";
 
@@ -28,16 +31,29 @@ function run(source: string, id: string, experimentalRewalk = false) {
   const document = experimentalRewalk
     ? withExperimentalRewalk(parse(source), "Main")
     : parse(source);
-  const runtime = new Runtime().add(id, document);
+  const runtime = new Runtime().add(id, document).init();
   const seeded = runtime.newTraversal(arc(id, "Main"));
   seeded.phase = "entered";
   return { runtime, brief: startRun(runtime, [seeded], EMPTY_DIALOG) };
 }
 
+function runTerminal(source: string, id: string, experimentalRewalk = false) {
+  const document = experimentalRewalk
+    ? withExperimentalRewalk(parse(source), "Main")
+    : parse(source);
+  const runtime = new Runtime().add(id, document).init();
+  const seeded = runtime.newTraversal(arc(id, "Main"));
+  seeded.phase = "entered";
+  return {
+    runtime,
+    brief: startTerminal(runtime, [seeded], EMPTY_DIALOG),
+  };
+}
+
 describe("Map and Span", () => {
   describe("map.value-transform", () => {
     it("commits the callback output array to results in input order", () => {
-      const { brief } = run(
+      const { brief } = runTerminal(
         `
 "arc";
 function Main() {
@@ -56,12 +72,12 @@ function Main() {
     });
 
     it("binds span.index and builds one ordered output per member", () => {
-      const { brief } = run(
+      const { brief } = runTerminal(
         `
 "arc";
 function Main() {
   let nums = Array(Str());
-  let out = Array(RangedInt(0, 9));
+  let out = Array(Num());
   nums.$set(["a", "b", "c"]);
   nums.$map(() => span.result.$set(span.index), out);
 }
@@ -75,7 +91,7 @@ function Main() {
     });
 
     it("accepts a concise expression-bodied callback", () => {
-      const { brief } = run(
+      const { brief } = runTerminal(
         `
 "arc";
 function Main() {
@@ -92,11 +108,11 @@ function Main() {
     });
 
     it("replaces the receiver in one write when results is the receiver", () => {
-      const { brief } = run(
+      const { brief } = runTerminal(
         `
 "arc";
 function Main() {
-  let xs = Array(RangedInt(0, 9));
+  let xs = Array(Num());
   xs.$set([5, 6]);
   xs.$map(() => span.result.$set(span.index), xs);
 }
@@ -110,7 +126,7 @@ function Main() {
     });
 
     it("retains the last reachable span.result write in a member", () => {
-      const { brief } = run(
+      const { brief } = runTerminal(
         `
 "arc";
 function Main() {
@@ -130,7 +146,7 @@ function Main() {
     });
 
     it("poisons when a member sets no span.result while results is bound", () => {
-      const { brief } = run(
+      const { brief } = runTerminal(
         `
 "arc";
 function Main() {
@@ -155,13 +171,13 @@ function Main() {
       ]);
     });
 
-    it("poisons when a kind-compatible member output violates the results element bounds", () => {
-      const { brief } = run(
+    it("does not apply results observation bounds to member output writes", () => {
+      const { brief } = runTerminal(
         `
 "arc";
 function Main() {
   let nums = Array(Str());
-  let out = Array(RangedInt(0, 2));
+  let out = Array(Num());
   nums.$set(["a", "b", "c", "d"]);
   nums.$map(() => span.result.$set(span.index), out);
 }
@@ -169,21 +185,14 @@ function Main() {
         "map-range-fail-arc",
       );
 
-      // span.index is number-kind (passes the static check) but index 3 is out
-      // of the results bounds, so the single commit poisons at runtime.
-      expect(rootTraversal(brief).phase).toBe("poisoned");
-      expect(brief.issues).toEqual([
-        expect.objectContaining({
-          kind: "poisoned-traversal",
-          reasonCode: "cell-out-of-range",
-        }),
-      ]);
+      expect(rootTraversal(brief).phase).toBe("completed");
+      expect(rootTraversal(brief).cells.out).toEqual([0, 1, 2, 3]);
     });
   });
 
   describe("map.for-each", () => {
     it("runs members for effects and writes no output array when results is omitted", () => {
-      const { brief } = run(
+      const { brief } = runTerminal(
         `
 "arc";
 function Main() {
@@ -248,20 +257,20 @@ function Main() {
       });
       expect(tail.instructions.map((item) => item.text)).toEqual(["done"]);
 
-      const done = progressBrief(runtime, tail, {
+      const done = progressTerminal(runtime, tail, {
         move: "proceed",
         instructions: appliedInstructions(tail),
       });
 
       // The map exposes one live member at a time, and the tail stays behind
       // the map until every member has acknowledged its instruction.
-      expect(done.instructions).toEqual([]);
+      expect("instructions" in done).toBe(false);
     });
   });
 
   describe("map.empty-input", () => {
     it("resolves with an empty output array over an empty input", () => {
-      const { brief } = run(
+      const { brief } = runTerminal(
         `
 "arc";
 function Main() {
@@ -391,7 +400,7 @@ function Main() {
       expect(rootTraversal(brief).cells.out).toEqual(["a"]);
       expect(brief.observations).toHaveLength(1);
 
-      const grown = progressBrief(runtime, brief, {
+      const grown = progressTerminal(runtime, brief, {
         move: "proceed",
         observations: {
           [brief.observations[0]!.id]: { status: "resolved", value: true },
@@ -404,7 +413,7 @@ function Main() {
     });
 
     it("re-walks a member locally on an in-callback read/write dependency and converges", () => {
-      const { brief } = run(
+      const { brief } = runTerminal(
         `
 "arc";
 function Main() {
@@ -433,7 +442,7 @@ function Main() {
     });
 
     it("poisons a non-convergent member", () => {
-      const { brief } = run(
+      const { brief } = runTerminal(
         `
 "arc";
 function Main() {
@@ -461,7 +470,7 @@ function Main() {
 
   describe("map.enter-callback", () => {
     it("binds span.item into a child arg and span.result from a child return sink", () => {
-      const { brief } = run(
+      const { brief } = runTerminal(
         `
 "arc";
 function Main() {
@@ -491,12 +500,12 @@ function Main() {
     });
 
     it("captures span.index by value into an Index() child argument", () => {
-      const { brief } = run(
+      const { brief } = runTerminal(
         `
 "arc";
 function Main() {
   let nums = Array(Str());
-  let out = Array(RangedInt(0, 9));
+  let out = Array(Num());
   nums.$set(["a", "b", "c"]);
   nums.$map(
     () => {
@@ -507,7 +516,7 @@ function Main() {
     },
     out,
   );
-  function Op(args = { idx: Index() }, returns = { output: RangedInt(0, 9) }) {
+  function Op(args = { idx: Index() }, returns = { output: Num() }) {
     this.effects = () => {
       returns.output.$set(args.idx);
     };
@@ -553,7 +562,7 @@ function Main() {
 
       // The member's child briefed on its own observation.
       expect(brief.observations).toHaveLength(1);
-      const resumed = progressBrief(runtime, brief, {
+      const resumed = progressTerminal(runtime, brief, {
         move: "proceed",
         observations: {
           [brief.observations[0]!.id]: { status: "resolved", value: "deep" },
@@ -587,7 +596,7 @@ function Main() {
       expect(brief.observations).toHaveLength(1);
       expect(rootTraversal(brief).cells.out).toBeUndefined();
 
-      const resumed = progressBrief(runtime, brief, {
+      const resumed = progressTerminal(runtime, brief, {
         move: "proceed",
         observations: {
           [brief.observations[0]!.id]: { status: "resolved", value: "done" },
@@ -626,7 +635,7 @@ function Main() {
 
       // Member 0 terminalized and member 1 is now the open frontier.
       expect(afterFirst.observations).toHaveLength(1);
-      const afterSecond = progressBrief(runtime, afterFirst, {
+      const afterSecond = progressTerminal(runtime, afterFirst, {
         move: "proceed",
         observations: {
           [afterFirst.observations[0]!.id]: { status: "resolved", value: "b" },
@@ -686,7 +695,7 @@ function Main() {
       );
 
       expect(brief.observations).toHaveLength(1);
-      const done = progressBrief(runtime, brief, {
+      const done = progressTerminal(runtime, brief, {
         move: "proceed",
         observations: {
           [brief.observations[0]!.id]: { status: "resolved", value: true },
@@ -815,10 +824,10 @@ function Main() {
       const revived = JSON.parse(
         JSON.stringify(afterFirst.traversals),
       ) as ArcTraversalSet;
-      const revivedBrief = runtime.start(revived, EMPTY_DIALOG);
+      const revivedBrief = actionProgress(runtime.start(revived, EMPTY_DIALOG));
       expect(revivedBrief.observations).toHaveLength(1);
 
-      const done = progressBrief(runtime, revivedBrief, {
+      const done = progressTerminal(runtime, revivedBrief, {
         move: "proceed",
         observations: {
           [revivedBrief.observations[0]!.id]: {
@@ -831,6 +840,68 @@ function Main() {
       // Member 0's terminal ("P") survived the round-trip and joined member 1.
       expect(rootTraversal(done).cells.out).toEqual(["P", "Q"]);
     });
+
+    it.each([
+      [
+        "pinned input",
+        (state: MapActionState) => {
+          state.pinnedInput[1] = 1;
+        },
+        /\$map pinned input violates its array guarantee.*string value/i,
+      ],
+      [
+        "terminal result",
+        (state: MapActionState) => {
+          state.terminals[0] = 1;
+        },
+        /\$map terminal\[0\] violates its string guarantee/i,
+      ],
+      [
+        "staged result",
+        (state: MapActionState) => {
+          state.staged = { set: true, value: 1 };
+        },
+        /\$map staged span\.result violates its string guarantee/i,
+      ],
+    ])(
+      "rejects a restored arena with an invalid %s before member replay",
+      (_label, corrupt, message) => {
+        const { runtime, brief } = run(
+          `
+"arc";
+function Main() {
+  let nums = Array(Str());
+  let out = Array(Str());
+  let label = Str();
+  nums.$set(["p", "q"]);
+  nums.$map(() => {
+    $observeOrAsk(label);
+    span.result.$set(label);
+  }, out);
+}
+`,
+          `map-restored-${_label.replace(" ", "-")}-arc`,
+        );
+        const afterFirst = progressBrief(runtime, brief, {
+          move: "proceed",
+          observations: {
+            [brief.observations[0]!.id]: { status: "resolved", value: "P" },
+          },
+        });
+        const revived = JSON.parse(
+          JSON.stringify(afterFirst.traversals),
+        ) as ArcTraversalSet;
+        const mapState = Object.values(revived[0]!.frame.actionStates).find(
+          (state) => state?.kind === "map" && state.map,
+        );
+        if (mapState?.kind !== "map" || !mapState.map) {
+          throw new Error("expected a persisted map arena");
+        }
+        corrupt(mapState.map);
+
+        expect(() => runtime.start(revived, EMPTY_DIALOG)).toThrow(message);
+      },
+    );
 
     it("round-trips span-backed enter links while a member's child is blocked", () => {
       const { runtime, brief } = run(
@@ -866,10 +937,10 @@ function Main() {
       const revived = JSON.parse(
         JSON.stringify(brief.traversals),
       ) as ArcTraversalSet;
-      const revivedBrief = runtime.start(revived, EMPTY_DIALOG);
+      const revivedBrief = actionProgress(runtime.start(revived, EMPTY_DIALOG));
       expect(revivedBrief.observations).toHaveLength(1);
 
-      const done = progressBrief(runtime, revivedBrief, {
+      const done = progressTerminal(runtime, revivedBrief, {
         move: "proceed",
         observations: {
           [revivedBrief.observations[0]!.id]: {
@@ -904,8 +975,8 @@ function Main() {
       const revived = JSON.parse(
         JSON.stringify(brief.traversals),
       ) as ArcTraversalSet;
-      const revivedBrief = runtime.start(revived, EMPTY_DIALOG);
-      const done = progressBrief(runtime, revivedBrief, {
+      const revivedBrief = actionProgress(runtime.start(revived, EMPTY_DIALOG));
+      const done = progressTerminal(runtime, revivedBrief, {
         move: "proceed",
         observations: {
           [revivedBrief.observations[0]!.id]: {
@@ -942,14 +1013,14 @@ function Main() {
       const revived = JSON.parse(
         JSON.stringify(brief.traversals),
       ) as ArcTraversalSet;
-      const revivedBrief = runtime.start(revived, EMPTY_DIALOG);
+      const revivedBrief = actionProgress(runtime.start(revived, EMPTY_DIALOG));
 
       expect(revivedBrief.instructions.map((item) => item.id)).toEqual([
         instructionId,
       ]);
       expect(rootTraversal(revivedBrief).cells.out).toBeUndefined();
 
-      const done = progressBrief(runtime, revivedBrief, {
+      const done = progressTerminal(runtime, revivedBrief, {
         move: "proceed",
         instructions: appliedInstructions(revivedBrief),
       });
@@ -986,7 +1057,7 @@ function Main() {
         ownedChild(rootTraversal(brief), "Main.Worker")?.cells.out,
       ).toEqual(["a"]);
 
-      const reentered = progressBrief(runtime, brief, {
+      const reentered = progressTerminal(runtime, brief, {
         move: "proceed",
         observations: {
           [brief.observations[0]!.id]: { status: "resolved", value: true },
@@ -1191,7 +1262,7 @@ function Main() {
 function Main() {
   let arr = Array(Str());
   let out = Array(Str());
-  let n = RangedInt(0, 9);
+  let n = Num();
   arr.$set(["a"]);
   arr.$map(() => { n.$set(span.item); span.result.$set(span.item); }, out);
 }
@@ -1208,7 +1279,7 @@ function Main() {
 function Main() {
   let arr = Array(Str());
   let out = Array(Str());
-  let nums = Array(RangedInt(0, 9));
+  let nums = Array(Num());
   arr.$set(["a"]);
   nums.$set([0]);
   arr.$map(() => {
@@ -1228,7 +1299,7 @@ function Main() {
 "arc";
 function Main() {
   let arr = Array(Str());
-  let out = Array(RangedInt(0, 5));
+  let out = Array(Num());
   arr.$set(["a"]);
   arr.$map(() => span.result.$set(span.item), out);
 }
@@ -1271,7 +1342,7 @@ function Main() {
     },
     out,
   );
-  function Op(args = { n: RangedInt(0, 9) }, returns = { output: Str() }) {
+  function Op(args = { n: Num() }, returns = { output: Str() }) {
     this.effects = () => {
       returns.output.$set("x");
     };
@@ -1282,13 +1353,13 @@ function Main() {
       ).toThrow(/incompatible/i);
     });
 
-    it("accepts a kind-compatible span.index into a RangedInt results", () => {
-      const { brief } = run(
+    it("accepts a span.index numeric value into numeric results", () => {
+      const { brief } = runTerminal(
         `
 "arc";
 function Main() {
   let arr = Array(Str());
-  let out = Array(RangedInt(0, 9));
+  let out = Array(Num());
   arr.$set(["a", "b"]);
   arr.$map(() => span.result.$set(span.index), out);
 }
@@ -1296,8 +1367,7 @@ function Main() {
         "map-span-index-ranged-arc",
       );
 
-      // span.index (Index) is number-kind, so it writes a RangedInt results cell
-      // without a static complaint.
+      // span.index (Index) is numeric, so it writes a numeric results cell.
       expect(rootTraversal(brief).cells.out).toEqual([0, 1]);
     });
   });
@@ -1357,7 +1427,7 @@ function Main() {
 
       expect(brief.observations).toHaveLength(1);
 
-      const deflected = progressBrief(runtime, brief, { move: "deflect" });
+      const deflected = progressTerminal(runtime, brief, { move: "deflect" });
 
       // No catch: the node deflects and the arc suspends with no output commit.
       expect(rootTraversal(deflected).phase).toBe("suspended");
@@ -1447,7 +1517,7 @@ function Main() {
         },
       });
       expect(m0.observations).toHaveLength(1);
-      const m1 = progressBrief(runtime, m0, {
+      const m1 = progressTerminal(runtime, m0, {
         move: "proceed",
         observations: {
           [m0.observations[0]!.id]: { status: "resolved", value: true },
@@ -1486,7 +1556,9 @@ function Main() {
           [brief.observations[0]!.id]: { status: "resolved", value: "kept" },
         },
       });
-      const deflected = progressBrief(runtime, afterFirst, { move: "deflect" });
+      const deflected = progressTerminal(runtime, afterFirst, {
+        move: "deflect",
+      });
 
       // Abandoning the arena clears its bookkeeping, not member 0's cell write.
       expect(rootTraversal(deflected).cells.witness).toBe("kept");
@@ -1541,8 +1613,8 @@ function Main() {
 
       // Deflect member 1 (which entered nothing): the arena is abandoned, but
       // member 0's applied host effect is neither re-emitted nor rolled back.
-      const deflected = progressBrief(runtime, member1, { move: "deflect" });
-      expect(deflected.hostEffects).toEqual([]);
+      const deflected = progressTerminal(runtime, member1, { move: "deflect" });
+      expect("hostEffects" in deflected).toBe(false);
     });
 
     it("aborts the map when a deflection escapes an entered child", () => {
@@ -1673,7 +1745,7 @@ function Main() {
 
       // Resolving that observation lets Op cover; its return reaches span.result
       // and the $map completes, so the recovered member still contributes.
-      const resolved = progressBrief(runtime, afterDeflect, {
+      const resolved = progressTerminal(runtime, afterDeflect, {
         move: "proceed",
         observations: {
           [afterDeflect.observations[0]!.id]: {

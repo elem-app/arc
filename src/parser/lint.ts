@@ -14,12 +14,12 @@ import type {
   Statement,
   TriggerStatement,
   ValueExpression,
-} from "../types.js";
+} from "../types/parser.js";
 import {
   isArrayCell,
-  isObservableCell,
   isScalarObservableCell,
-} from "../types.js";
+  isValueExpressionCell,
+} from "../types/parser.js";
 
 type LintRule = {
   severity: LintIssue["severity"];
@@ -64,12 +64,12 @@ const LINT_RULES = {
   "read-without-assignment": {
     severity: "error",
     message:
-      "Cell is read but never assigned — by $set(), $observe()/$observeOrAsk(), or an enter returns binding — anywhere it is in scope; with no default value the read is always a dead-cell read. Assign it before it is read, or remove the read.",
+      "Cell is read but never set — by $set(), $observe()/$observeOrAsk(), or an enter returns binding — anywhere it is in scope; the read therefore always reaches an unset cell. Set it before it is read, or remove the read.",
   },
   "read-before-assignment": {
     severity: "notice",
     message:
-      "Cell is read before any assignment — $set(), $observe()/$observeOrAsk(), or an enter returns binding — reaches it on this path; on the first walk the read lands on an unassigned cell. Assign it before the read, or guard the read until it is set.",
+      "Cell is read before $set(), $observe()/$observeOrAsk(), or an enter returns binding sets it on this path; on the first walk the read reaches an unset cell. Set it before the read, or guard the read until it is set.",
   },
 } satisfies Record<string, LintRule>;
 
@@ -125,7 +125,7 @@ export function lintNodeBareCellBooleans(
   for (const cell of node.cells) {
     const observing = isScalarObservableCell(cell)
       ? cell.observing
-      : isArrayCell(cell)
+      : isArrayCell(cell) && cell.element.type !== "artifact"
         ? cell.element.observing
         : undefined;
     if (observing && semanticStringContainsBareCellBoolean(observing)) {
@@ -133,8 +133,8 @@ export function lintNodeBareCellBooleans(
     }
     if (
       cell.type === "artifact" &&
-      typeof cell.path !== "string" &&
-      expressionContainsBareCellBoolean(cell.path, false)
+      cell.initializer !== undefined &&
+      expressionContainsBareCellBoolean(cell.initializer.path, false)
     ) {
       emitLintIssue(lintIssues, "bare-cell-boolean", cell.loc);
     }
@@ -382,7 +382,8 @@ function expressionContainsBareCellBoolean(
 ): boolean {
   if (expression.kind === "cell") return booleanPosition;
   switch (expression.kind) {
-    case "binary":
+    case "comparison":
+    case "arithmetic":
       return (
         expressionContainsBareCellBoolean(expression.left, false) ||
         expressionContainsBareCellBoolean(expression.right, false)
@@ -402,6 +403,8 @@ function expressionContainsBareCellBoolean(
         expressionContainsBareCellBoolean(expression.alternate, booleanPosition)
       );
     case "unary":
+    case "numericUnary":
+    case "numIsFinite":
       return expressionContainsBareCellBoolean(expression.argument, true);
     case "regexTest":
       return expressionContainsBareCellBoolean(expression.target, false);
@@ -416,6 +419,8 @@ function expressionContainsBareCellBoolean(
           part.kind === "expression" &&
           expressionContainsBareCellBoolean(part.expression, false),
       );
+    case "artifact":
+      return expressionContainsBareCellBoolean(expression.path, false);
     case "judge":
       return semanticStringContainsBareCellBoolean(expression.question);
     case "host-call":
@@ -538,7 +543,7 @@ function booleanSetLiteral(expression: ValueExpression): boolean | undefined {
  * is decidable, so a boolean write is judged precisely: it is flagged only when
  * it can invert its own value (`v(true)` can be false while `v(false)` can be
  * true), which lets a settling write such as `x.$set(x && cond)` through while
- * still catching a guarded toggle such as `x.$set(x !== true && cond)`. For any
+ * still catching a guarded toggle such as `x.$set(x != true && cond)`. For any
  * other type the domain is unbounded and convergence is not something we can
  * establish from structure, so every non-identity self-write is flagged — a
  * string that appends to itself or an enum that cycles never settles.
@@ -589,12 +594,8 @@ function evalSelfRange(
       const argument = evalSelfRange(expression.argument, cell, selfValue);
       return { canBeTrue: argument.canBeFalse, canBeFalse: argument.canBeTrue };
     }
-    case "binary": {
-      const equality =
-        expression.op === "===" ||
-        expression.op === "==" ||
-        expression.op === "!==" ||
-        expression.op === "!=";
+    case "comparison": {
+      const equality = expression.op === "==" || expression.op === "!=";
       if (!equality) return SELF_RANGE_UNKNOWN;
       const left = evalSelfRange(expression.left, cell, selfValue);
       const right = evalSelfRange(expression.right, cell, selfValue);
@@ -604,7 +605,7 @@ function evalSelfRange(
       const canDiffer =
         (left.canBeTrue && right.canBeFalse) ||
         (left.canBeFalse && right.canBeTrue);
-      return expression.op === "===" || expression.op === "=="
+      return expression.op === "=="
         ? { canBeTrue: canEqual, canBeFalse: canDiffer }
         : { canBeTrue: canDiffer, canBeFalse: canEqual };
     }
@@ -668,7 +669,8 @@ function collectExpressionReads(
       collectExpressionReads(expression.receiver, into);
       collectExpressionReads(expression.baseline, into);
       return;
-    case "binary":
+    case "comparison":
+    case "arithmetic":
     case "logical":
       collectExpressionReads(expression.left, into);
       collectExpressionReads(expression.right, into);
@@ -679,6 +681,8 @@ function collectExpressionReads(
       collectExpressionReads(expression.alternate, into);
       return;
     case "unary":
+    case "numericUnary":
+    case "numIsFinite":
       collectExpressionReads(expression.argument, into);
       return;
     case "template-string":
@@ -687,6 +691,9 @@ function collectExpressionReads(
           collectExpressionReads(part.expression, into);
         }
       }
+      return;
+    case "artifact":
+      collectExpressionReads(expression.path, into);
       return;
     case "host-call":
       for (const arg of expression.arguments) {
@@ -727,22 +734,22 @@ function collectHostCallArgumentReads(
 
 // ---- Dead-cell read analysis -------------------------------------------
 //
-// With no default values, reading a cell before any action has assigned it
+// With no default values, reading a cell before any action has set it
 // is a dead-cell read (arc-runtime-api). Two static views of that hazard:
-// a whole-arc view (a cell read but never assigned anywhere → warning) and
-// a node-local view (a cell assigned in its node but read before the
-// assignment on some path → notice). Reads come from every position that
+// a whole-arc view (a cell read but never set anywhere → warning) and
+// a node-local view (a cell set in its node but read before that set on some
+// path → notice). Reads come from every position that
 // evaluates a cell: value expressions (conditions, set/return values,
 // channel bindings, host-call arguments) and authored semantic-text
 // interpolations (instruction templates, observe questions, guidance) — a
 // `${var}` rendered into semantic text must read the cell to render it.
 
-/** Visit a cell name used (read or assigned) at a source location. */
+/** Visit a cell name read or written at a source location. */
 type CellUse = (name: string, loc: SourceRange | undefined) => void;
 
 /**
  * Walk every statement list (a node body or a hook body), reporting each
- * value-expression cell read through `onRead` and each cell assignment
+ * value-expression cell read through `onRead` and each cell write
  * (`set`, `observe`, `observeOrAsk`, or an enter `returns` binding) through
  * `onWrite`. An enter `args` binding reads its caller cell.
  */
@@ -893,8 +900,8 @@ function emitChannelUses(
 }
 
 /**
- * Whole-arc view: flag every observable cell that is read somewhere but
- * never assigned anywhere it is in scope. With no defaults such a read can only
+ * Whole-arc view: flag every readable value cell that is read somewhere but
+ * never set anywhere it is in scope. With no defaults such a read can only
  * ever be dead.
  */
 export function lintArcCellReads(root: Node, lintIssues: LintIssue[]): void {
@@ -914,12 +921,13 @@ function collectArcCellUsage(
   firstRead: Map<Cell, SourceRange | undefined>,
   assigned: Set<Cell>,
 ): void {
-  // Only observable cells are tracked; a non-observable shadow hides an
-  // outer observable of the same name from this scope down.
+  // Static setness follows value readability, independently of semantic
+  // observability. A non-readable declaration still shadows an inherited cell.
   const declarations = new Map(inheritedDeclarations);
   for (const cell of node.cells) {
-    if (isObservableCell(cell)) declarations.set(cell.name, cell);
-    else declarations.delete(cell.name);
+    const name = cell.name;
+    if (isValueExpressionCell(cell)) declarations.set(name, cell);
+    else declarations.delete(name);
   }
   const onRead: CellUse = (name, loc) => {
     const cell = declarations.get(name);
@@ -929,6 +937,11 @@ function collectArcCellUsage(
     const cell = declarations.get(name);
     if (cell) assigned.add(cell);
   };
+  for (const cell of node.cells) {
+    if (cell.type !== "artifact" || cell.initializer === undefined) continue;
+    emitExpressionReads(cell.initializer, cell.loc, onRead);
+    onWrite(cell.name, cell.loc);
+  }
   for (const list of [
     node.statements,
     node.trigger,
@@ -944,7 +957,7 @@ function collectArcCellUsage(
   for (const cell of node.cells) {
     const observing = isScalarObservableCell(cell)
       ? cell.observing
-      : isArrayCell(cell)
+      : isArrayCell(cell) && cell.element.type !== "artifact"
         ? cell.element.observing
         : undefined;
     if (observing) {
@@ -958,8 +971,8 @@ function collectArcCellUsage(
 
 /**
  * Node-local view: flag a read of a cell declared in this node that, on
- * some path, precedes every assignment to it. Restricted to cells this node
- * does assign somewhere (a never-assigned read is the whole-arc warning's
+ * some path, precedes every operation that sets it. Restricted to cells this
+ * node does set somewhere (a never-set read is the whole-arc warning's
  * concern), so this is strictly the "read before set" ordering hazard.
  */
 export function lintNodeReadBeforeSet(
@@ -967,7 +980,7 @@ export function lintNodeReadBeforeSet(
   lintIssues: LintIssue[],
 ): void {
   const local = new Set(
-    node.cells.filter(isObservableCell).map((cell) => cell.name),
+    node.cells.filter(isValueExpressionCell).map((cell) => cell.name),
   );
   if (local.size === 0) return;
 
@@ -978,12 +991,17 @@ export function lintNodeReadBeforeSet(
   const ignore: CellUse = () => {};
   collectReadsAndWrites(node.statements, ignore, noteAssignment);
   collectReadsAndWrites(node.trigger ?? [], ignore, noteAssignment);
+  for (const cell of node.cells) {
+    if (cell.type === "artifact" && cell.initializer !== undefined) {
+      qualifying.add(cell.name);
+    }
+  }
   if (qualifying.size === 0) return;
 
   const childrenById = new Map(
     node.children.map((child) => [child.identifier, child]),
   );
-  // Trigger runs before the body, so its definite assignments are already live.
+  // Trigger runs before the body, so cells it definitely sets are already live.
   const assigned = new Set<string>();
   const reported = new Set<string>();
   walkReadBeforeSet(
@@ -994,6 +1012,18 @@ export function lintNodeReadBeforeSet(
     reported,
     undefined,
   );
+  for (const cell of node.cells) {
+    if (cell.type !== "artifact" || cell.initializer === undefined) continue;
+    const reads = new Set<string>();
+    collectExpressionReads(cell.initializer, reads);
+    for (const name of reads) {
+      if (qualifying.has(name) && !assigned.has(name) && !reported.has(name)) {
+        reported.add(name);
+        emitLintIssue(lintIssues, "read-before-assignment", cell.loc);
+      }
+    }
+    assigned.add(cell.name);
+  }
   walkReadBeforeSet(
     node.statements,
     assigned,
@@ -1005,14 +1035,14 @@ export function lintNodeReadBeforeSet(
 }
 
 /**
- * Definite-assignment walk of a statement list. `assigned` is mutated in place
+ * Static-setness walk of a statement list. `assigned` is mutated in place
  * with the cells certainly written once the list completes; branch arms are
- * intersected so a cell assigned in only one arm stays unassigned after. An
+ * intersected so a cell set in only one arm stays potentially unset after. An
  * invoke body shares the enclosing scope, so it is walked inline; a `$map`
  * callback is walked over a copy, since an empty input runs it zero times, and
- * only the map's `results` array counts as assigned after it. When
- * `lintIssues` is undefined the walk only accumulates assignments (used to seed
- * from the trigger stage); otherwise each first read-before-assignment of a
+ * only the map's `results` array counts as set after it. When `lintIssues` is
+ * undefined the walk only accumulates set cells (used to seed from the trigger
+ * stage); otherwise each first read-before-set of a
  * qualifying cell is reported once.
  */
 function walkReadBeforeSet(

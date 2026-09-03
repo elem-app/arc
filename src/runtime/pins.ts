@@ -1,13 +1,16 @@
+import type { ElementId, SegKey } from "../types/parser.js";
 import type {
   BriefId,
-  ElementId,
-  PayloadValue,
   PinEntry,
   PinTape,
-  SegKey,
   Traversal,
-} from "../types.js";
-import { clonePayloadValue } from "./payload.js";
+} from "../types/runtime.js";
+import type { PayloadValue } from "../types/value.js";
+import {
+  clonePayloadValue,
+  cloneWithCanonicalNumbers,
+  firstNonFiniteNumberPath,
+} from "../value-utils.js";
 
 /**
  * The active pin cursor for one statement visit: the SEG's tape, the statement's
@@ -161,6 +164,9 @@ export function completeValuePin(
   reservation: ValuePinReservation,
   value: PayloadValue,
 ): void {
+  if (firstNonFiniteNumberPath(value) !== undefined) {
+    throw new Error("Internal invariant: a completed value pin must be finite");
+  }
   const { scope, entry, start } = reservation;
   entry.resolved = true;
   entry.subtreeSize = Math.max(1, scope.pos - start);
@@ -189,6 +195,9 @@ export function readValuePin(
 
 /** Records one live atomic value as a completed pin entry. */
 export function recordValuePin(holder: PinHolder, value: PayloadValue): void {
+  if (firstNonFiniteNumberPath(value) !== undefined) {
+    throw new Error("Internal invariant: a completed value pin must be finite");
+  }
   const scope = requirePinScope(holder);
   appendEntry(scope, {
     kind: "value",
@@ -275,12 +284,17 @@ export function settleHostCallPin(
     (entry) => (entry.hasValue ? clonePayloadValue(entry.value) : undefined),
     (entry) => {
       if (!reported) return undefined;
+      if (firstNonFiniteNumberPath(reported.value) !== undefined) {
+        throw new Error(
+          "Internal invariant: a host-call pin result must be finite",
+        );
+      }
       entry.resolved = true;
       entry.hasValue = reported.value !== undefined;
       if (reported.value !== undefined) {
-        entry.value = clonePayloadValue(reported.value);
+        entry.value = cloneWithCanonicalNumbers(reported.value);
       }
-      return { value: clonePayloadValue(reported.value) };
+      return { value: cloneWithCanonicalNumbers(reported.value) };
     },
   );
 }

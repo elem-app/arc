@@ -12,9 +12,9 @@ import {
   validateActionReport,
   validateTriggerReport,
 } from "../src/runtime/briefs.js";
-import { Runtime } from "../src/runtime/index.js";
-import { mergeAndClonePayload } from "../src/runtime/payload.js";
+import { createArtifactValue } from "../src/runtime/index.js";
 import {
+  filterHostCallResults,
   runtimeError,
   runtimeErrorReasonCode,
 } from "../src/runtime/report-validation.js";
@@ -26,19 +26,23 @@ import type {
   HostCallBrief,
   HostEffectBrief,
   PayloadValue,
-} from "../src/types.js";
+} from "../src/types/index.js";
+import { mergeAndClonePayload } from "../src/value-utils.js";
 import {
-  EMPTY_DIALOG,
-  METAL_SOURCE,
+  actionProgress,
   appliedHostEffects,
   appliedInstructions,
   arc,
+  EMPTY_DIALOG,
+  METAL_SOURCE,
   node,
   payloadArray,
   payloadObject,
   progressBrief,
+  progressTerminal,
   renderSemanticTextForTest,
   rootTraversal,
+  TestRuntime as Runtime,
   singleObservations,
   startRun,
   startTrigger,
@@ -58,6 +62,7 @@ function Main() {}
       expect(() => runtime.add("registration-arc", document)).toThrow(
         /already registered/,
       );
+      runtime.init();
       expect(() =>
         runtime.newTraversal(arc("registration-arc", "Missing")),
       ).toThrow(/Unknown arc/);
@@ -73,7 +78,7 @@ function First() {
 function Second() {
   $instruct(\`two\`);}
 `);
-      const runtime = new Runtime().add("main-arc", document);
+      const runtime = new Runtime().add("main-arc", document).init();
 
       expect(runtime.has(arc("main-arc", "First"))).toBe(true);
       expect(runtime.has(arc("main-arc", "Second"))).toBe(true);
@@ -86,7 +91,9 @@ function Second() {
 function Main() {
   $instruct(\`hello\`);}
 `);
-      const runtime = new Runtime().add("dormant-enter-count-arc", document);
+      const runtime = new Runtime()
+        .add("dormant-enter-count-arc", document)
+        .init();
       const traversal = runtime.newTraversal(
         arc("dormant-enter-count-arc", "Main"),
       );
@@ -104,9 +111,10 @@ function Main() {
 
   describe("proto.trigger-scope", () => {
     it("scopes trigger calculation to the requested Arc refs", () => {
-      const runtime = new Runtime().add(
-        "scoped",
-        parse(`
+      const runtime = new Runtime()
+        .add(
+          "scoped",
+          parse(`
 "arc";
 
 function First() {
@@ -117,7 +125,8 @@ function Second() {
   this.trigger = () => judge(\`second matches\`);
 }
 `),
-      );
+        )
+        .init();
 
       const brief = startTrigger(runtime, EMPTY_DIALOG, [], {
         arcRefs: [arc("scoped", "Second")],
@@ -159,7 +168,7 @@ function Outside() {
   };
 }
 `);
-      const runtime = new Runtime().add("trigger-scope-arc", document);
+      const runtime = new Runtime().add("trigger-scope-arc", document).init();
       const scopedRef = arc("trigger-scope-arc", "Scoped");
       const outsideNode = node("trigger-scope-arc", "Outside");
 
@@ -193,7 +202,7 @@ function Outside() {
 
 function Main() {}
 `);
-      const runtime = new Runtime().add("start-phase-arc", document);
+      const runtime = new Runtime().add("start-phase-arc", document).init();
       const dormant = runtime.newTraversal(arc("start-phase-arc", "Main"));
 
       expect(() => runtime.start([dormant], EMPTY_DIALOG)).toThrow(
@@ -213,7 +222,7 @@ function Other() {
   $instruct(\`other work\`);
 }
 `);
-      const runtime = new Runtime().add("co-root-arc", document);
+      const runtime = new Runtime().add("co-root-arc", document).init();
       const entered = runtime.newTraversal(arc("co-root-arc", "Main"));
       entered.phase = "entered";
       const dormant = runtime.newTraversal(arc("co-root-arc", "Other"));
@@ -356,7 +365,7 @@ function Main() {
     $instruct(\`second\`);  }
 }
 `);
-      const runtime = new Runtime().add("action-clone-arc", document);
+      const runtime = new Runtime().add("action-clone-arc", document).init();
       const seeded = runtime.newTraversal(arc("action-clone-arc", "Main"));
       seeded.phase = "entered";
 
@@ -384,7 +393,7 @@ function Main() {
   };
   $instruct(\`started\`);}
 `);
-      const runtime = new Runtime().add("trigger-clone-arc", document);
+      const runtime = new Runtime().add("trigger-clone-arc", document).init();
       const seeded = runtime.newTraversal(arc("trigger-clone-arc", "Main"));
       const brief = startTrigger(
         runtime,
@@ -425,7 +434,7 @@ function Main() {
   };
 }
 `);
-      const runtime = new Runtime().add("brief-identity-arc", document);
+      const runtime = new Runtime().add("brief-identity-arc", document).init();
 
       const triggerBrief = startTrigger(runtime, EMPTY_DIALOG);
       const triggerClone = JSON.parse(JSON.stringify(triggerBrief));
@@ -451,7 +460,9 @@ function Main() {
 function Main() {
   $instruct(\`hello\`);}
 `);
-      const runtime = new Runtime().add("instruction-move-arc", document);
+      const runtime = new Runtime()
+        .add("instruction-move-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("instruction-move-arc", "Main"));
       seeded.phase = "entered";
 
@@ -483,7 +494,7 @@ function Main() {
   };
 }
 `);
-      const runtime = new Runtime().add("effect-move-arc", document);
+      const runtime = new Runtime().add("effect-move-arc", document).init();
       const seeded = runtime.newTraversal(arc("effect-move-arc", "Main"));
       seeded.phase = "entered";
 
@@ -506,6 +517,20 @@ function Main() {
   });
 
   describe("proto.report-validation", () => {
+    it("rejects null host-call results at the payload boundary", () => {
+      const result = filterHostCallResults({
+        call: null,
+      } as unknown as Record<string, PayloadValue>);
+
+      expect(result.accepted).toBeUndefined();
+      expect(result.issues).toContainEqual(
+        expect.objectContaining({
+          briefId: "call",
+          reasonCode: "invalid-struct-value",
+        }),
+      );
+    });
+
     it("validates instruction application reports by id, status, and phase", () => {
       const onceDocument = parse(`
 "arc";
@@ -514,10 +539,9 @@ function Main() {
   $instruct(\`A\`);
 }
 `);
-      const onceRuntime = new Runtime().add(
-        "instruction-report-validation-arc",
-        onceDocument,
-      );
+      const onceRuntime = new Runtime()
+        .add("instruction-report-validation-arc", onceDocument)
+        .init();
       const onceSeeded = onceRuntime.newTraversal(
         arc("instruction-report-validation-arc", "Main"),
       );
@@ -560,10 +584,9 @@ function Main() {
   $instructLoop(\`A\`, { resolveWhen: \`is A done\` });
 }
 `);
-      const loopRuntime = new Runtime().add(
-        "instruction-phase-validation-arc",
-        loopDocument,
-      );
+      const loopRuntime = new Runtime()
+        .add("instruction-phase-validation-arc", loopDocument)
+        .init();
       const loopSeeded = loopRuntime.newTraversal(
         arc("instruction-phase-validation-arc", "Main"),
       );
@@ -593,7 +616,7 @@ function Main() {
 
     it("returns invalid-report issues for invalid action reports", () => {
       const document = parse(METAL_SOURCE);
-      const runtime = new Runtime().add("metal-arc", document);
+      const runtime = new Runtime().add("metal-arc", document).init();
       const triggerBrief = startTrigger(runtime, {
         cursor: { user: 0, self: 0 },
         lastTurns: [{ role: "user", message: "music" }],
@@ -615,7 +638,7 @@ function Main() {
       });
 
       expect(() =>
-        progressBrief(runtime, brief, { move: "deflect" as "proceed" }),
+        progressTerminal(runtime, brief, { move: "deflect" as "proceed" }),
       ).not.toThrow();
 
       const brief2 = startRun(runtime, triggerOutcome.traversals, {
@@ -657,10 +680,10 @@ import Dice from "host:rng";
 
 function Main() {
   let lucky = Bool();
-  lucky.$set(Dice.roll(20));
+  lucky.$set(Dice.roll(20) > 10);
   $instruct(\`after\`);}
 `);
-      const runtime = new Runtime().add("action-host-id-arc", document);
+      const runtime = new Runtime().add("action-host-id-arc", document).init();
       const seeded = runtime.newTraversal(arc("action-host-id-arc", "Main"));
       seeded.phase = "entered";
 
@@ -683,7 +706,7 @@ function Main() {
 
     it("returns invalid-report issues for invalid trigger reports", () => {
       const document = parse(METAL_SOURCE);
-      const runtime = new Runtime().add("metal-arc", document);
+      const runtime = new Runtime().add("metal-arc", document).init();
       const triggerBrief = startTrigger(runtime, {
         cursor: { user: 0, self: 0 },
         lastTurns: [{ role: "user", message: "music" }],
@@ -737,10 +760,9 @@ function Main() {
   $instruct(\`B\`);
 }
 `);
-      const runtime = new Runtime().add(
-        "partial-instruction-batch-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("partial-instruction-batch-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("partial-instruction-batch-arc", "Main"),
       );
@@ -774,7 +796,9 @@ function Main() {
   $instruct(\`B\`, { deflectWhen: \`should this instruction deflect\` });
 }
 `);
-      const runtime = new Runtime().add("hook-instruction-batch-arc", document);
+      const runtime = new Runtime()
+        .add("hook-instruction-batch-arc", document)
+        .init();
 
       const partialSeeded = runtime.newTraversal(
         arc("hook-instruction-batch-arc", "Main"),
@@ -822,7 +846,7 @@ function Main() {
   flag.$set(true);
 }
 `);
-      const runtime = new Runtime().add("mid-body-batch-arc", document);
+      const runtime = new Runtime().add("mid-body-batch-arc", document).init();
       const seeded = runtime.newTraversal(arc("mid-body-batch-arc", "Main"));
       seeded.phase = "entered";
       const issued = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -852,7 +876,9 @@ function Main() {
   flag.$set(true);
 }
 `);
-      const runtime = new Runtime().add("mid-body-batch-tail-arc", document);
+      const runtime = new Runtime()
+        .add("mid-body-batch-tail-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("mid-body-batch-tail-arc", "Main"),
       );
@@ -895,7 +921,7 @@ function Main() {
   flag.$set(true);
 }
 `);
-      const runtime = new Runtime().add("mid-owner-batch-arc", document);
+      const runtime = new Runtime().add("mid-owner-batch-arc", document).init();
       const seeded = runtime.newTraversal(arc("mid-owner-batch-arc", "Main"));
       seeded.phase = "entered";
       const issued = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -948,10 +974,9 @@ function Main() {
   });
 }
 `);
-      const runtime = new Runtime().add(
-        "batched-instruction-host-params-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("batched-instruction-host-params-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("batched-instruction-host-params-arc", "Main"),
       );
@@ -986,7 +1011,9 @@ function Main() {
   });
 }
 `);
-      const modeRuntime = new Runtime().add("batch-mode-arc", modeDocument);
+      const modeRuntime = new Runtime()
+        .add("batch-mode-arc", modeDocument)
+        .init();
       const modeSeeded = modeRuntime.newTraversal(
         arc("batch-mode-arc", "Main"),
       );
@@ -1006,7 +1033,9 @@ function Main() {
   $instruct(\`plain text\`);
 }
 `);
-      const hookRuntime = new Runtime().add("batch-hook-arc", hookDocument);
+      const hookRuntime = new Runtime()
+        .add("batch-hook-arc", hookDocument)
+        .init();
       const hookSeeded = hookRuntime.newTraversal(
         arc("batch-hook-arc", "Main"),
       );
@@ -1053,10 +1082,9 @@ function Main() {
         "Main",
       );
 
-      const runtime = new Runtime().add(
-        "enter-instruction-boundary-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("enter-instruction-boundary-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("enter-instruction-boundary-arc", "Main"),
       );
@@ -1111,7 +1139,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("return-batch-boundary-arc", document);
+      const runtime = new Runtime()
+        .add("return-batch-boundary-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("return-batch-boundary-arc", "Main"),
       );
@@ -1153,7 +1183,9 @@ function Main() {
   };
 }
 `);
-      const runtime = new Runtime().add("effects-batch-boundary-arc", document);
+      const runtime = new Runtime()
+        .add("effects-batch-boundary-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("effects-batch-boundary-arc", "Main"),
       );
@@ -1181,6 +1213,100 @@ function Main() {
   });
 
   describe("proto.brief-fields", () => {
+    it("artifact.payload.host-flow applies Artifact context and preserves direct Artifact effect arguments", () => {
+      const runtime = new Runtime()
+        .add(
+          "artifact-host-flow",
+          parse(`
+"arc";
+import Store from "host:store";
+function Main() {
+  let note = Artifact("initial.md");
+  note.$set(Store.lookup());
+  $instruct(\`Use \${note}\`);
+  this.effects = () => {
+    Store.$record(note);
+  };
+}
+`),
+        )
+        .init();
+      const first = actionProgress(
+        runtime.enterArc(arc("artifact-host-flow", "Main"), EMPTY_DIALOG),
+      );
+      const callId = first.hostCalls[0]!.id;
+      const rejected = progressBrief(runtime, first, {
+        move: "proceed",
+        hostCalls: {
+          [callId]: { nested: undefined } as unknown as PayloadValue,
+        },
+      });
+      expect(rejected.issues).toContainEqual(
+        expect.objectContaining({ reasonCode: "invalid-struct-value" }),
+      );
+      expect(rejected.hostCalls[0]?.id).toBe(callId);
+
+      const hostValue = createArtifactValue("host.md");
+      const instruction = progressBrief(runtime, rejected, {
+        move: "proceed",
+        hostCalls: { [callId]: hostValue },
+      });
+      (hostValue as { path: string }).path = "mutated.md";
+      expect(instruction.instructions[0]?.text).toEqual([
+        { kind: "text", value: "Use " },
+        { kind: "artifact", path: "host.md" },
+      ]);
+
+      const effect = progressBrief(runtime, instruction, {
+        move: "proceed",
+        instructions: appliedInstructions(instruction),
+      });
+      expect(effect.hostEffects[0]?.arguments[0]).toEqual(
+        createArtifactValue("host.md"),
+      );
+
+      const structuralRuntime = new Runtime()
+        .add(
+          "artifact-struct-set",
+          parse(`
+"arc";
+import Store from "host:store";
+function Main() {
+  let note = Artifact("initial.md");
+  note.$set(Store.lookup());
+}
+`),
+        )
+        .init();
+      const structuralCall = actionProgress(
+        structuralRuntime.enterArc(
+          arc("artifact-struct-set", "Main"),
+          EMPTY_DIALOG,
+        ),
+      );
+      const structuralRetry = actionProgress(
+        structuralRuntime.progress(
+          structuralCall,
+          {
+            move: "proceed",
+            hostCalls: {
+              [structuralCall.hostCalls[0]!.id]: {
+                kind: "artifact",
+                path: "structural.md",
+              },
+            },
+          },
+          EMPTY_DIALOG,
+        ),
+      );
+      expect(structuralRetry.hostCalls[0]?.id).toBe(
+        structuralCall.hostCalls[0]!.id,
+      );
+      expect(structuralRetry.issues[0]).toMatchObject({
+        reasonCode: "host-call-result-type",
+      });
+    });
+
     it("preserves semantic text parts in host-call briefs and host effects", () => {
       const hostCallDocument = parse(`
 "arc";
@@ -1193,10 +1319,9 @@ function Main() {
   ready.$set(Reader.check(\`Read \${note} for \${user}\`) == true);
 }
 `);
-      const hostCallRuntime = new Runtime().add(
-        "semantic-text-hostcall-arc",
-        hostCallDocument,
-      );
+      const hostCallRuntime = new Runtime()
+        .add("semantic-text-hostcall-arc", hostCallDocument)
+        .init();
       const hostCallTraversal = hostCallRuntime.newTraversal(
         arc("semantic-text-hostcall-arc", "Main"),
       );
@@ -1225,10 +1350,9 @@ function Main() {
   };
 }
 `);
-      const effectRuntime = new Runtime().add(
-        "semantic-text-effect-arc",
-        effectDocument,
-      );
+      const effectRuntime = new Runtime()
+        .add("semantic-text-effect-arc", effectDocument)
+        .init();
       const effectTraversal = effectRuntime.newTraversal(
         arc("semantic-text-effect-arc", "Main"),
       );
@@ -1256,7 +1380,7 @@ function Main() {
   $instruct(\`Ask \${Audience.supervisor} to approve.\`);
 }
 `);
-      const runtime = new Runtime().add("host-var-brief-arc", document);
+      const runtime = new Runtime().add("host-var-brief-arc", document).init();
       const seeded = runtime.newTraversal(arc("host-var-brief-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1281,7 +1405,7 @@ function Main() {
   $observe(ready);
 }
 `);
-      const runtime = new Runtime().add("bool-meta-arc", document);
+      const runtime = new Runtime().add("bool-meta-arc", document).init();
       const seeded = runtime.newTraversal(arc("bool-meta-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1308,7 +1432,9 @@ function Main() {
   });
 }
 `);
-      const runtime = new Runtime().add("instruction-postcheck-arc", document);
+      const runtime = new Runtime()
+        .add("instruction-postcheck-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("instruction-postcheck-arc", "Main"),
       );
@@ -1366,10 +1492,9 @@ function Main() {
   $instruct(\`A\`, { deflectWhen: \`should A deflect\` });
 }
 `);
-      const runtime = new Runtime().add(
-        "instruction-deflection-order-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("instruction-deflection-order-arc", document)
+        .init();
 
       const firstSeeded = runtime.newTraversal(
         arc("instruction-deflection-order-arc", "Main"),
@@ -1387,11 +1512,11 @@ function Main() {
       // re-pose while the application is still awaited.
       expect(stillApply.judgments).toEqual([]);
 
-      const completedTogether = progressBrief(runtime, stillApply, {
+      const completedTogether = progressTerminal(runtime, stillApply, {
         move: "proceed",
         instructions: appliedInstructions(stillApply),
       });
-      expect(completedTogether.instructions).toEqual([]);
+      expect("instructions" in completedTogether).toBe(false);
       expect(rootTraversal(completedTogether).phase).toBe("completed");
 
       const secondSeeded = runtime.newTraversal(
@@ -1399,11 +1524,15 @@ function Main() {
       );
       secondSeeded.phase = "entered";
       const issuedAgain = startRun(runtime, [secondSeeded], EMPTY_DIALOG);
-      const deflectedBeforeApplication = progressBrief(runtime, issuedAgain, {
-        move: "proceed",
-        judgments: { [issuedAgain.judgments[0]!.id]: true },
-      });
-      expect(deflectedBeforeApplication.instructions).toEqual([]);
+      const deflectedBeforeApplication = progressTerminal(
+        runtime,
+        issuedAgain,
+        {
+          move: "proceed",
+          judgments: { [issuedAgain.judgments[0]!.id]: true },
+        },
+      );
+      expect("instructions" in deflectedBeforeApplication).toBe(false);
       expect(rootTraversal(deflectedBeforeApplication).phase).toBe("suspended");
     });
 
@@ -1421,10 +1550,9 @@ function Main() {
   });
 }
 `);
-      const runtime = new Runtime().add(
-        "instruction-hostcall-postcheck-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("instruction-hostcall-postcheck-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("instruction-hostcall-postcheck-arc", "Main"),
       );
@@ -1457,7 +1585,7 @@ function Main() {
   });
   $instruct(\`after\`);}
 `);
-      const runtime = new Runtime().add("persistent-arc", document);
+      const runtime = new Runtime().add("persistent-arc", document).init();
       const seeded = runtime.newTraversal(arc("persistent-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1663,12 +1791,12 @@ function Main() {
 function Main() {
   $instruct(\`hello\`);}
 `);
-      const runtime = new Runtime().add("host-poison-arc", document);
+      const runtime = new Runtime().add("host-poison-arc", document).init();
       const seeded = runtime.newTraversal(arc("host-poison-arc", "Main"));
       seeded.phase = "entered";
 
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
-      const poisoned = progressBrief(runtime, brief, {
+      const poisoned = progressTerminal(runtime, brief, {
         move: "poison",
         poisonReason: {
           reasonCode: "missing-required-host-params",
@@ -1679,8 +1807,8 @@ function Main() {
 
       expect(rootTraversal(poisoned).phase).toBe("poisoned");
       expect(poisoned.canProgress).toBe(false);
-      expect(poisoned.instructions).toEqual([]);
-      expect(poisoned.allowedMoves).toEqual([]);
+      expect("instructions" in poisoned).toBe(false);
+      expect("allowedMoves" in poisoned).toBe(false);
       expect(poisoned.issues).toEqual([
         expect.objectContaining({
           kind: "poisoned-traversal",
@@ -1700,7 +1828,7 @@ function Main() {
   $observeOrAsk(ready);
 }
 `);
-      const runtime = new Runtime().add("poison-default-arc", document);
+      const runtime = new Runtime().add("poison-default-arc", document).init();
       const seeded = runtime.newTraversal(arc("poison-default-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -1744,7 +1872,7 @@ function Good() {
   };
 }
 `);
-      const runtime = new Runtime().add("trigger-poison-arc", document);
+      const runtime = new Runtime().add("trigger-poison-arc", document).init();
       const dialog: Dialog = {
         cursor: { user: 0, self: 0 },
         lastTurns: [{ role: "user", message: "hello" }],
@@ -1808,7 +1936,9 @@ function Main() {
 `),
         "Main",
       );
-      const runtime = new Runtime().add("idempotent-resume-arc", document);
+      const runtime = new Runtime()
+        .add("idempotent-resume-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("idempotent-resume-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1860,7 +1990,9 @@ function Main() {
     $instruct(\`child work\`);  }
 }
 `);
-      const runtime = new Runtime().add("transition-entry-arc", document);
+      const runtime = new Runtime()
+        .add("transition-entry-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("transition-entry-arc", "Main"));
       seeded.phase = "entered";
       return { runtime, seeded };
@@ -1882,7 +2014,7 @@ function Main() {
   }
 }
 `;
-      const first = new Runtime().add("json-resume-arc", parse(source));
+      const first = new Runtime().add("json-resume-arc", parse(source)).init();
       const seeded = first.newTraversal(arc("json-resume-arc", "Main"));
       seeded.phase = "entered";
       const blocked = startRun(first, [seeded], EMPTY_DIALOG);
@@ -1890,7 +2022,7 @@ function Main() {
       expect(blocked.observations).toHaveLength(1);
 
       const restored = JSON.parse(JSON.stringify(blocked.traversals));
-      const second = new Runtime().add("json-resume-arc", parse(source));
+      const second = new Runtime().add("json-resume-arc", parse(source)).init();
       const resumed = startRun(second, restored, EMPTY_DIALOG);
 
       expect(resumed.active).toEqual(node("json-resume-arc", "Main.Child"));
@@ -1930,7 +2062,9 @@ function Main() {
   }
 }
 `;
-      const first = new Runtime().add("array-persist-arc", parse(source));
+      const first = new Runtime()
+        .add("array-persist-arc", parse(source))
+        .init();
       const seeded = first.newTraversal(arc("array-persist-arc", "Main"));
       seeded.phase = "entered";
       const blocked = startRun(first, [seeded], EMPTY_DIALOG);
@@ -1940,7 +2074,9 @@ function Main() {
         rootTraversal({ ...blocked, traversals: restored }).cells.items,
       ).toEqual(["alpha", "beta"]);
 
-      const second = new Runtime().add("array-persist-arc", parse(source));
+      const second = new Runtime()
+        .add("array-persist-arc", parse(source))
+        .init();
       const resumed = startRun(second, restored, EMPTY_DIALOG);
       expect(rootTraversal(resumed).cells.items).toEqual(["alpha", "beta"]);
     });
@@ -1967,10 +2103,9 @@ function Main() {
   $observeOrAsk(ready);
 }
 `;
-        const first = new Runtime().add(
-          "effects-json-resume-arc",
-          parse(source),
-        );
+        const first = new Runtime()
+          .add("effects-json-resume-arc", parse(source))
+          .init();
         const seeded = first.newTraversal(
           arc("effects-json-resume-arc", "Main"),
         );
@@ -1997,10 +2132,9 @@ function Main() {
         expect(effects.hostEffects).toHaveLength(1);
 
         const restored = JSON.parse(JSON.stringify(effects.traversals));
-        const second = new Runtime().add(
-          "effects-json-resume-arc",
-          parse(source),
-        );
+        const second = new Runtime()
+          .add("effects-json-resume-arc", parse(source))
+          .init();
         const resumed = startRun(second, restored, EMPTY_DIALOG);
 
         expect(resumed.hostEffects).toEqual(effects.hostEffects);
@@ -2010,7 +2144,7 @@ function Main() {
           finalizing: { reason: pendingState, phase: "effects" },
         });
 
-        const finished = progressBrief(second, resumed, {
+        const finished = progressTerminal(second, resumed, {
           move: "proceed",
           hostEffects: appliedHostEffects(resumed),
         });
@@ -2048,10 +2182,9 @@ function Main() {
   }
 }
 `;
-      const first = new Runtime().add(
-        "pending-deflection-json-resume-arc",
-        parse(source),
-      );
+      const first = new Runtime()
+        .add("pending-deflection-json-resume-arc", parse(source))
+        .init();
       const seeded = first.newTraversal(
         arc("pending-deflection-json-resume-arc", "Main"),
       );
@@ -2072,10 +2205,9 @@ function Main() {
       ).toBe("intro deflected");
 
       const restored = JSON.parse(JSON.stringify(effects.traversals));
-      const second = new Runtime().add(
-        "pending-deflection-json-resume-arc",
-        parse(source),
-      );
+      const second = new Runtime()
+        .add("pending-deflection-json-resume-arc", parse(source))
+        .init();
       const resumed = startRun(second, restored, EMPTY_DIALOG);
 
       expect(resumed.hostEffects).toEqual(effects.hostEffects);
@@ -2083,7 +2215,7 @@ function Main() {
         rootTraversal(effects).finalizing,
       );
 
-      const finished = progressBrief(second, resumed, {
+      const finished = progressTerminal(second, resumed, {
         move: "proceed",
         hostEffects: appliedHostEffects(resumed),
       });
@@ -2102,7 +2234,7 @@ function Main() {
   $instruct(\`A\`);
 }
 `;
-      const first = new Runtime().add("pending-once-arc", parse(source));
+      const first = new Runtime().add("pending-once-arc", parse(source)).init();
       const seeded = first.newTraversal(arc("pending-once-arc", "Main"));
       seeded.phase = "entered";
       const issued = startRun(first, [seeded], EMPTY_DIALOG);
@@ -2110,7 +2242,9 @@ function Main() {
         { text: "A", mode: "once", phase: "apply" },
       ]);
 
-      const second = new Runtime().add("pending-once-arc", parse(source));
+      const second = new Runtime()
+        .add("pending-once-arc", parse(source))
+        .init();
       const restored = startRun(
         second,
         JSON.parse(JSON.stringify(issued.traversals)) as ArcTraversalSet,
@@ -2128,7 +2262,7 @@ function Main() {
       ]);
       expect(rejected.instructions).toEqual(issued.instructions);
 
-      const third = new Runtime().add("pending-once-arc", parse(source));
+      const third = new Runtime().add("pending-once-arc", parse(source)).init();
       const reissued = startRun(
         third,
         JSON.parse(JSON.stringify(rejected.traversals)) as ArcTraversalSet,
@@ -2136,11 +2270,11 @@ function Main() {
       );
       expect(reissued.instructions).toEqual(issued.instructions);
 
-      const applied = progressBrief(third, reissued, {
+      const applied = progressTerminal(third, reissued, {
         move: "proceed",
         instructions: appliedInstructions(reissued),
       });
-      expect(applied.instructions).toEqual([]);
+      expect("instructions" in applied).toBe(false);
       expect(applied.canProgress).toBe(false);
       expect(rootTraversal(applied).phase).toBe("completed");
     });
@@ -2154,13 +2288,13 @@ function Main() {
   $instruct(\`B\`);
 }
 `);
-      const first = new Runtime().add("pending-batch-arc", document);
+      const first = new Runtime().add("pending-batch-arc", document).init();
       const seeded = first.newTraversal(arc("pending-batch-arc", "Main"));
       seeded.phase = "entered";
       const issued = startRun(first, [seeded], EMPTY_DIALOG);
       expect(issued.instructions.map((item) => item.text)).toEqual(["A", "B"]);
 
-      const second = new Runtime().add("pending-batch-arc", document);
+      const second = new Runtime().add("pending-batch-arc", document).init();
       const restored = startRun(
         second,
         JSON.parse(JSON.stringify(issued.traversals)) as ArcTraversalSet,
@@ -2187,7 +2321,7 @@ function Main() {
   $instruct(\`B\`);
 }
 `);
-      const first = new Runtime().add("n17-arc", document);
+      const first = new Runtime().add("n17-arc", document).init();
       const seeded = first.newTraversal(arc("n17-arc", "Main"));
       seeded.phase = "entered";
       const firstBrief = startRun(first, [seeded], EMPTY_DIALOG);
@@ -2195,7 +2329,7 @@ function Main() {
       expect(firstBrief.instructions[0]?.phase).toBe("apply");
       expect(firstBrief.judgments).toHaveLength(1);
 
-      const resumed = new Runtime().add("n17-arc", document);
+      const resumed = new Runtime().add("n17-arc", document).init();
       const resumedBrief = startRun(
         resumed,
         JSON.parse(JSON.stringify(firstBrief.traversals)) as ArcTraversalSet,
@@ -2217,7 +2351,7 @@ function Main() {
       ]);
       expect(postcheck.judgments).toHaveLength(1);
 
-      const finalRuntime = new Runtime().add("n17-arc", document);
+      const finalRuntime = new Runtime().add("n17-arc", document).init();
       const restoredPostcheck = startRun(
         finalRuntime,
         JSON.parse(JSON.stringify(postcheck.traversals)) as ArcTraversalSet,
@@ -2241,15 +2375,16 @@ function Main() {
 
     it("re-yields the same transition after a JSON round-trip on a fresh runtime", () => {
       const { runtime, seeded } = guardedChildRuntime();
-      const brief = runtime.start([seeded], EMPTY_DIALOG);
+      const brief = actionProgress(runtime.start([seeded], EMPTY_DIALOG));
       expect(brief.transition).toBeDefined();
 
       const revived = JSON.parse(
         JSON.stringify(brief.traversals),
       ) as ArcTraversalSet;
-      const freshRuntime = new Runtime().add(
-        "transition-entry-arc",
-        parse(`
+      const freshRuntime = new Runtime()
+        .add(
+          "transition-entry-arc",
+          parse(`
 "arc";
 
 function Main() {
@@ -2266,14 +2401,15 @@ function Main() {
     $instruct(\`child work\`);  }
 }
 `),
+        )
+        .init();
+      const reyielded = actionProgress(
+        freshRuntime.start(revived, EMPTY_DIALOG),
       );
-      const reyielded = freshRuntime.start(revived, EMPTY_DIALOG);
       expect(reyielded.transition).toEqual(brief.transition);
 
-      const work = freshRuntime.progress(
-        reyielded,
-        { move: "proceed" },
-        GO_DIALOG,
+      const work = actionProgress(
+        freshRuntime.progress(reyielded, { move: "proceed" }, GO_DIALOG),
       );
       expect(work.instructions.map((item) => item.text)).toEqual([
         "child work",

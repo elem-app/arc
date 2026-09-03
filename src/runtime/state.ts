@@ -1,67 +1,80 @@
 import type {
   ActionBrief,
-  ActionState,
-  ActionStateOf,
-  ActionStatement,
-  ArcRef,
-  ArcTraversal,
-  ArcTraversalSet,
-  BriefId,
-  BriefSiteQualifier,
-  CellTarget,
-  CellValue,
-  Dialog,
-  DialogCursor,
-  Document,
-  DocumentRewalkPlan,
-  ElementId,
-  EnterChannelLink,
-  EnterChannelState,
-  HostCallArgument,
   HostCallBrief,
   HostEffectBrief,
   HostEffectReport,
-  HostEffectStatement,
-  InstructionAction,
   InstructionBrief,
   JudgmentBrief,
-  MapActionState,
-  Node,
-  NodeFrame,
-  NodeRef,
-  NodeState,
-  NodeTraversal,
   ObservationBrief,
   ObservationGroupBrief,
   ObservationGroupReport,
   ObservationReport,
   ObservationValueMeta,
+  ScalarObservationMeta,
+  TriggerBrief,
+  TriggerReport,
+} from "../types/host-interaction.js";
+import type {
+  ActionStatement,
+  CellTarget,
+  Document,
+  DocumentRewalkPlan,
+  ElementId,
+  HostCallArgument,
+  HostEffectStatement,
+  InstructionAction,
+  Node,
   ObserveAction,
   ObserveGroupAction,
   ObserveOrAskAction,
   ObserveOrAskGroupAction,
-  PayloadValue,
-  PendingActionExtras,
-  PinTape,
-  PrimitiveValue,
-  RuntimeIssue,
-  ScalarSpec,
-  SegId,
   SegKey,
   SemanticString,
-  SemanticText,
   SetAction,
-  StateSnapshot,
-  TransitionStretch,
-  Traversal,
-  TriggerBrief,
-  TriggerReport,
   TriggerStatement,
   UnsetAction,
   ValueExpression,
-} from "../types.js";
-import { mapMemberSegKey } from "../types.js";
-import { clonePayloadValue, mergeAndClonePayload } from "./payload.js";
+} from "../types/parser.js";
+import type {
+  ActionState,
+  ActionStateOf,
+  ArcRef,
+  ArcTraversal,
+  ArcTraversalSet,
+  BriefId,
+  BriefSiteQualifier,
+  EnterChannelLink,
+  EnterChannelState,
+  MapActionState,
+  NodeFrame,
+  NodeRef,
+  NodeState,
+  NodeTraversal,
+  PendingActionExtras,
+  PinTape,
+  RuntimeIssue,
+  SegId,
+  StateSnapshot,
+  TransitionStretch,
+  Traversal,
+} from "../types/runtime.js";
+import { mapMemberSegKey } from "../types/runtime.js";
+import type { ArrayElementSpec, HostModuleSpec } from "../types/spec.js";
+import type {
+  ArrayElementValue,
+  ArrayValue,
+  CellValue,
+  Dialog,
+  DialogCursor,
+  PayloadValue,
+  SemanticText,
+} from "../types/value.js";
+import {
+  clonePayloadValue,
+  cloneWithCanonicalNumbers,
+  firstNonFiniteNumberPath,
+  mergeAndClonePayload,
+} from "../value-utils.js";
 import {
   clonePinTapes,
   dropAllPinTapes,
@@ -83,6 +96,7 @@ export type RegistryEntry = {
   document: Document;
   root: Node;
   importRefs: Record<string, ArcRef>;
+  hostModules: ReadonlyMap<string, HostModuleSpec>;
   /**
    * Static re-walk plan for this entry's document, computed once at registration.
    * Referenced/imported arcs carry their own entry and therefore their own plan,
@@ -170,7 +184,13 @@ export type Accumulator = {
    * `span.item` / `span.index`. Set by the map driver around each member's
    * callback SEG.
    */
-  mapMember?: { mapId: ElementId; index: number; item: PrimitiveValue };
+  mapMember?: {
+    mapId: ElementId;
+    index: number;
+    item: ArrayElementValue;
+    receiverSpec?: ArrayElementSpec;
+    resultSpec?: ArrayElementSpec;
+  };
   /**
    * The invoke bodies the walk is currently inside, innermost last. Read-set
    * brackets taken inside a body use that invoke's local plan, and the SEG
@@ -286,7 +306,7 @@ export function createEmptyEnterChannelState(): EnterChannelState {
 function createCellSlots(node: Node): Record<string, CellValue | undefined> {
   const cells: Record<string, CellValue | undefined> = {};
   for (const cell of node.cells) {
-    if (cell.type !== "artifact") cells[cell.name] = undefined;
+    cells[cell.name] = undefined;
   }
   return cells;
 }
@@ -458,7 +478,14 @@ function cloneTraversalBase<T extends Traversal>(traversal: T) {
 export function cloneTraversalSet(
   traversals: ArcTraversalSet,
 ): ArcTraversalSet {
-  return traversals.map((traversal) => cloneArcTraversal(traversal));
+  const cloned = traversals.map((traversal) => cloneArcTraversal(traversal));
+  const nonFinitePath = firstNonFiniteNumberPath(cloned);
+  if (nonFinitePath !== undefined) {
+    throw new Error(
+      `Internal invariant: traversal state contains a non-finite number at ${nonFinitePath}`,
+    );
+  }
+  return cloneWithCanonicalNumbers(cloned);
 }
 
 export function cloneDialogCursor(cursor: DialogCursor): DialogCursor {
@@ -473,18 +500,32 @@ export function cloneDialogCursor(cursor: DialogCursor): DialogCursor {
 export function cloneEnterChannelLink(
   link: EnterChannelLink,
 ): EnterChannelLink {
-  return link.kind === "spanValue"
-    ? { kind: "spanValue", value: cloneCellValue(link.value) ?? link.value }
+  return link.kind === "value"
+    ? { kind: "value", value: cloneCellValue(link.value) ?? link.value }
     : { ...link };
 }
 
 function cloneMapActionState(map: MapActionState): MapActionState {
+  const pinnedInput = cloneCellValue(map.pinnedInput) as ArrayValue;
   return {
-    pinnedInput: [...map.pinnedInput],
+    pinnedInput,
     results: map.results,
     nextIndex: map.nextIndex,
-    terminals: [...map.terminals],
-    staged: map.staged ? { ...map.staged } : undefined,
+    terminals: map.terminals.map((value) =>
+      value === undefined
+        ? undefined
+        : (cloneCellValue(value) as ArrayElementValue),
+    ),
+    staged: map.staged
+      ? {
+          set: map.staged.set,
+          ...(map.staged.value === undefined
+            ? {}
+            : {
+                value: cloneCellValue(map.staged.value) as ArrayElementValue,
+              }),
+        }
+      : undefined,
   };
 }
 
@@ -502,54 +543,46 @@ function cloneStagedReturns(
 export function cloneCellValue(
   value: CellValue | undefined,
 ): CellValue | undefined {
-  // Array values clone as arrays. This branch must precede the object⇒cursor
-  // assumption below: an array is an object, but never a dialog cursor.
-  if (Array.isArray(value)) return [...value];
-  if (value && typeof value === "object") return cloneDialogCursor(value);
-  return value;
+  if (value === undefined) return undefined;
+  return clonePayloadValue(value as PayloadValue) as CellValue;
 }
 
-/**
- * Narrows a `CellValue` to a `DialogCursor` by shape. The type guarantees a
- * cursor is the only object-shaped value, but this guards by shape anyway so a
- * malformed value from a durable-store round-trip is rejected rather than read
- * as a cursor with `undefined` fields.
- */
-function isDialogCursor(value: CellValue): value is DialogCursor {
-  return (
-    typeof value === "object" &&
-    !Array.isArray(value) &&
-    typeof value.user === "number" &&
-    typeof value.self === "number" &&
-    (value.view === undefined || typeof value.view === "string")
-  );
-}
-
-/**
- * Value equality for authored cell values. `undefined` equals `undefined`;
- * primitives compare by `===`; two `DialogCursor`s compare structurally by their
- * `user` and `self` cursors; two arrays compare structurally by ordered element
- * value. Any other object pairing — a cursor vs a non-cursor, an array vs a
- * non-array, or an unrecognized shape — is treated as unequal, so a re-walk
- * decision can never under-fire by mistaking distinct values for equal.
- */
+/** Compares authored values by their declared value components. */
 export function cellValuesEqual(
   a: CellValue | undefined,
   b: CellValue | undefined,
 ): boolean {
-  if (a === undefined || b === undefined) return a === b;
+  return payloadValuesEqual(a, b);
+}
+
+function payloadValuesEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
   if (Array.isArray(a) || Array.isArray(b)) {
     if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
       return false;
     }
-    return a.every((element, index) => element === b[index]);
+    return a.every((element, index) => payloadValuesEqual(element, b[index]));
   }
-  if (typeof a === "object" || typeof b === "object") {
-    return isDialogCursor(a) && isDialogCursor(b)
-      ? a.user === b.user && a.self === b.self && a.view === b.view
-      : false;
+  if (
+    a !== null &&
+    b !== null &&
+    typeof a === "object" &&
+    typeof b === "object"
+  ) {
+    const left = a as Record<string, unknown>;
+    const right = b as Record<string, unknown>;
+    const leftKeys = Object.keys(left);
+    const rightKeys = Object.keys(right);
+    return (
+      leftKeys.length === rightKeys.length &&
+      leftKeys.every(
+        (key) =>
+          Object.hasOwn(right, key) &&
+          payloadValuesEqual(left[key], right[key]),
+      )
+    );
   }
-  return a === b;
+  return false;
 }
 
 export function isStopped(traversal: ArcTraversal): boolean {
@@ -675,7 +708,9 @@ function cloneActionState(state: ActionState): ActionState {
 }
 
 /** Clones a scalar shape, copying the member list an `enum` carries. */
-function cloneScalarSpec(spec: ScalarSpec): ScalarSpec {
+function cloneScalarObservationMeta(
+  spec: ScalarObservationMeta,
+): ScalarObservationMeta {
   switch (spec.type) {
     case "boolean":
       return { type: "boolean" };
@@ -685,6 +720,12 @@ function cloneScalarSpec(spec: ScalarSpec): ScalarSpec {
       return { type: "enum", values: [...spec.values] };
     case "rangedInt":
       return { type: "rangedInt", min: spec.min, max: spec.max };
+    case "number":
+      return {
+        type: "number",
+        ...(spec.min !== undefined ? { min: spec.min } : {}),
+        ...(spec.max !== undefined ? { max: spec.max } : {}),
+      };
   }
 }
 
@@ -693,9 +734,12 @@ function cloneObservationValueMeta(
   meta: ObservationValueMeta,
 ): ObservationValueMeta {
   if (meta.type === "array") {
-    return { type: "array", element: cloneScalarSpec(meta.element) };
+    return {
+      type: "array",
+      element: cloneScalarObservationMeta(meta.element),
+    };
   }
-  return cloneScalarSpec(meta);
+  return cloneScalarObservationMeta(meta);
 }
 
 export function cloneObservationBrief(
@@ -923,9 +967,16 @@ export function cloneValueExpression(
           expression.target,
         ) as typeof expression.target,
       };
-    case "binary":
+    case "comparison":
       return {
-        kind: "binary",
+        kind: "comparison",
+        op: expression.op,
+        left: cloneValueExpression(expression.left),
+        right: cloneValueExpression(expression.right),
+      };
+    case "arithmetic":
+      return {
+        kind: "arithmetic",
         op: expression.op,
         left: cloneValueExpression(expression.left),
         right: cloneValueExpression(expression.right),
@@ -950,6 +1001,17 @@ export function cloneValueExpression(
         op: expression.op,
         argument: cloneValueExpression(expression.argument),
       };
+    case "numericUnary":
+      return {
+        kind: "numericUnary",
+        op: expression.op,
+        argument: cloneValueExpression(expression.argument),
+      };
+    case "numIsFinite":
+      return {
+        kind: "numIsFinite",
+        argument: cloneValueExpression(expression.argument),
+      };
     case "template-string":
       return {
         kind: "template-string",
@@ -960,6 +1022,11 @@ export function cloneValueExpression(
             expression: cloneValueExpression(part.expression),
           };
         }),
+      };
+    case "artifact":
+      return {
+        kind: "artifact",
+        path: cloneValueExpression(expression.path),
       };
   }
 }
@@ -1638,9 +1705,16 @@ export function normalizeValueExpression(expression: ValueExpression): unknown {
         flags: expression.flags,
         target: normalizeValueExpression(expression.target),
       };
-    case "binary":
+    case "comparison":
       return {
-        kind: "binary",
+        kind: "comparison",
+        op: expression.op,
+        left: normalizeValueExpression(expression.left),
+        right: normalizeValueExpression(expression.right),
+      };
+    case "arithmetic":
+      return {
+        kind: "arithmetic",
         op: expression.op,
         left: normalizeValueExpression(expression.left),
         right: normalizeValueExpression(expression.right),
@@ -1665,6 +1739,17 @@ export function normalizeValueExpression(expression: ValueExpression): unknown {
         op: expression.op,
         argument: normalizeValueExpression(expression.argument),
       };
+    case "numericUnary":
+      return {
+        kind: "numericUnary",
+        op: expression.op,
+        argument: normalizeValueExpression(expression.argument),
+      };
+    case "numIsFinite":
+      return {
+        kind: "numIsFinite",
+        argument: normalizeValueExpression(expression.argument),
+      };
     case "template-string":
       return {
         kind: "template-string",
@@ -1675,6 +1760,11 @@ export function normalizeValueExpression(expression: ValueExpression): unknown {
             expression: normalizeValueExpression(part.expression),
           };
         }),
+      };
+    case "artifact":
+      return {
+        kind: "artifact",
+        path: normalizeValueExpression(expression.path),
       };
   }
 }

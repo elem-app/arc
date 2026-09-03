@@ -2,26 +2,38 @@ import type * as acorn from "acorn";
 import { parse as acornParse } from "acorn";
 
 import {
-  cellSpecToChannelSpec,
-  channelSpecsCompatible,
-} from "../channel-compat.js";
+  arithmeticRule,
+  artifactPathRule,
+  booleanRule,
+  comparisonRule,
+  interpolationRule,
+  judgeHostArgument,
+  judgeProducerLanding,
+  numIsFiniteRule,
+  type ProducerContext,
+  producerGuaranteesArtifact,
+  resolveHostOperation,
+  resolveProducer,
+  reusableSpecCompatible,
+  stringOperandRule,
+} from "../spec/resolution.js";
+import { validateSpec } from "../spec/validation.js";
 import type {
   ArrayReference,
-  ArtifactPathExpression,
   BreakStatement,
   CatchDeflectionStatement,
   Cell,
-  CellSpec,
   CellTarget,
-  ChannelSpec,
   Document,
   DocumentAnalysis,
+  DocumentAnalysisOptions,
   EffectStatement,
   ElementId,
   EnterChannelBindings,
   EnterTarget,
   GuardStatement,
   HostCallArgument,
+  HostCallExpression,
   HostEffectStatement,
   HostModuleBinding,
   IfStatement,
@@ -33,13 +45,13 @@ import type {
   Node,
   NodeReadSet,
   NodeSignature,
+  NumericObserveAs,
+  ObservableScalar,
   ObserveAction,
   ObserveGroupAction,
   ObserveOrAskAction,
   ObserveOrAskGroupAction,
-  PayloadValue,
   ResolutionStatement,
-  ScalarObservableSpec,
   SegKey,
   SemanticString,
   SetAction,
@@ -52,19 +64,37 @@ import type {
   UnsetAction,
   ValidationIssue,
   ValueExpression,
+  ValueString,
   WriteDiffMode,
-} from "../types.js";
+} from "../types/parser.js";
 import {
-  invokeSegKey,
   isArrayCell,
-  isArtifactCell,
-  isObservableCellSpec,
   isScalarObservableCell,
-  isSettableCellSpec,
   isValueExpressionCell,
-  nodeSegKey,
   UNSTAMPED_ID,
-} from "../types.js";
+} from "../types/parser.js";
+import { invokeSegKey, nodeSegKey } from "../types/runtime.js";
+import type {
+  ArrayElementSpec,
+  ArtifactSpec,
+  CellSpec,
+  ChannelSpec,
+  HostModuleSpec,
+} from "../types/spec.js";
+import {
+  cellSpecToChannelSpec,
+  isObservableCellSpec,
+  isSettableCellSpec,
+} from "../types/spec.js";
+import {
+  classifyArtifactPath,
+  type PayloadValue,
+  type StructValue,
+} from "../types/value.js";
+import {
+  describeArtifactPathIssue,
+  firstInvalidPayloadValue,
+} from "../value-utils.js";
 import {
   containsBriefableExpression,
   type ExpressionParseContext,
@@ -74,6 +104,7 @@ import {
   getMemberTarget,
   getThisProperty,
   locOf,
+  parseArtifactConstructCall,
   parseCellTarget,
   parseExpression,
   parseHostCallArgument,
@@ -91,6 +122,35 @@ import { type EnclosingNode, parseTarget } from "./targets.js";
 
 const HOST_MODULE_SOURCE_PREFIX = "host:";
 
+/** Identifiers whose Arc meaning takes precedence over host-module lookup. */
+const ARC_RESERVED_HOST_ALIAS_NAMES: ReadonlySet<string> = new Set([
+  "$enter",
+  "$enterLoop",
+  "$instruct",
+  "$instructLoop",
+  "$observe",
+  "$observeOrAsk",
+  "Array",
+  "Artifact",
+  "Bool",
+  "Dialog",
+  "Enum",
+  "Index",
+  "Num",
+  "RangedInt",
+  "State",
+  "Str",
+  "args",
+  "forgetful",
+  "invoke",
+  "judge",
+  "newcopy",
+  "returns",
+  "self",
+  "span",
+  "user",
+]);
+
 /**
  * Parses Arc source text into a validated `Document`.
  *
@@ -104,6 +164,7 @@ export function parse(source: string): Document {
     sourceType: "module",
     locations: true,
   }) as acorn.Program;
+  assertFiniteNumericLiterals(program);
 
   if (!hasArcDirective(program.body)) {
     throw new Error('Expected "arc" directive');
@@ -119,6 +180,7 @@ export function parse(source: string): Document {
     for (const specifier of statement.specifiers) {
       if (specifier.type === "ImportDefaultSpecifier") {
         if (isHostModuleImport) {
+          assertHostModuleAliasAvailable(specifier.local.name);
           hostModules.push({
             module: parseHostModuleName(source),
             importedName: "default",
@@ -229,6 +291,37 @@ export function parse(source: string): Document {
   return document;
 }
 
+function assertFiniteNumericLiterals(program: acorn.Program): void {
+  const seen = new WeakSet<object>();
+  const visit = (value: unknown): void => {
+    if (value === null || typeof value !== "object") return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    const node = value as { type?: unknown; value?: unknown };
+    if (
+      node.type === "Literal" &&
+      typeof node.value === "number" &&
+      !Number.isFinite(node.value)
+    ) {
+      const error = new Error("Numeric literal must be finite") as Error & {
+        code: string;
+        loc: SourceRange | undefined;
+      };
+      error.code = "NON_FINITE_NUMBER";
+      error.loc = locOf(value as acorn.Node);
+      throw error;
+    }
+    for (const item of Object.values(value as Record<string, unknown>)) {
+      visit(item);
+    }
+  };
+  visit(program);
+}
+
 /**
  * Validates a parsed `Document` without reparsing source text.
  *
@@ -250,15 +343,40 @@ export function validate(document: Document): ValidationIssue[] {
  *
  * Neither product is stored on the `Document`; the IR stays pure parser output.
  */
-export function analyzeDocument(document: Document): DocumentAnalysis {
+export function analyzeDocument(
+  document: Document,
+  options: DocumentAnalysisOptions = {},
+): DocumentAnalysis {
   const issues: ValidationIssue[] = [];
   const lintIssues: LintIssue[] = [];
   const bySeg = new Map<Node, Map<SegKey, NodeReadSet>>();
-  validateDocumentShape(document, issues);
   activeReadSet = undefined;
   activeInvokeBuilders = [];
   mapContextStack = [];
   activeSegReadSets = undefined;
+  validatePublicDocumentGraph(document, issues);
+  if (issues.length > 0) {
+    return { issues, lintIssues, rewalkPlan: { bySeg } };
+  }
+  validatePublicHostModuleBindings(document, issues);
+  if (issues.length > 0) {
+    return { issues, lintIssues, rewalkPlan: { bySeg } };
+  }
+  if (options.hostModules !== undefined) {
+    validateDeclaredHostModules(document, options.hostModules, issues);
+    if (issues.length > 0) {
+      return { issues, lintIssues, rewalkPlan: { bySeg } };
+    }
+  }
+  validatePublicNumericIr(document, issues);
+  if (issues.length > 0) {
+    return { issues, lintIssues, rewalkPlan: { bySeg } };
+  }
+  validateDocumentSpecs(document, issues);
+  if (issues.length > 0) {
+    return { issues, lintIssues, rewalkPlan: { bySeg } };
+  }
+  validateDocumentShape(document, issues);
   const documentImportNames = new Set(
     document.imports.map((entry) => entry.localName),
   );
@@ -277,9 +395,709 @@ export function analyzeDocument(document: Document): DocumentAnalysis {
         root.children.map((child) => [child.identifier, child]),
       ),
       bySeg,
+      hostModules: options.hostModules,
     });
   }
   return { issues, lintIssues, rewalkPlan: { bySeg } };
+}
+
+/**
+ * Validates the caller-owned IR graph before any clone can erase accessors,
+ * symbols, non-enumerable fields, sparse arrays, custom prototypes, or cycles.
+ * Optional properties may be present with an `undefined` data value.
+ */
+function validatePublicDocumentGraph(
+  document: Document,
+  issues: ValidationIssue[],
+): void {
+  const seen = new WeakSet<object>();
+  const active = new WeakSet<object>();
+
+  const reject = (path: string, detail: string): void => {
+    issues.push({
+      code: "INVALID_PUBLIC_IR",
+      message: `Invalid public IR at ${path}: ${detail}`,
+    });
+  };
+
+  const visit = (value: unknown, path: string): void => {
+    if (
+      value === undefined ||
+      value === null ||
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "boolean"
+    ) {
+      return;
+    }
+    if (typeof value !== "object") {
+      reject(path, `unsupported ${typeof value} value`);
+      return;
+    }
+    if (active.has(value)) {
+      reject(path, "cyclic references are not allowed");
+      return;
+    }
+    if (seen.has(value)) return;
+    seen.add(value);
+    active.add(value);
+
+    let prototype: object | null;
+    let keys: (string | symbol)[];
+    try {
+      prototype = Object.getPrototypeOf(value);
+      keys = Reflect.ownKeys(value);
+    } catch {
+      active.delete(value);
+      reject(path, "object shape could not be inspected");
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      if (prototype !== Array.prototype) {
+        reject(path, "arrays must use the ordinary Array prototype");
+      } else {
+        for (let index = 0; index < value.length; index += 1) {
+          const descriptor = Object.getOwnPropertyDescriptor(
+            value,
+            String(index),
+          );
+          if (
+            !descriptor ||
+            !("value" in descriptor) ||
+            !descriptor.enumerable
+          ) {
+            reject(
+              `${path}[${index}]`,
+              "arrays must contain dense enumerable data elements",
+            );
+            continue;
+          }
+          visit(descriptor.value, `${path}[${index}]`);
+        }
+        for (const key of keys) {
+          if (key === "length") continue;
+          if (
+            typeof key !== "string" ||
+            !Number.isSafeInteger(Number(key)) ||
+            Number(key) < 0 ||
+            String(Number(key)) !== key ||
+            Number(key) >= value.length
+          ) {
+            reject(
+              typeof key === "string"
+                ? `${path}[${JSON.stringify(key)}]`
+                : path,
+              "arrays cannot contain non-element properties",
+            );
+          }
+        }
+      }
+      active.delete(value);
+      return;
+    }
+
+    if (prototype !== Object.prototype && prototype !== null) {
+      reject(path, "objects must use a plain or null prototype");
+      active.delete(value);
+      return;
+    }
+    for (const key of keys) {
+      if (typeof key !== "string") {
+        reject(path, "objects cannot contain symbol keys");
+        continue;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      const fieldPath = `${path}[${JSON.stringify(key)}]`;
+      if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
+        reject(fieldPath, "fields must be enumerable data properties");
+        continue;
+      }
+      if (key === "hostParams") {
+        const payloadIssue = firstInvalidPayloadValue(descriptor.value);
+        if (payloadIssue) {
+          issues.push({
+            code: "INVALID_PAYLOAD_VALUE",
+            message: `Invalid hostParams payload at ${fieldPath}${
+              payloadIssue.path === "$" ? "" : payloadIssue.path.slice(1)
+            }: ${payloadIssue.detail}`,
+          });
+        }
+        continue;
+      }
+      visit(descriptor.value, fieldPath);
+    }
+    active.delete(value);
+  };
+
+  visit(document, "$");
+}
+
+function validateDocumentSpecs(
+  document: Document,
+  issues: ValidationIssue[],
+): void {
+  const visit = (node: Node): void => {
+    for (const cell of node.cells) {
+      const violation = validateSpec(cell);
+      if (violation) {
+        issues.push({
+          code: "INVALID_SPEC",
+          message: `Invalid spec for cell ${cell.name}: ${violation.detail}`,
+          loc: cell.loc,
+        });
+      }
+      validateArtifactArrayElementShape(
+        cell,
+        `cell ${cell.name}`,
+        cell.loc,
+        issues,
+      );
+    }
+    for (const namespace of ["args", "returns"] as const) {
+      for (const [key, spec] of Object.entries(
+        node.signature?.[namespace] ?? {},
+      )) {
+        const violation = validateSpec(spec);
+        if (violation) {
+          issues.push({
+            code: "INVALID_SPEC",
+            message: `Invalid spec for ${namespace}.${key}: ${violation.detail}`,
+          });
+        }
+        validateArtifactArrayElementShape(
+          spec,
+          `${namespace}.${key}`,
+          undefined,
+          issues,
+        );
+      }
+    }
+    node.children.forEach(visit);
+  };
+  document.roots.forEach(visit);
+}
+
+function validateArtifactArrayElementShape(
+  spec: unknown,
+  owner: string,
+  loc: SourceRange | undefined,
+  issues: ValidationIssue[],
+): void {
+  if (!spec || typeof spec !== "object" || Array.isArray(spec)) return;
+  const object = spec as Record<string, unknown>;
+  if (object.type !== "array") return;
+  const element = object.element;
+  if (!element || typeof element !== "object" || Array.isArray(element)) return;
+  const elementObject = element as Record<string, unknown>;
+  if (elementObject.type !== "artifact") return;
+  const unsupported = Object.keys(elementObject).find((key) => key !== "type");
+  if (unsupported === undefined) return;
+  issues.push({
+    code: "INVALID_SPEC",
+    message: `Invalid spec for ${owner}: Artifact array element does not support ${JSON.stringify(unsupported)}`,
+    loc,
+  });
+}
+
+function validatePublicNumericIr(
+  document: Document,
+  issues: ValidationIssue[],
+): void {
+  const numericSeen = new WeakSet<object>();
+  const scanNumbers = (value: unknown, path: string): void => {
+    if (typeof value === "number") {
+      if (!Number.isFinite(value)) {
+        issues.push({
+          code: "NON_FINITE_NUMBER",
+          message: `Document contains a non-finite number at ${path}`,
+        });
+      }
+      return;
+    }
+    if (value === null || typeof value !== "object") return;
+    if (numericSeen.has(value)) return;
+    numericSeen.add(value);
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => scanNumbers(item, `${path}[${index}]`));
+      return;
+    }
+    for (const key of Object.keys(value)) {
+      scanNumbers(
+        (value as Record<string, unknown>)[key],
+        `${path}[${JSON.stringify(key)}]`,
+      );
+    }
+  };
+  scanNumbers(document, "$");
+  if (issues.length > 0) return;
+
+  const seen = new WeakSet<object>();
+  const visit = (value: unknown, path: string): void => {
+    if (typeof value === "number") {
+      return;
+    }
+    if (value === null || typeof value !== "object") return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => visit(item, `${path}[${index}]`));
+      return;
+    }
+    const object = value as Record<string, unknown>;
+    if (object.type === "rangedInt") {
+      issues.push({
+        code: "NON_CANONICAL_NUMERIC_SPEC",
+        message: `Source / IR numeric spec at ${path} must use type "number"; found "rangedInt"`,
+      });
+    }
+    if (object.type === "number" && "observeAs" in object) {
+      validatePublicObserveAs(object.observeAs, `${path}["observeAs"]`, issues);
+    } else if ("observeAs" in object) {
+      issues.push({
+        code: "INVALID_NUMERIC_OBSERVE_AS",
+        message: `Invalid numeric observeAs at ${path}: unsupported field "observeAs"`,
+      });
+    }
+    validatePublicArtifactCellSpec(object, path, issues);
+    validatePublicExpressionObject(object, path, issues);
+    validateLocalConsumerShapes(object, path, issues);
+    for (const key of Object.keys(object)) {
+      // `hostParams` is an opaque PayloadValue boundary. The number-admission
+      // walk above still descends through it, but Source / IR schema and
+      // expression rules must not interpret payload keys such as `type`,
+      // `observeAs`, `kind`, or `op`.
+      if (key === "hostParams") {
+        const payloadIssue = firstInvalidPayloadValue(object[key]);
+        if (payloadIssue) {
+          issues.push({
+            code: "INVALID_PAYLOAD_VALUE",
+            message: `Invalid hostParams payload at ${path}[${JSON.stringify(key)}]${payloadIssue.path === "$" ? "" : payloadIssue.path.slice(1)}: ${payloadIssue.detail}`,
+          });
+        }
+        continue;
+      }
+      visit(object[key], `${path}[${JSON.stringify(key)}]`);
+    }
+  };
+  visit(document, "$");
+  document.roots.forEach((root, index) =>
+    validateNodeChannelObserveAs(root, `$["roots"][${index}]`, issues),
+  );
+}
+
+function validateNodeChannelObserveAs(
+  node: Node,
+  path: string,
+  issues: ValidationIssue[],
+): void {
+  for (const namespace of ["args", "returns"] as const) {
+    for (const [key, spec] of Object.entries(
+      node.signature?.[namespace] ?? {},
+    )) {
+      validateChannelObserveAs(
+        spec,
+        `${path}["signature"][${JSON.stringify(namespace)}][${JSON.stringify(key)}]`,
+        issues,
+      );
+    }
+  }
+  node.children.forEach((child, index) =>
+    validateNodeChannelObserveAs(
+      child,
+      `${path}["children"][${index}]`,
+      issues,
+    ),
+  );
+}
+
+function validateChannelObserveAs(
+  spec: ChannelSpec,
+  path: string,
+  issues: ValidationIssue[],
+): void {
+  if ("observeAs" in (spec as unknown as Record<string, unknown>)) {
+    issues.push({
+      code: "INVALID_NUMERIC_OBSERVE_AS",
+      message: `Invalid numeric observeAs at ${path}: unsupported field "observeAs"`,
+    });
+  }
+  if (spec.type === "array") {
+    validateChannelObserveAs(spec.element, `${path}["element"]`, issues);
+  }
+}
+
+function validatePublicObserveAs(
+  value: unknown,
+  path: string,
+  issues: ValidationIssue[],
+): void {
+  const fail = (detail: string): void => {
+    issues.push({
+      code: "INVALID_NUMERIC_OBSERVE_AS",
+      message: `Invalid numeric observeAs at ${path}: ${detail}`,
+    });
+  };
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    fail("expected an object");
+    return;
+  }
+  const object = value as Record<string, unknown>;
+  for (const key of Object.keys(object)) {
+    if (key !== "kind" && key !== "min" && key !== "max") {
+      fail(`unsupported field ${JSON.stringify(key)}`);
+    }
+  }
+  if (object.kind !== "number" && object.kind !== "integer") {
+    fail('kind must be "number" or "integer"');
+    return;
+  }
+  for (const bound of ["min", "max"] as const) {
+    if (object[bound] !== undefined && typeof object[bound] !== "number") {
+      fail(`${bound} must be a number`);
+    }
+  }
+  const min = typeof object.min === "number" ? object.min : undefined;
+  const max = typeof object.max === "number" ? object.max : undefined;
+  if (min !== undefined && max !== undefined && min > max) {
+    fail("bounds must satisfy min <= max");
+  }
+  if (object.kind === "integer") {
+    if (min !== undefined && !Number.isSafeInteger(min)) {
+      fail("integer min must be a safe integer");
+    }
+    if (max !== undefined && !Number.isSafeInteger(max)) {
+      fail("integer max must be a safe integer");
+    }
+  }
+}
+
+function validatePublicArtifactCellSpec(
+  object: Record<string, unknown>,
+  path: string,
+  issues: ValidationIssue[],
+): void {
+  if (object.type !== "artifact" || typeof object.name !== "string") return;
+  if ("path" in object) {
+    issues.push({
+      code: "INVALID_ARTIFACT_CELL_SPEC",
+      message: `Invalid Artifact cell at ${path}: declaration path expressions belong under "initializer"`,
+    });
+  }
+  if (
+    object.initializer !== undefined &&
+    (!isPublicValueExpression(object.initializer) ||
+      (object.initializer as Record<string, unknown>).kind !== "artifact")
+  ) {
+    issues.push({
+      code: "INVALID_ARTIFACT_CELL_SPEC",
+      message: `Invalid Artifact cell at ${path}: initializer must be omitted or an Artifact constructor expression`,
+    });
+  }
+}
+
+function validatePublicExpressionObject(
+  object: Record<string, unknown>,
+  path: string,
+  issues: ValidationIssue[],
+): void {
+  const requireValue = (field: string): void => {
+    if (!isPublicValueExpression(object[field])) {
+      issues.push({
+        code: "INVALID_EXPRESSION_STRATUM",
+        message: `Expression at ${path}[${JSON.stringify(field)}] is not valid in the value expression stratum`,
+      });
+    }
+  };
+  const requireLocal = (field: string): void => {
+    if (!isPublicLocalExpression(object[field])) {
+      issues.push({
+        code: "INVALID_EXPRESSION_STRATUM",
+        message: `Expression at ${path}[${JSON.stringify(field)}] is not valid in the local expression stratum`,
+      });
+    }
+  };
+  const invalidOperator = (code: string, label: string): void => {
+    issues.push({
+      code,
+      message: `Invalid ${label} operator ${JSON.stringify(object.op)} at ${path}`,
+    });
+  };
+  if (object.kind === "artifact") {
+    if (!isPublicValueExpression(object.path)) {
+      issues.push({
+        code: "INVALID_ARTIFACT_CONSTRUCT_EXPRESSION",
+        message: `Invalid Artifact constructor at ${path}: path must be a value expression`,
+      });
+    } else if (
+      object.path !== null &&
+      typeof object.path === "object" &&
+      !Array.isArray(object.path) &&
+      (object.path as Record<string, unknown>).kind === "literal" &&
+      typeof (object.path as Record<string, unknown>).value === "string"
+    ) {
+      const issue = classifyArtifactPath(
+        (object.path as Record<string, unknown>).value as string,
+      );
+      if (issue !== undefined) {
+        issues.push({
+          code: "INVALID_ARTIFACT_PATH",
+          message: `Invalid Artifact constructor at ${path}["path"]: ${describeArtifactPathIssue(issue)}`,
+        });
+      }
+    }
+  }
+  if (
+    object.kind === "comparison" &&
+    object.op !== "==" &&
+    object.op !== "!=" &&
+    object.op !== ">" &&
+    object.op !== ">=" &&
+    object.op !== "<" &&
+    object.op !== "<="
+  ) {
+    invalidOperator("INVALID_COMPARISON_OPERATOR", "comparison");
+  }
+  if (
+    object.kind === "arithmetic" &&
+    object.op !== "+" &&
+    object.op !== "-" &&
+    object.op !== "*" &&
+    object.op !== "/" &&
+    object.op !== "%"
+  ) {
+    invalidOperator("INVALID_ARITHMETIC_OPERATOR", "arithmetic");
+  }
+  if (object.kind === "arithmetic") {
+    for (const side of ["left", "right"] as const) {
+      requireValue(side);
+    }
+  }
+  if (
+    object.kind === "numericUnary" &&
+    !isPublicValueExpression(object.argument)
+  ) {
+    issues.push({
+      code: "INVALID_EXPRESSION_STRATUM",
+      message: `Expression at ${path}["argument"] is not valid in the value expression stratum`,
+    });
+  }
+  if (object.kind === "logical" && object.op !== "&&" && object.op !== "||") {
+    invalidOperator("INVALID_LOGICAL_OPERATOR", "logical");
+  }
+  if (object.kind === "numericUnary" && object.op !== "-") {
+    invalidOperator("INVALID_NUMERIC_UNARY_OPERATOR", "numeric unary");
+  }
+  if (object.kind === "unary" && object.op !== "!") {
+    invalidOperator("INVALID_LOGICAL_UNARY_OPERATOR", "logical unary");
+  }
+  if (object.kind === "comparison" || object.kind === "logical") {
+    requireValue("left");
+    requireValue("right");
+  }
+  if (object.kind === "conditional") {
+    requireValue("test");
+    requireValue("consequent");
+    requireValue("alternate");
+  }
+  if (object.kind === "if") requireValue("test");
+  if (object.kind === "set" || object.kind === "set-return") {
+    requireValue("value");
+  }
+  if (
+    object.kind === "return" &&
+    object.value !== undefined &&
+    object.value !== null
+  ) {
+    requireValue("value");
+  }
+  if (object.kind === "value") requireValue("value");
+  if (object.kind === "unary") requireValue("argument");
+  if (object.kind === "regexTest") requireLocal("target");
+  if (object.kind === "dialogTurnsSince") {
+    requireLocal("receiver");
+    requireLocal("baseline");
+  }
+  if (object.kind === "arrayLiteral") {
+    if (!Array.isArray(object.elements)) {
+      issues.push({
+        code: "INVALID_EXPRESSION_STRATUM",
+        message: `Expression at ${path}["elements"] is not valid in the value expression stratum`,
+      });
+    } else {
+      object.elements.forEach((element, index) => {
+        if (!isPublicValueExpression(element)) {
+          issues.push({
+            code: "INVALID_EXPRESSION_STRATUM",
+            message: `Expression at ${path}["elements"][${index}] is not valid in the value expression stratum`,
+          });
+        }
+      });
+    }
+  }
+  if (object.kind === "numIsFinite") {
+    if (!("argument" in object)) {
+      issues.push({
+        code: "INVALID_NUM_IS_FINITE_EXPRESSION",
+        message: `Invalid Num.isFinite expression at ${path}: expected one value-expression argument`,
+      });
+    } else if (!isPublicValueExpression(object.argument)) {
+      issues.push({
+        code: "INVALID_EXPRESSION_STRATUM",
+        message: `Expression at ${path}["argument"] is not valid in the value expression stratum`,
+      });
+    }
+  }
+  if (
+    object.kind === "scope" &&
+    object.name === "lastTurns" &&
+    object.count !== undefined &&
+    (typeof object.count !== "number" ||
+      !Number.isSafeInteger(object.count) ||
+      object.count < 0)
+  ) {
+    issues.push({
+      code: "INVALID_DIALOG_LAST_TURNS_COUNT",
+      message: `Dialog.lastTurns count at ${path}["count"] must be a non-negative safe integer`,
+    });
+  }
+}
+
+function validateLocalConsumerShapes(
+  object: Record<string, unknown>,
+  path: string,
+  issues: ValidationIssue[],
+): void {
+  const check = (value: unknown, valuePath: string): void => {
+    if (!isPublicLocalExpression(value)) {
+      issues.push({
+        code: "INVALID_EXPRESSION_STRATUM",
+        message: `Expression at ${valuePath} is not valid in the local expression stratum`,
+      });
+    }
+  };
+  if (object.kind === "arrayElementRead") {
+    check(object.index, `${path}["index"]`);
+  }
+  if (
+    (object.kind === "set" ||
+      object.kind === "unset" ||
+      object.kind === "observe" ||
+      object.kind === "observeOrAsk") &&
+    Array.isArray(object.target)
+  ) {
+    object.target
+      .slice(1)
+      .forEach((item, index) => check(item, `${path}["target"][${index + 1}]`));
+  }
+  if (
+    (object.kind === "observeGroup" || object.kind === "observeOrAskGroup") &&
+    Array.isArray(object.targets)
+  ) {
+    object.targets.forEach((target, targetIndex) => {
+      if (!Array.isArray(target)) return;
+      target
+        .slice(1)
+        .forEach((item, index) =>
+          check(item, `${path}["targets"][${targetIndex}][${index + 1}]`),
+        );
+    });
+  }
+}
+
+function isPublicLocalExpression(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const expression = value as Record<string, unknown>;
+  if (expression.kind === "arithmetic") {
+    return (
+      isPublicLocalExpression(expression.left) &&
+      isPublicLocalExpression(expression.right)
+    );
+  }
+  if (expression.kind === "numericUnary") {
+    return isPublicLocalExpression(expression.argument);
+  }
+  return (
+    expression.kind === "literal" ||
+    expression.kind === "cell" ||
+    expression.kind === "isUnset" ||
+    expression.kind === "channel" ||
+    expression.kind === "channelIsUnset" ||
+    expression.kind === "arrayElementRead" ||
+    expression.kind === "arrayLength" ||
+    expression.kind === "span" ||
+    expression.kind === "deflectionEscaped" ||
+    expression.kind === "dialogCursor" ||
+    expression.kind === "dialogTurnsSince" ||
+    expression.kind === "scope" ||
+    expression.kind === "enterCount" ||
+    expression.kind === "pendingState" ||
+    expression.kind === "nodeState"
+  );
+}
+
+function isPublicValueExpression(value: unknown): boolean {
+  if (isPublicLocalExpression(value)) return true;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const expression = value as Record<string, unknown>;
+  if (expression.kind === "arithmetic") {
+    return (
+      isPublicValueExpression(expression.left) &&
+      isPublicValueExpression(expression.right)
+    );
+  }
+  if (expression.kind === "numericUnary") {
+    return isPublicValueExpression(expression.argument);
+  }
+  if (expression.kind === "template-string") {
+    return isPublicValueString(expression);
+  }
+  if (expression.kind === "artifact") {
+    return isPublicValueExpression(expression.path);
+  }
+  return (
+    expression.kind === "judge" ||
+    expression.kind === "host-call" ||
+    expression.kind === "arrayLiteral" ||
+    expression.kind === "regexTest" ||
+    expression.kind === "comparison" ||
+    expression.kind === "logical" ||
+    expression.kind === "conditional" ||
+    expression.kind === "unary" ||
+    expression.kind === "numIsFinite"
+  );
+}
+
+/** Validates an untrusted public value-template shape before typed walkers use it. */
+function isPublicValueString(value: unknown): value is ValueString {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const expression = value as Record<string, unknown>;
+  if (
+    expression.kind !== "template-string" ||
+    !Array.isArray(expression.parts)
+  ) {
+    return false;
+  }
+  return expression.parts.every((valuePart) => {
+    if (
+      valuePart === null ||
+      typeof valuePart !== "object" ||
+      Array.isArray(valuePart)
+    ) {
+      return false;
+    }
+    const part = valuePart as Record<string, unknown>;
+    if (part.kind === "text") return typeof part.value === "string";
+    return (
+      part.kind === "expression" && isPublicValueExpression(part.expression)
+    );
+  });
 }
 
 /**
@@ -311,8 +1129,8 @@ let activeInvokeBuilders: ReadSetBuilder[] = [];
  * type `span.item` and `span.result`.
  */
 type MapValidationContext = {
-  receiverSpec?: ChannelSpec;
-  resultsSpec?: ChannelSpec;
+  receiverSpec?: ArrayElementSpec;
+  resultsSpec?: ArrayElementSpec;
 };
 let mapContextStack: MapValidationContext[] = [];
 
@@ -364,6 +1182,43 @@ function parseHostModuleName(source: string): string {
     throw new Error("Host module import source must include a module name");
   }
   return module;
+}
+
+function assertHostModuleAliasAvailable(localName: string): void {
+  if (ARC_RESERVED_HOST_ALIAS_NAMES.has(localName)) {
+    throw new Error(
+      `Host module alias ${JSON.stringify(localName)} is reserved by Arc`,
+    );
+  }
+}
+
+function validatePublicHostModuleBindings(
+  document: Document,
+  issues: ValidationIssue[],
+): void {
+  for (const binding of document.hostModules) {
+    if (!ARC_RESERVED_HOST_ALIAS_NAMES.has(binding.localName)) continue;
+    issues.push({
+      code: "RESERVED_HOST_MODULE_ALIAS",
+      message: `Host module alias ${JSON.stringify(binding.localName)} is reserved by Arc`,
+      loc: binding.loc,
+    });
+  }
+}
+
+function validateDeclaredHostModules(
+  document: Document,
+  hostModules: ReadonlyMap<string, HostModuleSpec>,
+  issues: ValidationIssue[],
+): void {
+  for (const binding of document.hostModules) {
+    if (hostModules.has(binding.module)) continue;
+    issues.push({
+      code: "HOST_MODULE_UNDECLARED",
+      message: `Host module ${JSON.stringify(binding.module)} has no injected declaration`,
+      loc: binding.loc,
+    });
+  }
 }
 
 function parseNode(
@@ -582,9 +1437,7 @@ function parseNode(
   ]);
   const nextVisibleCellNames = new Set([
     ...visibleCellNames,
-    ...cells
-      .filter((entry) => entry.type !== "artifact")
-      .map((entry) => entry.name),
+    ...cells.map((entry) => entry.name),
   ]);
   const enclosing: EnclosingNode = {
     identifier: fn.id.name,
@@ -733,7 +1586,8 @@ function parseChannelSchema(
 
 /**
  * Parses one channel spec constructor: `Bool()`, `Str()`, `Enum([...])`,
- * `RangedInt(min, max)`, `Dialog.Cursor()`, `Index()`, or `Array(elementSpec)`.
+ * `Num()`, `Artifact()`, `Dialog.Cursor()`, `Index()`, or
+ * `Array(elementSpec)`.
  * Observation configuration is not part of channel compatibility, so a config
  * argument is rejected. Nested arrays are rejected as they are for cells.
  */
@@ -766,6 +1620,12 @@ function parseChannelSpec(
     throw new Error(`${owner} must be a channel spec constructor`);
   }
   const name = callee.name;
+  if (name === "Artifact") {
+    if (expression.arguments.length !== 0) {
+      throw new Error(`${owner} Artifact() channel spec takes no arguments`);
+    }
+    return { type: "artifact" };
+  }
   if (name === "Index") {
     if (expression.arguments.length !== 0) {
       throw new Error(`${owner} Index() takes no arguments`);
@@ -783,6 +1643,12 @@ function parseChannelSpec(
       throw new Error(`${owner} Str() channel spec takes no configuration`);
     }
     return { type: "string" };
+  }
+  if (name === "Num") {
+    if (expression.arguments.length !== 0) {
+      throw new Error(`${owner} Num() channel spec takes no configuration`);
+    }
+    return { type: "number" };
   }
   if (name === "Enum") {
     const arg = expression.arguments[0];
@@ -808,22 +1674,9 @@ function parseChannelSpec(
     return { type: "enum", values };
   }
   if (name === "RangedInt") {
-    const minArg = expression.arguments[0];
-    const maxArg = expression.arguments[1];
-    if (
-      expression.arguments.length !== 2 ||
-      !minArg ||
-      !maxArg ||
-      minArg.type !== "Literal" ||
-      maxArg.type !== "Literal" ||
-      typeof minArg.value !== "number" ||
-      typeof maxArg.value !== "number"
-    ) {
-      throw new Error(
-        `${owner} RangedInt() channel spec requires numeric min/max literals`,
-      );
-    }
-    return { type: "rangedInt", min: minArg.value, max: maxArg.value };
+    throw new Error(
+      `${owner} RangedInt() is observation shorthand and cannot declare a channel; use Num()`,
+    );
   }
   if (name === "Array") {
     const arg = expression.arguments[0];
@@ -841,7 +1694,9 @@ function parseChannelSpec(
       throw new Error(`${owner} Array() channel spec cannot nest arrays`);
     }
     if (element.type === "index" || element.type === "dialogCursor") {
-      throw new Error(`${owner} Array() element must be a scalar channel type`);
+      throw new Error(
+        `${owner} Array() element must be a scalar or Artifact channel type`,
+      );
     }
     return { type: "array", element };
   }
@@ -1098,7 +1953,8 @@ function applyExpressionIds(
     case "regexTest":
       applyExpressionIds(expression.target, nextExpressionId, verify);
       return;
-    case "binary":
+    case "comparison":
+    case "arithmetic":
     case "logical":
       applyExpressionIds(expression.left, nextExpressionId, verify);
       applyExpressionIds(expression.right, nextExpressionId, verify);
@@ -1109,6 +1965,8 @@ function applyExpressionIds(
       applyExpressionIds(expression.alternate, nextExpressionId, verify);
       return;
     case "unary":
+    case "numericUnary":
+    case "numIsFinite":
       applyExpressionIds(expression.argument, nextExpressionId, verify);
       return;
     case "template-string":
@@ -1117,6 +1975,9 @@ function applyExpressionIds(
           applyExpressionIds(part.expression, nextExpressionId, verify);
         }
       }
+      return;
+    case "artifact":
+      applyExpressionIds(expression.path, nextExpressionId, verify);
       return;
     case "arrayElementRead":
       applyExpressionIds(expression.index, nextExpressionId, verify);
@@ -1226,18 +2087,29 @@ function parseCellDeclarations(
     if (callee.type !== "Identifier") continue;
 
     if (callee.name === "Artifact") {
-      if (declaration.init.arguments.length !== 1) {
-        throw new Error(`Artifact ${id.name} requires one path argument`);
+      if (declaration.init.arguments.length === 0) {
+        cells.push({
+          name: id.name,
+          type: "artifact",
+          loc: locOf(id),
+        });
+        continue;
       }
-      const path = parseArtifactPathArgument(
-        id.name,
-        declaration.init.arguments[0],
+      const initializer = parseArtifactConstructCall(
+        declaration.init,
+        `Artifact ${id.name}`,
         availableHostModules,
+        true,
       );
+      if (containsBriefableExpression(initializer)) {
+        throw new Error(
+          `Artifact ${id.name} path cannot contain judge() or host call expressions`,
+        );
+      }
       cells.push({
         name: id.name,
         type: "artifact",
-        path,
+        initializer,
         loc: locOf(id),
       });
       continue;
@@ -1255,12 +2127,21 @@ function parseCellDeclarations(
         declaration.init.arguments,
         availableHostModules,
       );
-      cells.push({
-        name: id.name,
-        type: "array",
-        element,
-        loc: locOf(id),
-      });
+      if (element.type === "artifact") {
+        cells.push({
+          name: id.name,
+          type: "array",
+          element: { type: "artifact" },
+          loc: locOf(id),
+        });
+      } else {
+        cells.push({
+          name: id.name,
+          type: "array",
+          element,
+          loc: locOf(id),
+        });
+      }
       continue;
     }
 
@@ -1279,7 +2160,8 @@ function parseCellDeclarations(
 
 /**
  * Recognizes an inline scalar cell constructor — `Enum([...], config?)`,
- * `Bool(config?)`, `Str(config?)`, or `RangedInt(min, max, config?)` — and
+ * `Bool(config?)`, `Str(config?)`, `Num(config?)`, or
+ * `RangedInt(min, max, config?)` — and
  * returns its element spec. Returns `undefined` when the callee is not a scalar
  * constructor. Shared by top-level scalar cell declarations, array element
  * declarations, and (in Phase 2) typed channel specs; `owner` names the owning
@@ -1289,7 +2171,7 @@ function parseScalarConstructorSpec(
   call: acorn.CallExpression,
   owner: string,
   availableHostModules: ReadonlyMap<string, string>,
-): ScalarObservableSpec | undefined {
+): ObservableScalar | undefined {
   if (call.callee.type !== "Identifier") return undefined;
   const name = call.callee.name;
 
@@ -1341,7 +2223,25 @@ function parseScalarConstructorSpec(
     return { type: "string", ...config };
   }
 
+  if (name === "Num") {
+    const config = parseNumericCellConfig(
+      owner,
+      name,
+      call.arguments[0],
+      availableHostModules,
+    );
+    if (call.arguments.length > 1) {
+      throw new Error(`Num cell ${owner} accepts at most one config argument`);
+    }
+    return { type: "number", ...config };
+  }
+
   if (name === "RangedInt") {
+    if (call.arguments.length > 3) {
+      throw new Error(
+        `RangedInt cell ${owner} accepts min, max, and an optional config argument`,
+      );
+    }
     const minArg = call.arguments[0];
     const maxArg = call.arguments[1];
     const config = parseCellConfig(
@@ -1350,24 +2250,21 @@ function parseScalarConstructorSpec(
       call.arguments[2],
       availableHostModules,
     );
-    if (
-      !minArg ||
-      !maxArg ||
-      minArg.type === "SpreadElement" ||
-      maxArg.type === "SpreadElement" ||
-      minArg.type !== "Literal" ||
-      maxArg.type !== "Literal" ||
-      typeof minArg.value !== "number" ||
-      typeof maxArg.value !== "number"
-    ) {
+    const min = parseSignedNumericLiteral(minArg);
+    const max = parseSignedNumericLiteral(maxArg);
+    if (min === undefined || max === undefined) {
       throw new Error(
         `RangedInt cell ${owner} requires numeric min/max literals`,
       );
     }
+    if (!Number.isSafeInteger(min) || !Number.isSafeInteger(max) || min > max) {
+      throw new Error(
+        `RangedInt cell ${owner} requires ordered safe-integer min/max literals`,
+      );
+    }
     return {
-      type: "rangedInt",
-      min: minArg.value,
-      max: maxArg.value,
+      type: "number",
+      observeAs: { kind: "integer", min, max },
       ...config,
     };
   }
@@ -1377,7 +2274,7 @@ function parseScalarConstructorSpec(
 
 /**
  * Parses the single element constructor of an `Array(elementCell)` declaration
- * into a {@link ScalarObservableSpec}. The element must be a constructed scalar
+ * into an {@link ObservableScalar}. The element must be a constructed scalar
  * cell: a bare constructor (`Array(Str)`), a nested array, extra arguments, or a
  * non-scalar constructor are all rejected.
  */
@@ -1385,7 +2282,7 @@ function parseArrayElementSpec(
   cellName: string,
   args: readonly (acorn.Expression | acorn.SpreadElement)[],
   availableHostModules: ReadonlyMap<string, string>,
-): ScalarObservableSpec {
+): ObservableScalar | ArtifactSpec {
   const arg = args[0];
   if (args.length !== 1 || !arg || arg.type === "SpreadElement") {
     throw new Error(
@@ -1400,6 +2297,14 @@ function parseArrayElementSpec(
   if (arg.callee.type === "Identifier" && arg.callee.name === "Array") {
     throw new Error(`Array cell ${cellName} cannot nest arrays`);
   }
+  if (arg.callee.type === "Identifier" && arg.callee.name === "Artifact") {
+    if (arg.arguments.length !== 0) {
+      throw new Error(
+        `Array cell ${cellName} Artifact() element takes no arguments`,
+      );
+    }
+    return { type: "artifact" };
+  }
   const element = parseScalarConstructorSpec(
     arg,
     cellName,
@@ -1407,59 +2312,10 @@ function parseArrayElementSpec(
   );
   if (!element) {
     throw new Error(
-      `Array cell ${cellName} element must be a scalar cell constructor`,
+      `Array cell ${cellName} element must be a scalar or Artifact cell constructor`,
     );
   }
   return element;
-}
-
-function parseArtifactPathArgument(
-  name: string,
-  arg: acorn.Expression | acorn.SpreadElement | undefined,
-  availableHostModules: ReadonlyMap<string, string>,
-): ArtifactPathExpression {
-  if (!arg || arg.type === "SpreadElement") {
-    throw new Error(
-      `Artifact ${name} path must be a string literal or template literal`,
-    );
-  }
-  if (arg.type === "Literal" && typeof arg.value === "string") {
-    validateLiteralArtifactPath(name, arg.value);
-    return arg.value;
-  }
-  if (arg.type === "TemplateLiteral") {
-    const path = parseExpression(arg, availableHostModules, true);
-    if (path.kind !== "template-string") {
-      throw new Error(
-        `Artifact ${name} path must be a string literal or template literal`,
-      );
-    }
-    if (containsBriefableExpression(path)) {
-      throw new Error(
-        `Artifact ${name} path cannot contain judge() or host call expressions`,
-      );
-    }
-    return path;
-  }
-  throw new Error(
-    `Artifact ${name} path must be a string literal or template literal`,
-  );
-}
-
-function validateLiteralArtifactPath(name: string, path: string): void {
-  if (path.length === 0) {
-    throw new Error(`Artifact ${name} path cannot be empty`);
-  }
-  if (path.startsWith("/")) {
-    throw new Error(`Artifact ${name} path must be relative`);
-  }
-  for (const segment of path.split("/")) {
-    if (segment === "." || segment === "..") {
-      throw new Error(
-        `Artifact ${name} path cannot contain "." or ".." segments`,
-      );
-    }
-  }
 }
 
 function parseCellConfig(
@@ -1467,7 +2323,7 @@ function parseCellConfig(
   typeName: string,
   arg: acorn.Expression | acorn.SpreadElement | undefined,
   availableHostModules: ReadonlyMap<string, string>,
-): Pick<ScalarObservableSpec, "observing"> {
+): Pick<ObservableScalar, "observing"> {
   if (!arg) return {};
   if (arg.type === "SpreadElement" || arg.type !== "ObjectExpression") {
     throw new Error(
@@ -1475,7 +2331,7 @@ function parseCellConfig(
     );
   }
 
-  const config: Pick<ScalarObservableSpec, "observing"> = {};
+  const config: Pick<ObservableScalar, "observing"> = {};
   for (const property of arg.properties) {
     if (property.type === "SpreadElement") {
       throw new Error(
@@ -1505,6 +2361,164 @@ function parseCellConfig(
     );
   }
   return config;
+}
+
+function parseNumericCellConfig(
+  cellName: string,
+  typeName: string,
+  arg: acorn.Expression | acorn.SpreadElement | undefined,
+  availableHostModules: ReadonlyMap<string, string>,
+): { observing?: SemanticString; observeAs?: NumericObserveAs } {
+  if (!arg) return {};
+  if (arg.type === "SpreadElement" || arg.type !== "ObjectExpression") {
+    throw new Error(
+      `${typeName} cell ${cellName} config must be an object literal`,
+    );
+  }
+  const config: { observing?: SemanticString; observeAs?: NumericObserveAs } =
+    {};
+  for (const property of arg.properties) {
+    if (property.type === "SpreadElement" || property.computed) {
+      throw new Error(
+        `${typeName} cell ${cellName} config does not support spread or computed keys`,
+      );
+    }
+    const key =
+      property.key.type === "Identifier"
+        ? property.key.name
+        : property.key.type === "Literal" &&
+            typeof property.key.value === "string"
+          ? property.key.value
+          : undefined;
+    if (key === "observing") {
+      if (config.observing !== undefined) {
+        throw new Error(
+          `Duplicate cell config assignment: ${cellName}.observing`,
+        );
+      }
+      config.observing = parseSemanticString(
+        property.value,
+        availableHostModules,
+      );
+      continue;
+    }
+    if (key === "observeAs") {
+      if (config.observeAs !== undefined) {
+        throw new Error(
+          `Duplicate cell config assignment: ${cellName}.observeAs`,
+        );
+      }
+      config.observeAs = parseNumericObserveAs(property.value, cellName);
+      continue;
+    }
+    throw new Error(
+      `${typeName} cell ${cellName} has unsupported config key: ${key ?? "<computed>"}`,
+    );
+  }
+  return config;
+}
+
+function parseNumericObserveAs(
+  expression: acorn.Expression | acorn.Pattern,
+  cellName: string,
+): NumericObserveAs {
+  if (expression.type !== "ObjectExpression") {
+    throw new Error(`Num cell ${cellName} observeAs must be an object literal`);
+  }
+  let kind: NumericObserveAs["kind"] | undefined;
+  let min: number | undefined;
+  let max: number | undefined;
+  const seen = new Set<string>();
+  for (const property of expression.properties) {
+    if (property.type === "SpreadElement" || property.computed) {
+      throw new Error(
+        `Num cell ${cellName} observeAs does not support spread or computed keys`,
+      );
+    }
+    const key =
+      property.key.type === "Identifier"
+        ? property.key.name
+        : property.key.type === "Literal" &&
+            typeof property.key.value === "string"
+          ? property.key.value
+          : undefined;
+    if (key && seen.has(key)) {
+      throw new Error(`Num cell ${cellName} observeAs repeats field: ${key}`);
+    }
+    if (key) seen.add(key);
+    if (key === "kind") {
+      if (
+        property.value.type !== "Literal" ||
+        (property.value.value !== "number" &&
+          property.value.value !== "integer")
+      ) {
+        throw new Error(
+          `Num cell ${cellName} observeAs kind must be "number" or "integer"`,
+        );
+      }
+      kind = property.value.value;
+      continue;
+    }
+    if (key === "min" || key === "max") {
+      const value = parseSignedNumericLiteral(property.value);
+      if (value === undefined) {
+        throw new Error(
+          `Num cell ${cellName} observeAs ${key} must be a numeric literal`,
+        );
+      }
+      if (key === "min") min = value;
+      else max = value;
+      continue;
+    }
+    throw new Error(
+      `Num cell ${cellName} observeAs has unsupported field: ${key ?? "<computed>"}`,
+    );
+  }
+  if (!kind) {
+    throw new Error(`Num cell ${cellName} observeAs requires kind`);
+  }
+  if (min !== undefined && max !== undefined && min > max) {
+    throw new Error(
+      `Num cell ${cellName} observeAs bounds must satisfy min <= max`,
+    );
+  }
+  if (
+    kind === "integer" &&
+    ((min !== undefined && !Number.isSafeInteger(min)) ||
+      (max !== undefined && !Number.isSafeInteger(max)))
+  ) {
+    throw new Error(
+      `Num cell ${cellName} integer observeAs bounds must be safe integers`,
+    );
+  }
+  return {
+    kind,
+    ...(min !== undefined ? { min } : {}),
+    ...(max !== undefined ? { max } : {}),
+  };
+}
+
+function parseSignedNumericLiteral(
+  expression:
+    | acorn.Expression
+    | acorn.SpreadElement
+    | acorn.Pattern
+    | undefined,
+): number | undefined {
+  if (!expression || expression.type === "SpreadElement") return undefined;
+  if (expression.type === "Literal" && typeof expression.value === "number") {
+    return Object.is(expression.value, -0) ? 0 : expression.value;
+  }
+  if (
+    expression.type === "UnaryExpression" &&
+    expression.operator === "-" &&
+    expression.argument.type === "Literal" &&
+    typeof expression.argument.value === "number"
+  ) {
+    const value = -expression.argument.value;
+    return Object.is(value, -0) ? 0 : value;
+  }
+  return undefined;
 }
 
 function parseNodeStatement(
@@ -2228,8 +3242,7 @@ function parseHostParamsValue(
     if (
       typeof value === "string" ||
       typeof value === "number" ||
-      typeof value === "boolean" ||
-      value === null
+      typeof value === "boolean"
     ) {
       return value;
     }
@@ -2252,7 +3265,7 @@ function parseHostParamsValue(
 function parseParamsObject(
   expression: acorn.ObjectExpression,
   context: string,
-): Record<string, PayloadValue> {
+): StructValue {
   const value: Record<string, PayloadValue> = {};
   for (const property of expression.properties) {
     if (property.type === "SpreadElement") {
@@ -2273,7 +3286,7 @@ function parseParamsObject(
     }
     value[key] = parseHostParamsValue(property.value, context);
   }
-  return value;
+  return value as StructValue;
 }
 
 function parseEnterCall(
@@ -3434,7 +4447,7 @@ function validateEnterChannelBindings(
           message: `${callLabel}() binds args.${key}, which ${statement.target.identifier} does not declare`,
           loc: statement.loc,
         });
-      } else if (provided && !channelSpecsCompatible(provided, declared)) {
+      } else if (provided && !reusableSpecCompatible(provided, declared)) {
         issues.push({
           code: "ENTER_CHANNEL_INCOMPATIBLE",
           message: `${callLabel}() args.${key} binding is incompatible with the declared channel type`,
@@ -3465,7 +4478,7 @@ function validateEnterChannelBindings(
           message: `${callLabel}() binds returns.${key}, which ${statement.target.identifier} does not declare`,
           loc: statement.loc,
         });
-      } else if (provided && !channelSpecsCompatible(provided, declared)) {
+      } else if (provided && !reusableSpecCompatible(declared, provided)) {
         issues.push({
           code: "ENTER_CHANNEL_INCOMPATIBLE",
           message: `${callLabel}() returns.${key} binding is incompatible with the declared channel type`,
@@ -3474,11 +4487,6 @@ function validateEnterChannelBindings(
       }
     }
   }
-}
-
-function isArtifactCellByName(cells: Cell[], name: string): boolean {
-  const cell = findCell(cells, name);
-  return cell !== undefined && isArtifactCell(cell);
 }
 
 type ExpressionScope = "ordinary" | "catchDeflection" | "effects";
@@ -3501,6 +4509,7 @@ type ValidationOptions = {
   forbidArtifactSemanticRefs?: boolean;
   expressionScope?: ExpressionScope;
   references?: ReferenceValidationContext;
+  hostModules?: ReadonlyMap<string, HostModuleSpec>;
 };
 
 const TRIGGER_VALIDATION_OPTIONS: ValidationOptions = {
@@ -3731,7 +4740,7 @@ function validateDeflectionTarget(
 
 type ResolvedCellTargetSpec =
   | { kind: "direct"; spec: CellSpec }
-  | { kind: "decorated"; spec: ScalarObservableSpec };
+  | { kind: "decorated"; spec: ArrayElementSpec };
 
 function cellTargetRoot(target: CellTarget): string {
   return target[0];
@@ -3756,7 +4765,7 @@ function descendCellTargetSpec(
   spec: CellSpec,
   remainingAccessors: number,
   onNonContainer?: () => void,
-): ScalarObservableSpec | undefined {
+): ArrayElementSpec | undefined {
   if (spec.type !== "array") {
     onNonContainer?.();
     return undefined;
@@ -3821,6 +4830,7 @@ function validateCellTarget(
         accessor,
         cells,
         options.references?.currentNode.signature,
+        options,
       )
     ) {
       issues.push({
@@ -3856,7 +4866,7 @@ function validateObserveTarget(
     options,
     statement.loc,
   );
-  if (!targetSpec || targetSpec.kind === "decorated") return;
+  if (!targetSpec) return;
   if (!isObservableCellSpec(targetSpec.spec)) {
     issues.push({
       code: "NON_OBSERVABLE_CELL",
@@ -3883,7 +4893,7 @@ function validateObserveGroupTarget(
       options,
       statement.loc,
     );
-    if (!targetSpec || targetSpec.kind === "decorated") continue;
+    if (!targetSpec) continue;
     if (!isObservableCellSpec(targetSpec.spec)) {
       issues.push({
         code: "NON_OBSERVABLE_CELL",
@@ -3913,7 +4923,7 @@ function validateSetTarget(
   if (targetSpec.kind === "direct" && !isSettableCellSpec(targetSpec.spec)) {
     issues.push({
       code: "NON_SETTABLE_CELL",
-      message: `Cell target cannot be assigned with $set(): ${formatCellTarget(statement.target)}`,
+      message: `Cell target cannot be set with $set(): ${formatCellTarget(statement.target)}`,
       loc: statement.loc,
     });
     return false;
@@ -3967,6 +4977,7 @@ function validateNode(
     documentImportNames: ReadonlySet<string>;
     nodeLookup: Map<string, Node>;
     bySeg: Map<Node, Map<SegKey, NodeReadSet>>;
+    hostModules?: ReadonlyMap<string, HostModuleSpec>;
   },
 ): void {
   validateNodeShape(node, context.documentImportNames, context.issues);
@@ -3987,6 +4998,7 @@ function validateNode(
   }
   const baseOptions: ValidationOptions = {
     expressionScope: "ordinary",
+    hostModules: context.hostModules,
     references: {
       currentNode: node,
       visibleLocalNodes,
@@ -4031,7 +5043,11 @@ function validateNode(
           baseOptions,
         );
       }
-      if (isArrayCell(cell) && cell.element.observing !== undefined) {
+      if (
+        isArrayCell(cell) &&
+        cell.element.type !== "artifact" &&
+        cell.element.observing !== undefined
+      ) {
         validateSemanticString(
           cell.element.observing,
           cells,
@@ -4040,9 +5056,9 @@ function validateNode(
           baseOptions,
         );
       }
-      if (cell.type === "artifact" && typeof cell.path !== "string") {
+      if (cell.type === "artifact" && cell.initializer !== undefined) {
         validateExpression(
-          cell.path,
+          cell.initializer,
           cells,
           nodeNames,
           context.issues,
@@ -4139,6 +5155,7 @@ function validateNode(
       documentImportNames: context.documentImportNames,
       nodeLookup,
       bySeg: context.bySeg,
+      hostModules: context.hostModules,
     });
   }
 }
@@ -4158,6 +5175,7 @@ function validateStatement(
       cells,
       options.references?.currentNode.signature,
       issues,
+      options,
     );
     statement.consequent.forEach((entry) =>
       validateStatement(entry, cells, nodes, issues, labels, options),
@@ -4242,13 +5260,14 @@ function validateStatement(
 
   if (statement.kind === "set") {
     validateSetTarget(statement, cells, nodes, issues, options);
-    checkTypedReadAssignment(
+    validateExpression(statement.value, cells, nodes, issues, options);
+    checkTypedCellAssignment(
       statement,
       cells,
       options.references?.currentNode.signature,
       issues,
+      options,
     );
-    validateExpression(statement.value, cells, nodes, issues, options);
     return;
   }
 
@@ -4301,6 +5320,7 @@ function validateStatement(
         "span.result.$set() value type is incompatible with the results element type",
         issues,
         statement.loc,
+        options,
       );
     }
     validateExpression(statement.value, cells, nodes, issues, options);
@@ -4326,12 +5346,10 @@ function arrayReferenceElementSpec(
   ref: ArrayReference,
   cells: Cell[],
   signature: NodeSignature | undefined,
-): ChannelSpec | undefined {
+): ArrayElementSpec | undefined {
   if (ref.kind === "cell") {
     const cell = findCell(cells, ref.name);
-    return cell && isArrayCell(cell)
-      ? cellSpecToChannelSpec(cell.element)
-      : undefined;
+    return cell && isArrayCell(cell) ? cell.element : undefined;
   }
   const spec = signature?.[ref.namespace]?.[ref.key];
   return spec?.type === "array" ? spec.element : undefined;
@@ -4341,107 +5359,82 @@ function arrayReferenceElementSpec(
 function arrayCellElementSpec(
   name: string,
   cells: Cell[],
-): ChannelSpec | undefined {
+): ArrayElementSpec | undefined {
   const cell = findCell(cells, name);
-  return cell && isArrayCell(cell)
-    ? cellSpecToChannelSpec(cell.element)
-    : undefined;
+  return cell && isArrayCell(cell) ? cell.element : undefined;
 }
 
-/**
- * The scalar kind of a channel schema, or `undefined` for non-scalar shapes
- * (arrays, dialog cursors). Used to type-check a scalar literal, which carries a
- * kind but no exact schema, against a typed target.
- */
-function specScalarKind(
-  spec: ChannelSpec,
-): "string" | "number" | "boolean" | undefined {
-  switch (spec.type) {
-    case "boolean":
-      return "boolean";
-    case "string":
-    case "enum":
-      return "string";
-    case "rangedInt":
-    case "index":
-      return "number";
-    default:
-      return undefined;
+function producerContext(
+  cells: Cell[],
+  signature: NodeSignature | undefined,
+  options: ValidationOptions = {},
+): ProducerContext {
+  const map = mapContextStack[mapContextStack.length - 1];
+  return {
+    cells,
+    signature,
+    map: map
+      ? {
+          receiverSpec: map.receiverSpec,
+          resultSpec: map.resultsSpec,
+        }
+      : undefined,
+    resolveHostOperation:
+      options.hostModules === undefined
+        ? undefined
+        : (call) => {
+            const resolution = resolveHostOperation(options.hostModules!, call);
+            return resolution.kind === "resolved"
+              ? resolution.operation
+              : undefined;
+          },
+  };
+}
+
+function checkNumericOperand(
+  expression: ValueExpression,
+  op: string,
+  side: "left" | "right" | "argument",
+  cells: Cell[],
+  signature: NodeSignature | undefined,
+  issues: ValidationIssue[],
+  options: ValidationOptions,
+): void {
+  const judgment = arithmeticRule.checkProducer(
+    expression,
+    producerContext(cells, signature, options),
+  );
+  if (judgment.kind === "incompatible") {
+    issues.push({
+      code: "NON_NUMERIC_ARITHMETIC_OPERAND",
+      message: `Arithmetic operator ${op} requires a numeric ${side} operand`,
+    });
   }
 }
 
-/**
- * The schema a value expression assigns, resolved only for shapes whose type is
- * statically known: scalar literals (by kind), lexical cells, typed channels,
- * and `span.item`/`span.index` (from the enclosing map). Any other expression
- * returns `undefined`, so type-checking skips it rather than guessing.
- */
-type InferredValueSpec =
-  | { kind: "exact"; spec: ChannelSpec }
-  | { kind: "scalar"; scalar: "string" | "number" | "boolean" };
-
-function inferValueSpec(
+function checkNumIsFiniteArgument(
   expression: ValueExpression,
   cells: Cell[],
   signature: NodeSignature | undefined,
-): InferredValueSpec | undefined {
-  switch (expression.kind) {
-    case "literal": {
-      const value = expression.value;
-      if (typeof value === "string")
-        return { kind: "scalar", scalar: "string" };
-      if (typeof value === "number")
-        return { kind: "scalar", scalar: "number" };
-      if (typeof value === "boolean")
-        return { kind: "scalar", scalar: "boolean" };
-      return undefined;
-    }
-    case "cell": {
-      const cell = findCell(cells, expression.name);
-      const spec = cell ? cellSpecToChannelSpec(cell) : undefined;
-      return spec ? { kind: "exact", spec } : undefined;
-    }
-    case "channel": {
-      const spec = signature?.[expression.namespace]?.[expression.key];
-      return spec ? { kind: "exact", spec } : undefined;
-    }
-    case "span": {
-      const context = mapContextStack[mapContextStack.length - 1];
-      if (expression.key === "index") {
-        return { kind: "exact", spec: { type: "index" } };
-      }
-      return context?.receiverSpec
-        ? { kind: "exact", spec: context.receiverSpec }
-        : undefined;
-    }
-    default:
-      return undefined;
+  issues: ValidationIssue[],
+  options: ValidationOptions,
+): void {
+  const judgment = numIsFiniteRule.checkProducer(
+    expression,
+    producerContext(cells, signature, options),
+  );
+  if (judgment.kind === "incompatible") {
+    issues.push({
+      code: "NON_NUMERIC_IS_FINITE_ARGUMENT",
+      message: "Num.isFinite requires a numeric argument",
+    });
   }
-}
-
-/**
- * Whether a value is assignable to a typed target as a value write — a
- * scalar-kind check (string / number / boolean), the granularity `$set` enforces
- * statically. Enum membership and ranged-int bounds stay runtime concerns, and a
- * non-scalar target (array, cursor) or an uninferable value is not flagged. This
- * is looser than `channelSpecsCompatible`, which governs the stricter enter
- * boundary where `index` and `rangedInt` are distinct.
- */
-function valueAssignableTo(
-  target: ChannelSpec,
-  value: InferredValueSpec,
-): boolean {
-  const targetKind = specScalarKind(target);
-  const valueKind =
-    value.kind === "scalar" ? value.scalar : specScalarKind(value.spec);
-  if (targetKind === undefined || valueKind === undefined) return true;
-  return targetKind === valueKind;
 }
 
 /**
  * Reports a type issue when a value expression's statically-known schema is
  * incompatible with a typed target — a `span.result` / `returns.*` sink element
- * type, or the cell an assigned `span.*` / `args.*` / `returns.*` read flows
+ * type, or the cell a `span.*` / `args.*` / `returns.*` read flows
  * into. Skips a target or value whose schema is not statically known.
  */
 function checkTypedAssignable(
@@ -4453,45 +5446,59 @@ function checkTypedAssignable(
   label: string,
   issues: ValidationIssue[],
   loc: SourceRange | undefined,
+  options: ValidationOptions,
 ): void {
   if (!target) return;
-  const inferred = inferValueSpec(value, cells, signature);
-  if (inferred && !valueAssignableTo(target, inferred)) {
+  const judgment = judgeProducerLanding(
+    resolveProducer(value, producerContext(cells, signature, options)),
+    target,
+  );
+  if (judgment.kind === "incompatible") {
     issues.push({ code, message: label, loc });
   }
 }
 
 /**
- * Checks a `cell.$set(value)` whose value reads a typed namespace — `span.*`,
- * `args.*`, or `returns.*` — against the target cell's type. Plain cell and
- * literal values stay runtime-checked, preserving the ordinary cell-write rule.
+ * Rejects a cell write when both its source and destination value families are
+ * statically known and disjoint. Unknown sources remain runtime-checked.
  */
-function checkTypedReadAssignment(
+function checkTypedCellAssignment(
   statement: SetAction,
   cells: Cell[],
   signature: NodeSignature | undefined,
   issues: ValidationIssue[],
+  options: ValidationOptions,
 ): void {
-  const value = statement.value;
-  if (value.kind !== "span" && value.kind !== "channel") return;
   const targetSpec = cellTargetSpec(statement.target, cells);
   const destination =
     targetSpec === undefined
       ? undefined
       : cellSpecToChannelSpec(targetSpec.spec);
-  const source =
-    value.kind === "span"
-      ? { code: "SPAN_TYPE", ref: `span.${value.key}` }
-      : { code: "CHANNEL_VALUE_TYPE", ref: `${value.namespace}.${value.key}` };
+  let code: string;
+  let message: string;
+  if (destination?.type === "artifact") {
+    code = "ARTIFACT_VALUE_TYPE";
+    message = `${formatCellTarget(statement.target)}.$set() requires an Artifact value`;
+  } else if (statement.value.kind === "span") {
+    code = "SPAN_TYPE";
+    message = `span.${statement.value.key} type is incompatible with ${formatCellTarget(statement.target)}`;
+  } else if (statement.value.kind === "channel") {
+    code = "CHANNEL_VALUE_TYPE";
+    message = `${statement.value.namespace}.${statement.value.key} type is incompatible with ${formatCellTarget(statement.target)}`;
+  } else {
+    code = "CELL_VALUE_TYPE";
+    message = `Value type is incompatible with ${formatCellTarget(statement.target)}`;
+  }
   checkTypedAssignable(
     destination,
-    value,
+    statement.value,
     cells,
     signature,
-    source.code,
-    `${source.ref} type is incompatible with ${formatCellTarget(statement.target)}`,
+    code,
+    message,
     issues,
     statement.loc,
+    options,
   );
 }
 
@@ -4694,6 +5701,7 @@ function validateTriggerStatement(
       cells,
       options.references?.currentNode.signature,
       issues,
+      options,
     );
     statement.consequent.forEach((entry) =>
       validateTriggerStatement(entry, cells, nodes, issues, labels, options),
@@ -4745,6 +5753,7 @@ function validateTriggerStatement(
         cells,
         options.references?.currentNode.signature,
         issues,
+        options,
       );
     }
     return;
@@ -4761,6 +5770,13 @@ function validateTriggerStatement(
   if (statement.kind === "set") {
     validateSetTarget(statement, cells, nodes, issues, options);
     validateExpression(statement.value, cells, nodes, issues, options);
+    checkTypedCellAssignment(
+      statement,
+      cells,
+      options.references?.currentNode.signature,
+      issues,
+      options,
+    );
     return;
   }
 
@@ -4785,6 +5801,7 @@ function validateGuardStatement(
       cells,
       options.references?.currentNode.signature,
       issues,
+      options,
     );
     statement.consequent.forEach((entry) =>
       validateGuardStatement(entry, cells, nodes, issues, labels, options),
@@ -4845,6 +5862,13 @@ function validateGuardStatement(
   if (statement.kind === "set") {
     validateSetTarget(statement, cells, nodes, issues, options);
     validateExpression(statement.value, cells, nodes, issues, options);
+    checkTypedCellAssignment(
+      statement,
+      cells,
+      options.references?.currentNode.signature,
+      issues,
+      options,
+    );
     return;
   }
 
@@ -4869,6 +5893,7 @@ function validateCatchDeflectionStatement(
       cells,
       options.references?.currentNode.signature,
       issues,
+      options,
     );
     statement.consequent.forEach((entry) =>
       validateCatchDeflectionStatement(
@@ -4933,6 +5958,7 @@ function validateCatchDeflectionStatement(
         cells,
         options.references?.currentNode.signature,
         issues,
+        options,
       );
     }
     return;
@@ -4957,6 +5983,13 @@ function validateCatchDeflectionStatement(
   if (statement.kind === "set") {
     validateSetTarget(statement, cells, nodes, issues, options);
     validateExpression(statement.value, cells, nodes, issues, options);
+    checkTypedCellAssignment(
+      statement,
+      cells,
+      options.references?.currentNode.signature,
+      issues,
+      options,
+    );
     return;
   }
 
@@ -4981,6 +6014,7 @@ function validateEffectStatement(
       cells,
       options.references?.currentNode.signature,
       issues,
+      options,
     );
     statement.consequent.forEach((entry) =>
       validateEffectStatement(entry, cells, nodes, issues, labels, options),
@@ -5038,13 +6072,14 @@ function validateEffectStatement(
 
   if (statement.kind === "set") {
     validateSetTarget(statement, cells, nodes, issues, options);
-    checkTypedReadAssignment(
+    validateExpression(statement.value, cells, nodes, issues, options);
+    checkTypedCellAssignment(
       statement,
       cells,
       options.references?.currentNode.signature,
       issues,
+      options,
     );
-    validateExpression(statement.value, cells, nodes, issues, options);
     return;
   }
 
@@ -5055,6 +6090,7 @@ function validateEffectStatement(
 
   if (statement.kind === "set-return") {
     const signature = options.references?.currentNode.signature;
+    validateExpression(statement.value, cells, nodes, issues, options);
     checkTypedAssignable(
       signature?.returns[statement.key],
       statement.value,
@@ -5064,14 +6100,15 @@ function validateEffectStatement(
       `returns.${statement.key}.$set() value type is incompatible with the declared channel type`,
       issues,
       statement.loc,
+      options,
     );
-    validateExpression(statement.value, cells, nodes, issues, options);
     return;
   }
 
   for (const arg of statement.arguments) {
     validateHostEffectArgument(arg, cells, nodes, issues, options);
   }
+  validateHostAction(statement, "effect", cells, issues, options);
 }
 
 function validateHostEffectArgument(
@@ -5108,6 +6145,76 @@ function validateHostEffectArgument(
   }
 }
 
+function validateHostAction(
+  action: HostCallExpression | HostEffectStatement,
+  mode: "call" | "effect",
+  cells: Cell[],
+  issues: ValidationIssue[],
+  options: ValidationOptions,
+): void {
+  if (options.hostModules === undefined) return;
+
+  const path = [action.module, ...action.target, action.operation].join(".");
+  const resolution = resolveHostOperation(options.hostModules, action);
+  if (resolution.kind === "unresolved") {
+    if (resolution.reason === "module") {
+      issues.push({
+        code: "HOST_MODULE_UNDECLARED",
+        message: `Host module ${JSON.stringify(action.module)} has no injected declaration`,
+        loc: action.loc,
+      });
+    } else if (resolution.reason === "member") {
+      issues.push({
+        code: "HOST_MEMBER_UNDECLARED",
+        message: `Host action ${path} refers to undeclared member ${JSON.stringify(resolution.segment)}`,
+        loc: action.loc,
+      });
+    } else {
+      issues.push({
+        code: "HOST_MEMBER_NOT_OPERATION",
+        message: `Host action ${path} does not resolve to an operation`,
+        loc: action.loc,
+      });
+    }
+    return;
+  }
+
+  const operation = resolution.operation;
+  if (mode === "call" && operation.returns === undefined) {
+    issues.push({
+      code: "HOST_CALL_RESULT_UNDECLARED",
+      message: `Host operation ${path} does not declare a result`,
+      loc: action.loc,
+    });
+  }
+  if (action.arguments.length !== operation.parameters.length) {
+    issues.push({
+      code: "HOST_ARGUMENT_ARITY",
+      message: `Host action ${path} requires ${operation.parameters.length} arguments but received ${action.arguments.length}`,
+      loc: action.loc,
+    });
+    return;
+  }
+
+  const context = producerContext(
+    cells,
+    options.references?.currentNode.signature,
+    options,
+  );
+  action.arguments.forEach((argument, index) => {
+    const parameter = operation.parameters[index]!;
+    if (
+      judgeHostArgument(argument, parameter, context).kind === "incompatible"
+    ) {
+      issues.push({
+        code: "HOST_ARGUMENT_TYPE",
+        message: `Host action ${path} argument ${index + 1} is incompatible with its declared parameter spec`,
+        loc: action.loc,
+      });
+    }
+  });
+}
+
 function validateSemanticString(
   value: SemanticString,
   cells: Cell[],
@@ -5130,8 +6237,12 @@ function validateSemanticString(
         continue;
       }
       if (
-        part.expression.kind === "cell" &&
-        isArtifactCellByName(cells, part.expression.name)
+        expressionIsArtifact(
+          part.expression,
+          cells,
+          options.references?.currentNode.signature,
+          options,
+        )
       ) {
         if (options.forbidArtifactSemanticRefs) {
           issues.push({
@@ -5143,6 +6254,21 @@ function validateSemanticString(
         continue;
       }
       validateExpression(part.expression, cells, nodes, issues, options);
+      const judgment = interpolationRule.checkProducer(
+        part.expression,
+        producerContext(
+          cells,
+          options.references?.currentNode.signature,
+          options,
+        ),
+      );
+      if (judgment.kind === "incompatible") {
+        issues.push({
+          code: "INVALID_TEMPLATE_INTERPOLATION",
+          message: "Value template interpolation cannot render this value",
+          loc: briefableExpressionLoc(part.expression),
+        });
+      }
     }
   }
 }
@@ -5156,7 +6282,8 @@ function briefableExpressionLoc(
       return expression.loc;
     case "regexTest":
       return briefableExpressionLoc(expression.target);
-    case "binary":
+    case "comparison":
+    case "arithmetic":
     case "logical":
       return (
         briefableExpressionLoc(expression.left) ??
@@ -5169,6 +6296,8 @@ function briefableExpressionLoc(
         briefableExpressionLoc(expression.alternate)
       );
     case "unary":
+    case "numericUnary":
+    case "numIsFinite":
       return briefableExpressionLoc(expression.argument);
     case "template-string":
       for (const part of expression.parts) {
@@ -5178,6 +6307,8 @@ function briefableExpressionLoc(
         }
       }
       return undefined;
+    case "artifact":
+      return briefableExpressionLoc(expression.path);
     case "arrayElementRead":
       return briefableExpressionLoc(expression.index);
     case "arrayLiteral":
@@ -5203,6 +6334,7 @@ function expressionIsArray(
   expression: ValueExpression,
   cells: Cell[],
   signature: NodeSignature | undefined,
+  options: ValidationOptions = {},
 ): boolean {
   switch (expression.kind) {
     case "arrayLiteral":
@@ -5217,67 +6349,32 @@ function expressionIsArray(
       );
     case "conditional":
       return (
-        expressionIsArray(expression.consequent, cells, signature) &&
-        expressionIsArray(expression.alternate, cells, signature)
+        expressionIsArray(expression.consequent, cells, signature, options) &&
+        expressionIsArray(expression.alternate, cells, signature, options)
       );
+    case "host-call": {
+      const resolution = options.hostModules
+        ? resolveHostOperation(options.hostModules, expression)
+        : undefined;
+      return (
+        resolution?.kind === "resolved" &&
+        resolution.operation.returns?.type === "array"
+      );
+    }
     default:
       return false;
   }
 }
 
-/**
- * Whether an expression's value is confidently non-boolean, so using it in a
- * boolean position is a coercion Arc rejects. Conservative: an expression whose
- * type is not statically known — a host call or an undeclared channel — returns
- * `false` and is left to the runtime boolean check. A non-value cell (artifact)
- * also returns `false`, since it is reported as NON_VALUE_CELL instead.
- */
-function expressionIsNonBoolean(
+function expressionIsArtifact(
   expression: ValueExpression,
   cells: Cell[],
   signature: NodeSignature | undefined,
+  options: ValidationOptions = {},
 ): boolean {
-  switch (expression.kind) {
-    case "literal":
-      return typeof expression.value !== "boolean";
-    case "cell": {
-      const cell = findCell(cells, expression.name);
-      if (!cell || !isValueExpressionCell(cell)) return false;
-      return cell.type !== "boolean";
-    }
-    case "channel": {
-      const spec = signature?.[expression.namespace]?.[expression.key];
-      return spec ? specScalarKind(spec) !== "boolean" : false;
-    }
-    case "arrayElementRead": {
-      const spec = arrayReferenceElementSpec(
-        expression.array,
-        cells,
-        signature,
-      );
-      return spec ? specScalarKind(spec) !== "boolean" : false;
-    }
-    case "span": {
-      if (expression.key === "index") return true;
-      const spec = mapContextStack[mapContextStack.length - 1]?.receiverSpec;
-      return spec ? specScalarKind(spec) !== "boolean" : false;
-    }
-    case "nodeState":
-    case "pendingState":
-    case "dialogCursor":
-    case "dialogTurnsSince":
-    case "enterCount":
-    case "arrayLength":
-    case "arrayLiteral":
-    case "template-string":
-    case "scope":
-      return true;
-    default:
-      // Comparisons, `&&`/`||`/`!`, `judge`, regex `.test`, `.isUnset()`, and
-      // `this.deflection.escaped(...)` are boolean; host calls have no
-      // statically-known type and are left to the runtime check.
-      return false;
-  }
+  return producerGuaranteesArtifact(
+    resolveProducer(expression, producerContext(cells, signature, options)),
+  );
 }
 
 /**
@@ -5293,13 +6390,13 @@ function checkBooleanValue(
   cells: Cell[],
   signature: NodeSignature | undefined,
   issues: ValidationIssue[],
+  options: ValidationOptions,
 ): void {
-  if (expression.kind === "conditional") {
-    checkBooleanValue(expression.consequent, cells, signature, issues);
-    checkBooleanValue(expression.alternate, cells, signature, issues);
-    return;
-  }
-  if (expressionIsNonBoolean(expression, cells, signature)) {
+  const judgment = booleanRule.checkProducer(
+    expression,
+    producerContext(cells, signature, options),
+  );
+  if (judgment.kind === "incompatible") {
     issues.push({
       code: "NON_BOOLEAN_CONDITION",
       message:
@@ -5364,7 +6461,7 @@ function validateExpression(
         signature,
       );
       validateExpression(expression.index, cells, nodes, issues, options);
-      if (expressionIsArray(expression.index, cells, signature)) {
+      if (expressionIsArray(expression.index, cells, signature, options)) {
         issues.push({
           code: "ARRAY_AS_INDEX",
           message: "An array cannot be used as an array index",
@@ -5475,9 +6572,35 @@ function validateExpression(
       for (const arg of expression.arguments) {
         validateHostEffectArgument(arg, cells, nodes, issues, options);
       }
+      validateHostAction(expression, "call", cells, issues, options);
       return;
     case "regexTest":
       validateExpression(expression.target, cells, nodes, issues, options);
+      if (
+        stringOperandRule.checkProducer(
+          expression.target,
+          producerContext(cells, signature, options),
+        ).kind === "incompatible"
+      ) {
+        issues.push({
+          code: expressionIsArtifact(
+            expression.target,
+            cells,
+            signature,
+            options,
+          )
+            ? "INVALID_ARTIFACT_OPERATION"
+            : "REGEX_TARGET_TYPE",
+          message: expressionIsArtifact(
+            expression.target,
+            cells,
+            signature,
+            options,
+          )
+            ? "Artifacts cannot be used in regular-expression tests"
+            : "Regular-expression tests require a string target",
+        });
+      }
       return;
     case "dialogTurnsSince":
       validateExpression(expression.receiver, cells, nodes, issues, options);
@@ -5499,7 +6622,7 @@ function validateExpression(
       return;
     case "enterCount":
       return;
-    case "binary": {
+    case "comparison": {
       validateExpression(expression.left, cells, nodes, issues, options);
       validateExpression(expression.right, cells, nodes, issues, options);
       const isOrdering =
@@ -5507,41 +6630,131 @@ function validateExpression(
         expression.op === ">=" ||
         expression.op === "<" ||
         expression.op === "<=";
-      if (
-        isOrdering &&
-        (expressionIsArray(expression.left, cells, signature) ||
-          expressionIsArray(expression.right, cells, signature))
-      ) {
+      const decision = comparisonRule.checkProducers(
+        expression.op,
+        expression.left,
+        expression.right,
+        producerContext(cells, signature, options),
+      );
+      if (decision.judgment.kind === "incompatible") {
+        const artifact =
+          expressionIsArtifact(expression.left, cells, signature, options) ||
+          expressionIsArtifact(expression.right, cells, signature, options);
+        const array =
+          expressionIsArray(expression.left, cells, signature, options) ||
+          expressionIsArray(expression.right, cells, signature, options);
         issues.push({
-          code: "ARRAY_ORDERING",
-          message: "A whole array cannot be used in an ordering comparison",
+          code:
+            isOrdering && artifact
+              ? "INVALID_ARTIFACT_OPERATION"
+              : isOrdering && array
+                ? "ARRAY_ORDERING"
+                : "COMPARISON_VALUE_TYPE",
+          message:
+            isOrdering && artifact
+              ? "Artifacts cannot be ordered"
+              : isOrdering && array
+                ? "A whole array cannot be used in an ordering comparison"
+                : "Comparison operands do not have a coherent shared domain",
         });
       }
       return;
     }
+    case "arithmetic":
+      validateExpression(expression.left, cells, nodes, issues, options);
+      validateExpression(expression.right, cells, nodes, issues, options);
+      checkNumericOperand(
+        expression.left,
+        expression.op,
+        "left",
+        cells,
+        signature,
+        issues,
+        options,
+      );
+      checkNumericOperand(
+        expression.right,
+        expression.op,
+        "right",
+        cells,
+        signature,
+        issues,
+        options,
+      );
+      return;
     case "logical":
       validateExpression(expression.left, cells, nodes, issues, options);
       validateExpression(expression.right, cells, nodes, issues, options);
       // `&&` and `||` are boolean operators: both operands are boolean positions
       // wherever the expression appears.
-      checkBooleanValue(expression.left, cells, signature, issues);
-      checkBooleanValue(expression.right, cells, signature, issues);
+      checkBooleanValue(expression.left, cells, signature, issues, options);
+      checkBooleanValue(expression.right, cells, signature, issues, options);
       return;
     case "conditional":
       validateExpression(expression.test, cells, nodes, issues, options);
       validateExpression(expression.consequent, cells, nodes, issues, options);
       validateExpression(expression.alternate, cells, nodes, issues, options);
       // Only the test is a boolean position; the branches are values of any type.
-      checkBooleanValue(expression.test, cells, signature, issues);
+      checkBooleanValue(expression.test, cells, signature, issues, options);
       return;
     case "unary":
       validateExpression(expression.argument, cells, nodes, issues, options);
-      checkBooleanValue(expression.argument, cells, signature, issues);
+      checkBooleanValue(expression.argument, cells, signature, issues, options);
+      return;
+    case "numericUnary":
+      validateExpression(expression.argument, cells, nodes, issues, options);
+      checkNumericOperand(
+        expression.argument,
+        expression.op,
+        "argument",
+        cells,
+        signature,
+        issues,
+        options,
+      );
+      return;
+    case "numIsFinite":
+      validateExpression(expression.argument, cells, nodes, issues, options);
+      checkNumIsFiniteArgument(
+        expression.argument,
+        cells,
+        signature,
+        issues,
+        options,
+      );
       return;
     case "template-string":
       for (const part of expression.parts) {
         if (part.kind === "expression") {
           validateExpression(part.expression, cells, nodes, issues, options);
+          if (
+            interpolationRule.checkProducer(
+              part.expression,
+              producerContext(cells, signature, options),
+            ).kind === "incompatible"
+          ) {
+            issues.push({
+              code: "INVALID_TEMPLATE_INTERPOLATION",
+              message: "Value template interpolation cannot render this value",
+              loc: briefableExpressionLoc(part.expression),
+            });
+          }
+        }
+      }
+      return;
+    case "artifact":
+      validateExpression(expression.path, cells, nodes, issues, options);
+      {
+        const judgment = artifactPathRule.checkProducer(
+          expression.path,
+          producerContext(cells, signature, options),
+        );
+        if (judgment.kind === "incompatible") {
+          issues.push({
+            code: "ARTIFACT_PATH_TYPE",
+            message: "Artifact path expression must produce a string value",
+            loc: briefableExpressionLoc(expression.path),
+          });
         }
       }
       return;
@@ -5550,11 +6763,5 @@ function validateExpression(
   }
 }
 
-export type {
-  Document,
-  LintIssue,
-  Node,
-  PayloadValue,
-  Statement,
-  ValidationIssue,
-} from "../types.js";
+export type * from "../types/parser.js";
+export type { PayloadValue } from "../types/value.js";

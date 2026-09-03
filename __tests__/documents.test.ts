@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { parse } from "../src/parser/index.js";
+import { parse, validate } from "../src/parser/index.js";
 
 describe("documents", () => {
   describe("doc.directive", () => {
@@ -136,6 +136,77 @@ function Helper() {
   });
 
   describe("doc.host-imports", () => {
+    it("rejects host import aliases that collide with Arc built-in roots and namespaces", () => {
+      const reserved = [
+        "$enter",
+        "$enterLoop",
+        "$instruct",
+        "$instructLoop",
+        "$observe",
+        "$observeOrAsk",
+        "Array",
+        "Artifact",
+        "Bool",
+        "Dialog",
+        "Enum",
+        "Index",
+        "Num",
+        "RangedInt",
+        "State",
+        "Str",
+        "args",
+        "forgetful",
+        "invoke",
+        "judge",
+        "newcopy",
+        "returns",
+        "self",
+        "span",
+        "user",
+      ];
+      for (const alias of reserved) {
+        expect(() =>
+          parse(`
+"arc";
+import ${alias} from "host:test";
+function Main() {}
+`),
+        ).toThrow(
+          new RegExp(
+            `Host module alias .*${alias.replace("$", "\\$")}.*reserved`,
+          ),
+        );
+      }
+
+      expect(() =>
+        parse(`
+"arc";
+import Files from "host:files";
+function Main() {
+  let path = Str();
+  path.$set(Files.path());
+  this.effects = () => Files.$save(path);
+}
+`),
+      ).not.toThrow();
+
+      const publicDocument = parse(`
+"arc";
+import Files from "host:files";
+function Main() {
+  let path = Str();
+  path.$set(Files.path());
+}
+`);
+      publicDocument.hostModules[0]!.localName = "Artifact";
+      const set = publicDocument.roots[0]!.statements[0]!;
+      if (set.kind !== "set") throw new Error("expected set statement");
+      set.value = { kind: "template-string", parts: {} } as never;
+      expect(validate(publicDocument)).toEqual([
+        expect.objectContaining({ code: "RESERVED_HOST_MODULE_ALIAS" }),
+      ]);
+    });
+
     it("requires host module imports to be default imports", () => {
       expect(() =>
         parse(`

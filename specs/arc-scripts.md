@@ -64,7 +64,13 @@ At semantic-text use sites — `$instruct(...)`, `$instructLoop(...)`, `judge(..
 
 Semantic templates render lazily. A template is stored unevaluated where it is authored and renders each time its text is emitted to the host, using inner values current at that emission. A declaration-site template such as a cell's `observing` may therefore mention cells that are unset at declaration; an interpolation is a runtime error only when a render reaches it while its value is unset.
 
-At value-expression use sites — for example `cell.$set(...)`, conditionals, comparisons, and hook returns — string and template literals produce ordinary string values. Semantic references such as `${Dialog.user}`/`${user}`, `${Dialog.self}`/`${self}`, artifacts, and host variables, as well as evaluating unset cells, are rejected.
+At value-expression use sites — for example `cell.$set(...)`, conditionals, comparisons, and hook returns — string and template literals produce ordinary string values. An Artifact interpolation contributes its logical path. Semantic references such as `${Dialog.user}`/`${user}`, `${Dialog.self}`/`${self}`, and host variables are rejected.
+
+### Numeric Conventions
+
+Stored numeric values are finite and represent negative zero as zero. Numeric inputs to non-arithmetic operations must also be finite, except that `Num.isFinite(...)` may inspect a non-finite arithmetic result. Integer-only positions—such as integer observations, array indices, and `Index()` values—additionally require a JavaScript safe integer: an integral number from JavaScript's `Number.MIN_SAFE_INTEGER` through `Number.MAX_SAFE_INTEGER`, inclusive.
+
+Individual use sites may impose further numeric requirements. If runtime execution reaches a use site with a value that does not satisfy its requirements, the traversal may poison. For example, an array index must be non-negative and select an existing element, while an `Index()` return cannot accept a fraction or a negative value.
 
 ### Arrow Functions
 
@@ -103,7 +109,7 @@ Cells are a node's persistent typed state. Each cell is scoped to the node that 
 
 Inner values are written only through dedicated channels: `cell.$set(...)`, a resolved `$observe(...)` or `$observeOrAsk(...)` report, and `returns` committed by a covered `$enter(...)` (see [Control Transfer](#control-transfer)).
 
-A cell starts _unset_ and stays so until a write action provides its inner value. It becomes unset again when `cell.$unset()` resolves. Using a cell in a value position attempts its inner value: a set cell produces the inner value, while an unset cell resolves only where [Operators](#operators) define a result for an unset operand, and any other evaluation of it raises a runtime error. Member forms target the cell itself rather than its inner value and stay available while unset: `cell.isUnset()` reports whether the cell is unset, and `$set`, `$unset`, `observing`, and observation calls work the same way on set and unset cells.
+A cell starts _unset_ and stays so until a write action provides its inner value. An Artifact declaration with a path instead initializes on first entry. A cell becomes unset again when `cell.$unset()` resolves. Using a cell in a value position attempts its inner value: a set cell produces the inner value, while an unset cell resolves only where [Operators](#operators) define a result for an unset operand, and any other evaluation of it raises a runtime error. Member forms target the cell itself rather than its inner value and stay available while unset: `cell.isUnset()` reports whether the cell is unset, and `$set`, `$unset`, `observing`, and observation calls work the same way on set and unset cells.
 
 Cells are declared with `let` inside a node body:
 
@@ -120,8 +126,9 @@ let topic = Str({
   observing: `what topic has ${user} mentioned`,
 });
 
-let skill = RangedInt(1, 10, {
+let skill = Num({
   observing: `how skilled ${user} feels at this`,
+  observeAs: { kind: "integer", min: 1, max: 10 },
 });
 
 let startedAt = Dialog.Cursor();
@@ -138,64 +145,111 @@ let report = Artifact(`reports/${reportName}.md`);
 | `Enum(values, config?)` | Ordered string enum. Comparisons use ordinal position. | `values: string[]` |
 | `Bool(config?)` | True/false flag. |  |
 | `Str(config?)` | Arbitrary plain string value. |  |
-| `RangedInt(min, max, config?)` | Bounded integer. | `min: number, max: number` |
+| `Num(config?)` | IEEE-754 number. |  |
+| `RangedInt(min, max, config?)` | Authoring shorthand for an integer-observed `Num`. | `min: safe integer, max: safe integer` |
 | `Dialog.Cursor()` | Snapshot of a scoped dialog cursor. |  |
-| `Artifact(path)` | Semantic reference to a host artifact. | `path: string or value template` |
-| `Array(elementCell)` | Ordered list of one element shape. See [Arrays](#arrays). | `elementCell: constructed scalar observable cell` |
+| `Artifact(path?)` | Nominal host Artifact value, optionally initialized from a logical path. | `path?: string-valued expression` |
+| `Array(elementCell)` | Ordered list of one scalar or Artifact element shape. See [Arrays](#arrays). | `elementCell: constructed scalar observable cell or zero-argument Artifact()` |
 
-The optional `config` object supports `observing`, a string literal or template literal.
-
-Only `Enum`, `Bool`, `Str`, `RangedInt`, and `Array` cells are observable; `$observe(...)` and `$observeOrAsk(...)` accept only these types, whether observed singly or in a group (see [Grouped Observation](#grouped-observation)). `Array` cells are covered under [Arrays](#arrays).
-
-Enum comparisons use **ordinal position** within the declared values array. For `Enum(["cold", "lukewarm", "curious", "enthusiastic"])`, `interest >= "lukewarm"` is true when `interest` is `"lukewarm"` (index 1), `"curious"` (index 2), or `"enthusiastic"` (index 3).
-
-`Dialog.Cursor`s are local value cells. They are assigned with `cell.$set(Dialog.cursor)` and used as the receiver or argument of the `cursor.*TurnsSince(...)` methods.
-
-`Artifact(path)`s are local mention-only cells: their inner value is the artifact reference declared at the cell, and they are valid only as semantic text interpolation references. `$set(...)` and `$unset()` are rejected on artifacts:
+The optional `config` object supports `observing`, a string literal or template literal. `Num` additionally supports `observeAs`, which constrains values accepted from observation reports:
 
 ```js
-let researchLog = Artifact(/*...*/);
-$instruct(`Read ${researchLog}`);
+let confidence = Num({
+  observing: `rate ${user}'s confidence`,
+  observeAs: { kind: "number", min: 0, max: 1 },
+});
+
+let attempts = Num({
+  observing: `how many attempts ${user} has made`,
+  observeAs: { kind: "integer", min: 0 },
+});
 ```
 
-`path` is a logical path relative to the host's workspace for the current Arc run. It may be a string literal or a value-position template literal such as `` `reports/${reportName}.md` ``. Path template interpolation may use ordinary value expressions, including Arc cells, and may not use semantic-only references such as `${user}`, `${self}`, artifacts, or host variables. A template path renders each time the artifact is mentioned, using inner values current at that mention. The rendered path must be a non-empty relative path and may not contain `.` or `..` path segments.
+`observeAs` has exactly one of these shapes:
+
+- `{ kind: "number", min?, max? }` accepts numeric observations, including fractions.
+- `{ kind: "integer", min?, max? }` accepts safe-integer observations. Omitted bounds extend to the corresponding end of the safe-integer range.
+
+Bounds are inclusive, finite, and ordered. Integer-observation bounds must themselves be safe integers. `observeAs` governs observation reports only: it does not constrain `$set(...)`, `args`/`returns`, arithmetic, or any other in-Arc value flow. Those paths may write a fraction or a value outside the observation bounds.
+
+`RangedInt(min, max, config?)` is shorthand for `Num({ ...config, observeAs: { kind: "integer", min, max } })`. Its `min` and `max` must be ordered safe integers, and its config supports `observing` but not another `observeAs`. For example, a `let cell = RangedInt(1, 10)` observation must be an integer from 1 through 10, while `cell.$set(10.5)` and `cell.$set(20)` are valid direct writes.
+
+Only `Enum`, `Bool`, `Str`, `Num`, `RangedInt`, and arrays of those scalar elements are observable. `$observe(...)` and `$observeOrAsk(...)` accept only these types, whether observed singly or in a group (see [Grouped Observation](#grouped-observation)). `Array` cells are covered under [Arrays](#arrays).
+
+Enum ordering comparisons use **ordinal position** within the declared values array. For `Enum(["cold", "lukewarm", "curious", "enthusiastic"])`, `interest >= "lukewarm"` is true when `interest` is `"lukewarm"` (index 1), `"curious"` (index 2), or `"enthusiastic"` (index 3). Equality and inequality compare the produced strings directly, so they do not require matching Enum declarations or membership of a literal operand.
+
+`Dialog.Cursor`s are local value cells. They are set with `cell.$set(Dialog.cursor)` and used as the receiver or argument of the `cursor.*TurnsSince(...)` methods.
+
+`Artifact()` declares an unset value cell. `Artifact(path)` declares the same cell with an initializer evaluated once on first entry, after binding `args` and in declaration order. The path expression must resolve to a string; Arc then validates that complete string as a non-empty relative path with no `.` or `..` segment. An initializer may read a string channel directly, such as `let report = Artifact(args.reportPath)`, or project an earlier Artifact through a value template, such as ``let derived = Artifact(`root/${source}`)``.
+
+Artifact construction snapshots its path. The constructor does not retain or subscribe to the cells read by its path expression, so changing one of those cells later does not change the stored Artifact. An author who wants to refresh an Artifact cell constructs and writes a new value explicitly, for example `artifact.$set(Artifact(linkedPath))` after `linkedPath` changes.
+
+Artifact values otherwise follow ordinary value-cell semantics and compare equal when their logical paths are equal. In a value-position template literal, an Artifact contributes its logical path as ordinary string text. In semantic text, it remains a structured Artifact reference for the host.
+
+The same `Artifact(path)` syntax constructs an Artifact value in an ordinary value position, such as `researchLog.$set(Artifact(linkedPath))` or ``researchLog.$set(Artifact(`archive/${slug}.md`))``. The path is required in a value position, and construction runs when the expression is reached. Any expression that resolves to a string is accepted; a statically known non-string path is rejected, while a dynamic producer such as a host call is checked at runtime. Briefable path work completes before Arc validates the resulting string and before the surrounding write or return can mutate its destination. `$enter(...).args` stays a channel-binding map, so an inline constructor must first be written to an Artifact cell before that cell is bound as an argument.
+
+Arc statically judges each cell or return write from the producer evidence available at that site. A read from a cell or channel supplies its declared guarantee; literals retain their exact value; fixed operations supply their carrier or intrinsic provenance; arrays retain element evidence; a definitively declared host call supplies its result spec; and an environment-free host call supplies no source fact. A provably incompatible landing is rejected. A landing the rule cannot prove either way is deferred and still validated before mutation. Exact literals are checked against destination refinements immediately, so an undeclared string literal cannot land in an `Enum`; a general `Str` producer may reach that one-time landing only subject to runtime Enum admission. Reusable channel bindings are stricter and reject `Str` providers for `Enum` receivers because every future provider value must be safe. `Num` and `Index`, Artifact and Struct, cursor, boolean, and array relationships follow the same destination-directed rule rather than one global value-family test.
 
 #### Arrays
 
-`Array(elementCell)` declares an array cell whose inner value is an ordered list of one element shape. The element is a constructed scalar observable cell — `Bool`, `Str`, `Enum`, or `RangedInt` — declared once and instanced by every stored element:
+`Array(elementCell)` declares an array cell whose inner value is an ordered list of one element shape. The element is either a constructed scalar observable cell — `Bool`, `Str`, `Enum`, or `Num`, including the `RangedInt(...)` shorthand — or zero-argument `Artifact()`. The element guarantee is declared once and applies to every stored member:
 
 ```js
 let findings = Array(Str({ observing: `a finding ${user} mentioned` }));
-let scores = Array(RangedInt(1, 5));
+let scores = Array(Num({ observeAs: { kind: "integer", min: 1, max: 5 } }));
+let artifacts = Array(Artifact());
 ```
 
-The element's `observing` is the per-item extraction question for observation. `Array(Str)` (a bare constructor), a nested array, and extra arguments are parse errors.
+For a scalar array, the element's `observing` is the per-item extraction question. An `Artifact()` element takes no arguments and makes the array non-observable. `Array(Str)` (a bare constructor), a nested array, and extra arguments are parse errors.
 
 An array cell holds a whole list value and supports:
 
 - whole-value `$set(...)` and `$unset()`,
 - `items[index]` as an element-value read,
 - `items[index].$set(...)` as an existing-element cell write,
-- `items.length` as a non-negative-integer read,
+- `items.length` as a non-negative-safe-integer read,
 - `items.isUnset()`,
-- observation as a whole collection or as one element.
+- observation as a whole collection or as one element, only when the element is scalar.
 
-An action cell target is a lexical cell name followed by zero or more accesses into its inner value. A direct target such as `items` addresses the whole cell; `items[i]` is a synthetic subcell target whose access expression is evaluated when the action reaches it. Arrays are the only inner-value container currently implemented, so object-field paths are not yet valid targets.
+An action cell target is a lexical cell name followed by zero or more accesses into its inner value. A direct target such as `items` addresses the whole cell; `items[i]` addresses one element and evaluates `i` when the action reaches it. Only arrays support access paths in cell targets; object-field paths are invalid.
 
-An element target must select an existing position. `$set(...)` replaces that element without changing its siblings, and `$observe(items[i])` briefs and writes the scalar element using the element's type and `observing` question. `$unset()` remains a whole-cell operation: `items[i].$unset()` is a parse error because array values are dense and have no unset element slots. An array literal is a contextually typed value where a compatible array type can be inferred, as in `items.$set(["a", "b"])` or `items == ["a", "b"]`; each element is validated against the element shape.
+An element target must select an existing position. `$set(...)` replaces that element without changing its siblings. Observation is available only for scalar-element arrays; `$observe(items[i])` briefs and writes the element using its type and `observing` question. `$unset()` remains a whole-cell operation: `items[i].$unset()` is a parse error because array values are dense and have no unset element slots. An array literal contributes element evidence to its consuming context, as in `items.$set(["a", "b"])`, `artifacts.$set([Artifact("a.md")])`, or an equality expression; the destination or operation supplies the element guarantee, and each concrete element is validated against it before mutation.
 
-Equality and inequality compare ordered element values structurally, and the shared unset-comparison rule applies unchanged (equality involving an unset array is `false`, inequality is `true`). Ordering, arithmetic, and boolean evaluation of a whole array are rejected. Template interpolation renders an array by JavaScript array stringification — elements joined with commas, an empty array as the empty string.
+Equality and inequality require one shared element authority, admit every concrete element under it, and then compare ordered element values structurally. Scalar arrays use their boolean, string, or number family; Enum elements participate as strings because equality does not apply Enum ordering domains. Artifact arrays use Artifact authority and compare members by admitted path, while two dynamic object arrays do not become Artifact arrays from shape alone. The shared unset-comparison rule applies unchanged (equality involving an unset array is `false`, inequality is `true`). Ordering, arithmetic, and boolean evaluation of a whole array are rejected. Template interpolation renders a primitive array by JavaScript array stringification — elements joined with commas, an empty array as the empty string. A whole Artifact array is not renderable; index it first to project one path in a value template or emit one structured Artifact part in semantic text.
 
-Indexing, targeting an element, or reading `length` on an unset array is a runtime error, as is an out-of-range or non-integer index. A whole-array write validates every element; an element write or observation validates its scalar value against the element shape before replacing the parent array.
+Indexing, targeting an element, or reading `length` on an unset array is a runtime error. An index must resolve to a non-negative safe integer and select an existing position; other values and positions outside the current array are runtime errors. Index expressions may use arithmetic over literals and locally available values, such as `items[i + 1]` and `items[i + 1].$set(value)`. They cannot contain a host call or another expression that requires host resolution.
+
+A whole-array write and an element write must match the array's element type and are validated before mutation. An element observation must also satisfy a scalar element's `observeAs`; a direct write does not.
 
 #### Operators
 
-Operators combine cell values and literals into a result. Arc supports comparison operators and logical operators.
+Operators combine cell values and literals into a result. Arc supports numeric arithmetic, comparisons, and logical operators.
+
+Every numeric literal must be finite. For example, `1e309` and `-1e309` are rejected.
+
+Numeric arithmetic uses JavaScript number operations without JavaScript coercion:
+
+| Operator  | Meaning          |
+| --------- | ---------------- |
+| `+`       | addition         |
+| `-`       | subtraction      |
+| `*`       | multiplication   |
+| `/`       | division         |
+| `%`       | remainder        |
+| unary `-` | numeric negation |
+
+Both operands of a binary arithmetic operator, and the operand of unary `-`, must be numbers. Arc does not coerce other values: a value known to be nonnumeric is an authoring error, while a nonnumeric value supplied dynamically poisons the traversal. `+` never concatenates strings. Normal JavaScript precedence and associativity apply.
+
+Division always uses ordinary numeric division: `6 / 3` is `2` and `5 / 2` is `2.5`, and either result may be written to a `Num` cell.
+
+Arithmetic expressions producing non-finite values, such as `0 / 0` or `2 * 1e308`, are not themselves poison, but such values cannot be used in most cases. A non-finite write, comparison, interpolation, array index, or value sent to the host, poisons the traversal.
+
+To guard against such poisoning, use `Num.isFinite(expr)` as a precheck. It returns a boolean indicating whether `expr` is finite. The consuming position may impose additional constraints that `Num.isFinite()` cannot check, such as requiring a safe integer. `Num.isFinite()` accepts only a numeric argument; it neither coerces another value nor suppresses an error raised while evaluating the argument. Applying it to an unset cell follows the ordinary unset-read rule and poisons the traversal as well.
 
 Comparison operators pair two values and produce a boolean:
 
-- Equality — `==` and `!=` — compares by value. Scalars are equal when their values are identical; arrays are equal when they hold the same elements in the same order (see [Arrays](#arrays)). When either operand is an unset cell, `==` is `false` and `!=` is `true`. Arc applies no type coercion.
-- Ordering — `>`, `>=`, `<`, and `<=` — compares magnitude. Numbers order numerically, enum values order by ordinal position within the cell's declared values, and other values order lexicographically by their string form. When either operand is an unset cell, all four are `false`. Arrays have no ordering.
+- Equality — `==` and `!=` — compares by value. Numeric equality is exact, with no rounding tolerance. Scalars are otherwise equal when their values are identical, Artifacts are equal when their logical paths are equal, and arrays are equal when they hold the same elements in the same order (see [Arrays](#arrays)). When either operand is an unset cell, `==` is `false` and `!=` is `true`.
+- Ordering — `>`, `>=`, `<`, and `<=` — compares magnitude. Numbers order numerically. When either operand supplies one proven Enum domain, both operands must be guaranteed members of that same domain, exact member literals, or dynamic values that pass concrete membership admission; a known `Str` site and conflicting Enum domains are rejected. Admitted Enum members order by their declared ordinal positions. Without a proven Enum domain, admitted strings order lexicographically. When either operand is an unset cell, all four are `false`. Artifacts and arrays have no ordering.
 
 `&&` and `||` are logical conjunction and disjunction over boolean operands, producing a boolean. Each short-circuits: `&&` evaluates its right operand only when its left is `true`, and `||` only when its left is `false`, so a blocking or effectful right operand runs only where the left has not already decided the result.
 
@@ -261,7 +315,7 @@ function Review() {
 }
 ```
 
-The value may be any scalar value or an array or object of scalar values with non-computed keys. Template literals are value expressions and are not valid inside `hostParams`.
+The value may be any scalar literal or an array or object of scalar literals with non-computed keys. Numeric entries use direct unsigned literal syntax; signed numeric expressions are not part of the `hostParams` grammar. Template literals are also not valid inside `hostParams`.
 
 Arc never interprets these keys. Which ones are meaningful, and what they select — the agent that carries out the node's work, the dialog view the node evaluates under — belongs to the host the arc is deployed on; write them as that host documents them. Host params do not inherit: each node declares its own or supplies none.
 
@@ -397,7 +451,7 @@ Different actions and expressions resolve as follows:
 | Form | Resolution rule |
 | --- | --- |
 | `cell.$set(value)` | Resolves after the value expression is available and the typed write succeeds. |
-| `cell.$unset()` | Resolves after clearing the inner value. Artifact cells reject this action. |
+| `cell.$unset()` | Resolves after clearing the inner value. |
 | `$observe(cell)` | Resolves after the host reports an observation result. A `resolved` result writes the reported value. An `unknown` result consumes the action and preserves any existing value. Prior `$set(...)` writes provide the observation's current value; they do not resolve the `$observe(...)` action. |
 | `$observeOrAsk(cell)` | Resolves after the host reports a concrete value. |
 | `$observe({ ... })` / `$observeOrAsk({ ... })` | Resolves after the host reports results for every field in one report. All `resolved` fields are written together; `unknown` fields are skipped. A grouped `$observeOrAsk` whose report leaves any field pending re-emits the whole group and writes nothing. See [Grouped Observation](#grouped-observation). |
@@ -414,10 +468,13 @@ Different actions and expressions resolve as follows:
 Arc expressions are shared across value positions, including `if` tests, hook returns, `cell.$set(...)` values, template interpolations, and expression-position host calls. They support:
 
 - Value-bearing cell references — `interest`, `musicSurfaced`, `startedAt`
+- Numeric arithmetic — `subtotal + tax`, `distance / duration`, `i + 1`, `-offset`
+- Numeric finiteness checks — `Num.isFinite(arith)`
 - Comparisons — `interest >= "lukewarm"`, `ready == true`
 - Node state checks — `Spark.state == State.COVERED`
 - Semantic checks — ``judge(`semantic question`)``
 - Host calls — `Dice.roll(20)`, `Store.flags.enabled()`
+- Artifact construction — `Artifact("report.md")`, ``Artifact(`reports/${slug}.md`)``
 - Regex tests — `/pattern/flags.test(target)` (e.g., `/music|band/i.test(Dialog.lastUserMessage)`)
 - Cursor turn differences — `Dialog.cursor.userTurnsSince(startedAt)`, `endedAt.totalTurnsSince(startedAt)`
 - Unset checks — `topic.isUnset()`, `startedAt.isUnset()`
@@ -426,15 +483,15 @@ Arc expressions are shared across value positions, including `if` tests, hook re
 
 Comparison and logical composition evaluate by the rules in [Operators](#operators).
 
-A **boolean position** — an `if` test, the operands of `&&`, `||`, and `!`, a ternary test, and a `this.trigger`, `this.catchDeflection`, `resolveWhen`, or `deflectWhen` return — accepts only a boolean value, without coercion. A comparison, `&&` / `||` / `!`, `judge(...)`, a regex `.test(...)`, `.isUnset()`, `this.deflection.escaped(...)`, and a set `Bool` cell are booleans; a `Str`, `RangedInt`, `Enum`, `Dialog.Cursor`, or array value is not, and must be compared explicitly — `count > 0`, never `count`.
+A template literal in a value position renders each interpolation to ordinary string text. Primitive values and primitive arrays use their existing string rendering, while an Artifact contributes its logical path. A whole Artifact array is rejected; indexing it first contributes the selected Artifact's path. The rendered result is an ordinary string regardless of which supported values contributed to it.
+
+A **boolean position** — an `if` test, the operands of `&&`, `||`, and `!`, a ternary test, and a `this.trigger`, `this.catchDeflection`, `resolveWhen`, or `deflectWhen` return — accepts only a boolean value, without coercion. A comparison, `Num.isFinite(...)`, `&&` / `||` / `!`, `judge(...)`, a regex `.test(...)`, `.isUnset()`, `this.deflection.escaped(...)`, and a set `Bool` cell are booleans; a `Str`, `Num`, `Enum`, `Dialog.Cursor`, Artifact, or array value is not, and must be compared explicitly — `count > 0`, never `count`.
 
 A non-boolean value in a boolean position is rejected at parse time when its type is statically known, and poisons the traversal at runtime otherwise. An unset `Bool` used bare poisons the traversal too — its type passes the parse check, but there is no boolean to read — so either compare it (`== true` / `== false`, which are `false` on an unset cell) or ensure it is set before the bare read.
 
-Artifact cells are not value-bearing expression references. They may appear only as direct template interpolation mentions.
-
 ### Host Modules
 
-Host modules let arcs interact with host-owned systems — rolling dice, reading feature flags, writing to memoir. The arc declares what it needs; the host decides what the call means.
+Host modules let arcs interact with host-owned systems — rolling dice, reading feature flags, writing to memoir. Each module has a declared namespace and operation surface; the host supplies the implementations.
 
 Host modules are imported with a default import whose source starts with `host:`:
 
@@ -442,6 +499,10 @@ Host modules are imported with a default import whose source starts with `host:`
 import Dice from "host:rng";
 import Memoir from "host:memoir";
 ```
+
+The local import alias cannot be a reserved Arc identifier. Reserved aliases are `$enter`, `$enterLoop`, `$instruct`, `$instructLoop`, `$observe`, `$observeOrAsk`, `Array`, `Artifact`, `Bool`, `Dialog`, `Enum`, `Index`, `Num`, `RangedInt`, `State`, `Str`, `args`, `forgetful`, `invoke`, `judge`, `newcopy`, `returns`, `self`, `span`, and `user`. This keeps the same Arc form unambiguous everywhere it is recognized.
+
+The runtime associates every imported module with a typed operation surface. Each operation defines its ordered parameters and whether it returns a value. Arc authors consume that contract through host calls; how the host supplies it is outside the Arc script language.
 
 A host module exposes a namespace under the imported binding. Arc reaches into that namespace through member access at any depth. A callable path such as `Dice.roll(...)` or `Dice["tables"].roll(...)` asks the host to perform an operation. A bare member path such as `Audience.supervisor`, `Audience.group.supervisor`, or `Audience["supervisor"]` mentions a host-owned symbolic variable. Paths may use dot segments or static string-literal bracket segments.
 
@@ -468,6 +529,8 @@ this.effects = () => {
 
 Host effects must prefix the operation name with `$`, as in `Memoir.facts.$apply(...)`.
 
+An operation with a declared result may be called in expression position or used as an effect; effect use discards the result. An operation without a result is valid only as an effect. The `$` belongs only to the authored effect use site. Arc lowers `Memoir.facts.$apply(...)` to the unsigiled operation path `memoir.facts.apply`, which is also the path carried in the host-effect brief.
+
 **Template interpolation** — a host variable mentioned inside semantic text. The host variable carries a reference for the host to render or route when it consumes the text.
 
 ```js
@@ -478,7 +541,11 @@ $instruct(`Ask ${Audience["supervisor"]} whether the plan is acceptable.`);
 
 Host variables are valid only inside template literals. `Audience.supervisor`, `Audience.group.supervisor`, and `Audience["group"]["supervisor"]` are host variables. Bracket segments must be static string literals, so `Audience[role]` is not a host variable. `Audience.supervisor()` is a host call, not a host variable, and follows the same static segment rule.
 
-Arguments to a host call must be renderable without further host work: a host call may not appear inside another host call's arguments. Template-literal arguments follow the same semantic text rendering as judgments, observations, and instructions, so they may preserve `user`, `self`, artifact mentions, and host-variable mentions for host rendering.
+Arguments to a host call must be renderable without further host work; a host call may not appear inside another host call's arguments. Arc enforces exact arity and the operation's parameter types before emitting host work.
+
+Template-literal arguments use semantic text rendering. Structured semantic text is admitted only by semantic-text parameters; plain-string and enum parameters require plain string values.
+
+Host-call result types participate in ordinary spec resolution and compatibility checks. The runtime admits a reported payload against the result type before expression use or pin hydration. Artifact identity comes from the result type, not payload shape.
 
 ## Hooks
 
@@ -581,7 +648,7 @@ Processing rules:
 
 ### `this.guard`
 
-`this.guard` is evaluated when traversal reaches a node — after the parent's `if` condition passes but before the node's action graph runs. It may return a `State.*` value to resolve the node without entering it. If it returns `undefined`, traversal continues normally.
+`this.guard` is evaluated when traversal reaches a node — after the parent's `if` condition passes but before the node's action graph runs. It may return a `State.*` value to resolve the node without entering it. If it returns no node-state value, traversal continues normally.
 
 ```js
 this.guard = () => {
@@ -768,7 +835,7 @@ function Op(
 
 A node may declare `args`, `returns`, both, or neither; when both are present `args` precedes `returns`, and no other parameter name is admitted.
 
-Each channel key has a type; a cell bound to a key must be that type. A key's type is `Bool()`, `Str()`, `Enum(...)`, `RangedInt(...)`, `Dialog.Cursor()`, or `Array(elementSpec)`, with no observation config. `Index()` is a channel-only non-negative-integer type and cannot declare a cell.
+Each channel key has a type. A key's type is `Bool()`, `Str()`, `Enum(...)`, `Num()`, `Artifact()`, `Dialog.Cursor()`, or `Array(elementSpec)`, with no observation config. `Array` accepts the same scalar element specs as a cell array or zero-argument `Artifact()`; nested channel arrays remain invalid. `Index()` is a channel-only non-negative-safe-integer refinement of `Num()` and cannot declare a cell or array element.
 
 `$enter(...)` and `$enterLoop(...)` bind caller cells to the target's keys:
 
@@ -798,7 +865,7 @@ Binding rules:
 - An `args` binding gives the node a value to read: a caller cell, or the caller's own `args.<key>` (`args: { key: args.other }`).
 - A `returns` binding is a caller cell the node writes.
 - Each entry binds the node's key to a caller cell, shorthand (`{ ready }`) or renamed (`{ input: ready }`).
-- The bound cell's type must match the key's type, including enum members, ranged-int bounds, and array element type (recursively). Same-document targets are checked during analysis; imported targets at registration.
+- The value provider must be assignable to the receiving channel, including scalar type, enum members, and array element types recursively. `Index()` is assignable to `Num()`, while `Num()` is not assignable to `Index()` because an arbitrary number may be fractional, negative, or outside the safe-integer range. For `args`, the caller binding provides the value; for `returns`, the declared return channel provides the value to the caller cell.
 - Binding a key the target does not declare is an error. Within one `returns` map, each caller cell may back at most one key.
 - `args` and `returns` must be object literals (no spread, no computed keys).
 
@@ -828,7 +895,7 @@ Arc provides built-in accessors for semantic participants, node outcomes, dialog
 | `Dialog.user` | semantic reference | The human interlocutor. |
 | `Dialog.self` | semantic reference | The AI companion. |
 | `Dialog.lastUserMessage` | `string` | The most recent user message. |
-| `Dialog.lastTurns(n)` | `{ role: "self" \| "user"; message: string }[]` | The last `n` turns of conversation. |
+| `Dialog.lastTurns(n)` | `{ role: "self" \| "user"; message: string }[]` | The last `n` turns of conversation. `n` must be a direct non-negative safe-integer literal. |
 | `Dialog.cursor` | `Dialog.Cursor` | The current scoped dialog cursor. |
 
 `user` and `self` are shorthands for `Dialog.user` and `Dialog.self`. Both forms are semantic references: they are available in semantic template interpolation and are not ordinary value expressions.

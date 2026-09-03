@@ -9,27 +9,32 @@ import { describe, expect, it } from "vitest";
 
 import { parse } from "../src/parser/index.js";
 import { applyUnset } from "../src/runtime/evaluate.js";
-import { Runtime } from "../src/runtime/index.js";
+import { createArtifactValue } from "../src/runtime/index.js";
 import {
   createAccumulator,
   createEmptyArcTraversal,
   type RegistryEntry,
 } from "../src/runtime/state.js";
-import type { ArcTraversalSet, Dialog } from "../src/types.js";
+import type { ArcTraversalSet, Dialog } from "../src/types/index.js";
 import {
-  EMPTY_DIALOG,
-  METAL_SOURCE,
+  actionProgress,
+  actionTerminal,
   appliedHostEffects,
   appliedInstructions,
   arc,
+  EMPTY_DIALOG,
   groupObservation,
+  METAL_SOURCE,
   node,
   ownedChild,
   progressBrief,
+  progressTerminal,
   renderSemanticTextForTest,
   rootTraversal,
+  TestRuntime as Runtime,
   singleObservation,
   startRun,
+  startTerminal,
   startTrigger,
   withExperimentalRewalk,
 } from "./helpers.js";
@@ -52,7 +57,7 @@ function Main() {
 `),
         "Main",
       );
-      const runtime = new Runtime().add("set-rewalk-arc", document);
+      const runtime = new Runtime().add("set-rewalk-arc", document).init();
       const seeded = runtime.newTraversal(arc("set-rewalk-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -79,7 +84,7 @@ function Main() {
 `),
         "Main",
       );
-      const runtime = new Runtime().add("n1-arc", document);
+      const runtime = new Runtime().add("n1-arc", document).init();
       const seeded = runtime.newTraversal(arc("n1-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -173,7 +178,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("unset-rewalk-arc", document);
+      const runtime = new Runtime().add("unset-rewalk-arc", document).init();
       const seeded = runtime.newTraversal(arc("unset-rewalk-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -202,6 +207,7 @@ function Main() {
         document,
         root,
         importRefs: {},
+        hostModules: new Map(),
       };
       const traversal = createEmptyArcTraversal(ref, root);
       const accum = createAccumulator(
@@ -220,7 +226,7 @@ function Main() {
       });
     });
 
-    it("rejects arguments, unknown cells, and Artifact cells", () => {
+    it("rejects arguments and unknown cells while permitting Artifact unset", () => {
       expect(() =>
         parse(`
 "arc";
@@ -248,7 +254,7 @@ function Bad() {
   report.$unset();
 }
 `),
-      ).toThrow(/NON_UNSETTABLE_CELL/);
+      ).not.toThrow();
     });
   });
 
@@ -276,7 +282,7 @@ function Main() {
 }
 `);
 
-      const runtime = new Runtime().add("effects-arc", document);
+      const runtime = new Runtime().add("effects-arc", document).init();
       const seeded = runtime.newTraversal(arc("effects-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], {
@@ -284,7 +290,7 @@ function Main() {
         lastTurns: [{ role: "user", message: "I like metal" }],
       });
 
-      const nextBrief = progressBrief(runtime, brief, {
+      const nextBrief = progressTerminal(runtime, brief, {
         move: "proceed",
         observations: {
           [brief.observations[0]!.id]: { status: "unknown" },
@@ -293,7 +299,7 @@ function Main() {
 
       expect(rootTraversal(nextBrief).cells.interest).toBeUndefined();
       expect(rootTraversal(nextBrief).cells.topic).toBeUndefined();
-      expect(nextBrief.hostEffects).toEqual([]);
+      expect("hostEffects" in nextBrief).toBe(false);
       expect(rootTraversal(nextBrief).phase).toBe("completed");
     });
 
@@ -309,7 +315,7 @@ function Main() {
 }
 `);
 
-      const runtime = new Runtime().add("observe-arc", document);
+      const runtime = new Runtime().add("observe-arc", document).init();
       const seeded = runtime.newTraversal(arc("observe-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], {
@@ -317,7 +323,7 @@ function Main() {
         lastTurns: [],
       });
 
-      const nextBrief = progressBrief(runtime, brief, {
+      const nextBrief = progressTerminal(runtime, brief, {
         move: "proceed",
         observations: {
           [brief.observations[0]!.id]: { status: "unknown" },
@@ -340,7 +346,9 @@ function Main() {
   $observe(interest);
 }
 `);
-      const runtime = new Runtime().add("observe-current-value-arc", document);
+      const runtime = new Runtime()
+        .add("observe-current-value-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("observe-current-value-arc", "Main"),
       );
@@ -367,7 +375,9 @@ function Main() {
   $observe(items[1]);
 }
 `);
-      const runtime = new Runtime().add("observe-array-element-arc", document);
+      const runtime = new Runtime()
+        .add("observe-array-element-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("observe-array-element-arc", "Main"),
       );
@@ -384,7 +394,7 @@ function Main() {
         "the selected item",
       );
 
-      const done = progressBrief(runtime, brief, {
+      const done = progressTerminal(runtime, brief, {
         move: "proceed",
         observations: {
           [observation.id]: { status: "resolved", value: "BETA" },
@@ -416,7 +426,7 @@ function Main() {
 `),
         "Main",
       );
-      const runtime = new Runtime().add("observe-rewalk-arc", document);
+      const runtime = new Runtime().add("observe-rewalk-arc", document).init();
       const seeded = runtime.newTraversal(arc("observe-rewalk-arc", "Main"));
       seeded.phase = "entered";
 
@@ -462,7 +472,9 @@ function Main() {
 `),
         "Main",
       );
-      const runtime = new Runtime().add("observe-branch-rewalk-arc", document);
+      const runtime = new Runtime()
+        .add("observe-branch-rewalk-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("observe-branch-rewalk-arc", "Main"),
       );
@@ -491,7 +503,7 @@ function Main() {
 
     it("records needs-user/proceed flow against the active owned child", () => {
       const document = parse(METAL_SOURCE);
-      const runtime = new Runtime().add("metal-arc", document);
+      const runtime = new Runtime().add("metal-arc", document).init();
       const dialog: Dialog = {
         cursor: { user: 0, self: 0 },
         lastTurns: [{ role: "user", message: "what music are you into?" }],
@@ -554,7 +566,7 @@ function Main() {
           .subgenre,
       ).toBe("thrash");
 
-      const completed = progressBrief(runtime, afterProceed, {
+      const completed = progressTerminal(runtime, afterProceed, {
         move: "proceed",
         instructions: appliedInstructions(afterProceed),
       });
@@ -574,7 +586,7 @@ function Main() {
   $instruct(\`after\`);
 }
 `);
-      const runtime = new Runtime().add("ask-unknown-arc", document);
+      const runtime = new Runtime().add("ask-unknown-arc", document).init();
       const seeded = runtime.newTraversal(arc("ask-unknown-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -617,7 +629,7 @@ function Main() {
 function Main() {
   $instruct(\`hello\`);}
 `);
-      const runtime = new Runtime().add("once-arc", document);
+      const runtime = new Runtime().add("once-arc", document).init();
       const seeded = runtime.newTraversal(arc("once-arc", "Main"));
       seeded.phase = "entered";
 
@@ -636,11 +648,11 @@ function Main() {
       ]);
       expect(brief.allowedMoves).toEqual(["poison", "proceed"]);
 
-      const afterProceed = progressBrief(runtime, brief, {
+      const afterProceed = progressTerminal(runtime, brief, {
         move: "proceed",
         instructions: appliedInstructions(brief),
       });
-      expect(afterProceed.instructions).toEqual([]);
+      expect("instructions" in afterProceed).toBe(false);
       expect(afterProceed.canProgress).toBe(false);
       expect(rootTraversal(afterProceed).phase).toBe("completed");
     });
@@ -653,7 +665,9 @@ function Main() {
   $instruct(\`Mention this once.\`);
   $instruct(\`after\`);}
 `);
-      const runtime = new Runtime().add("instruct-implicit-arc", document);
+      const runtime = new Runtime()
+        .add("instruct-implicit-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("instruct-implicit-arc", "Main"));
       seeded.phase = "entered";
 
@@ -675,11 +689,11 @@ function Main() {
       });
       expect(resolved.instructions.map((item) => item.text)).toEqual(["after"]);
 
-      const completed = progressBrief(runtime, resolved, {
+      const completed = progressTerminal(runtime, resolved, {
         move: "proceed",
         instructions: appliedInstructions(resolved),
       });
-      expect(completed.instructions).toEqual([]);
+      expect("instructions" in completed).toBe(false);
       expect(completed.canProgress).toBe(false);
     });
 
@@ -692,10 +706,9 @@ function Main() {
   $instruct(\`Say it.\`, { deflectWhen: \`user changed topic\` });
 }
 `);
-      const runtime = new Runtime().add(
-        "instruct-lap-deflect-applied-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("instruct-lap-deflect-applied-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("instruct-lap-deflect-applied-arc", "Main"),
       );
@@ -706,12 +719,12 @@ function Main() {
       // The lap short-circuits on the deflection but honors the application
       // evidence from the same handback: the one-shot stays resolved, so the
       // catch rewalk completes the node instead of re-presenting it.
-      const caught = progressBrief(runtime, issued, {
+      const caught = progressTerminal(runtime, issued, {
         move: "proceed",
         instructions: appliedInstructions(issued),
         judgments: { [check]: true },
       });
-      expect(caught.instructions).toEqual([]);
+      expect("instructions" in caught).toBe(false);
       expect(rootTraversal(caught).phase).toBe("completed");
     });
 
@@ -724,10 +737,9 @@ function Main() {
   $instruct(\`Say it.\`, { deflectWhen: \`user changed topic\` });
 }
 `);
-      const runtime = new Runtime().add(
-        "instruct-lap-deflect-unapplied-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("instruct-lap-deflect-unapplied-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("instruct-lap-deflect-unapplied-arc", "Main"),
       );
@@ -822,7 +834,9 @@ function Main() {
   });
 }
 `);
-      const runtime = new Runtime().add("instruction-precedence-arc", document);
+      const runtime = new Runtime()
+        .add("instruction-precedence-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("instruction-precedence-arc", "Main"),
       );
@@ -845,7 +859,7 @@ function Main() {
       expect(deflect).toBeDefined();
       expect(resolve).toBeDefined();
 
-      const nextBrief = progressBrief(runtime, brief, {
+      const nextBrief = progressTerminal(runtime, brief, {
         move: "proceed",
         judgments: {
           [deflect!.id]: true,
@@ -869,7 +883,9 @@ function Main() {
   });
 }
 `);
-      const runtime = new Runtime().add("loop-bank-resolve-arc", document);
+      const runtime = new Runtime()
+        .add("loop-bank-resolve-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("loop-bank-resolve-arc", "Main"));
       seeded.phase = "entered";
       const issued = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -898,11 +914,11 @@ function Main() {
 
       // The banked true is read at the decision: deflect settles false and the
       // loop resolves without the resolve question ever re-posing.
-      const resolved = progressBrief(runtime, waiting, {
+      const resolved = progressTerminal(runtime, waiting, {
         move: "proceed",
         judgments: { [deflectId]: false },
       });
-      expect(resolved.instructions).toEqual([]);
+      expect("instructions" in resolved).toBe(false);
       expect(rootTraversal(resolved).phase).toBe("completed");
     });
 
@@ -917,7 +933,9 @@ function Main() {
   });
 }
 `);
-      const runtime = new Runtime().add("loop-bank-deflect-arc", document);
+      const runtime = new Runtime()
+        .add("loop-bank-deflect-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("loop-bank-deflect-arc", "Main"));
       seeded.phase = "entered";
       const issued = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -939,11 +957,11 @@ function Main() {
       });
       expect(waiting.judgments.map((item) => item.id)).toEqual([resolveId]);
 
-      const resolved = progressBrief(runtime, waiting, {
+      const resolved = progressTerminal(runtime, waiting, {
         move: "proceed",
         judgments: { [resolveId]: true },
       });
-      expect(resolved.instructions).toEqual([]);
+      expect("instructions" in resolved).toBe(false);
       expect(rootTraversal(resolved).phase).toBe("completed");
     });
 
@@ -958,7 +976,9 @@ function Main() {
   });
 }
 `;
-      const first = new Runtime().add("loop-bank-restore-arc", parse(source));
+      const first = new Runtime()
+        .add("loop-bank-restore-arc", parse(source))
+        .init();
       const seeded = first.newTraversal(arc("loop-bank-restore-arc", "Main"));
       seeded.phase = "entered";
       const issued = startRun(first, [seeded], EMPTY_DIALOG);
@@ -978,7 +998,9 @@ function Main() {
         judgments: { [resolveId]: true },
       });
 
-      const second = new Runtime().add("loop-bank-restore-arc", parse(source));
+      const second = new Runtime()
+        .add("loop-bank-restore-arc", parse(source))
+        .init();
       const restored = startRun(
         second,
         JSON.parse(JSON.stringify(waiting.traversals)) as ArcTraversalSet,
@@ -986,11 +1008,11 @@ function Main() {
       );
       expect(restored.judgments.map((item) => item.id)).toEqual([deflectId]);
 
-      const resolved = progressBrief(second, restored, {
+      const resolved = progressTerminal(second, restored, {
         move: "proceed",
         judgments: { [deflectId]: false },
       });
-      expect(resolved.instructions).toEqual([]);
+      expect("instructions" in resolved).toBe(false);
       expect(rootTraversal(resolved).phase).toBe("completed");
     });
 
@@ -1006,7 +1028,9 @@ function Main() {
   });
 }
 `);
-      const runtime = new Runtime().add("loop-bank-deflected-arc", document);
+      const runtime = new Runtime()
+        .add("loop-bank-deflected-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("loop-bank-deflected-arc", "Main"),
       );
@@ -1032,11 +1056,11 @@ function Main() {
       // The lap short-circuits on the deflection but honors the banked
       // finished evidence: the loop stays resolved, so the catch rewalk
       // completes the node instead of re-presenting it.
-      const caught = progressBrief(runtime, waiting, {
+      const caught = progressTerminal(runtime, waiting, {
         move: "proceed",
         judgments: { [deflectId]: true },
       });
-      expect(caught.instructions).toEqual([]);
+      expect("instructions" in caught).toBe(false);
       expect(rootTraversal(caught).phase).toBe("completed");
     });
 
@@ -1055,10 +1079,9 @@ function Main() {
   });
 }
 `);
-      const runtime = new Runtime().add(
-        "instruction-observe-unknown-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("instruction-observe-unknown-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("instruction-observe-unknown-arc", "Main"),
       );
@@ -1140,7 +1163,9 @@ function Main() {
   interest.$set("warm");
   $instruct(\`Interest is \${interest}; \${interest >= "warm" ? "lean in" : "hold back"}.\`);}
 `);
-      const runtime = new Runtime().add("instruction-rendering-arc", document);
+      const runtime = new Runtime()
+        .add("instruction-rendering-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("instruction-rendering-arc", "Main"),
       );
@@ -1282,7 +1307,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("judge-set-arc", document);
+      const runtime = new Runtime().add("judge-set-arc", document).init();
       const seeded = runtime.newTraversal(arc("judge-set-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -1300,7 +1325,212 @@ function Main() {
     });
   });
 
+  describe("expr.artifact-construction", () => {
+    it("artifact.construct lowers identical source syntax to contextual IR", () => {
+      const document = parse(`
+"arc";
+function Main() {
+  let artifact = Artifact("x.md");
+  artifact.$set(Artifact("x.md"));
+}
+`);
+
+      expect(document.roots[0]!.cells[0]).toMatchObject({
+        name: "artifact",
+        type: "artifact",
+        initializer: {
+          kind: "artifact",
+          path: { kind: "literal", value: "x.md" },
+        },
+      });
+      expect(document.roots[0]!.statements[0]).toMatchObject({
+        kind: "set",
+        target: ["artifact"],
+        value: {
+          kind: "artifact",
+          path: { kind: "literal", value: "x.md" },
+        },
+      });
+    });
+
+    it.each([
+      ["zero arguments", "Artifact()"],
+      ["multiple arguments", 'Artifact("a.md", "b.md")'],
+      ["spread argument", "Artifact(...paths)"],
+      ["object expression", 'Artifact({ path: "a.md" })'],
+    ])(
+      "artifact.construct rejects invalid value-site argument forms: %s",
+      (_case, expression) => {
+        expect(() =>
+          parse(`
+"arc";
+import Files from "host:files";
+function Main() {
+  let path = Str();
+  let artifact = Artifact("initial.md");
+  artifact.$set(${expression});
+}
+`),
+        ).toThrow(/Artifact value/);
+      },
+    );
+
+    it.each([
+      ["number literal", "42"],
+      ["boolean literal", "true"],
+      ["null literal", "null"],
+      ["Artifact value", 'Artifact("nested.md")'],
+    ])(
+      "artifact.construct rejects a statically non-string path expression: %s",
+      (_case, expression) => {
+        expect(() =>
+          parse(`
+"arc";
+function Main() {
+  let artifact = Artifact("initial.md");
+  artifact.$set(Artifact(${expression}));
+}
+`),
+        ).toThrow(/ARTIFACT_PATH_TYPE/);
+      },
+    );
+
+    it.each([
+      ["empty", ""],
+      ["absolute", "/absolute.md"],
+      ["dot segment", "docs/./note.md"],
+      ["parent segment", "docs/../note.md"],
+    ])("artifact.construct rejects invalid literal path: %s", (_case, path) => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let artifact = Artifact("initial.md");
+  artifact.$set(Artifact(${JSON.stringify(path)}));
+}
+`),
+      ).toThrow(/Artifact value path/);
+    });
+
+    it("artifact.construct snapshots a Str expression at the action position", () => {
+      const runtime = new Runtime()
+        .add(
+          "artifact-dynamic-construction",
+          parse(`
+"arc";
+function Main() {
+  let linked = Str();
+  let first = Artifact("first.md");
+  let second = Artifact("second.md");
+  linked.$set("docs/a.md");
+  first.$set(Artifact(linked));
+  linked.$set("docs/b.md");
+  second.$set(Artifact(linked));
+}
+`),
+        )
+        .init();
+
+      const terminal = actionTerminal(
+        runtime.enterArc(
+          arc("artifact-dynamic-construction", "Main"),
+          EMPTY_DIALOG,
+        ),
+      );
+      const cells = rootTraversal(terminal).cells;
+      expect(cells.first).toEqual(createArtifactValue("docs/a.md"));
+      expect(cells.second).toEqual(createArtifactValue("docs/b.md"));
+      expect(cells.first).not.toBe(cells.second);
+    });
+
+    it("artifact.construct poisons before mutation for unset and invalid dynamic paths", () => {
+      for (const [name, setup, pathExpression, reasonCode] of [
+        ["unset-direct", "", "slug", "unset-value"],
+        [
+          "unset-template",
+          "",
+          "`docs/${slug}.md`",
+          "invalid-template-interpolation",
+        ],
+        ["invalid", 'slug.$set("..");', "slug", "invalid-artifact-path"],
+      ] as const) {
+        const runtime = new Runtime()
+          .add(
+            `artifact-${name}-construction`,
+            parse(`
+"arc";
+function Main() {
+  let slug = Str();
+  let artifact = Artifact("initial.md");
+  ${setup}
+  artifact.$set(Artifact(${pathExpression}));
+}
+`),
+          )
+          .init();
+        const seeded = runtime.newTraversal(
+          arc(`artifact-${name}-construction`, "Main"),
+        );
+        seeded.phase = "entered";
+        seeded.cells.artifact = createArtifactValue("initial.md");
+        const terminal = startTerminal(runtime, [seeded], EMPTY_DIALOG);
+        expect(rootTraversal(terminal).cells.artifact).toEqual(
+          createArtifactValue("initial.md"),
+        );
+        expect(terminal.issues[0]).toMatchObject({ reasonCode });
+      }
+    });
+
+    it("artifact.construct rejects invalid Artifact operations", () => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let result = Bool();
+  result.$set(Artifact("x.md") < Artifact("y.md"));
+}
+`),
+      ).toThrow(/INVALID_ARTIFACT_OPERATION/);
+    });
+  });
+
   describe("act.host-call", () => {
+    it("uses the declaration to distinguish Artifact and object-shaped arguments", () => {
+      const document = parse(`
+"arc";
+import Sink from "host:sink";
+function Main() {
+  let accepted = Bool();
+  accepted.$set(Sink.accept(Artifact("docs/result.md")));
+}
+`);
+      const runtime = new Runtime()
+        .add("host-argument-provenance", document)
+        .init();
+      const seeded = runtime.newTraversal(
+        arc("host-argument-provenance", "Main"),
+      );
+      seeded.phase = "entered";
+
+      const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+      expect(first.hostCalls).toHaveLength(1);
+      expect(first.hostCalls[0]!.arguments).toEqual([
+        createArtifactValue("docs/result.md"),
+      ]);
+
+      const objectArgument = parse(`
+"arc";
+import Sink from "host:sink";
+function Main() {
+  let accepted = Bool();
+  accepted.$set(Sink.accept({ path: "docs/result.md" }));
+}
+`);
+      expect(() =>
+        new Runtime().add("host-object-argument", objectArgument),
+      ).toThrow(/HOST_ARGUMENT_TYPE/);
+    });
+
     it("poisons before emitting a host call with an unset value argument", () => {
       const document = parse(`
 "arc";
@@ -1314,16 +1544,18 @@ function Main() {
   topic.$set("pricing");
 }
 `);
-      const runtime = new Runtime().add("host-call-unset-arg-arc", document);
+      const runtime = new Runtime()
+        .add("host-call-unset-arg-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("host-call-unset-arg-arc", "Main"),
       );
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).phase).toBe("poisoned");
-      expect(brief.hostCalls).toEqual([]);
+      expect("hostCalls" in brief).toBe(false);
       expect(brief.issues).toEqual([
         expect.objectContaining({
           kind: "poisoned-traversal",
@@ -1457,9 +1689,9 @@ import Score from "host:scorer";
 import Memoir from "host:memoir";
 
 function Main() {
-  let roll = RangedInt(1, 20);
+  let roll = Num();
   let lucky = Bool();
-  let score = RangedInt(0, 100);
+  let score = Num();
 
   roll.$set(Dice.roll(20));
   lucky.$set(roll > 10);
@@ -1470,17 +1702,17 @@ function Main() {
 
   this.effects = () => {
     if (lucky) {
-      Memoir.facts.$apply({
-        roll,
-        score,
-        label: lucky ? "lucky" : "plain",
-      });
+      Memoir.facts.$apply(
+        \`roll: \${roll}; score: \${score}; label: \${lucky ? "lucky" : "plain"}\`,
+      );
     }
   };
 }
 `);
 
-      const runtime = new Runtime().add("value-expression-arc", document);
+      const runtime = new Runtime()
+        .add("value-expression-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("value-expression-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1532,17 +1764,17 @@ function Main() {
           module: "memoir",
           target: ["facts"],
           operation: "apply",
-          arguments: [{ roll: 17, score: 88, label: "lucky" }],
+          arguments: ["roll: 17; score: 88; label: lucky"],
         },
       ]);
       expect(rootTraversal(emitted).phase).toBe("entered");
 
-      const completed = progressBrief(runtime, emitted, {
+      const completed = progressTerminal(runtime, emitted, {
         move: "proceed",
         hostEffects: appliedHostEffects(emitted),
       });
 
-      expect(completed.hostEffects).toEqual([]);
+      expect("hostEffects" in completed).toBe(false);
       expect(rootTraversal(completed).phase).toBe("completed");
     });
 
@@ -1556,7 +1788,9 @@ function Main() {
   this.trigger = () => Gate.isOpen();
 }
 `);
-      const runtime = new Runtime().add("host-call-rewalk-arc", document);
+      const runtime = new Runtime()
+        .add("host-call-rewalk-arc", document)
+        .init();
       const first = startTrigger(runtime, EMPTY_DIALOG);
       expect(first.hostCalls).toHaveLength(1);
 
@@ -1575,6 +1809,37 @@ function Main() {
         module: "gate",
         operation: "isOpen",
       });
+    });
+
+    it("keeps Artifact host templates semantic while materialized paths are strings", () => {
+      const runtime = new Runtime()
+        .add(
+          "artifact-host-argument-contexts",
+          parse(`
+"arc";
+import Store from "host:store";
+function Main() {
+  let note = Artifact("docs/note.md");
+  let pathText = Str();
+  let accepted = Bool();
+  pathText.$set(\`\${note}\`);
+  accepted.$set(Store.send(note, \`\${note}\`, pathText));
+}
+`),
+        )
+        .init();
+
+      const brief = actionProgress(
+        runtime.enterArc(
+          arc("artifact-host-argument-contexts", "Main"),
+          EMPTY_DIALOG,
+        ),
+      );
+      expect(brief.hostCalls[0]?.arguments).toEqual([
+        createArtifactValue("docs/note.md"),
+        [{ kind: "artifact", path: "docs/note.md" }],
+        "docs/note.md",
+      ]);
     });
 
     it("keeps host call string and template arguments as semantic text", () => {
@@ -1607,7 +1872,7 @@ function Main() {
 
 function Main() {
   let name = Str();
-  let age = RangedInt(0, 99);
+  let age = Num({ observeAs: { kind: "integer", min: 0, max: 99 } });
   name.observing = \`the user's name\`;
   age.observing = \`the user's age\`;
   $observe({ name, age });
@@ -1619,7 +1884,7 @@ function Main() {
 
     function startGroupRun() {
       const document = parse(GROUP_SOURCE);
-      const runtime = new Runtime().add("group-arc", document);
+      const runtime = new Runtime().add("group-arc", document).init();
       const seeded = runtime.newTraversal(arc("group-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -1632,7 +1897,7 @@ function Main() {
 
 function Main() {
   let name = Str();
-  let age = RangedInt(0, 99);
+  let age = Num({ observeAs: { kind: "integer", min: 0, max: 99 } });
   $observe({ name, age });
   $observeOrAsk({ name, age });
 }
@@ -1806,13 +2071,13 @@ function Main() {
 
 function Main() {
   let name = Str();
-  let age = RangedInt(0, 99);
+  let age = Num({ observeAs: { kind: "integer", min: 0, max: 99 } });
   name.observing = \`the user's name\`;
   age.observing = \`the user's age\`;
   $observeOrAsk({ name, age });
 }
 `);
-      const runtime = new Runtime().add("group-ask-arc", document);
+      const runtime = new Runtime().add("group-ask-arc", document).init();
       const seeded = runtime.newTraversal(arc("group-ask-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -1833,7 +2098,7 @@ function Main() {
       expect(rootTraversal(pending).cells.name).toBeUndefined();
       expect(pending.observations).toHaveLength(1);
 
-      const done = progressBrief(runtime, pending, {
+      const done = progressTerminal(runtime, pending, {
         move: "proceed",
         observations: {
           [pending.observations[0]!.id]: {
@@ -1861,7 +2126,7 @@ function Main() {
 
     function startGroupArrayRun() {
       const document = parse(GROUP_ARRAY_SOURCE);
-      const runtime = new Runtime().add("group-array-arc", document);
+      const runtime = new Runtime().add("group-array-arc", document).init();
       const seeded = runtime.newTraversal(arc("group-array-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -1879,7 +2144,7 @@ function Main() {
         element: { type: "string" },
       });
 
-      const done = progressBrief(runtime, brief, {
+      const done = progressTerminal(runtime, brief, {
         move: "proceed",
         observations: {
           [brief.observations[0]!.id]: {
@@ -1892,7 +2157,7 @@ function Main() {
       });
       expect(rootTraversal(done).cells.name).toBe("John");
       expect(rootTraversal(done).cells.findings).toEqual(["one", "two"]);
-      expect(done.observations).toEqual([]);
+      expect("observations" in done).toBe(false);
     });
 
     it("writes nothing and re-emits when an array group field has a bad element", () => {
@@ -1931,7 +2196,7 @@ function Main() {
   $observe(findings);
 }
 `);
-      const runtime = new Runtime().add("observe-array-arc", document);
+      const runtime = new Runtime().add("observe-array-arc", document).init();
       const seeded = runtime.newTraversal(arc("observe-array-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -1941,7 +2206,7 @@ function Main() {
         element: { type: "string" },
       });
 
-      const done = progressBrief(runtime, brief, {
+      const done = progressTerminal(runtime, brief, {
         move: "proceed",
         observations: {
           [brief.observations[0]!.id]: {
@@ -1960,11 +2225,13 @@ function Main() {
 "arc";
 
 function Main() {
-  let scores = Array(RangedInt(1, 5));
+  let scores = Array(Num({ observeAs: { kind: "integer", min: 1, max: 5 } }));
   $observe(scores);
 }
 `);
-      const runtime = new Runtime().add("observe-array-type-arc", document);
+      const runtime = new Runtime()
+        .add("observe-array-type-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("observe-array-type-arc", "Main"),
       );

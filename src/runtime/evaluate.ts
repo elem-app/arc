@@ -1,54 +1,93 @@
+import {
+  admitHostArgument,
+  admitValue,
+  arithmeticRule,
+  artifactPathRule,
+  booleanRule,
+  comparisonRule,
+  interpolationRule,
+  numIsFiniteRule,
+  producerGuaranteesArtifact,
+  resolveHostOperation,
+  resolveProducer,
+  stringOperandRule,
+  type ProducerContext,
+} from "../spec/resolution.js";
+import type {
+  HostCallBrief,
+  HostEffectBrief,
+  ObservationGroupField,
+  ObservationValueMeta,
+  ScalarObservationMeta,
+} from "../types/host-interaction.js";
 import type {
   ActionStatement,
-  ArcRef,
+  ArithmeticOperator,
   ArrayReference,
-  BinaryOperator,
+  ArtifactConstructExpression,
   Cell,
-  CellSpec,
   CellTarget,
-  CellValue,
-  ChannelSpec,
-  DialogCursor,
+  ComparisonOperator,
+  ElementId,
   EnterTarget,
   HostCallArgument,
-  HostCallBrief,
   HostCallExpression,
-  HostEffectBrief,
   HostEffectStatement,
   JudgeExpression,
   LocalExpression,
   Node,
-  NodeRef,
-  NodeState,
-  ObservableCellSpec,
-  ObservationGroupField,
-  ObservationValueMeta,
+  ObservableScalar,
   ObserveAction,
   ObserveGroupAction,
   ObserveOrAskAction,
   ObserveOrAskGroupAction,
-  PayloadValue,
-  PrimitiveValue,
-  ScalarObservationMeta,
-  ScalarSpec,
   SemanticString,
-  SemanticText,
-  SemanticTextPart,
   SetAction,
-  Traversal,
   UnsetAction,
   ValueExpression,
-  ValueString,
-} from "../types.js";
+} from "../types/parser.js";
+import { isSettableCell } from "../types/parser.js";
+import type {
+  ArcRef,
+  NodeRef,
+  NodeState,
+  Traversal,
+} from "../types/runtime.js";
+import { qualifiedBriefSite } from "../types/runtime.js";
+import type {
+  ArrayElementSpec,
+  CellSpec,
+  ObservableCellSpec,
+} from "../types/spec.js";
+import { isObservableCellSpec } from "../types/spec.js";
 import {
-  isArrayValue,
-  isObservableCellSpec,
-  isPrimitiveValue,
-  isSettableCell,
-  qualifiedBriefSite,
-} from "../types.js";
-import { clonePayloadValue } from "./payload.js";
+  classifyArtifactValue,
+  isArtifactValue,
+  type ArrayElementValue,
+  type ArrayValue,
+  type ArtifactValue,
+  type CellValue,
+  type DialogCursor,
+  type PayloadValue,
+  type PrimitiveArrayValue,
+  type PrimitiveValue,
+  type SemanticText,
+  type SemanticTextPart,
+  type StructValue,
+} from "../types/value.js";
 import {
+  cloneWithCanonicalNumbers,
+  createArtifactValue,
+  describeArtifactValueIssue,
+  firstInvalidPayloadValue,
+  firstNonFiniteNumberPath,
+} from "../value-utils.js";
+import {
+  assertAssignableChannelValue,
+  isDialogCursorValue,
+} from "./channel-values.js";
+import {
+  beginPinForElement,
   beginValuePin,
   completeValuePin,
   settleHostCallPin,
@@ -67,7 +106,6 @@ import {
 } from "./refs.js";
 import { runtimeError } from "./report-validation.js";
 import {
-  type Accumulator,
   briefSiteQualifiers,
   cellValuesEqual,
   childState,
@@ -80,6 +118,7 @@ import {
   makeObservationGroupId,
   makeObservationId,
   noteBriefYield,
+  type Accumulator,
 } from "./state.js";
 
 export type ActionOutcome<T = undefined> =
@@ -91,10 +130,14 @@ type ResolvedCellTarget = {
   root: string;
   rootCell: Cell;
   path: number[];
-  leafSpec: CellSpec;
+  leafSpec: Cell | ArrayElementSpec;
   label: string;
   value: CellValue | undefined;
 };
+
+type ObservableTargetSpec =
+  | ObservableScalar
+  | { type: "array"; element: ObservableScalar };
 
 function formatAuthoredCellTarget(target: CellTarget): string {
   const [root, ...accessors] = target;
@@ -121,7 +164,7 @@ function resolveCellTarget(
     );
   }
 
-  let leafSpec: CellSpec = owner.cell;
+  let leafSpec: Cell | ArrayElementSpec = owner.cell;
   let value = owner.traversal.cells[root];
   const path: number[] = [];
   let label = root;
@@ -154,7 +197,7 @@ function resolveCellTarget(
     const position = resolvedAccessor.value;
     if (
       typeof position !== "number" ||
-      !Number.isInteger(position) ||
+      !Number.isSafeInteger(position) ||
       position < 0
     ) {
       throw runtimeError(
@@ -190,10 +233,16 @@ function resolveCellTarget(
 
 function writeResolvedCellTarget(
   target: ResolvedCellTarget,
-  value: CellValue,
+  value: unknown,
 ): { changed: boolean } {
   if (target.path.length === 0) {
-    return writeOwnedCell(target.ownerTraversal, target.root, value);
+    return writeOwnedCellValue(
+      target.ownerTraversal,
+      target.root,
+      target.leafSpec,
+      value,
+      target.label,
+    );
   }
   if (target.path.length !== 1) {
     throw runtimeError(
@@ -201,6 +250,7 @@ function writeResolvedCellTarget(
       `${target.label} exceeds the supported array target depth`,
     );
   }
+  assertAssignableValue(target.label, target.leafSpec, value);
   const current = target.ownerTraversal.cells[target.root];
   if (!Array.isArray(current)) {
     throw runtimeError(
@@ -215,14 +265,15 @@ function writeResolvedCellTarget(
       `Array index ${String(position)} is out of range for length ${current.length}`,
     );
   }
-  if (!isPrimitiveValue(value)) {
-    throw runtimeError(
-      "invalid-cell-assignment",
-      `${target.label}.$set() requires a scalar value`,
-    );
+  const next = cloneCellValue(current);
+  if (!Array.isArray(next)) {
+    throw new Error("Internal invariant: cloned array target is not an array");
   }
-  const next = [...current];
-  next[position] = value;
+  const replacement = cloneCellValue(value);
+  if (replacement === undefined) {
+    throw new Error("Internal invariant: admitted array element is unset");
+  }
+  next[position] = replacement as ArrayElementValue;
   return writeOwnedCell(target.ownerTraversal, target.root, next);
 }
 
@@ -281,9 +332,12 @@ export function applyObserve(
       ),
       currentValue: cloneCellValue(target.value) as
         | PrimitiveValue
-        | PrimitiveValue[]
+        | PrimitiveArrayValue
         | undefined,
-      hostParams: clonePayloadValue(effectiveHostParams(node, accum)),
+      hostParams: admitFinitePayload(
+        effectiveHostParams(node, accum),
+        "brief/effect emission",
+      ),
       meta: observationMetaForTarget(observableSpec),
     });
   }
@@ -332,7 +386,7 @@ export function applyObserveGroup(
     }
     const writes: {
       target: ResolvedCellTarget;
-      value: PrimitiveValue | PrimitiveValue[];
+      value: PrimitiveValue | PrimitiveArrayValue;
     }[] = [];
     for (const { target } of targets) {
       const field = resolution.fields[target.label];
@@ -365,7 +419,7 @@ export function applyObserveGroup(
           ),
           currentValue: cloneCellValue(target.value) as
             | PrimitiveValue
-            | PrimitiveValue[]
+            | PrimitiveArrayValue
             | undefined,
           meta: observationMetaForTarget(observableSpec),
         };
@@ -376,7 +430,10 @@ export function applyObserveGroup(
       id: workId,
       sourceRef: traversalToNodeRef(traversal),
       mode,
-      hostParams: clonePayloadValue(effectiveHostParams(node, accum)),
+      hostParams: admitFinitePayload(
+        effectiveHostParams(node, accum),
+        "brief/effect emission",
+      ),
       fields,
     });
   }
@@ -388,7 +445,7 @@ export function applyObserveGroup(
  */
 function requireObservableTarget(
   target: ResolvedCellTarget,
-): ObservableCellSpec {
+): ObservableTargetSpec {
   if (!isObservableCellSpec(target.leafSpec)) {
     throw runtimeError(
       "invalid-observation-target",
@@ -403,13 +460,13 @@ function requireObservableTarget(
  * cell, or the element's `observing` for an array cell.
  */
 function cellObservingText(
-  spec: ObservableCellSpec,
+  spec: ObservableTargetSpec,
 ): SemanticString | undefined {
   return spec.type === "array" ? spec.element.observing : spec.observing;
 }
 
 /** The bare scalar shape of a declaration, without its authoring extras. */
-function scalarMetaOf(spec: ScalarSpec): ScalarObservationMeta {
+function scalarMetaOf(spec: ObservableScalar): ScalarObservationMeta {
   switch (spec.type) {
     case "boolean":
       return { type: "boolean" };
@@ -417,14 +474,29 @@ function scalarMetaOf(spec: ScalarSpec): ScalarObservationMeta {
       return { type: "string" };
     case "enum":
       return { type: "enum", values: spec.values };
-    case "rangedInt":
-      return { type: "rangedInt", min: spec.min, max: spec.max };
+    case "number":
+      if (spec.observeAs?.kind === "integer") {
+        return {
+          type: "rangedInt",
+          min: spec.observeAs.min ?? Number.MIN_SAFE_INTEGER,
+          max: spec.observeAs.max ?? Number.MAX_SAFE_INTEGER,
+        };
+      }
+      return {
+        type: "number",
+        ...(spec.observeAs?.min !== undefined
+          ? { min: spec.observeAs.min }
+          : {}),
+        ...(spec.observeAs?.max !== undefined
+          ? { max: spec.observeAs.max }
+          : {}),
+      };
   }
 }
 
 /** Observation value metadata for a scalar or array cell. */
 function observationMetaForTarget(
-  spec: ObservableCellSpec,
+  spec: ObservableTargetSpec,
 ): ObservationValueMeta {
   if (spec.type === "array") {
     return { type: "array", element: scalarMetaOf(spec.element) };
@@ -434,7 +506,7 @@ function observationMetaForTarget(
 
 /** Renders a cell's own `observing` question, or a default when it declares none. */
 function renderCellObservingQuestion(
-  spec: ObservableCellSpec,
+  spec: ObservableTargetSpec,
   targetLabel: string,
   traversal: Traversal,
   node: Node,
@@ -466,7 +538,6 @@ export function applySet(
     accum,
   );
   if (value.status === "blocked") return { status: "blocked" };
-  assertAssignableValue(target.label, target.leafSpec, value.value);
   return {
     status: "resolved",
     value: writeResolvedCellTarget(target, value.value),
@@ -528,99 +599,25 @@ export function applySetReturn(
       `returns.${statement.key}.$set() targets an undeclared returns channel`,
     );
   }
-  assertAssignableChannelValue(statement.key, declared, value.value);
+  assertAssignableChannelValue(
+    "returns",
+    statement.key,
+    declared,
+    value.value,
+    "return-write",
+  );
   // `returns.*` is readable in the same SEG via `readChannelValue`, so the
   // staged value is its own change signal. The caller-cell commit stays at
   // enter resolution (bracketed by the enter's wide snapshot), so this does not
   // route through `writeOwnedCell`.
-  const nextStaged = value.value as CellValue;
+  const nextStaged = cloneWithCanonicalNumbers(value.value) as CellValue;
+  const clonedStaged = cloneCellValue(nextStaged) ?? nextStaged;
   const changed = !cellValuesEqual(
     traversal.enterChannels.stagedReturns[statement.key],
-    nextStaged,
+    clonedStaged,
   );
-  traversal.enterChannels.stagedReturns[statement.key] = nextStaged;
+  traversal.enterChannels.stagedReturns[statement.key] = clonedStaged;
   return { status: "resolved", value: { changed } };
-}
-
-/**
- * Validates a value against a typed channel schema — the arm shared by a return
- * write and (later) span-result and args-projection checks. Mirrors
- * {@link assertAssignableValue} but keys off a {@link ChannelSpec} rather than a
- * lexical cell.
- */
-function assertAssignableChannelValue(
-  key: string,
-  spec: ChannelSpec,
-  value: unknown,
-): asserts value is CellValue {
-  if (value == null) {
-    throw runtimeError(
-      "invalid-return-value",
-      `returns.${key}.$set() cannot assign null or undefined`,
-    );
-  }
-  switch (spec.type) {
-    case "boolean":
-      if (typeof value !== "boolean") {
-        throw runtimeError(
-          "invalid-return-value",
-          `returns.${key}.$set() requires a boolean value`,
-        );
-      }
-      return;
-    case "string":
-      if (typeof value !== "string") {
-        throw runtimeError(
-          "invalid-return-value",
-          `returns.${key}.$set() requires a string value`,
-        );
-      }
-      return;
-    case "index":
-      if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
-        throw runtimeError(
-          "invalid-return-value",
-          `returns.${key}.$set() requires a non-negative integer`,
-        );
-      }
-      return;
-    case "rangedInt":
-      if (typeof value !== "number" || !Number.isInteger(value)) {
-        throw runtimeError(
-          "invalid-return-value",
-          `returns.${key}.$set() requires an integer value`,
-        );
-      }
-      if (value < spec.min || value > spec.max) {
-        throw runtimeError(
-          "cell-out-of-range",
-          `returns.${key}.$set() value ${value} is outside ${spec.min}..${spec.max}`,
-        );
-      }
-      return;
-    case "enum":
-      if (typeof value !== "string" || !spec.values.includes(value)) {
-        throw runtimeError(
-          "invalid-enum-value",
-          `returns.${key}.$set() must use one of ${spec.values.join(", ")}`,
-        );
-      }
-      return;
-    case "dialogCursor":
-      assertDialogCursor(value, `returns.${key}.$set()`);
-      return;
-    case "array":
-      if (!Array.isArray(value)) {
-        throw runtimeError(
-          "invalid-return-value",
-          `returns.${key}.$set() requires an array value`,
-        );
-      }
-      for (const element of value) {
-        assertAssignableChannelValue(key, spec.element, element);
-      }
-      return;
-  }
 }
 
 export function renderHostEffect(
@@ -629,19 +626,81 @@ export function renderHostEffect(
   node: Node,
   accum: Accumulator,
 ): HostEffectBrief {
-  return {
+  const renderedArguments = renderTypedHostArguments(
+    statement,
+    traversal,
+    node,
+    accum,
+  );
+  const rendered: HostEffectBrief = {
     id: makeHostEffectId(accum.entry.arc, traversal, statement.id),
     sourceRef: traversalToNodeRef(traversal),
     module: statement.module,
     target: [...statement.target],
     operation: statement.operation,
-    arguments: statement.arguments.map((arg) =>
-      renderHostCallArgument(arg, traversal, node, accum),
-    ),
+    arguments: renderedArguments,
   };
+  assertPayloadConsumer(rendered.arguments, "brief/effect emission");
+  assertFiniteConsumer(rendered.arguments, "brief/effect emission");
+  return cloneWithCanonicalNumbers(rendered);
 }
 
 export function renderHostCallArgument(
+  arg: HostCallArgument,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): PayloadValue {
+  const rendered = renderHostCallArgumentValue(arg, traversal, node, accum);
+  assertPayloadConsumer(rendered, "host-call argument emission");
+  assertFiniteConsumer(rendered, "host-call argument emission");
+  return cloneWithCanonicalNumbers(rendered);
+}
+
+function renderTypedHostArguments(
+  action: HostCallExpression | HostEffectStatement,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): PayloadValue[] {
+  const resolution = resolveHostOperation(accum.entry.hostModules, action);
+  if (resolution.kind === "unresolved") {
+    throw new Error(
+      "Registered host action no longer resolves to an operation",
+    );
+  }
+  const operation = resolution.operation;
+  if (action.arguments.length !== operation.parameters.length) {
+    throw new Error(
+      "Registered host action no longer matches its declared arity",
+    );
+  }
+  return action.arguments.map((argument, index) => {
+    const rendered = renderHostCallArgumentValue(
+      argument,
+      traversal,
+      node,
+      accum,
+    );
+    const admission = admitHostArgument(
+      argument,
+      rendered,
+      operation.parameters[index]!,
+      `$[${index}]`,
+    );
+    if (!admission.admitted) {
+      throw runtimeError(
+        admission.violation.code,
+        `Invalid host argument at ${admission.violation.path}: ${admission.violation.detail}`,
+      );
+    }
+    assertPayloadConsumer(rendered, "host-call argument emission");
+    assertFiniteConsumer(rendered, "host-call argument emission");
+    return cloneWithCanonicalNumbers(rendered);
+  });
+}
+
+function renderHostCallArgumentValue(
   arg: HostCallArgument,
   traversal: Traversal,
   node: Node,
@@ -661,19 +720,20 @@ export function renderHostCallArgument(
         "Host call value argument cannot use an unset value",
       );
     }
+    assertPayloadConsumer(value.value, "host-call argument emission");
     return value.value;
   }
   if (arg.kind === "array") {
     return arg.elements.map((item) =>
-      renderHostCallArgument(item, traversal, node, accum),
+      renderHostCallArgumentValue(item, traversal, node, accum),
     );
   }
   return Object.fromEntries(
     Object.entries(arg.value).map(([key, value]) => [
       key,
-      renderHostCallArgument(value, traversal, node, accum),
+      renderHostCallArgumentValue(value, traversal, node, accum),
     ]),
-  );
+  ) as StructValue;
 }
 
 // A host-call result is a sigil-less value: it pins for the rest of the walk
@@ -691,8 +751,11 @@ export function evaluateHostCall(
     traversal,
     qualifiedBriefSite(briefSiteQualifiers(accum), expression.id),
   );
-  const renderedArguments = expression.arguments.map((arg) =>
-    renderHostCallArgument(arg, traversal, node, accum),
+  const renderedArguments = renderTypedHostArguments(
+    expression,
+    traversal,
+    node,
+    accum,
   );
   const settled = settleHostCallPin(
     accum,
@@ -714,7 +777,10 @@ export function evaluateHostCall(
         target: [...expression.target],
         operation: expression.operation,
         arguments: renderedArguments,
-        hostParams: clonePayloadValue(effectiveHostParams(node, accum)),
+        hostParams: admitFinitePayload(
+          effectiveHostParams(node, accum),
+          "brief/effect emission",
+        ),
       } satisfies HostCallBrief),
     );
   }
@@ -752,7 +818,10 @@ export function evaluateJudge(
       id,
       sourceRef: traversalToNodeRef(traversal),
       question: rendered,
-      hostParams: clonePayloadValue(effectiveHostParams(node, accum)),
+      hostParams: admitFinitePayload(
+        effectiveHostParams(node, accum),
+        "brief/effect emission",
+      ),
     });
   }
   return { status: "blocked" };
@@ -763,15 +832,22 @@ type CompoundValueExpression = Exclude<
   LocalExpression | HostCallExpression | JudgeExpression
 >;
 
+/** Internal expression domain; parsed `null` literals never enter payload consumers. */
+type EvaluatedValue = PayloadValue | NodeState | null;
+
 function isCompoundValueExpression(
   expression: ValueExpression,
 ): expression is CompoundValueExpression {
   return (
     expression.kind === "regexTest" ||
-    expression.kind === "binary" ||
+    expression.kind === "comparison" ||
+    expression.kind === "arithmetic" ||
     expression.kind === "logical" ||
     expression.kind === "conditional" ||
     expression.kind === "unary" ||
+    expression.kind === "numericUnary" ||
+    expression.kind === "numIsFinite" ||
+    expression.kind === "artifact" ||
     expression.kind === "template-string" ||
     expression.kind === "arrayLiteral"
   );
@@ -782,7 +858,7 @@ export function evaluateValueExpression(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): ActionOutcome<PayloadValue | NodeState> {
+): ActionOutcome<EvaluatedValue> {
   if (expression.kind === "host-call")
     return evaluateHostCall(expression, traversal, node, accum);
   if (expression.kind === "judge")
@@ -803,15 +879,20 @@ export function evaluateValueExpression(
  */
 function withValuePin(
   accum: Accumulator,
-  compute: () => ActionOutcome<PayloadValue | NodeState>,
-): ActionOutcome<PayloadValue | NodeState> {
+  compute: () => ActionOutcome<EvaluatedValue>,
+): ActionOutcome<EvaluatedValue> {
   const pin = beginValuePin(accum);
   if (pin.status === "replayed") {
     return { status: "resolved", value: pin.value as PayloadValue | NodeState };
   }
   const result = compute();
-  if (result.status === "resolved") {
-    completeValuePin(pin.reservation, result.value as PayloadValue);
+  if (result.status === "resolved" && result.value !== null) {
+    if (firstNonFiniteNumberPath(result.value) === undefined) {
+      completeValuePin(
+        pin.reservation,
+        cloneWithCanonicalNumbers(result.value) as PayloadValue,
+      );
+    }
   }
   return result;
 }
@@ -821,7 +902,7 @@ function computeCompoundValueExpression(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): ActionOutcome<PayloadValue | NodeState> {
+): ActionOutcome<EvaluatedValue> {
   if (expression.kind === "regexTest") {
     const target = evaluateLocalExpression(
       expression.target,
@@ -830,14 +911,38 @@ function computeCompoundValueExpression(
       accum,
     );
     if (target.status === "blocked") return target;
-    const value = target.value;
-    if (typeof value !== "string") return { status: "resolved", value: false };
+    if (target.value === undefined) return { status: "resolved", value: false };
+    const admitted = stringOperandRule.admitValue(target.value);
+    if (!admitted.admitted) {
+      throw runtimeError(
+        expressionHasArtifactType(expression.target, traversal, node, accum)
+          ? "invalid-artifact-operation"
+          : "invalid-regex-target",
+        expressionHasArtifactType(expression.target, traversal, node, accum)
+          ? "Artifacts cannot be used in regular-expression tests"
+          : admitted.violation.detail,
+      );
+    }
     return {
       status: "resolved",
-      value: new RegExp(expression.pattern, expression.flags).test(value),
+      value: new RegExp(expression.pattern, expression.flags).test(
+        admitted.value,
+      ),
     };
   }
-  if (expression.kind === "binary") {
+  if (expression.kind === "comparison") {
+    const decision = comparisonRule.checkProducers(
+      expression.op,
+      expression.left,
+      expression.right,
+      runtimeProducerContext(traversal, node, accum),
+    );
+    if (decision.judgment.kind === "incompatible") {
+      throw runtimeError(
+        "invalid-comparison-operands",
+        "Comparison operands do not have a coherent shared domain",
+      );
+    }
     const left = evaluateValueExpression(
       expression.left,
       traversal,
@@ -857,29 +962,63 @@ function computeCompoundValueExpression(
       expression.op === ">=" ||
       expression.op === "<" ||
       expression.op === "<=";
-    if (isOrdering) {
-      if (left.value === undefined || right.value === undefined) {
-        return { status: "resolved", value: false };
-      }
-      const enumValues =
-        findEnumValues(expression.left, traversal, accum) ??
-        findEnumValues(expression.right, traversal, accum);
-      if (enumValues) {
-        const li =
-          typeof left.value === "string" ? enumValues.indexOf(left.value) : -1;
-        const ri =
-          typeof right.value === "string"
-            ? enumValues.indexOf(right.value)
-            : -1;
-        return {
-          status: "resolved",
-          value: evaluateBinary(expression.op, li, ri),
-        };
-      }
+    if (left.value === undefined || right.value === undefined) {
+      return {
+        status: "resolved",
+        value:
+          expression.op === "!=" &&
+          (left.value === undefined || right.value === undefined),
+      };
+    }
+    const admitted = comparisonRule.admitValues(
+      expression.op,
+      decision,
+      left.value,
+      right.value,
+    );
+    if (!admitted.admitted) {
+      throw runtimeError(admitted.violation.code, admitted.violation.detail);
+    }
+    if (isOrdering && decision.mode === "enum") {
+      const enumValues = decision.enumValues ?? [];
+      const li = enumValues.indexOf(admitted.value.left as string);
+      const ri = enumValues.indexOf(admitted.value.right as string);
+      return {
+        status: "resolved",
+        value: evaluateBinary(expression.op, li, ri, false, false),
+      };
     }
     return {
       status: "resolved",
-      value: evaluateBinary(expression.op, left.value, right.value),
+      value: evaluateBinary(
+        expression.op,
+        admitted.value.left,
+        admitted.value.right,
+        decision.mode === "artifact",
+        decision.mode === "artifact",
+      ),
+    };
+  }
+  if (expression.kind === "arithmetic") {
+    const left = evaluateValueExpression(
+      expression.left,
+      traversal,
+      node,
+      accum,
+    );
+    if (left.status === "blocked") return left;
+    const right = evaluateValueExpression(
+      expression.right,
+      traversal,
+      node,
+      accum,
+    );
+    if (right.status === "blocked") return right;
+    const lhs = requireArithmeticNumber(left.value, expression.op, "left");
+    const rhs = requireArithmeticNumber(right.value, expression.op, "right");
+    return {
+      status: "resolved",
+      value: evaluateArithmetic(expression.op, lhs, rhs),
     };
   }
   if (expression.kind === "logical") {
@@ -936,25 +1075,109 @@ function computeCompoundValueExpression(
     if (argument.status === "blocked") return argument;
     return { status: "resolved", value: !truthy(argument.value) };
   }
+  if (expression.kind === "numericUnary") {
+    const argument = evaluateValueExpression(
+      expression.argument,
+      traversal,
+      node,
+      accum,
+    );
+    if (argument.status === "blocked") return argument;
+    return {
+      status: "resolved",
+      value: -requireArithmeticNumber(
+        argument.value,
+        expression.op,
+        "argument",
+      ),
+    };
+  }
+  if (expression.kind === "numIsFinite") {
+    const argument = evaluateValueExpression(
+      expression.argument,
+      traversal,
+      node,
+      accum,
+    );
+    if (argument.status === "blocked") return argument;
+    if (argument.value === undefined) {
+      throw runtimeError(
+        "unset-value",
+        "Unset value cannot be evaluated by Num.isFinite",
+      );
+    }
+    const admission = numIsFiniteRule.admitValue(argument.value);
+    if (!admission.admitted) {
+      throw runtimeError(
+        "non-numeric-is-finite-argument",
+        `Num.isFinite requires a numeric argument; got ${runtimeKind(argument.value)}`,
+      );
+    }
+    return { status: "resolved", value: Number.isFinite(admission.value) };
+  }
+  if (expression.kind === "artifact") {
+    return computeArtifactConstructExpression(
+      expression,
+      traversal,
+      node,
+      accum,
+    );
+  }
   if (expression.kind === "template-string") {
     return computeValueText(expression, traversal, node, accum);
   }
   if (expression.kind === "arrayLiteral") {
-    const elements: PrimitiveValue[] = [];
+    const elements: PayloadValue[] = [];
     for (const element of expression.elements) {
       const value = evaluateValueExpression(element, traversal, node, accum);
       if (value.status === "blocked") return value;
-      if (!isPrimitiveValue(value.value)) {
+      if (value.value === undefined) {
         throw runtimeError(
-          "invalid-array-literal",
-          "Array literal elements must be primitive values",
+          "unset-value",
+          "Array literal elements cannot use an unset value",
         );
       }
-      elements.push(value.value);
+      const issue = firstInvalidPayloadValue(value.value);
+      if (issue) {
+        throw runtimeError(
+          "invalid-array-literal",
+          `Invalid array literal element at ${issue.path}: ${issue.detail}`,
+        );
+      }
+      elements.push(cloneWithCanonicalNumbers(value.value as PayloadValue));
     }
     return { status: "resolved", value: elements };
   }
   throw new Error("Unknown compound value expression");
+}
+
+function computeArtifactConstructExpression(
+  expression: ArtifactConstructExpression,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): ActionOutcome<ArtifactValue> {
+  const evaluated = evaluateValueExpression(
+    expression.path,
+    traversal,
+    node,
+    accum,
+  );
+  if (evaluated.status === "blocked") return evaluated;
+  if (evaluated.value === undefined) {
+    throw runtimeError(
+      "unset-value",
+      "Artifact path cannot use an unset value",
+    );
+  }
+  const admission = artifactPathRule.admitValue(evaluated.value);
+  if (!admission.admitted) {
+    throw runtimeError(admission.violation.code, admission.violation.detail);
+  }
+  return {
+    status: "resolved",
+    value: createArtifactValue(admission.value),
+  };
 }
 
 function computeValueText(
@@ -976,15 +1199,26 @@ function computeValueText(
       accum,
     );
     if (value.status === "blocked") return value;
-    // Arrays interpolate via JS array stringification (comma-joined; empty →
-    // ""); a dialog cursor and other non-primitive objects are rejected.
-    if (!isPrimitiveValue(value.value) && !isArrayValue(value.value)) {
+    if (value.value === undefined) {
       throw runtimeError(
         "invalid-template-interpolation",
-        `Template interpolation must resolve to a primitive value or array; got ${value.value === null ? "null" : typeof value.value}.`,
+        "Value template interpolation cannot use an unset value",
       );
     }
-    rendered += String(value.value);
+    const projection = interpolationRule.projectValue(
+      resolveProducer(
+        part.expression,
+        runtimeProducerContext(traversal, node, accum),
+      ),
+      value.value,
+    );
+    if (!projection.admitted) {
+      throw runtimeError(
+        projection.violation.code,
+        projection.violation.detail,
+      );
+    }
+    rendered += projection.value;
   }
   return { status: "resolved", value: rendered };
 }
@@ -994,7 +1228,7 @@ export function evaluateLocalExpression(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): ActionOutcome<PayloadValue | NodeState> {
+): ActionOutcome<EvaluatedValue> {
   if (expression.kind === "literal") {
     return computeLocalExpression(expression, traversal, node, accum);
   }
@@ -1008,30 +1242,24 @@ function computeLocalExpression(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): ActionOutcome<PayloadValue | NodeState> {
+): ActionOutcome<EvaluatedValue> {
   switch (expression.kind) {
     case "literal":
       return { status: "resolved", value: expression.value };
     case "cell":
-      return {
-        status: "resolved",
-        value: getCellValue(expression.name, traversal, accum),
-      };
+      return resolvedCellRead(expression.name, traversal, accum);
     case "isUnset":
       return {
         status: "resolved",
         value: getCellValue(expression.cell, traversal, accum) === undefined,
       };
     case "channel":
-      return {
-        status: "resolved",
-        value: readChannelValue(
-          traversal,
-          expression.namespace,
-          expression.key,
-          accum,
-        ),
-      };
+      return resolvedChannelRead(
+        traversal,
+        expression.namespace,
+        expression.key,
+        accum,
+      );
     case "channelIsUnset":
       return {
         status: "resolved",
@@ -1134,7 +1362,7 @@ function computeLocalExpression(
       const position = index.value;
       if (
         typeof position !== "number" ||
-        !Number.isInteger(position) ||
+        !Number.isSafeInteger(position) ||
         position < 0
       ) {
         throw runtimeError(
@@ -1159,6 +1387,47 @@ function computeLocalExpression(
       );
       return { status: "resolved", value: array.length };
     }
+    case "arithmetic": {
+      const left = evaluateLocalExpression(
+        expression.left,
+        traversal,
+        node,
+        accum,
+      );
+      if (left.status === "blocked") return left;
+      const right = evaluateLocalExpression(
+        expression.right,
+        traversal,
+        node,
+        accum,
+      );
+      if (right.status === "blocked") return right;
+      return {
+        status: "resolved",
+        value: evaluateArithmetic(
+          expression.op,
+          requireArithmeticNumber(left.value, expression.op, "left"),
+          requireArithmeticNumber(right.value, expression.op, "right"),
+        ),
+      };
+    }
+    case "numericUnary": {
+      const argument = evaluateLocalExpression(
+        expression.argument,
+        traversal,
+        node,
+        accum,
+      );
+      if (argument.status === "blocked") return argument;
+      return {
+        status: "resolved",
+        value: -requireArithmeticNumber(
+          argument.value,
+          expression.op,
+          "argument",
+        ),
+      };
+    }
   }
 }
 
@@ -1173,7 +1442,7 @@ export function requireArrayValue(
   traversal: Traversal,
   accum: Accumulator,
   operation: string,
-): PrimitiveValue[] {
+): ArrayValue {
   const value =
     array.kind === "cell"
       ? getCellValue(array.name, traversal, accum)
@@ -1285,6 +1554,44 @@ export function getCellMeta(
   return findCellOwner(cell, traversal, accum)?.cell;
 }
 
+function runtimeProducerContext(
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): ProducerContext {
+  return {
+    cells: [],
+    resolveCell: (name) => getCellMeta(name, traversal, accum),
+    signature: node.signature,
+    map: accum.mapMember
+      ? {
+          receiverSpec: accum.mapMember.receiverSpec,
+          resultSpec: accum.mapMember.resultSpec,
+        }
+      : undefined,
+    resolveHostOperation: (call) => {
+      const resolution = resolveHostOperation(accum.entry.hostModules, call);
+      return resolution.kind === "resolved" ? resolution.operation : undefined;
+    },
+  };
+}
+
+/**
+ * Whether an expression's authored type context identifies its result as an
+ * Artifact. Runtime values stay representation-only; Artifact meaning comes
+ * from constructor IR or the declaring cell/channel spec.
+ */
+function expressionHasArtifactType(
+  expression: ValueExpression,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): boolean {
+  return producerGuaranteesArtifact(
+    resolveProducer(expression, runtimeProducerContext(traversal, node, accum)),
+  );
+}
+
 export function getCellValue(
   cell: string,
   traversal: Traversal,
@@ -1293,6 +1600,14 @@ export function getCellValue(
   return cloneCellValue(
     findCellOwner(cell, traversal, accum)?.traversal.cells[cell],
   );
+}
+
+function resolvedCellRead(
+  name: string,
+  traversal: Traversal,
+  accum: Accumulator,
+): ActionOutcome<CellValue | undefined> {
+  return { status: "resolved", value: getCellValue(name, traversal, accum) };
 }
 
 /** Resolves the node a traversal belongs to, for signature lookups. */
@@ -1324,7 +1639,7 @@ export function readChannelValue(
 ): CellValue | undefined {
   const channelState = traversal.enterChannels;
   if (namespace === "returns" && key in channelState.stagedReturns) {
-    return channelState.stagedReturns[key];
+    return cloneCellValue(channelState.stagedReturns[key]);
   }
   const link = channelState[namespace][key];
   if (!link) {
@@ -1338,7 +1653,7 @@ export function readChannelValue(
       `Unknown ${namespace} channel key "${key}" for ${formatRef(traversalToNodeRef(traversal))}`,
     );
   }
-  if (link.kind === "spanValue") {
+  if (link.kind === "value") {
     return cloneCellValue(link.value);
   }
   if (link.kind === "spanResult") {
@@ -1356,6 +1671,18 @@ export function readChannelValue(
   return cloneCellValue(callerTraversal.cells[link.cell]);
 }
 
+function resolvedChannelRead(
+  traversal: Traversal,
+  namespace: "args" | "returns",
+  key: string,
+  accum: Accumulator,
+): ActionOutcome<CellValue | undefined> {
+  return {
+    status: "resolved",
+    value: readChannelValue(traversal, namespace, key, accum),
+  };
+}
+
 /**
  * Single write path for an owned cell. Clones the value, compares it by
  * value against the current value, writes it, and reports whether it changed.
@@ -1367,28 +1694,34 @@ export function writeOwnedCell(
   name: string,
   value: CellValue | undefined,
 ): { changed: boolean } {
-  const next = cloneCellValue(value);
+  const nonFinitePath = firstNonFiniteNumberPath(value);
+  if (nonFinitePath !== undefined) {
+    throw new Error(
+      `Internal invariant: a cell write reached storage with a non-finite number at ${nonFinitePath}`,
+    );
+  }
+  const next = cloneWithCanonicalNumbers(cloneCellValue(value));
   const changed = !cellValuesEqual(ownerTraversal.cells[name], next);
   ownerTraversal.cells[name] = next;
   return { changed };
 }
 
-export function findEnumValues(
-  expression: ValueExpression,
-  traversal: Traversal,
-  accum: Accumulator,
-): string[] | undefined {
-  if (expression.kind === "cell") {
-    const meta = getCellMeta(expression.name, traversal, accum);
-    if (meta?.type === "enum" && meta.values) return meta.values;
-  }
-  return undefined;
+/** Validates and stores one direct owned-cell write by its declared spec. */
+export function writeOwnedCellValue(
+  ownerTraversal: Traversal,
+  name: string,
+  spec: CellSpec,
+  value: unknown,
+  label = name,
+): { changed: boolean } {
+  assertAssignableValue(label, spec, value);
+  return writeOwnedCell(ownerTraversal, name, value);
 }
 
 export function renderObservationQuestion(
   statement: ObserveAction | ObserveOrAskAction,
   target: ResolvedCellTarget,
-  spec: ObservableCellSpec,
+  spec: ObservableTargetSpec,
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
@@ -1405,84 +1738,68 @@ export function assertAssignableValue(
   spec: CellSpec,
   value: unknown,
 ): asserts value is CellValue {
-  if (value == null)
-    throw runtimeError(
-      "invalid-cell-assignment",
-      `${cell}.$set() cannot assign null or undefined`,
-    );
-  if (spec.type === "artifact") {
-    throw runtimeError(
-      "invalid-cell-assignment",
-      `${cell}.$set() cannot assign this cell`,
-    );
-  }
-  if (spec.type === "dialogCursor") {
-    assertDialogCursor(value, `${cell}.$set()`);
-    return;
-  }
-  if (spec.type === "array") {
-    if (!Array.isArray(value)) {
-      throw runtimeError(
-        "invalid-cell-assignment",
-        `${cell}.$set() requires an array value`,
-      );
-    }
-    for (const element of value) {
-      assertAssignableScalar(cell, spec.element, element);
-    }
-    return;
-  }
-  assertAssignableScalar(cell, spec, value);
-}
+  const admission = admitValue(spec, value);
+  if (admission.admitted) return;
 
-/**
- * Validates one scalar value against a scalar cell spec — the shared arm for a
- * scalar cell assignment and for every element of an array cell assignment.
- */
-function assertAssignableScalar(
-  cell: string,
-  spec: ScalarObservationMeta,
-  value: unknown,
-): asserts value is PrimitiveValue {
-  if (spec.type === "boolean") {
-    if (typeof value !== "boolean")
-      throw runtimeError(
-        "invalid-cell-assignment",
-        `${cell}.$set() requires a boolean value`,
-      );
-    return;
+  const { code, detail, path } = admission.violation;
+  if (code === "non-finite-number") {
+    const consumer =
+      spec.type === "array"
+        ? "array write"
+        : cell.includes("[")
+          ? "array element write"
+          : "cell write";
+    throw runtimeError(
+      "non-finite-number",
+      `Numeric value must be finite before ${consumer}${path === "$" ? "" : ` at ${path}`}`,
+    );
   }
-  if (spec.type === "string") {
-    if (typeof value !== "string")
-      throw runtimeError(
-        "invalid-cell-assignment",
-        `${cell}.$set() requires a string value`,
-      );
-    return;
-  }
-  if (spec.type === "rangedInt") {
-    if (typeof value !== "number" || !Number.isInteger(value))
-      throw runtimeError(
-        "invalid-cell-assignment",
-        `${cell}.$set() requires an integer value`,
-      );
-    if (
-      (spec.min !== undefined && value < spec.min) ||
-      (spec.max !== undefined && value > spec.max)
-    ) {
-      throw runtimeError(
-        "cell-out-of-range",
-        `${cell}.$set() value ${value} is outside ${spec.min}..${spec.max}`,
-      );
-    }
-    return;
-  }
-  if (typeof value !== "string" || !spec.values?.includes(value)) {
+  if (code === "invalid-enum") {
     throw runtimeError(
       "invalid-enum-value",
-      `${cell}.$set() must use one of ${spec.values?.join(", ")}`,
+      `${cell}.$set() must satisfy its Enum constraint: ${detail}`,
     );
   }
+  if (code === "invalid-artifact") {
+    throw runtimeError(
+      "invalid-artifact-value",
+      `${cell}.$set() requires a valid Artifact value${path === "$" ? "" : ` at ${path}`}: ${detail}`,
+    );
+  }
+  if (code === "invalid-dialog-cursor") {
+    throw runtimeError(
+      "invalid-dialog-cursor",
+      `${cell}.$set() requires a valid Dialog cursor`,
+    );
+  }
+  if (code === "unset") {
+    throw runtimeError(
+      "invalid-cell-assignment",
+      `${cell}.$set() requires a set value`,
+    );
+  }
+  if (code === "invalid-string") {
+    throw runtimeError(
+      "invalid-cell-assignment",
+      `${cell}.$set() requires a string value`,
+    );
+  }
+  if (code === "invalid-boolean") {
+    throw runtimeError(
+      "invalid-cell-assignment",
+      `${cell}.$set() requires a boolean value`,
+    );
+  }
+  if (code === "invalid-number") {
+    throw runtimeError(
+      "invalid-cell-assignment",
+      `${cell}.$set() requires a numeric value`,
+    );
+  }
+  throw runtimeError(
+    "invalid-cell-assignment",
+    `${cell}.$set() is incompatible with its ${spec.type} constraint${path === "$" ? "" : ` at ${path}`}`,
+  );
 }
 
 function evaluateDialogTurnsSince(
@@ -1561,26 +1878,12 @@ function assertDialogCursor(
   value: unknown,
   label: string,
 ): asserts value is DialogCursor {
-  if (!isDialogCursor(value)) {
+  if (!isDialogCursorValue(value)) {
     throw runtimeError(
       "invalid-dialog-cursor",
       `${label} must be a valid Dialog cursor`,
     );
   }
-}
-
-function isDialogCursor(value: unknown): value is DialogCursor {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const cursor = value as Record<string, unknown>;
-  return (
-    Number.isSafeInteger(cursor.user) &&
-    Number.isSafeInteger(cursor.self) &&
-    (cursor.user as number) >= 0 &&
-    (cursor.self as number) >= 0 &&
-    (cursor.view === undefined || typeof cursor.view === "string")
-  );
 }
 
 export function renderSemanticText(
@@ -1637,20 +1940,12 @@ function computeSemanticText(
       continue;
     }
 
-    const expression = part.expression;
-    if (expression.kind === "cell") {
-      const cell = getCellMeta(expression.name, traversal, accum);
-      if (cell?.type === "artifact") {
-        parts.push({
-          kind: "artifact",
-          path: renderArtifactPath(cell, traversal, node, accum),
-        });
-        deferred = true;
-        continue;
-      }
-    }
-
-    const value = evaluateValueExpression(expression, traversal, node, accum);
+    const value = evaluateValueExpression(
+      part.expression,
+      traversal,
+      node,
+      accum,
+    );
     if (value.status === "blocked") continue;
     if (value.value === undefined) {
       throw runtimeError(
@@ -1658,7 +1953,30 @@ function computeSemanticText(
         "Semantic template interpolation cannot use an unset value",
       );
     }
-    pushText(value.value == null ? "" : String(value.value));
+    const evidence = resolveProducer(
+      part.expression,
+      runtimeProducerContext(traversal, node, accum),
+    );
+    if (producerGuaranteesArtifact(evidence)) {
+      if (!isArtifactValue(value.value)) {
+        const issue = classifyArtifactValue(value.value);
+        throw runtimeError(
+          "invalid-artifact-value",
+          `Invalid Artifact value: ${describeArtifactValueIssue(issue ?? "not-plain-object")}`,
+        );
+      }
+      parts.push({ kind: "artifact", path: value.value.path });
+      deferred = true;
+      continue;
+    }
+    const projection = interpolationRule.projectValue(evidence, value.value);
+    if (!projection.admitted) {
+      const detail = projection.violation.detail
+        .replace("value-template", "semantic-template")
+        .replace("Value template", "Semantic template");
+      throw runtimeError(projection.violation.code, detail);
+    }
+    pushText(projection.value);
   }
 
   if (!deferred) {
@@ -1669,58 +1987,35 @@ function computeSemanticText(
   return parts;
 }
 
-function renderArtifactPath(
-  cell: Extract<Cell, { type: "artifact" }>,
+export function initializeArtifactCells(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): string {
-  const path =
-    typeof cell.path === "string"
-      ? cell.path
-      : renderArtifactTemplatePath(cell.path, traversal, node, accum);
-  validateRenderedArtifactPath(cell.name, path);
-  return path;
-}
-
-function renderArtifactTemplatePath(
-  path: ValueString,
-  traversal: Traversal,
-  node: Node,
-  accum: Accumulator,
-): string {
-  const rendered = evaluateValueExpression(path, traversal, node, accum);
-  if (rendered.status === "blocked") {
-    throw runtimeError(
-      "invalid-artifact-path",
-      "Artifact path template cannot contain blocked work",
+): void {
+  for (const cell of node.cells) {
+    if (cell.type !== "artifact" || cell.initializer === undefined) continue;
+    const savedPin = accum.pin;
+    beginPinForElement(
+      accum,
+      {},
+      `artifact-initializer/${cell.name}` as ElementId,
     );
-  }
-  if (typeof rendered.value !== "string") {
-    throw new Error("Artifact path template resolved to a non-string value");
-  }
-  return rendered.value;
-}
-
-function validateRenderedArtifactPath(name: string, path: string): void {
-  if (path.length === 0) {
-    throw runtimeError(
-      "invalid-artifact-path",
-      `Artifact ${name} path cannot be empty`,
-    );
-  }
-  if (path.startsWith("/")) {
-    throw runtimeError(
-      "invalid-artifact-path",
-      `Artifact ${name} path must be relative`,
-    );
-  }
-  for (const segment of path.split("/")) {
-    if (segment === "." || segment === "..") {
-      throw runtimeError(
-        "invalid-artifact-path",
-        `Artifact ${name} path cannot contain "." or ".." segments`,
+    try {
+      const initialized = evaluateValueExpression(
+        cell.initializer,
+        traversal,
+        node,
+        accum,
       );
+      if (initialized.status === "blocked") {
+        throw runtimeError(
+          "invalid-artifact-path",
+          "Artifact path initializer cannot contain blocked work",
+        );
+      }
+      writeOwnedCellValue(traversal, cell.name, cell, initialized.value);
+    } finally {
+      accum.pin = savedPin;
     }
   }
 }
@@ -1736,33 +2031,133 @@ export function truthy(value: unknown): boolean {
       "Unset value cannot be evaluated as a boolean",
     );
   }
-  if (typeof value !== "boolean") {
+  const admission = booleanRule.admitValue(value);
+  if (!admission.admitted) {
     throw runtimeError(
-      "non-boolean-value",
+      admission.violation.code,
       "Only a boolean value can be evaluated as a boolean; compare a non-boolean value explicitly",
     );
   }
-  return value;
+  return admission.value;
 }
 
 /** Structural equality of two ordered arrays by element value. */
 function arraysStructurallyEqual(left: unknown[], right: unknown[]): boolean {
   return (
     left.length === right.length &&
-    left.every((element, index) => element === right[index])
+    left.every((element, index) =>
+      cellValuesEqual(element as CellValue, right[index] as CellValue),
+    )
+  );
+}
+
+function runtimeKind(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  if (typeof value === "object") {
+    if (
+      "status" in value &&
+      (value.status === "idle" ||
+        value.status === "running" ||
+        value.status === "resolved" ||
+        value.status === "deflected")
+    ) {
+      return "node-state";
+    }
+    return "object";
+  }
+  return typeof value;
+}
+
+function requireArithmeticNumber(
+  value: unknown,
+  op: string,
+  side: "left" | "right" | "argument",
+): number {
+  if (value === undefined) {
+    throw runtimeError(
+      "unset-value",
+      `Unset value cannot be used as the ${side} operand of ${op}`,
+    );
+  }
+  const admission = arithmeticRule.admitValue(value);
+  if (!admission.admitted) {
+    throw runtimeError(
+      "non-numeric-arithmetic-operand",
+      `Arithmetic operator ${op} requires a numeric ${side} operand; got ${runtimeKind(value)}`,
+    );
+  }
+  return admission.value;
+}
+
+function evaluateArithmetic(
+  op: ArithmeticOperator,
+  left: number,
+  right: number,
+): number {
+  switch (op) {
+    case "+":
+      return left + right;
+    case "-":
+      return left - right;
+    case "*":
+      return left * right;
+    case "/":
+      return left / right;
+    case "%":
+      return left % right;
+  }
+}
+
+function assertFiniteConsumer(value: unknown, consumer: string): void {
+  const path = firstNonFiniteNumberPath(value);
+  if (path === undefined) return;
+  throw runtimeError(
+    "non-finite-number",
+    `Numeric value must be finite before ${consumer}${path === "$" ? "" : ` at ${path}`}`,
+  );
+}
+
+function admitFinitePayload(
+  value: PayloadValue,
+  consumer: string,
+): PayloadValue {
+  assertPayloadConsumer(value, consumer);
+  assertFiniteConsumer(value, consumer);
+  return cloneWithCanonicalNumbers(value);
+}
+
+function assertPayloadConsumer(
+  value: unknown,
+  consumer: string,
+): asserts value is PayloadValue {
+  const issue = firstInvalidPayloadValue(value);
+  if (!issue) return;
+  throw runtimeError(
+    issue.code,
+    `Invalid payload before ${consumer} at ${issue.path}: ${issue.detail}`,
   );
 }
 
 function evaluateBinary(
-  op: BinaryOperator,
+  op: ComparisonOperator,
   left: unknown,
   right: unknown,
+  leftHasArtifactType: boolean,
+  rightHasArtifactType: boolean,
 ): boolean {
+  const artifactOperand = leftHasArtifactType || rightHasArtifactType;
+  const artifactsEqual =
+    leftHasArtifactType &&
+    rightHasArtifactType &&
+    isArtifactValue(left) &&
+    isArtifactValue(right) &&
+    left.path === right.path;
   const arrayOperand = Array.isArray(left) || Array.isArray(right);
   switch (op) {
     case "==":
-    case "===":
       if (left === undefined || right === undefined) return false;
+      if (artifactOperand) return artifactsEqual;
       if (arrayOperand) {
         return (
           Array.isArray(left) &&
@@ -1772,8 +2167,8 @@ function evaluateBinary(
       }
       return left === right;
     case "!=":
-    case "!==":
       if (left === undefined || right === undefined) return true;
+      if (artifactOperand) return !artifactsEqual;
       if (arrayOperand) {
         return !(
           Array.isArray(left) &&
@@ -1786,6 +2181,12 @@ function evaluateBinary(
     case ">=":
     case "<":
     case "<=":
+      if (artifactOperand) {
+        throw runtimeError(
+          "invalid-artifact-operation",
+          `Artifacts cannot be used with ordering operator ${op}`,
+        );
+      }
       if (arrayOperand) {
         throw runtimeError(
           "invalid-array-operation",

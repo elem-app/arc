@@ -9,19 +9,21 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { parse } from "../src/parser/index.js";
-import { Runtime } from "../src/runtime/index.js";
-import type { ArcTraversalSet } from "../src/types.js";
+import { parse, validate } from "../src/parser/index.js";
+import type { ActionBrief, ArcTraversalSet } from "../src/types/index.js";
 import {
-  EMPTY_DIALOG,
+  actionProgress,
   appliedInstructions,
   arc,
+  EMPTY_DIALOG,
   node,
   ownedChild,
   progressBrief,
   rootTraversal,
+  TestRuntime as Runtime,
   singleObservations,
   startRun,
+  startTerminal,
 } from "./helpers.js";
 
 const ARC_SOURCE = `
@@ -69,7 +71,7 @@ function HeavyMetal() {
 
 function runtimeAfterAsk(
   runtime: Runtime,
-  brief: ReturnType<Runtime["start"]>,
+  brief: ActionBrief,
 ): ArcTraversalSet {
   return progressBrief(runtime, brief, {
     move: "proceed",
@@ -156,13 +158,15 @@ function Main() {
       ]);
       expect(root.children).toMatchObject([{ identifier: "Child" }]);
 
-      const runtime = new Runtime().add("late-cell-declaration-arc", document);
+      const runtime = new Runtime()
+        .add("late-cell-declaration-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("late-cell-declaration-arc", "Main"),
       );
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
       expect(rootTraversal(brief).cells.ready).toBe(true);
     });
 
@@ -391,10 +395,9 @@ function Main() {
   $instruct(\`intro\`);  $observeOrAsk(topic);
   $instruct(\`after \${topic}\`);}
 `);
-      const retainedFrameRuntime = new Runtime().add(
-        "retained-frame-arc",
-        retainedFrameDocument,
-      );
+      const retainedFrameRuntime = new Runtime()
+        .add("retained-frame-arc", retainedFrameDocument)
+        .init();
       const retainedFrameSeeded = retainedFrameRuntime.newTraversal(
         arc("retained-frame-arc", "Main"),
       );
@@ -440,10 +443,9 @@ function Main() {
   $instruct(\`intro\`);  $observeOrAsk(topic);
   $instruct(\`after \${topic}\`);}
 `);
-      const forgetfulEntryRuntime = new Runtime().add(
-        "forgetful-entry-arc",
-        forgetfulEntryDocument,
-      );
+      const forgetfulEntryRuntime = new Runtime()
+        .add("forgetful-entry-arc", forgetfulEntryDocument)
+        .init();
       const forgetfulEntrySeeded = forgetfulEntryRuntime.newTraversal(
         arc("forgetful-entry-arc", "Main"),
       );
@@ -495,7 +497,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("forgetful-entry-keep-arc", document);
+      const runtime = new Runtime()
+        .add("forgetful-entry-keep-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("forgetful-entry-keep-arc", "Main"),
       );
@@ -610,7 +614,7 @@ function Main() {
   });
 
   $instruct(\`Array params.\`, {
-    hostParams: ["greeter", null, true, 3],
+    hostParams: ["greeter", true, 3],
   });
 }
 `);
@@ -621,7 +625,48 @@ function Main() {
       });
       expect(document.roots[0]?.statements[1]).toMatchObject({
         kind: "instruction",
-        hostParams: ["greeter", null, true, 3],
+        hostParams: ["greeter", true, 3],
+      });
+    });
+
+    it("keeps IR-like node and instruction host params keys opaque", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  this.hostParams = {
+    numericSchema: {
+      type: "rangedInt",
+      observeAs: "opaque",
+    },
+  };
+
+  $instruct(\`Use the supplied metadata.\`, {
+    hostParams: {
+      expression: {
+        kind: "arithmetic",
+        op: "^",
+      },
+    },
+  });
+}
+`);
+
+      expect(validate(document)).toEqual([]);
+      expect(document.roots[0]?.hostParams).toEqual({
+        numericSchema: {
+          type: "rangedInt",
+          observeAs: "opaque",
+        },
+      });
+      expect(document.roots[0]?.statements[0]).toMatchObject({
+        kind: "instruction",
+        hostParams: {
+          expression: {
+            kind: "arithmetic",
+            op: "^",
+          },
+        },
       });
     });
 
@@ -683,6 +728,32 @@ function Main() {
 `),
       ).toThrow(
         /instruct\(\)\.hostParams objects do not support computed keys/,
+      );
+    });
+
+    it("rejects null host params metadata at every nesting depth", () => {
+      expect(() =>
+        parse(`
+"arc";
+
+function Main() {
+  this.hostParams = null;
+}
+`),
+      ).toThrow(/this\.hostParams only supports literal metadata values/);
+
+      expect(() =>
+        parse(`
+"arc";
+
+function Main() {
+  $instruct(\`Welcome the user.\`, {
+    hostParams: { consumer: null },
+  });
+}
+`),
+      ).toThrow(
+        /instruct\(\)\.hostParams only supports literal metadata values/,
       );
     });
 
@@ -757,10 +828,9 @@ function Main() {
   $instruct(\`No params.\`);
 }
 `);
-      const runtime = new Runtime().add(
-        "instruction-host-params-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("instruction-host-params-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("instruction-host-params-arc", "Main"),
       );
@@ -806,10 +876,9 @@ function Main() {
   $observe(ready);
 }
 `);
-      const observationRuntime = new Runtime().add(
-        "semantic-observation-arc",
-        observationDocument,
-      );
+      const observationRuntime = new Runtime()
+        .add("semantic-observation-arc", observationDocument)
+        .init();
       const observationTraversal = observationRuntime.newTraversal(
         arc("semantic-observation-arc", "Main"),
       );
@@ -832,10 +901,9 @@ function Main() {
     $instruct(\`Proceed.\`);  }
 }
 `);
-      const judgmentRuntime = new Runtime().add(
-        "semantic-judgment-arc",
-        judgmentDocument,
-      );
+      const judgmentRuntime = new Runtime()
+        .add("semantic-judgment-arc", judgmentDocument)
+        .init();
       const judgmentTraversal = judgmentRuntime.newTraversal(
         arc("semantic-judgment-arc", "Main"),
       );
@@ -860,10 +928,9 @@ function Main() {
   lucky.$set(Dice.roll(20) > 10);
 }
 `);
-      const hostCallRuntime = new Runtime().add(
-        "semantic-hostcall-arc",
-        hostCallDocument,
-      );
+      const hostCallRuntime = new Runtime()
+        .add("semantic-hostcall-arc", hostCallDocument)
+        .init();
       const hostCallTraversal = hostCallRuntime.newTraversal(
         arc("semantic-hostcall-arc", "Main"),
       );
@@ -885,10 +952,9 @@ function Main() {
   $instruct(\`Proceed.\`);
 }
 `);
-      const instructionRuntime = new Runtime().add(
-        "semantic-instruction-arc",
-        instructionDocument,
-      );
+      const instructionRuntime = new Runtime()
+        .add("semantic-instruction-arc", instructionDocument)
+        .init();
       const instructionTraversal = instructionRuntime.newTraversal(
         arc("semantic-instruction-arc", "Main"),
       );
@@ -920,10 +986,9 @@ function Main() {
   });
 }
 `);
-      const runtime = new Runtime().add(
-        "instruction-merged-params-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("instruction-merged-params-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("instruction-merged-params-arc", "Main"),
       );
@@ -963,10 +1028,9 @@ function Main() {
   });
 }
 `);
-      const runtime = new Runtime().add(
-        "instruction-resolution-params-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("instruction-resolution-params-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("instruction-resolution-params-arc", "Main"),
       );
@@ -999,10 +1063,9 @@ function Main() {
   });
 }
 `);
-      const runtime = new Runtime().add(
-        "instruction-resolution-judgment-params-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("instruction-resolution-judgment-params-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("instruction-resolution-judgment-params-arc", "Main"),
       );
@@ -1017,7 +1080,7 @@ function Main() {
       });
     });
 
-    it("carries null transition host params for a child that declares none", () => {
+    it("carries unset transition host params for a child that declares none", () => {
       const document = parse(`
 "arc";
 
@@ -1030,20 +1093,22 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("transition-no-inherit-arc", document);
+      const runtime = new Runtime()
+        .add("transition-no-inherit-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("transition-no-inherit-arc", "Main"),
       );
       seeded.phase = "entered";
 
-      const brief = runtime.start([seeded], EMPTY_DIALOG);
+      const brief = actionProgress(runtime.start([seeded], EMPTY_DIALOG));
 
       // The effective consumer does not inherit: the position's params are the
       // child's own (none), not the parent's.
       expect(brief.transition?.position).toBe(
         node("transition-no-inherit-arc", "Main.Child"),
       );
-      expect(brief.transition?.hostParams).toBeNull();
+      expect(brief.transition?.hostParams).toBeUndefined();
     });
   });
 
@@ -1187,7 +1252,7 @@ function Main() {
       const enterLoop = document.roots[0]?.statements[0];
       expect(enterLoop).toMatchObject({
         kind: "enter-loop",
-        resolveWhen: [{ kind: "return", value: { kind: "binary" } }],
+        resolveWhen: [{ kind: "return", value: { kind: "comparison" } }],
       });
     });
 
@@ -1270,7 +1335,7 @@ function Main() {
         {
           kind: "if",
           test: {
-            kind: "binary",
+            kind: "comparison",
             left: { kind: "pendingState" },
             right: { kind: "literal", value: "deflected" },
           },

@@ -12,21 +12,23 @@
 import { describe, expect, it } from "vitest";
 
 import { parse } from "../src/parser/index.js";
-import { Runtime } from "../src/runtime/index.js";
 import {
   beginValuePin,
   settleHostCallPin,
   settleJudgmentPin,
 } from "../src/runtime/pins.js";
-import type { ArcTraversalSet, Dialog } from "../src/types.js";
-import { nodeSegKey } from "../src/types.js";
+import type { ArcTraversalSet, Dialog } from "../src/types/index.js";
+import { nodeSegKey } from "../src/types/index.js";
 import {
+  actionProgress,
   appliedInstructions,
   arc,
   EMPTY_DIALOG,
   progressBrief,
+  progressTerminal,
   renderSemanticTextForTest,
   rootTraversal,
+  TestRuntime as Runtime,
   startRun,
   startTrigger,
   withExperimentalRewalk,
@@ -48,6 +50,48 @@ function Main() {
 
 describe("pins", () => {
   describe("seg.pins", () => {
+    it("artifact.construct blocks and resumes a nested host path exactly once", () => {
+      const document = parse(`
+"arc";
+import Slugs from "host:slugs";
+function Main() {
+  let artifact = Artifact("initial.md");
+  artifact.$set(Artifact(Slugs.next()));
+}
+`);
+      const statement = document.roots[0]!.statements[0]!;
+      if (
+        statement.kind !== "set" ||
+        statement.value.kind !== "artifact" ||
+        statement.value.path.kind !== "host-call"
+      ) {
+        throw new Error("expected dynamic Artifact construction");
+      }
+      expect(statement.value.path).toMatchObject({
+        kind: "host-call",
+        id: "body/0~0",
+      });
+
+      const runtime = new Runtime().add("artifact-host-path", document).init();
+      const first = actionProgress(
+        runtime.enterArc(arc("artifact-host-path", "Main"), EMPTY_DIALOG),
+      );
+      expect(first.hostCalls).toHaveLength(1);
+      expect(first.hostCalls[0]).toMatchObject({
+        module: "slugs",
+        operation: "next",
+      });
+
+      const terminal = progressTerminal(runtime, first, {
+        move: "proceed",
+        hostCalls: { [first.hostCalls[0]!.id]: "docs/current.md" },
+      });
+      expect(rootTraversal(terminal).cells.artifact).toEqual({
+        path: "docs/current.md",
+      });
+      expect("hostCalls" in terminal).toBe(false);
+    });
+
     it("pins every non-constant expression node and completed semantic render", () => {
       const document = parse(`
 "arc";
@@ -59,7 +103,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("pin-expression-tree-arc", document);
+      const runtime = new Runtime()
+        .add("pin-expression-tree-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("pin-expression-tree-arc", "Main"),
       );
@@ -100,10 +146,12 @@ function Main() {
     });
 
     it("a judge-gated condition before a blocking observation does not livelock", () => {
-      const runtime = new Runtime().add(
-        "pin-livelock-arc",
-        withExperimentalRewalk(parse(GATED_OBSERVE_SOURCE), "Main"),
-      );
+      const runtime = new Runtime()
+        .add(
+          "pin-livelock-arc",
+          withExperimentalRewalk(parse(GATED_OBSERVE_SOURCE), "Main"),
+        )
+        .init();
       const seeded = runtime.newTraversal(arc("pin-livelock-arc", "Main"));
       seeded.phase = "entered";
 
@@ -143,7 +191,7 @@ function Main() {
       expect(fourth.judgments).toHaveLength(0);
       expect(fourth.instructions.map((item) => item.text)).toEqual(["done"]);
 
-      const done = progressBrief(runtime, fourth, {
+      const done = progressTerminal(runtime, fourth, {
         move: "proceed",
         instructions: appliedInstructions(fourth),
       });
@@ -151,9 +199,10 @@ function Main() {
     });
 
     it("retains earlier pins and accrues later expressions after a direct write", () => {
-      const runtime = new Runtime().add(
-        "pin-write-advance-arc",
-        parse(`
+      const runtime = new Runtime()
+        .add(
+          "pin-write-advance-arc",
+          parse(`
 "arc";
 
 function Main() {
@@ -166,7 +215,8 @@ function Main() {
   }
 }
 `),
-      );
+        )
+        .init();
       const seeded = runtime.newTraversal(arc("pin-write-advance-arc", "Main"));
       seeded.phase = "entered";
 
@@ -198,10 +248,9 @@ function Main() {
     });
 
     it("a pure seek reuses the pinned judgment with no repeated ids", () => {
-      const runtime = new Runtime().add(
-        "pin-pure-seek-arc",
-        parse(GATED_OBSERVE_SOURCE),
-      );
+      const runtime = new Runtime()
+        .add("pin-pure-seek-arc", parse(GATED_OBSERVE_SOURCE))
+        .init();
       const seeded = runtime.newTraversal(arc("pin-pure-seek-arc", "Main"));
       seeded.phase = "entered";
 
@@ -238,7 +287,9 @@ function Main() {
   $instruct(\`after\`);
 }
 `);
-      const runtime = new Runtime().add("pin-compound-judge-arc", document);
+      const runtime = new Runtime()
+        .add("pin-compound-judge-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("pin-compound-judge-arc", "Main"),
       );
@@ -286,7 +337,9 @@ function Main() {
   $instruct(\`out\`);
 }
 `);
-      const runtime = new Runtime().add("pin-judge-or-call-arc", document);
+      const runtime = new Runtime()
+        .add("pin-judge-or-call-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("pin-judge-or-call-arc", "Main"));
       seeded.phase = "entered";
 
@@ -320,12 +373,12 @@ function Main() {
 "arc";
 
 function Main() {
-  let count = RangedInt(0, 9);
+  let count = Num();
   count.$set(judge(\`high\`) ? 9 : 1);
   $instruct(\`count \${count}\`);
 }
 `);
-      const runtime = new Runtime().add("pin-set-value-arc", document);
+      const runtime = new Runtime().add("pin-set-value-arc", document).init();
       const seeded = runtime.newTraversal(arc("pin-set-value-arc", "Main"));
       seeded.phase = "entered";
 
@@ -361,7 +414,9 @@ function Main() {
   $instruct(\`done\`);
 }
 `;
-      const runtime = new Runtime().add("pin-restart-arc", parse(source));
+      const runtime = new Runtime()
+        .add("pin-restart-arc", parse(source))
+        .init();
       const seeded = runtime.newTraversal(arc("pin-restart-arc", "Main"));
       seeded.phase = "entered";
 
@@ -383,11 +438,59 @@ function Main() {
       const revived = JSON.parse(
         JSON.stringify(called.traversals),
       ) as ArcTraversalSet;
-      const restarted = new Runtime().add("pin-restart-arc", parse(source));
+      const restarted = new Runtime()
+        .add("pin-restart-arc", parse(source))
+        .init();
       const rebuilt = startRun(restarted, revived, EMPTY_DIALOG);
       expect(rebuilt.judgments).toHaveLength(0);
       expect(rebuilt.hostCalls).toHaveLength(0);
       expect(rebuilt.observations).toHaveLength(1);
+    });
+
+    it("rejects a restored pin whose durable carrier invariant was corrupted", () => {
+      const source = `
+"arc";
+import Score from "host:scorer";
+function Main() {
+  let topic = Str();
+  if (Score.check() == "ok") {
+    $observeOrAsk(topic);
+  }
+}
+`;
+      const runtime = new Runtime()
+        .add("pin-corrupt-restore-arc", parse(source))
+        .init();
+      const seeded = runtime.newTraversal(
+        arc("pin-corrupt-restore-arc", "Main"),
+      );
+      seeded.phase = "entered";
+      const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const blocked = progressBrief(runtime, first, {
+        move: "proceed",
+        hostCalls: { [first.hostCalls[0]!.id]: "ok" },
+      });
+      const restored = JSON.parse(
+        JSON.stringify(blocked.traversals),
+      ) as ArcTraversalSet;
+      const entries = Object.values(
+        restored[0]!.frame.pinTapes[nodeSegKey("body")] ?? {},
+      ).flat();
+      const hostPin = entries.find(
+        (entry) => entry.kind === "hostCall" && entry.resolved,
+      );
+      if (hostPin?.kind !== "hostCall") {
+        throw new Error("expected a resolved host-call pin");
+      }
+      hostPin.hasValue = true;
+      hostPin.value = Number.NaN;
+
+      const restarted = new Runtime()
+        .add("pin-corrupt-restore-arc", parse(source))
+        .init();
+      expect(() => restarted.start(restored, EMPTY_DIALOG)).toThrow(
+        /pin contains a non-finite number/i,
+      );
     });
 
     it("pins a dynamic observation target across needs-user and JSON restart", () => {
@@ -395,16 +498,15 @@ function Main() {
 "arc";
 function Main() {
   let items = Array(Str({ observing: \`selected item\` }));
-  let index = RangedInt(0, 1);
+  let index = Num();
   items.$set(["a", "b"]);
   index.$set(0);
   $observeOrAsk(items[index]);
 }
 `;
-      const firstRuntime = new Runtime().add(
-        "pin-observation-target-arc",
-        parse(source),
-      );
+      const firstRuntime = new Runtime()
+        .add("pin-observation-target-arc", parse(source))
+        .init();
       const seeded = firstRuntime.newTraversal(
         arc("pin-observation-target-arc", "Main"),
       );
@@ -429,14 +531,13 @@ function Main() {
       if (!revivedRoot) throw new Error("missing revived action root");
       revivedRoot.cells.index = 1;
 
-      const restarted = new Runtime().add(
-        "pin-observation-target-arc",
-        parse(source),
-      );
+      const restarted = new Runtime()
+        .add("pin-observation-target-arc", parse(source))
+        .init();
       const rebuilt = startRun(restarted, revived, EMPTY_DIALOG);
       expect(rebuilt.observations[0]).toMatchObject({ cell: "items[0]" });
 
-      const done = progressBrief(restarted, rebuilt, {
+      const done = progressTerminal(restarted, rebuilt, {
         move: "proceed",
         observations: {
           [rebuilt.observations[0]!.id]: {
@@ -475,7 +576,9 @@ function Main() {
         "Main",
         "Main.Child",
       );
-      const runtime = new Runtime().add("pin-scoped-release-arc", document);
+      const runtime = new Runtime()
+        .add("pin-scoped-release-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("pin-scoped-release-arc", "Main"),
       );
@@ -547,7 +650,9 @@ function Main() {
   $instruct(\`tail\`);
 }
 `);
-      const runtime = new Runtime().add("pin-dialog-advance-arc", document);
+      const runtime = new Runtime()
+        .add("pin-dialog-advance-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("pin-dialog-advance-arc", "Main"),
       );
@@ -610,7 +715,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("pin-catch-seek-arc", document);
+      const runtime = new Runtime().add("pin-catch-seek-arc", document).init();
       const seeded = runtime.newTraversal(arc("pin-catch-seek-arc", "Main"));
       seeded.phase = "entered";
 
@@ -645,7 +750,9 @@ function Main() {
   $instruct(\`two\`);
 }
 `);
-      const runtime = new Runtime().add("pin-inherited-hook-arc", document);
+      const runtime = new Runtime()
+        .add("pin-inherited-hook-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("pin-inherited-hook-arc", "Main"),
       );
@@ -677,7 +784,7 @@ function Main() {
       ]);
 
       // The second owner's answer routes by its own id and deflects the node.
-      const deflected = progressBrief(runtime, second, {
+      const deflected = progressTerminal(runtime, second, {
         move: "proceed",
         judgments: { [secondId]: true },
       });
@@ -703,10 +810,9 @@ function Main() {
 `;
 
     it("a trigger retry seeks the candidate's answered judge", () => {
-      const runtime = new Runtime().add(
-        "pin-trigger-seek-arc",
-        parse(TRIGGER_SOURCE),
-      );
+      const runtime = new Runtime()
+        .add("pin-trigger-seek-arc", parse(TRIGGER_SOURCE))
+        .init();
       const dialog: Dialog = {
         cursor: { user: 1, self: 0 },
         lastTurns: [{ role: "user", message: "records" }],
@@ -766,7 +872,8 @@ function Eager() {
 `;
       const runtime = new Runtime()
         .add("pin-trigger-gated-arc", parse(gated))
-        .add("pin-trigger-eager-arc", parse(eager));
+        .add("pin-trigger-eager-arc", parse(eager))
+        .init();
       const dialog: Dialog = {
         cursor: { user: 1, self: 0 },
         lastTurns: [{ role: "user", message: "go" }],
@@ -815,9 +922,10 @@ function Eager() {
 
     it("does not rerun a terminal match while another trigger candidate remains open", () => {
       const source = "pin-trigger-terminal-match-arc";
-      const runtime = new Runtime().add(
-        source,
-        parse(`
+      const runtime = new Runtime()
+        .add(
+          source,
+          parse(`
 "arc";
 
 function Terminal() {
@@ -832,7 +940,8 @@ function Open() {
   };
 }
 `),
-      );
+        )
+        .init();
 
       const first = startTrigger(runtime, EMPTY_DIALOG);
       const terminalJudgment = first.judgments.find(
@@ -872,10 +981,9 @@ function Open() {
     });
 
     it("a fresh startTrigger starts new consultations", () => {
-      const runtime = new Runtime().add(
-        "pin-trigger-fresh-arc",
-        parse(TRIGGER_SOURCE),
-      );
+      const runtime = new Runtime()
+        .add("pin-trigger-fresh-arc", parse(TRIGGER_SOURCE))
+        .init();
       const dialog: Dialog = {
         cursor: { user: 1, self: 0 },
         lastTurns: [{ role: "user", message: "records" }],

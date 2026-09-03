@@ -9,15 +9,16 @@
 import { describe, expect, it } from "vitest";
 
 import { parse } from "../src/parser/index.js";
-import { Runtime } from "../src/runtime/index.js";
-import type { Dialog } from "../src/types.js";
+import type { Dialog } from "../src/types/index.js";
 import {
+  actionProgress,
   appliedHostEffects,
   appliedInstructions,
   arc,
   EMPTY_DIALOG,
   node,
   rootTraversal,
+  TestRuntime as Runtime,
   startTrigger,
 } from "./helpers.js";
 
@@ -45,7 +46,7 @@ function Main() {
     $instruct(\`child work\`);  }
 }
 `);
-    const runtime = new Runtime().add("transition-entry-arc", document);
+    const runtime = new Runtime().add("transition-entry-arc", document).init();
     const seeded = runtime.newTraversal(arc("transition-entry-arc", "Main"));
     seeded.phase = "entered";
     return { runtime, seeded };
@@ -54,7 +55,7 @@ function Main() {
   describe("trans.shapes", () => {
     it("yields an exclusive entry transition carrying the position's host params", () => {
       const { runtime, seeded } = guardedChildRuntime();
-      const brief = runtime.start([seeded], EMPTY_DIALOG);
+      const brief = actionProgress(runtime.start([seeded], EMPTY_DIALOG));
 
       expect(brief.transition).toBeDefined();
       expect(brief.transition?.entered).toEqual([
@@ -92,27 +93,30 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("transition-exit-arc", document);
+      const runtime = new Runtime().add("transition-exit-arc", document).init();
       const seeded = runtime.newTraversal(arc("transition-exit-arc", "Main"));
       seeded.phase = "entered";
 
-      const entry = runtime.start([seeded], EMPTY_DIALOG);
+      const entry = actionProgress(runtime.start([seeded], EMPTY_DIALOG));
       expect(entry.transition?.entered).toEqual([
         node("transition-exit-arc", "Main.Child"),
       ]);
-      const judging = runtime.progress(
-        entry,
-        { move: "proceed" },
-        EMPTY_DIALOG,
+      const judging = actionProgress(
+        runtime.progress(entry, { move: "proceed" }, EMPTY_DIALOG),
       );
       expect(judging.judgments).toHaveLength(1);
 
       // The judgment resolves false, the child covers, and its exit yields before
       // Main's dialog-gated branch evaluates.
-      const exit = runtime.progress(
-        judging,
-        { move: "proceed", judgments: { [judging.judgments[0]!.id]: false } },
-        EMPTY_DIALOG,
+      const exit = actionProgress(
+        runtime.progress(
+          judging,
+          {
+            move: "proceed",
+            judgments: { [judging.judgments[0]!.id]: false },
+          },
+          EMPTY_DIALOG,
+        ),
       );
       expect(exit.transition?.exited).toEqual([
         node("transition-exit-arc", "Main.Child"),
@@ -122,13 +126,15 @@ function Main() {
       );
 
       // Main's branch condition evaluates against the acknowledging dialog.
-      const after = runtime.progress(
-        exit,
-        { move: "proceed" },
-        {
-          cursor: { user: 1, self: 0 },
-          lastTurns: [{ role: "user", message: "later please" }],
-        },
+      const after = actionProgress(
+        runtime.progress(
+          exit,
+          { move: "proceed" },
+          {
+            cursor: { user: 1, self: 0 },
+            lastTurns: [{ role: "user", message: "later please" }],
+          },
+        ),
       );
       expect(after.instructions.map((item) => item.text)).toEqual([
         "after later",
@@ -150,11 +156,13 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("transition-chain-arc", document);
+      const runtime = new Runtime()
+        .add("transition-chain-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("transition-chain-arc", "Main"));
       seeded.phase = "entered";
 
-      const brief = runtime.start([seeded], EMPTY_DIALOG);
+      const brief = actionProgress(runtime.start([seeded], EMPTY_DIALOG));
       expect(brief.transition?.entered).toEqual([
         node("transition-chain-arc", "Main.A"),
         node("transition-chain-arc", "Main.A.B"),
@@ -187,27 +195,33 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("transition-deflect-arc", document);
+      const runtime = new Runtime()
+        .add("transition-deflect-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("transition-deflect-arc", "Main"),
       );
       seeded.phase = "entered";
 
-      const entry = runtime.start([seeded], EMPTY_DIALOG);
+      const entry = actionProgress(runtime.start([seeded], EMPTY_DIALOG));
       expect(entry.transition?.entered).toEqual([
         node("transition-deflect-arc", "Main.C"),
         node("transition-deflect-arc", "Main.C.K"),
       ]);
-      const work = runtime.progress(entry, { move: "proceed" }, EMPTY_DIALOG);
+      const work = actionProgress(
+        runtime.progress(entry, { move: "proceed" }, EMPTY_DIALOG),
+      );
       expect(work.instructions.map((item) => item.text)).toEqual(["k work"]);
       expect(work.judgments).toHaveLength(1);
 
       // Deflection unwinds K and C without their own hooks; the coalesced exits
       // pause at Main, the first ancestor with a catch.
-      const exit = runtime.progress(
-        work,
-        { move: "proceed", judgments: { [work.judgments[0]!.id]: true } },
-        EMPTY_DIALOG,
+      const exit = actionProgress(
+        runtime.progress(
+          work,
+          { move: "proceed", judgments: { [work.judgments[0]!.id]: true } },
+          EMPTY_DIALOG,
+        ),
       );
       expect(exit.transition?.exited).toEqual([
         node("transition-deflect-arc", "Main.C.K"),
@@ -217,7 +231,9 @@ function Main() {
         node("transition-deflect-arc", "Main"),
       );
 
-      const caught = runtime.progress(exit, { move: "proceed" }, EMPTY_DIALOG);
+      const caught = actionProgress(
+        runtime.progress(exit, { move: "proceed" }, EMPTY_DIALOG),
+      );
       expect(rootTraversal(caught).cells.caught).toBe(true);
     });
   });
@@ -238,36 +254,42 @@ function Main() {
     $instruct(\`child step\`);  }
 }
 `);
-      const runtime = new Runtime().add("transition-loop-arc", document);
+      const runtime = new Runtime().add("transition-loop-arc", document).init();
       const seeded = runtime.newTraversal(arc("transition-loop-arc", "Main"));
       seeded.phase = "entered";
 
-      const entry = runtime.start([seeded], EMPTY_DIALOG);
+      const entry = actionProgress(runtime.start([seeded], EMPTY_DIALOG));
       expect(entry.transition?.entered).toHaveLength(1);
-      const work = runtime.progress(entry, { move: "proceed" }, EMPTY_DIALOG);
+      const work = actionProgress(
+        runtime.progress(entry, { move: "proceed" }, EMPTY_DIALOG),
+      );
       expect(work.instructions.map((item) => item.text)).toEqual([
         "child step",
       ]);
 
       // The covered iteration's exit yields before resolveWhen evaluates; the
       // acknowledging dialog is what the hook sees.
-      const exit = runtime.progress(
-        work,
-        { move: "proceed", instructions: appliedInstructions(work) },
-        EMPTY_DIALOG,
+      const exit = actionProgress(
+        runtime.progress(
+          work,
+          { move: "proceed", instructions: appliedInstructions(work) },
+          EMPTY_DIALOG,
+        ),
       );
       expect(exit.transition?.exited).toHaveLength(1);
       expect(exit.transition?.position).toBe(
         node("transition-loop-arc", "Main"),
       );
 
-      const resolved = runtime.progress(
-        exit,
-        { move: "proceed" },
-        {
-          cursor: { user: 1, self: 0 },
-          lastTurns: [{ role: "user", message: "please stop" }],
-        },
+      const resolved = actionProgress(
+        runtime.progress(
+          exit,
+          { move: "proceed" },
+          {
+            cursor: { user: 1, self: 0 },
+            lastTurns: [{ role: "user", message: "please stop" }],
+          },
+        ),
       );
       expect(resolved.instructions.map((item) => item.text)).toEqual([
         "after loop",
@@ -291,35 +313,43 @@ function Main() {
     $instruct(\`child work\`);  }
 }
 `);
-      const runtime = new Runtime().add("transition-effects-arc", document);
+      const runtime = new Runtime()
+        .add("transition-effects-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("transition-effects-arc", "Main"),
       );
       seeded.phase = "entered";
 
-      const entry = runtime.start([seeded], EMPTY_DIALOG);
+      const entry = actionProgress(runtime.start([seeded], EMPTY_DIALOG));
       expect(entry.transition).toBeDefined();
       expect(entry.hostEffects).toEqual([]);
 
-      const work = runtime.progress(entry, { move: "proceed" }, EMPTY_DIALOG);
+      const work = actionProgress(
+        runtime.progress(entry, { move: "proceed" }, EMPTY_DIALOG),
+      );
       expect(work.instructions.map((item) => item.text)).toEqual([
         "child work",
       ]);
 
       // The child's declared effects surface only after its work resolves, on a
       // transition-free brief, and hold the frontier until applied.
-      const effects = runtime.progress(
-        work,
-        { move: "proceed", instructions: appliedInstructions(work) },
-        EMPTY_DIALOG,
+      const effects = actionProgress(
+        runtime.progress(
+          work,
+          { move: "proceed", instructions: appliedInstructions(work) },
+          EMPTY_DIALOG,
+        ),
       );
       expect(effects.transition).toBeUndefined();
       expect(effects.hostEffects).toHaveLength(1);
 
-      const exit = runtime.progress(
-        effects,
-        { move: "proceed", hostEffects: appliedHostEffects(effects) },
-        EMPTY_DIALOG,
+      const exit = actionProgress(
+        runtime.progress(
+          effects,
+          { move: "proceed", hostEffects: appliedHostEffects(effects) },
+          EMPTY_DIALOG,
+        ),
       );
       expect(exit.transition?.exited).toEqual([
         node("transition-effects-arc", "Main.Child"),
@@ -341,25 +371,27 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("rewalk-no-latch-arc", document);
+      const runtime = new Runtime().add("rewalk-no-latch-arc", document).init();
       const seeded = runtime.newTraversal(arc("rewalk-no-latch-arc", "Main"));
       seeded.phase = "entered";
 
-      const first = runtime.start([seeded], EMPTY_DIALOG);
+      const first = actionProgress(runtime.start([seeded], EMPTY_DIALOG));
       expect(first.transition).toBeUndefined();
       expect(first.observations).toHaveLength(1);
 
       // The resolved observation re-walks the body and fires the gated branch;
       // the re-walk is not a position change, so no transition rides the brief.
-      const second = runtime.progress(
-        first,
-        {
-          move: "proceed",
-          observations: {
-            [first.observations[0]!.id]: { status: "resolved", value: true },
+      const second = actionProgress(
+        runtime.progress(
+          first,
+          {
+            move: "proceed",
+            observations: {
+              [first.observations[0]!.id]: { status: "resolved", value: true },
+            },
           },
-        },
-        EMPTY_DIALOG,
+          EMPTY_DIALOG,
+        ),
       );
       expect(second.transition).toBeUndefined();
       expect(second.instructions.map((item) => item.text)).toEqual(["go"]);
@@ -382,7 +414,9 @@ function Main() {
     $instruct(\`child work\`);  }
 }
 `);
-      const runtime = new Runtime().add("transition-trigger-arc", document);
+      const runtime = new Runtime()
+        .add("transition-trigger-arc", document)
+        .init();
       const trigger = startTrigger(runtime, EMPTY_DIALOG);
       expect(
         trigger.traversals.every(
@@ -395,9 +429,11 @@ function Main() {
   describe("trans.persistence", () => {
     it("re-carries the transition when a report is rejected", () => {
       const { runtime, seeded } = guardedChildRuntime();
-      const brief = runtime.start([seeded], EMPTY_DIALOG);
+      const brief = actionProgress(runtime.start([seeded], EMPTY_DIALOG));
 
-      const rebriefed = runtime.progress(brief, { move: "deflect" }, GO_DIALOG);
+      const rebriefed = actionProgress(
+        runtime.progress(brief, { move: "deflect" }, GO_DIALOG),
+      );
       expect(rebriefed.transition).toEqual(brief.transition);
       expect(
         rebriefed.issues.some((issue) => issue.kind === "invalid-report"),

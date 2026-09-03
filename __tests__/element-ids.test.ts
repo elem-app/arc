@@ -10,13 +10,23 @@ import { describe, expect, it } from "vitest";
 
 import { parse, stampElementIds, validate } from "../src/parser/index.js";
 import { Runtime, toNodeRefParts } from "../src/runtime/index.js";
-import type { Document, ElementId, Statement } from "../src/types.js";
+import {
+  cloneValueExpression,
+  instructionBatchSignature,
+} from "../src/runtime/state.js";
+import type {
+  ArtifactConstructExpression,
+  Document,
+  ElementId,
+  Statement,
+} from "../src/types/index.js";
 import {
   EMPTY_DIALOG,
   appliedInstructions,
   arc,
   ephemeralChild,
   progressBrief,
+  progressTerminal,
   rootTraversal,
   startRun,
 } from "./helpers.js";
@@ -49,6 +59,65 @@ function stripIds(value: unknown): void {
 }
 
 describe("Element ids", () => {
+  describe("expr.artifact-construction", () => {
+    it("artifact.construct cloning preserves the path subtree", () => {
+      const expression: ArtifactConstructExpression = {
+        kind: "artifact",
+        path: {
+          kind: "template-string",
+          parts: [
+            { kind: "text", value: "docs/" },
+            {
+              kind: "expression",
+              expression: { kind: "cell", name: "slug" },
+            },
+          ],
+        },
+      };
+
+      const cloned = cloneValueExpression(expression);
+      expect(cloned).toEqual(expression);
+      expect(cloned).not.toBe(expression);
+      if (
+        cloned.kind !== "artifact" ||
+        cloned.path.kind !== "template-string" ||
+        expression.path.kind !== "template-string"
+      ) {
+        throw new Error("expected cloned Artifact template path");
+      }
+      expect(cloned.path).not.toBe(expression.path);
+      expect(cloned.path.parts).not.toBe(expression.path.parts);
+    });
+
+    it("artifact.construct normalization distinguishes constructor paths", () => {
+      const signature = (path: string): string => {
+        const document = parse(`
+"arc";
+function Main() {
+  let artifact = Artifact("initial.md");
+  $instructLoop(\`work\`, {
+    resolveWhen: () => {
+      artifact.$set(Artifact(${JSON.stringify(path)}));
+      return true;
+    },
+  });
+}
+`);
+        const node = document.roots[0]!;
+        const statement = node.statements[0]!;
+        if (statement.kind !== "instruction") {
+          throw new Error("expected instruction");
+        }
+        return instructionBatchSignature(node, statement);
+      };
+
+      expect(signature("a.md")).not.toBe(signature("b.md"));
+      expect(signature("a.md")).toContain(
+        '"path":{"kind":"literal","value":"a.md"}',
+      );
+    });
+  });
+
   describe("elemid.stability", () => {
     it("editing one SEG leaves every other SEG's ids unchanged", () => {
       const base = parse(`
@@ -178,7 +247,9 @@ function Main() {
       // stripping ids leaves each instruction a private unstamped copy.
       stripIds(document);
 
-      const runtime = new Runtime().add("elemid-handbuilt-arc", document);
+      const runtime = new Runtime()
+        .add("elemid-handbuilt-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("elemid-handbuilt-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -228,7 +299,7 @@ function Main() {
         },
       ]);
 
-      const runtime = new Runtime().add("elemid-copy-arc", document);
+      const runtime = new Runtime().add("elemid-copy-arc", document).init();
       const seeded = runtime.newTraversal(arc("elemid-copy-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -247,7 +318,7 @@ function Main() {
         "Child#body/0/0c/0",
       ]);
 
-      const done = progressBrief(runtime, brief, {
+      const done = progressTerminal(runtime, brief, {
         move: "proceed",
         instructions: appliedInstructions(brief),
       });

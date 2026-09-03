@@ -1,10 +1,5 @@
-import type {
-  DeflectionContext,
-  ElementId,
-  Node,
-  Traversal,
-  ValueExpression,
-} from "../types.js";
+import type { ElementId, Node, ValueExpression } from "../types/parser.js";
+import type { DeflectionContext, Traversal } from "../types/runtime.js";
 import { traversalToNodeRef } from "./refs.js";
 import { runtimeError } from "./report-validation.js";
 import {

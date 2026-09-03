@@ -8,17 +8,25 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { analyzeDocument, parse } from "../src/parser/index.js";
+import { analyzeDocument, parse, validate } from "../src/parser/index.js";
 import { Runtime } from "../src/runtime/index.js";
-import type { ArcTraversalSet, Dialog } from "../src/types.js";
-import { nodeSegKey } from "../src/types.js";
+import type {
+  ArcTraversalSet,
+  Dialog,
+  ElementId,
+  HostCallExpression,
+  SourceRange,
+} from "../src/types/index.js";
+import { nodeSegKey } from "../src/types/index.js";
 import {
   appliedInstructions,
   arc,
   EMPTY_DIALOG,
   progressBrief,
+  progressTerminal,
   rootTraversal,
   startRun,
+  startTerminal,
 } from "./helpers.js";
 
 describe("expressions and dialog", () => {
@@ -31,8 +39,8 @@ import Score from "host:scorer";
 import Memoir from "host:memoir";
 
 function Main() {
-  let roll = RangedInt(1, 20);
-  let score = RangedInt(0, 100);
+  let roll = Num();
+  let score = Num();
 
   this.trigger = () => {
     if (roll > 10 ? true : false) {
@@ -112,18 +120,17 @@ function Main() {
     });
 
     it("differential read-coverage: the static plan covers reads nested under every expression kind", () => {
-      // Each Child condition buries its reads under a different ValueExpression
-      // kind — logical/binary, unary, conditional (ternary), and regexTest — so
-      // this fails the moment the collector stops descending into any of them and
-      // drops a read. A dropped read is a correctness bug (the enclosing SEG would
-      // under-rewalk), not a perf miss, so completeness is asserted per kind.
+      // Child buries unique reads under logical/binary, unary, conditional,
+      // regexTest, and Artifact-construction subtrees. This fails the moment the
+      // collector stops descending into any one of them. A dropped read is a
+      // correctness bug (the enclosing SEG would under-rewalk), not a perf miss.
       const document = parse(`
 "arc";
 
 function Main() {
   let ready = Bool();
   let topic = Enum(["unknown", "metal"]);
-  let level = RangedInt(0, 10);
+  let level = Num();
 
   $enter(Child, {
     args: { ready },
@@ -136,6 +143,8 @@ function Main() {
     let lhs = Bool();
     let rhs = Bool();
     let label = Str();
+    let artifactPath = Str();
+    let artifact = Artifact("initial.md");
 
     if (args.ready == true && returns.topic == "metal") {
       $instruct(\`logical over channels\`);
@@ -149,6 +158,7 @@ function Main() {
     if (/metal/i.test(label)) {
       $instruct(\`regexTest\`);
     }
+    artifact.$set(Artifact(\`docs/\${artifactPath}.md\`));
     if (level >= 5 || Sibling.state == State.COVERED) {
       $instruct(\`binary and node-state\`);
     }
@@ -165,9 +175,9 @@ function Main() {
       )!;
       const readSet = plan.bySeg.get(childNode)!.get(nodeSegKey("body"))!;
 
-      // unary `flag`; conditional `pick`/`lhs`/`rhs`; regexTest `label`; binary
-      // `level` — every read nested under an expression kind must surface, and
-      // the length bound asserts completeness: a dropped or spurious read fails.
+      // unary `flag`; conditional `pick`/`lhs`/`rhs`; regexTest `label`;
+      // Artifact path `artifactPath`; binary `level` — every nested read must
+      // surface, and the length bound rejects either a dropped or spurious read.
       expect(readSet.cells).toEqual(
         expect.arrayContaining([
           "flag",
@@ -175,10 +185,11 @@ function Main() {
           "lhs",
           "rhs",
           "label",
+          "artifactPath",
           "level",
         ]),
       );
-      expect(readSet.cells).toHaveLength(6);
+      expect(readSet.cells).toHaveLength(7);
       expect(readSet.nodeIdentifiers).toContain("Sibling");
       expect(readSet.channels).toContainEqual({
         namespace: "args",
@@ -189,6 +200,65 @@ function Main() {
         key: "topic",
       });
       expect(readSet.channels).toHaveLength(2);
+    });
+
+    it("artifact.construct reports the nested briefable expression location", () => {
+      const document = parse(`
+"arc";
+import Store from "host:store";
+function Main() {
+  let accepted = Bool();
+  accepted.$set(Store.accept(Artifact("literal.md")));
+}
+`);
+      const statement = document.roots[0]!.statements[0]!;
+      if (statement.kind !== "set" || statement.value.kind !== "host-call") {
+        throw new Error("expected host-call set value");
+      }
+      const argument = statement.value.arguments[0];
+      if (argument?.kind !== "value" || argument.value.kind !== "artifact") {
+        throw new Error("expected Artifact host argument");
+      }
+      const nestedLoc: SourceRange = {
+        start: { line: 50, column: 7 },
+        end: { line: 50, column: 19 },
+      };
+      const nested: HostCallExpression = {
+        id: statement.value.id.replace(/~0$/, "~1") as ElementId,
+        kind: "host-call",
+        module: "store",
+        target: [],
+        operation: "path",
+        arguments: [],
+        loc: nestedLoc,
+      };
+      argument.value.path = {
+        kind: "template-string",
+        parts: [{ kind: "expression", expression: nested }],
+      };
+
+      expect(validate(document)).toContainEqual(
+        expect.objectContaining({ code: "HOST_CALL_ARGUMENT", loc: nestedLoc }),
+      );
+    });
+
+    it("artifact.construct preserves bare-boolean linting inside path templates", () => {
+      const lintCodes = (pathExpression: string) =>
+        analyzeDocument(
+          parse(`
+"arc";
+function Main() {
+  let ready = Bool();
+  let artifact = Artifact("initial.md");
+  artifact.$set(Artifact(\`${pathExpression}\`));
+}
+`),
+        ).lintIssues.map((issue) => issue.code);
+
+      expect(lintCodes('${ready ? "yes" : "no"}.md')).toContain(
+        "bare-cell-boolean",
+      );
+      expect(lintCodes("${ready}.md")).not.toContain("bare-cell-boolean");
     });
   });
 
@@ -206,7 +276,7 @@ function Main() {
     $instruct(\`no match\`);  }
 }
 `);
-      const runtime = new Runtime().add("regex-arc", document);
+      const runtime = new Runtime().add("regex-arc", document).init();
       const seeded = runtime.newTraversal(arc("regex-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], {
@@ -227,7 +297,9 @@ function Main() {
   $instruct(\`Address \${Dialog.user} like \${user}; respond as \${Dialog.self} like \${self}.\`);
 }
 `);
-      const runtime = new Runtime().add("dialog-participants-arc", document);
+      const runtime = new Runtime()
+        .add("dialog-participants-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("dialog-participants-arc", "Main"),
       );
@@ -319,18 +391,6 @@ function Main() {
         parse(`
 "arc";
 
-function Main() {
-  let file = Artifact("notes.md");
-  let note = Str();
-  note.$set(\`\${file}\`);
-}
-`),
-      ).toThrow(/NON_VALUE_CELL/);
-
-      expect(() =>
-        parse(`
-"arc";
-
 import Audience from "host:audience";
 
 function Main() {
@@ -356,11 +416,13 @@ function Main() {
 }
 `);
 
-      const runtime = new Runtime().add("value-string-set-arc", document);
+      const runtime = new Runtime()
+        .add("value-string-set-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("value-string-set-arc", "Main"));
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).phase).toBe("completed");
       expect(rootTraversal(brief).cells.note).toBe("haha");
@@ -429,7 +491,7 @@ function Main() {
     $instruct(\`second\`);  }
 }
 `);
-      const runtime = new Runtime().add("dialog-arc", document);
+      const runtime = new Runtime().add("dialog-arc", document).init();
       const seeded = runtime.newTraversal(arc("dialog-arc", "Main"));
       seeded.phase = "entered";
 
@@ -516,7 +578,7 @@ function Main() {
       expect(second).toMatchObject({
         kind: "if",
         test: {
-          kind: "binary",
+          kind: "comparison",
           left: {
             kind: "dialogTurnsSince",
             metric: "user",
@@ -528,7 +590,7 @@ function Main() {
       expect(third).toMatchObject({
         kind: "if",
         test: {
-          kind: "binary",
+          kind: "comparison",
           left: {
             kind: "dialogTurnsSince",
             metric: "self",
@@ -539,7 +601,7 @@ function Main() {
       expect(fourth).toMatchObject({
         kind: "if",
         test: {
-          kind: "binary",
+          kind: "comparison",
           left: {
             kind: "dialogTurnsSince",
             metric: "total",
@@ -610,7 +672,7 @@ function Main() {
 }
 `);
 
-      const runtime = new Runtime().add("dialog-signed-arc", document);
+      const runtime = new Runtime().add("dialog-signed-arc", document).init();
       const seeded = runtime.newTraversal(arc("dialog-signed-arc", "Main"));
       seeded.phase = "entered";
 
@@ -660,7 +722,9 @@ function Main() {
 }
 `);
 
-      const runtime = new Runtime().add("dialog-backwards-arc", document);
+      const runtime = new Runtime()
+        .add("dialog-backwards-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("dialog-backwards-arc", "Main"));
       seeded.phase = "entered";
 
@@ -673,7 +737,7 @@ function Main() {
       // The host supplies a cursor smaller than the snapshotted baseline; the
       // observation write rewalks the body, and the fresh live receiver must
       // reject the backwards movement rather than count negatively.
-      const second = progressBrief(
+      const second = progressTerminal(
         runtime,
         first,
         {
@@ -711,10 +775,9 @@ function Main() {
 }
 `);
 
-      const runtime = new Runtime().add(
-        "dialog-baseline-backwards-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("dialog-baseline-backwards-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("dialog-baseline-backwards-arc", "Main"),
       );
@@ -730,7 +793,7 @@ function Main() {
       // so `snapshot - Dialog.cursor` is positive — the observation write rewalks
       // the body, and the fresh live baseline moved backwards and must reject
       // rather than return a positive count.
-      const second = progressBrief(
+      const second = progressTerminal(
         runtime,
         first,
         {
@@ -769,15 +832,14 @@ function Main() {
       ];
 
       invalidCursors.forEach((cursor, index) => {
-        const runtime = new Runtime().add(
-          `dialog-invalid-cursor-arc-${index}`,
-          invalidCurrent,
-        );
+        const runtime = new Runtime()
+          .add(`dialog-invalid-cursor-arc-${index}`, invalidCurrent)
+          .init();
         const seeded = runtime.newTraversal(
           arc(`dialog-invalid-cursor-arc-${index}`, "Main"),
         );
         seeded.phase = "entered";
-        const invalid = startRun(runtime, [seeded], {
+        const invalid = startTerminal(runtime, [seeded], {
           cursor,
           lastTurns: [],
         } as unknown as Dialog);
@@ -797,22 +859,21 @@ function Main() {
 "arc";
 
 function Main() {
-  let startedAt = RangedInt(0, 10000);
+  let startedAt = Num();
   startedAt.$set(1);
   if (Dialog.cursor.totalTurnsSince(startedAt) > 0) {
     $instruct(\`pivot\`);  }
 }
 `);
 
-      const runtime = new Runtime().add(
-        "dialog-non-cursor-since-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("dialog-non-cursor-since-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("dialog-non-cursor-since-arc", "Main"),
       );
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).phase).toBe("poisoned");
       expect(brief.issues).toEqual([
@@ -828,22 +889,21 @@ function Main() {
 "arc";
 
 function Main() {
-  let startedAt = RangedInt(0, 10000);
+  let startedAt = Num();
   startedAt.$set(1);
   if (startedAt.totalTurnsSince(Dialog.cursor) > 0) {
     $instruct(\`pivot\`);  }
 }
 `);
 
-      const runtime = new Runtime().add(
-        "dialog-non-cursor-receiver-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("dialog-non-cursor-receiver-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("dialog-non-cursor-receiver-arc", "Main"),
       );
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).phase).toBe("poisoned");
       expect(brief.issues).toEqual([
@@ -881,7 +941,7 @@ function Main() {
     $instruct(\`enough\`);  }
 }
 `);
-      const runtime = new Runtime().add(name, document);
+      const runtime = new Runtime().add(name, document).init();
       const seeded = runtime.newTraversal(arc(name, "Main"));
       seeded.phase = "entered";
       return { runtime, seeded };
@@ -976,7 +1036,7 @@ function Main() {
       // The stored mark carries view "reviewer"; after the observation resolves,
       // the following comparison reads the live default-view cursor and poisons
       // the run as an authored runtime error.
-      const poisoned = progressBrief(
+      const poisoned = progressTerminal(
         runtime,
         first,
         {
@@ -998,9 +1058,9 @@ function Main() {
       expect(poisoned.issues[0]?.reason).toContain(
         'the baseline under view "reviewer"',
       );
-      expect(poisoned.instructions).toEqual([]);
-      expect(poisoned.judgments).toEqual([]);
-      expect(poisoned.allowedMoves).toEqual([]);
+      expect("instructions" in poisoned).toBe(false);
+      expect("judgments" in poisoned).toBe(false);
+      expect("allowedMoves" in poisoned).toBe(false);
       expect(poisoned.canProgress).toBe(false);
       expect(rootTraversal(poisoned).phase).toBe("poisoned");
     });
@@ -1013,7 +1073,7 @@ function Main() {
         view: "reviewer",
       });
 
-      const poisoned = progressBrief(
+      const poisoned = progressTerminal(
         runtime,
         first,
         {

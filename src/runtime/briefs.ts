@@ -1,30 +1,33 @@
 import type {
   ActionBrief,
-  ActionMove,
   ActionReport,
-  ArcRef,
-  ArcTraversal,
-  ArcTraversalSet,
-  BriefId,
-  Dialog,
   HostEffectBrief,
   HostEffectReport,
   InstructionBrief,
   InstructionReport,
+  TerminalBrief,
+  TriggerBrief,
+  TriggerReport,
+} from "../types/host-interaction.js";
+import type {
+  ActionMove,
+  ArcRef,
+  ArcTraversal,
+  ArcTraversalSet,
+  BriefId,
   NodeRef,
   NodeTransition,
   RuntimeIssue,
-  TriggerBrief,
-  TriggerReport,
-} from "../types.js";
-import { nodeSegKey } from "../types.js";
+} from "../types/runtime.js";
+import { nodeSegKey } from "../types/runtime.js";
+import type { Dialog } from "../types/value.js";
+import { clonePayloadValue } from "../value-utils.js";
 import {
   clearInvokeStateCrossedByDeflection,
   continueArc,
   resumeActiveFrame,
   runTrigger,
 } from "./execute.js";
-import { clonePayloadObject, clonePayloadValue } from "./payload.js";
 import { clonePinTape } from "./pins.js";
 import {
   arcToNodeRef,
@@ -42,6 +45,7 @@ import {
   buildInvalidReportIssue,
   buildPoisonedTraversalIssue,
   cloneRuntimeIssue,
+  filterHostCallResults,
   filterObservationReports,
   findUnknownReportIdIssue,
   runtimeErrorReasonCode,
@@ -49,6 +53,7 @@ import {
 } from "./report-validation.js";
 import {
   clearEvaluatorActionStates,
+  cloneCellValue,
   cloneHostCallBrief,
   cloneHostEffect,
   cloneInstructionBrief,
@@ -186,7 +191,9 @@ export function validateTriggerReport(
   }
 
   if (report.hostCalls) {
-    accepted.hostCalls = clonePayloadObject(report.hostCalls);
+    const result = filterHostCallResults(report.hostCalls);
+    if (result.accepted) accepted.hostCalls = result.accepted;
+    issues.push(...result.issues);
   }
 
   return { accepted, issues, rejected: false };
@@ -504,13 +511,8 @@ export function buildActionBrief(
   traversals: ArcTraversalSet,
   dialog: Dialog,
   leadingHostEffects: HostEffectBrief[] = [],
-  activeHint?: NodeRef,
   leadingIssues: RuntimeIssue[] = [],
-): {
-  brief: ActionBrief;
-  traversals: ArcTraversalSet;
-  snapshot: ActionBriefSnapshot;
-} {
+): BuiltActionOutput {
   const workingTraversals = cloneTraversalSet(traversals);
   const workingRoot = selectActionRootTraversal(workingTraversals, entry.arc);
   const accum = createAccumulator(
@@ -541,8 +543,6 @@ export function buildActionBrief(
     } else {
       continueArc(accum);
     }
-  } else if (activeHint) {
-    accum.active = activeHint;
   }
   for (const traversal of workingTraversals) {
     if (!entries.has(rootRefOf(traversal.ref))) {
@@ -568,13 +568,78 @@ export function buildActionBrief(
       "Transition brief exclusivity violated: a transition-bearing brief collected frontier work",
     );
   }
+  const issues = [
+    ...leadingIssues.map(cloneRuntimeIssue),
+    ...accum.issues.map(cloneRuntimeIssue),
+  ];
+  if (actionRoot.phase !== "entered") {
+    if (
+      instructions.length > 0 ||
+      hostEffects.length > 0 ||
+      accum.judgments.length > 0 ||
+      accum.observations.length > 0 ||
+      accum.hostCalls.length > 0 ||
+      transition
+    ) {
+      throw new Error(
+        "Terminal action-result invariant violated: a stopped root has pending frontier work",
+      );
+    }
+
+    let outcome: TerminalBrief["outcome"];
+    switch (actionRoot.phase) {
+      case "completed":
+        if (actionRoot.state !== "covered") {
+          throw new Error(
+            `Invalid completed action root state: expected "covered", got ${JSON.stringify(actionRoot.state)}`,
+          );
+        }
+        outcome = "covered";
+        break;
+      case "suspended":
+        if (actionRoot.state !== "deflected") {
+          throw new Error(
+            `Invalid suspended action root state: expected "deflected", got ${JSON.stringify(actionRoot.state)}`,
+          );
+        }
+        outcome = "deflected";
+        break;
+      case "poisoned":
+        outcome = "poisoned";
+        break;
+      default:
+        throw new Error(
+          `Invalid terminal action root phase: ${actionRoot.phase}`,
+        );
+    }
+
+    const actionEntry = getEntryForRef(entries, actionRoot.ref) ?? entry;
+    const declaredReturns = actionEntry.root.signature?.returns ?? {};
+    const returns =
+      outcome === "covered" && Object.keys(declaredReturns).length > 0
+        ? Object.fromEntries(
+            Object.entries(actionRoot.enterChannels.stagedReturns).map(
+              ([key, value]) => [key, cloneCellValue(value) ?? value],
+            ),
+          )
+        : undefined;
+    return {
+      brief: {
+        traversals: cloneTraversalSet(workingTraversals),
+        canProgress: false,
+        root: actionRoot.ref,
+        outcome,
+        ...(returns === undefined ? {} : { returns }),
+        issues,
+      },
+      traversals: workingTraversals,
+    };
+  }
+
   const snapshot: ActionBriefSnapshot = {
     active: accum.briefActive ?? accum.active ?? arcToNodeRef(actionRoot.ref),
-    canProgress: actionRoot.phase === "entered",
-    issues: [
-      ...leadingIssues.map(cloneRuntimeIssue),
-      ...accum.issues.map(cloneRuntimeIssue),
-    ],
+    canProgress: true,
+    issues,
     judgments: accum.judgments,
     observations: accum.observations,
     hostCalls: accum.hostCalls,
@@ -599,10 +664,23 @@ export function buildActionBrief(
   };
 }
 
+export type BuiltActionBrief = {
+  brief: ActionBrief;
+  traversals: ArcTraversalSet;
+  snapshot: ActionBriefSnapshot;
+};
+
+export type BuiltTerminalBrief = {
+  brief: TerminalBrief;
+  traversals: ArcTraversalSet;
+};
+
+export type BuiltActionOutput = BuiltActionBrief | BuiltTerminalBrief;
+
 /**
  * Builds the brief's transition payload from the walk's flushed latch:
  * absent unless a gate stamped `position` this walk. `hostParams` is the position
- * node's authored `hostParams`, resolved at build time; `null` when the
+ * node's authored `hostParams`, resolved at build time; unset when the
  * node declares none.
  */
 function buildTransitionPayload(
@@ -621,7 +699,7 @@ function buildTransitionPayload(
     hostParams:
       positionNode?.hostParams !== undefined
         ? clonePayloadValue(positionNode.hostParams)
-        : null,
+        : undefined,
   };
 }
 
@@ -653,26 +731,33 @@ export function buildPoisonedActionBrief(
   active: NodeRef,
   error: unknown,
   reasonCode?: string,
-): {
-  brief: ActionBrief;
-  traversals: ArcTraversalSet;
-  snapshot: ActionBriefSnapshot;
-} {
+): BuiltTerminalBrief {
   const working = cloneTraversalSet(traversals);
   const rootTraversal = selectActionRootTraversal(working, entry.arc);
   rootTraversal.phase = "poisoned";
   rootTraversal.finalizing = undefined;
   rootTraversal.pendingTransition = undefined;
   const message = error instanceof Error ? error.message : String(error);
-  return buildActionBrief(entries, entry, working, dialog, [], active, [
-    buildPoisonedTraversalIssue(
-      entry.arc,
-      active,
-      entry.root.loc,
-      message,
-      reasonCode ?? runtimeErrorReasonCode(error),
-    ),
-  ]);
+  const built = buildActionBrief(
+    entries,
+    entry,
+    working,
+    dialog,
+    [],
+    [
+      buildPoisonedTraversalIssue(
+        entry.arc,
+        active,
+        entry.root.loc,
+        message,
+        reasonCode ?? runtimeErrorReasonCode(error),
+      ),
+    ],
+  );
+  if ("snapshot" in built) {
+    throw new Error("Poisoned action root produced a progress brief");
+  }
+  return built;
 }
 
 function cloneActionBriefSnapshot(
@@ -859,7 +944,9 @@ export function validateActionReport(
   }
 
   if (report.hostCalls) {
-    accepted.hostCalls = clonePayloadObject(report.hostCalls);
+    const result = filterHostCallResults(report.hostCalls);
+    if (result.accepted) accepted.hostCalls = result.accepted;
+    issues.push(...result.issues);
   }
 
   if (report.hostEffects) {

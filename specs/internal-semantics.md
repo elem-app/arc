@@ -1,6 +1,6 @@
 # Internal Semantics
 
-This document is the implementer/user-facing reference for Arc parser and runtime behavior. When implementation details conflict with this document, treat the implementation as incomplete unless this document is first updated with the new intended semantics.
+This document normatively defines Arc parser, public IR, evaluation, traversal, persistence, and host-boundary semantics. An implementation that behaves differently does not conform to the specified semantics.
 
 ```mermaid
 graph TD
@@ -19,7 +19,7 @@ graph TD
 
 ## Parser Behavior
 
-The parser serves Arc language semantics. It must not reject a coherent language feature merely because the current implementation shape makes it inconvenient.
+Parser acceptance is defined by Arc language semantics rather than by the runtime's internal structure.
 
 Parsing recognizes Arc source and constructs Arc IR. Parse-time `Error`s are appropriate when source cannot be represented as Arc IR at all: unsupported forms, invalid hook shapes, malformed call syntax, unsupported option object shapes, non-template semantic text, or other syntax-shape violations.
 
@@ -29,7 +29,9 @@ Validation checks semantic references and cross-IR constraints after IR exists. 
 
 `parse(source)` is allowed to throw the first validation issue as an `Error` for convenience, but `validate(document)` is the structured interface for validation results.
 
-Public `Document` IR is a trust boundary. `validate(document)` must cover every semantic invariant needed to run a hand-crafted or deserialized document safely, including target binding, scoped expression legality, and duplicate bindings. The parser may also reject the same rule eagerly when doing so is needed to construct IR or gives clearer authored-source diagnostics; shared helpers are preferred where a rule is naturally common.
+Public `Document` IR is a trust boundary. `validate(document)` covers every semantic invariant needed to run a hand-crafted or deserialized document safely, including target binding, scoped expression legality, and duplicate bindings. Expression-bearing fields are structurally validated before typed walkers consume them; a public `ValueString`, for example, must have an array of string-valued text parts or recursively valid value-expression parts, and cannot contain semantic-only parts. The parser may reject the same rule earlier when source cannot be represented as valid IR or when the source form has a more specific diagnostic.
+
+The public graph itself must consist of plain enumerable data properties and dense ordinary arrays. Accessors, symbol or non-enumerable fields, custom prototypes, array properties, holes, cycles, and unsupported JavaScript values produce `INVALID_PUBLIC_IR`. This shape check runs before semantic walks and does not invoke caller-defined accessors.
 
 ## Parser Semantics
 
@@ -40,6 +42,194 @@ Target expressions are one example. `$enter(Target)`, `$enterLoop(Target)`, and 
 Scoped reserved names are acceptable when they are local to a coherent authored construct. `args` and `returns` are local channel namespaces inside node bodies. `span` is a local namespace inside a `$map` callback, carrying that member's `item`, `index`, and `result`. Global namespaces such as `State` and `Dialog` are document-wide.
 
 Scoped language forms should be available only in their intended authored scope. Outside that scope they should fail clearly rather than silently becoming ordinary cells or unrelated expressions.
+
+Host-module aliases cannot use any Arc-reserved identifier: primitive and global roots, semantic identifiers, action roots, target wrappers, or the scoped `args`, `returns`, and `span` namespaces. Source parsing rejects the alias while collecting imports. Public `Document` validation performs the same check before expression validation, so a reserved alias cannot change how an expression-shaped object is interpreted.
+
+Static coherence derives evidence from the value producer and applies the consumer-specific judgment defined by the Spec System. Writes, operation operands, and reusable channel bindings deliberately ask different questions of the same producer.
+
+## Spec System
+
+Arc values and Arc specs have different roles. An expression produces a carrier value: a primitive, array, Artifact carrier, dialog cursor, host payload, or unset result. A spec is a read/write guarantee attached to a stable site. `CellSpec` guarantees what may land in and later be read from a cell; `ChannelSpec` does the same for a channel; array specs recursively guarantee their elements. A one-level array element guarantee may be scalar or Artifact, while only scalar-element arrays are observable. Enum membership, finite `Num`, non-negative-safe-integer `Index`, Artifact, and cursor guarantees are stronger than their JavaScript carrier types.
+
+TypeScript spec and value-carrier types are representational supersets. Membership in `CellSpec`, `ChannelSpec`, `CellValue`, or `PayloadValue` proves only that a JavaScript shape is representable. Arc validates semantic spec invariants and applies a consumer's concrete admission before the value is used or stored. Observation configuration such as `observing` and `observeAs`, and an Artifact cell initializer, belong to authored cell declarations; they are not fields of the read/write guarantee.
+
+An arbitrary expression has no required spec. For example, `0 / 0` is a valid arithmetic expression that produces the numeric carrier `NaN`. Arithmetic accepts that flying value, and `Num.isFinite(0 / 0)` returns `false`. A `Num` cell promises finite reads, so the same value cannot land there.
+
+Static coherence derives producer evidence on demand from the original IR and its lexical context:
+
+- a cell or channel read supplies that site's spec;
+- an array-element read and `span.item` supply the selected element site's spec;
+- `span.index` and array length supply intrinsic `Index` provenance;
+- a literal supplies its exact value;
+- an array literal supplies its element evidence, while an empty array is contextual;
+- boolean, string, and numeric operations supply their result carrier fact;
+- Artifact construction and dialog-cursor production supply their intrinsic provenance;
+- a conditional expression retains both branch alternatives for its consumer;
+- a structured host argument supplies Struct provenance;
+- a host call resolved through an injected operation declaration supplies that operation's result spec as site evidence; an environment-free or otherwise untyped host call supplies no source fact.
+
+Producer evidence is recomputed from the IR when a consumer needs it. It is not carried beside a value, encoded in a value tag, or persisted in a pin. This is especially important for `{ path: "x" }`: Artifact provenance selects Artifact validation and projection, while structured-argument provenance treats the identical carrier as a Struct. Object shape alone never selects Artifact semantics.
+
+Arc applies three distinct spec judgments as a document moves from analysis through registry initialization to execution:
+
+1. **One-time landing coherence** is used during document analysis for a particular expression-to-destination occurrence, such as a cell or return write. It checks producer evidence against the destination spec and returns `compatible`, `incompatible`, or `unknown`. `unknown` means only that this invocation cannot prove either conclusion; analysis rejects `incompatible` and leaves `unknown` for concrete admission when the expression executes.
+2. **Reusable compatibility** is used for channel bindings. Document analysis applies it when both endpoints are available in the same document; `Runtime.init()` applies the same relation after resolving imported Arc targets against the complete registry. It succeeds only when every value guaranteed by the provider site is acceptable to the receiver site, because the binding may carry many future values.
+3. **Concrete admission** is the final runtime check when an actual value reaches a `CellSpec` or `ChannelSpec`. It enforces Bool, Str, Enum membership, finite `Num`, `Index` bounds, recursive arrays, Artifact, and cursor invariants before the value is used or stored. Analysis may apply the same predicate early when it has an exact literal, but every constrained runtime landing still admits its concrete value.
+
+Injected host-module specs participate at those same stages. A declared host parameter is the destination of one authored argument operand: analysis judges that occurrence from its `HostCallArgument` IR and runtime evaluation admits the rendered value immediately before emitting the call or effect. A declared host-call result is producer evidence for every surrounding consumer. When the host reports a result, transport sanitation runs first and concrete admission against the declared result runs before the value can hydrate a pin. Artifact authority therefore comes from the resolved result spec rather than the payload's object shape.
+
+Environment-free document analysis has no host-operation resolver, so host calls remain dynamic there. `Runtime.add()` repeats analysis on its private document under the runtime's immutable host-module registry and is definitive for module paths, arity, parameter operands, declared results, and result consumers. `Runtime.init()` retains the separate reusable-compatibility pass that requires the complete Arc document registry.
+
+The core directional relations are:
+
+| Producer evidence | Destination | One-time result | Reusable result when both are sites |
+| --- | --- | --- | --- |
+| `Index` | `Num` | compatible | compatible |
+| `Num` | `Index` | unknown | incompatible |
+| `Enum(A)` | `Str` | compatible | compatible |
+| `Str` | `Enum(A)` | unknown | incompatible |
+| `Enum(A)` | `Enum(B)` | compatible when A is a subset of B; unknown when they overlap; incompatible when disjoint | compatible only when A is a subset of B |
+| matching Bool, Artifact, or cursor | same family | compatible | compatible |
+| exact literal | any destination | result of concrete admission | not applicable |
+| boolean carrier | Bool | compatible | not applicable |
+| string carrier | Str / Enum | compatible / unknown | not applicable |
+| numeric carrier | Num or Index | unknown | not applicable |
+| array evidence | array destination | recurse over elements | recurse over element site specs |
+| empty-array evidence | array destination | compatible | not applicable |
+| no source fact | any destination | unknown | not applicable |
+
+Different proven families are incompatible. Array evidence is incompatible with a non-array destination. A one-time write may defer `unknown` to concrete destination admission; a reusable binding rejects anything it cannot prove.
+
+A conditional expression `cond ? x : y` is a special producer because it does not receive one merged spec. Analysis retains both `x` and `y` and asks the eventual consumer to judge each one. Their judgments use one deterministic reducer at every landing: if any reachable branch is `incompatible`, the conditional is rejected; otherwise, if at least one branch is `unknown`, the conditional is deferred; only all-`compatible` branches are accepted. A dynamic branch contributes the one-time result obtained from absence of a source fact. At runtime, only the selected branch is evaluated, and its concrete result is admitted by the consumer before use or storage.
+
+Operation rules refine these general relations. Parser analysis supplies producer context and applies the rule's static projection; evaluation obtains concrete operands and applies the same rule's strict projection immediately before operating. Arithmetic and `Num.isFinite` require numeric carriers but allow non-finite intermediates. Numeric comparison requires finite numbers. Enum ordering requires one unambiguous proven Enum domain: a member literal or dynamic operand may be checked against that domain, a known `Str` site is rejected, and conflicting proven Enum domains are rejected. Enum equality instead uses ordinary string equality without declaration or membership constraints. Without an Enum domain, admitted strings use ordinary string ordering. Array equality preserves one shared element authority from its producers: a scalar comparison family or Artifact. It rejects conflicting proven families, recursively admits every concrete element under the selected authority, and then compares structure in order. A pair of dynamic object arrays cannot acquire Artifact authority from carrier shape. Artifact projection requires proven Artifact production or an explicit Artifact landing authority.
+
+Every constrained runtime landing performs concrete admission even when static evidence was compatible. This includes cell and array-element writes, staged returns, direct root arguments, observation results, restored by-value channels, interpolation, comparison, host-bound emission, and persisted state restoration. Observation admission first enforces the cell guarantee and then applies observation-only `observeAs` constraints.
+
+A value pin proves only that its producer completed with a durable carrier. When an enclosing operation resumes, it replays the carrier, derives evidence again from the original producer IR and current host-module registry, reapplies the enclosing operand admission, and only then operates. A completed outer expression proceeds synchronously into its destination admission; there is no resumable gap between expression completion and storage. Traversal state and pins persist no host spec or producer evidence.
+
+Unset is absence of a value, independent of spec resolution. Setness expressions inspect absence directly. Each consumer that requires a concrete value owns its unset result or diagnostic.
+
+Static analysis checks every readable value cell, including non-observable cells, for reads before it is definitely set. Shadowed declarations are tracked independently, and a declaration with an initializer becomes set only after that initializer completes in source order. Writing an array element requires the root array to already be set, so `items[i].$set(value)` reads `items` and cannot set an unset root array.
+
+## Numeric Source / IR Semantics
+
+Numeric source declarations normalize to one canonical Source / IR representation:
+
+```ts
+type NumericObserveAs =
+  | { kind: "number"; min?: number; max?: number }
+  | { kind: "integer"; min?: number; max?: number };
+
+type NumericObservableSpec = {
+  type: "number";
+  observing?: SemanticString;
+  observeAs?: NumericObserveAs;
+};
+```
+
+Numeric cell specs and numeric array-element specs use `type: "number"`. Numeric channel specs use `{ type: "number" }` without `observeAs`. Canonical Source / IR has no `type: "rangedInt"`; the parser lowers authored `RangedInt(min, max, config?)` immediately to a numeric observable spec with integer `observeAs`.
+
+`NumericObserveAs` belongs to Source / IR only. Observation briefs represent `{ kind: "number", min?, max? }` as flat `{ type: "number", min?, max? }` metadata. They represent `{ kind: "integer", min?, max? }` as flat `{ type: "rangedInt", min, max }` metadata, filling omitted bounds with JavaScript's safe-integer extrema. Observation briefs and reports never expose `observeAs`.
+
+Arithmetic IR keeps comparison, logical, and arithmetic operator families distinct:
+
+```ts
+type ArithmeticExpression<TExpression> = {
+  kind: "arithmetic";
+  op: "+" | "-" | "*" | "/" | "%";
+  left: TExpression;
+  right: TExpression;
+};
+
+type NumericUnaryExpression<TExpression> = {
+  kind: "numericUnary";
+  op: "-";
+  argument: TExpression;
+};
+
+type NumIsFiniteExpression = {
+  kind: "numIsFinite";
+  argument: ValueExpression;
+};
+```
+
+`ValueExpression` instantiates arithmetic operands with `ValueExpression`, so general arithmetic may suspend. `LocalExpression` instantiates the same arithmetic forms with `LocalExpression`, so array indices and `CellTarget` accessors admit brief-free arithmetic without admitting host calls, judgments, comparisons, logical expressions, `numIsFinite`, templates, conditionals, or array literals. `NumIsFiniteExpression` is general-value-only. Validation walks every expression in its owning `value` or `local` mode and rejects a cross-stratum subtree with `INVALID_EXPRESSION_STRATUM`.
+
+Valid public IR contains only finite numeric literals and canonical numeric specs, and it satisfies the exact `observeAs` shape and placement, operator-family, `numIsFinite`, `Dialog.lastTurns`, and expression-stratum rules. `validate(document)` checks these rules without mutating `document`. `Runtime.add(...)` applies the same validity contract while collecting an independent private copy of all roots atomically. A non-finite number is rejected as such rather than accepted as another value, and accepted negative zero is represented as zero in collected IR.
+
+Before contextual source-shape checks, `parse(source)` rejects any program containing a non-finite numeric literal. This covers ordinary expressions, host params and nested host-param values, and `Dialog.lastTurns(...)`. The rejection is an ordinary `Error` with own enumerable `code: "NON_FINITE_NUMBER"` and `loc: SourceRange`, exact `message: "Numeric literal must be finite"`, and no `reasonCode`. Signed host-parameter syntax remains unsupported, and `Dialog.lastTurns(n)` retains its direct non-negative-safe-integer-literal grammar; `NON_FINITE_NUMBER` takes precedence when a signed literal is non-finite.
+
+Numeric public-IR validation has these stable issue codes and messages:
+
+| Code | Message contract |
+| --- | --- |
+| `NON_FINITE_NUMBER` | `Document contains a non-finite number at <IR-path>` |
+| `NON_CANONICAL_NUMERIC_SPEC` | `Source / IR numeric spec at <IR-path> must use type "number"; found "rangedInt"` |
+| `INVALID_NUMERIC_OBSERVE_AS` | `Invalid numeric observeAs at <IR-path>: <detail>` |
+| `INVALID_COMPARISON_OPERATOR` | `Invalid comparison operator <JSON-string> at <IR-path>` |
+| `INVALID_ARITHMETIC_OPERATOR` | `Invalid arithmetic operator <JSON-string> at <IR-path>` |
+| `INVALID_LOGICAL_OPERATOR` | `Invalid logical operator <JSON-string> at <IR-path>` |
+| `INVALID_NUMERIC_UNARY_OPERATOR` | `Invalid numeric unary operator <JSON-string> at <IR-path>` |
+| `INVALID_LOGICAL_UNARY_OPERATOR` | `Invalid logical unary operator <JSON-string> at <IR-path>` |
+| `INVALID_NUM_IS_FINITE_EXPRESSION` | `Invalid Num.isFinite expression at <IR-path>: expected one value-expression argument` |
+| `INVALID_DIALOG_LAST_TURNS_COUNT` | `Dialog.lastTurns count at <IR-path> must be a non-negative safe integer` |
+| `INVALID_EXPRESSION_STRATUM` | `Expression at <IR-path> is not valid in the <local\|value> expression stratum` |
+| `NON_NUMERIC_ARITHMETIC_OPERAND` | `Arithmetic operator <op> requires a numeric <left\|right\|argument> operand` |
+| `NON_NUMERIC_IS_FINITE_ARGUMENT` | `Num.isFinite requires a numeric argument` |
+
+The allowed `INVALID_NUMERIC_OBSERVE_AS` details are `expected an object`; `unsupported field <JSON-string>`; `kind must be "number" or "integer"`; `<min|max> must be a number`; `bounds must satisfy min <= max`; and `integer <min|max> must be a safe integer`. A non-finite bound instead produces `NON_FINITE_NUMBER`.
+
+IR and payload diagnostic paths use one grammar: root `$`; numeric brackets for array indices; bracketed `JSON.stringify(key)` for every object key; no dot notation. Arrays walk in ascending index order and objects in `Object.keys` order. Thus `$["0"]` is an object key, `$[0]` an array position, and keys containing dots, brackets, quotes, backslashes, or empty text stay unambiguous.
+
+`PayloadValue` is the recursively serializable carrier accepted across the Arc-host boundary, not a complete expression of an authored cell's constraints. Its structs admit ordinary string keys, including `$`-prefixed keys. Only top-level `undefined` represents an omitted payload; nested values must be set, arrays must be dense data arrays without extra properties, and structs must expose enumerable data properties on a plain or null prototype. `null` is rejected at every payload boundary. Cell and channel specs apply their additional constraints at the typed boundary.
+
+An Artifact runtime value has the exact shape `{ path: string }`, with path validity enforced by `createArtifactValue` and Artifact-typed admission. That shape is not globally self-identifying: in an unconstrained payload it is an ordinary struct. Artifact meaning comes from an `ArtifactConstructExpression`, an Artifact cell or channel spec, or another expression context whose Artifact family is statically known.
+
+## Numeric Evaluation and Admission
+
+All numeric values are JavaScript `number`s. Arithmetic evaluation may temporarily produce any IEEE-754 number, including `NaN`, infinities, and negative zero.
+
+Arithmetic applies `+`, `-`, `*`, `/`, `%`, and numeric unary `-` with JavaScript numeric semantics and no coercion, truncation, rational wrapper, zero-divisor special case, or immediate finite-result check. Recursive evaluation is left operand then right operand. A non-number is rejected by the settled static or dynamic arithmetic diagnostic; an unset numeric cell fails earlier with `unset-value`.
+
+`Num.isFinite(argument)` evaluates its argument normally, requires a number, and returns `Number.isFinite(argument)`. It catches no evaluation error, performs no coercion, and creates no refinement, cached-result relation, or authorization for a later evaluation. Its completed boolean follows ordinary pin behavior.
+
+When an arithmetic, numeric-unary, or `Num.isFinite` rule judges a producer, it derives evidence exhaustively over `ValueExpression`:
+
+- Numeric literals; numeric cells, channels, and elements; `array.length`; `span.index`; `this.enterCount`; dialog turn differences; and validated arithmetic/numeric-unary expressions are numeric.
+- String, boolean, enum, state, and `null` literals; value templates and string scopes; whole arrays and array literals; comparisons and other boolean expressions; cursors; and node or pending states are known nonnumeric.
+- A declared `span.item` or array-element read follows its element spec.
+- A conditional judges both retained alternatives: an incompatible branch rejects, otherwise a branch without numeric proof makes this rule invocation `unknown`.
+- An environment-free host call supplies no source fact, so that numeric-rule invocation is `unknown` and defers to concrete operand admission. Under a definitive host environment, the declared result spec determines whether the call is numeric, incompatible, or still refinement-dependent.
+
+This evidence resolution is exhaustive. Artifact producers are incompatible with numeric operations; undeclared channels and out-of-scope `span` forms retain their owning diagnostics rather than being replaced by an arithmetic error.
+
+A numeric comparison requires finite operands before producing a boolean. Every cell, array, array-element, span-result, and return write requires finite numbers at every nesting depth before mutation and ignores `observeAs`. Value and semantic interpolation require finite numbers before string coercion. Host-call arguments, briefs, and effects require finite numbers before emission. Accepted values represent negative zero as zero at every nesting depth. Array indices instead use their specific non-negative-safe-integer and range diagnostics.
+
+Dynamic nonnumeric arithmetic reports `Arithmetic operator <op> requires a numeric <left|right|argument> operand; got <runtime-kind>`. Dynamic nonnumeric `Num.isFinite` reports `Num.isFinite requires a numeric argument; got <runtime-kind>`. Stable runtime-kind labels are `string`, `boolean`, `null`, `array`, `object`, and `node-state`; unset remains `unset-value`.
+
+A failed finite-value check reports `Numeric value must be finite before <consumer><path-suffix>`. Stable consumer labels correspond to the comparison, write, interpolation, and emission sites above. A nested failure appends ` at <payload-path>`. Index consumers retain their index-specific reasons. Division and remainder by zero have no dedicated diagnostic because the arithmetic result remains an internal value until one of these sites or `Num.isFinite` uses it.
+
+`Index()` is a non-negative-safe-integer refinement of `Num()`. Assignability is directional: `Index` provides a valid `Num`, while an arbitrary `Num` cannot provide an `Index`. Return writes, array reads, and every decorated-target accessor enforce the refinement on the resolved value.
+
+## Template Evaluation
+
+Templates process their authored parts from left to right. Literal-text parts contribute immediately, and each expression part evaluates at its authored position. `ValueString` propagates a blocked expression without evaluating later parts; after resume, the expression pin tape preserves already completed work. Valid `SemanticString` expressions contain no briefable expression, so their evaluated parts complete in the same source order.
+
+Both forms report `invalid-template-interpolation` when interpolating an unset value. Numeric values must satisfy the form's finite-number consumer before conversion, including numbers nested in an interpolated array. Admission depends on the evaluated runtime value rather than source syntax, so a host-call result follows the same rules after resumption.
+
+| Interpolated part or value | `ValueString` result | `SemanticString` result |
+| --- | --- | --- |
+| Literal text | Appended as authored. | Appended as authored; adjacent text parts coalesce. |
+| String, boolean, or finite number | Appended with `String(value)`. | Appended with `String(value)`. |
+| Array of primitive values | Appended through JavaScript array stringification: comma-joined, with an empty array contributing empty text. | Appended through the same array stringification. |
+| Array with Artifact element authority | Rejected with `invalid-template-interpolation`. Indexing first projects the selected Artifact path. | Rejected with `invalid-template-interpolation`. Indexing first emits the selected structured Artifact part. |
+| Expression known to have the Artifact family | Its value's logical `path` is appended as text. | A structured `{ kind: "artifact", path }` part is emitted. |
+| Entity reference | Not admitted in a value-position template. | A structured `{ kind: "entity", name }` part is emitted. |
+| Host-variable reference | Not admitted in a value-position template. | A structured `{ kind: "hostVar", module, path }` part is emitted. |
+| `null` or another object-shaped value | Rejected with `invalid-template-interpolation`. | `null` contributes empty text; another value follows ordinary `String(value)` conversion. |
+
+A completed `ValueString` is always an ordinary string. A completed `SemanticString` is a plain string when every contribution is text; if any entity, host-variable, or Artifact part is present, it is a `SemanticTextPart[]` with the structured parts preserved.
 
 ## Element Ids
 
@@ -73,9 +263,11 @@ A SEG walks its statements through an explicit frame stack. `if`, `label`, and `
 
 Each resolved-once action occurrence has one frame slot: absent before reach, pending while blocked at the frontier, and resolved after settlement. Authored `$` forms such as `$enter(...)`, `$observe(...)`, `cell.$set(...)`, and host effect `Memoir.facts.$apply(...)` use these slots and resolve once per SEG instance. A grouped `$observe({ ... })` is one slot and writes all `resolved` fields atomically before advancing; an invalid or incomplete report writes nothing and re-emits the group.
 
-Expressions have no resolved-once slot. Every non-constant sigil-less evaluation — including judgments, host calls, `Dialog.*`, cell/channel/outcome reads, and invocation completions — records its value on the SEG's pin tape when first reached. The tape is keyed by statement element id and evaluation order, so resume can replay the exact route without re-reading state that may have changed while frontier work settled. Reported judgment and host-call values hydrate their pending tape entries. Action-traversal tapes persist with traversal state and therefore survive runtime reconstruction.
+Expressions have no resolved-once slot. Every non-constant sigil-less evaluation — including judgments, host calls, `Dialog.*`, cell/channel/outcome reads, and invocation completions — reserves its position on the SEG's pin tape when first reached. The tape is keyed by statement element id and evaluation order, so resume can replay the exact route without re-reading state that may have changed while frontier work settled. Accepted judgment and host-call results fill their pending tape entries. Action-traversal tapes persist with traversal state and therefore survive runtime reconstruction.
 
-Cell-writing and observation actions carry a `CellTarget`: one lexical root name followed by local-expression accessors into its inner value. The runtime resolves those accessors before evaluating a `$set(...)` value or emitting/consuming an observation. Non-constant accessors therefore pin on the same statement tape, fixing a dynamic target such as `items[index]` across suspension and process reconstruction without separate action continuation state. An array-element write validates the scalar leaf, clones the live root array, replaces the selected existing position, and commits the complete array through the ordinary owned-cell write path before the SEG advances.
+A completed expression value is pin-admissible only when every nested number is finite. An admissible scalar, array, or object is pinned with negative zero recursively represented as zero. A non-admissible value remains available to its immediately enclosing evaluation but is not recorded; its tape position remains unresolved. Already completed admissible child pins remain, so replay recomputes the unrecorded parent without duplicating settled host work. This applies to arithmetic, array literals, conditionals, and every other compound expression.
+
+Cell-writing and observation actions carry a `CellTarget`: one lexical root name followed by local-expression accessors into its inner value. The runtime resolves those accessors before evaluating a `$set(...)` value or emitting/consuming an observation. Local arithmetic remains brief-free, and non-constant accessors therefore pin on the same statement tape, fixing a dynamic target such as `items[index + 1]` across suspension and process reconstruction. Every accessor must be a non-negative safe integer before array bounds are checked. An array-element write validates the selected `ArrayElementSpec`, deep-clones the admitted replacement and complete root array, preserves its siblings, and commits one root-cell write before the SEG advances.
 
 ### Suspension and resume
 
@@ -123,7 +315,7 @@ Deflection boundaries: a deflection raised in the body — including a host `mov
 
 `arr.$map(callback, results?)` is a `$` resolved-once action that runs its callback — a bare arrow attached to the `$map` statement — once per element of a pinned input array. Like an invoke body, the callback shares the enclosing node's cell scope and its element ids live under the `$map` statement's id on the invoke scheme; unlike an invoke, each element is a distinct runtime instance, the member, whose brief sites, tape, and enter copies are qualified by member index.
 
-The pending action carries the arena: the input read once at first reach, and an index cursor over the members. Members before the cursor are terminal, holding their validated `span.result`; the member at the cursor is in-progress or not yet started; the rest are absent. v1 is sequential — at most one member and one anonymous copy are live — so a terminalized member's `$` slots, tape, and copy clear before the next member runs, and the callback's node-frame slots are reused per member, exactly as a fresh invoke reach starts clean.
+The pending action carries the arena: the input read once at first reach, and an index cursor over the members. Members before the cursor are terminal, holding their validated `span.result`; the member at the cursor is in-progress or not yet started; the rest are absent. The pinned input, terminal values, and staged result are deep-cloned with their members when traversal state is cloned. v1 is sequential — at most one member and one anonymous copy are live — so a terminalized member's `$` slots, tape, and copy clear before the next member runs, and the callback's node-frame slots are reused per member, exactly as a fresh invoke reach starts clean.
 
 `span` is the member's owner-bound namespace. `span.item` and `span.index` read the current member's element value and index; a callback `$enter` captures them by value into child args at bind time. `span.result` is the member's evaluator-local output: `span.result.$set(...)` stages it directly, or an `$enter` binds it as a return sink that commits when the child covers. When `results` is bound, a member that completes without a staged `span.result` is a runtime error.
 
@@ -169,6 +361,8 @@ The traversal set included in each brief is the persistence boundary. Hosts shou
 
 Reports are interpreted against the originating brief snapshot. Unknown ids are protocol issues, not dynamic lookups into the current traversal.
 
+An accepted host-call `PayloadValue` contains only finite numbers, with negative zero represented as zero at every nesting depth, and satisfies the recursive payload-shape rules above. The first invalid number or non-durable nested value rejects that report item; arrays are examined in ascending index order and objects in `Object.keys` order so its diagnostic path is deterministic. Observation results satisfy the same numeric representation together with their scalar, array, element, or grouped observation constraints; a grouped result is accepted only when every field is valid. Report acceptance does not mutate the caller's report object, and later caller mutation cannot change an accepted value.
+
 `allowedMoves` is authoritative. A host may only report moves listed on the brief. The runtime validates this before applying report data.
 
 `hostEffects` are ordered, id-keyed work items like judgments, observations, and host calls. An unreported effect keeps its node unfinished and re-surfaces under the same brief id on every later brief until the host reports it `applied` in `ActionReport.hostEffects` or rejects the frontier with `poison`.
@@ -181,11 +375,15 @@ Canonical node traversals are addressable through `ReferenceName.state`. Blank a
 
 Node state records the terminal outcome visible to parents. Node frame state records the absent, pending, or resolved slots occupied by resolved-once action occurrences inside the node. These are separate concepts and must not be collapsed.
 
+`Node.cells` contains declaration/schema IR; `Traversal.cells` contains runtime values. An optional Artifact constructor initializer therefore remains on its `ArtifactCell` declaration, runs once in source order after argument installation, and stores only the resulting concrete `ArtifactValue` in the traversal. The initializer is a snapshot: later changes to cells it read do not update the stored value.
+
 `this.forgetfulEntry = true` makes each new entry forget the prior outcome and action-frame progress without forgetting cell values, child traversal outcomes, or canonical identity. During the entry, resolved-once actions remain remembered normally.
 
 The active traversal is derived from runtime progression. It should identify the traversal currently owning the frontier represented by the brief. It is not an independent host-persisted control pointer.
 
 Runtime implementations must not rely on hidden in-memory continuation state for correctness. Persisted traversal state plus the registered documents must be sufficient to resume after a brief/report boundary. Pin tapes are part of that persisted state. The one exception is trigger consultation state, which lives in the brief chain by design (see SEG Semantics): a process restart starts fresh trigger consultations.
+
+Every number in persisted cells, staged returns, action state, resolved pin values, and other traversal payloads is finite and uses positive zero. Restored values are revalidated against their registered authority or durable-carrier invariants before execution; carrier types do not replace those specs, and producer provenance is not serialized. An unresolved pin reservation carries no candidate value. An invalid value discovered while serializing traversal state is an internal invariant violation, not an authored poison outcome, and serialization must not substitute another value for it.
 
 An instruction that inherits the node-level `deflectWhen` shares that hook's IR — element ids under the `deflectWhen/` scope — with every other inheriting instruction, so hook brief identity is qualified by the owning consultation instance: the brief site substitutes the instance key (`<ownerId>/deflectWhen`) for the static `deflectWhen/` prefix, yielding the same id shape an authored per-instruction hook produces, and answers never collide across owners. This prefix substitution is the single sanctioned manipulation of an element id. Within-instance records (the consultation's evaluator scope and pin tape) are already keyed by the instance and use the shared ids unqualified.
 

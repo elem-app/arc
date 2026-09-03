@@ -1,11 +1,10 @@
+import type { ElementId, Node } from "../types/parser.js";
 import type {
   ArcRef,
   ArcTraversalSet,
-  ElementId,
-  Node,
   NodeRef,
   Traversal,
-} from "../types.js";
+} from "../types/runtime.js";
 
 import type { RegistryEntry } from "./state.js";
 

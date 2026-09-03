@@ -7,9 +7,9 @@ import type {
   SegKey,
   SetAction,
   SetReturnAction,
-  Traversal,
   UnsetAction,
-} from "../types.js";
+} from "../types/parser.js";
+import type { Traversal } from "../types/runtime.js";
 import {
   type ActionOutcome,
   applyObserve,

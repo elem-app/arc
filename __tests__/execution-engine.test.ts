@@ -10,9 +10,8 @@ import { describe, expect, it } from "vitest";
 
 import { parse } from "../src/parser/index.js";
 import { resumePath } from "../src/runtime/execute.js";
-import { Runtime } from "../src/runtime/index.js";
 import type { SegFrame } from "../src/runtime/seg.js";
-import type { ElementId, Statement } from "../src/types.js";
+import type { ElementId, Statement } from "../src/types/index.js";
 import {
   appliedHostEffects,
   appliedInstructions,
@@ -22,9 +21,12 @@ import {
   node,
   ownedChild,
   progressBrief,
+  progressTerminal,
   renderSemanticTextForTest,
   rootTraversal,
+  TestRuntime as Runtime,
   startRun,
+  startTerminal,
   startTrigger,
   traversalByRef,
   withExperimentalRewalk,
@@ -43,7 +45,7 @@ function Main() {
   $instruct(\`after\`);
 }
 `);
-      const runtime = new Runtime().add("n2-arc", document);
+      const runtime = new Runtime().add("n2-arc", document).init();
       const seeded = runtime.newTraversal(arc("n2-arc", "Main"));
       seeded.phase = "entered";
 
@@ -80,7 +82,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("n3-arc", document);
+      const runtime = new Runtime().add("n3-arc", document).init();
       const seeded = runtime.newTraversal(arc("n3-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -114,7 +116,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("n4-arc", document);
+      const runtime = new Runtime().add("n4-arc", document).init();
       const seeded = runtime.newTraversal(arc("n4-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -139,7 +141,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("n6-arc", document);
+      const runtime = new Runtime().add("n6-arc", document).init();
       const seeded = runtime.newTraversal(arc("n6-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], {
@@ -173,7 +175,7 @@ function Main() {
   $instruct(\`tail\`);
 }
 `);
-      const runtime = new Runtime().add("n7a-arc", document);
+      const runtime = new Runtime().add("n7a-arc", document).init();
       const seeded = runtime.newTraversal(arc("n7a-arc", "Main"));
       seeded.phase = "entered";
 
@@ -212,7 +214,7 @@ function Main() {
 }
 `);
       withExperimentalRewalk(document, "Main");
-      const runtime = new Runtime().add("n7b-arc", document);
+      const runtime = new Runtime().add("n7b-arc", document).init();
       const seeded = runtime.newTraversal(arc("n7b-arc", "Main"));
       seeded.phase = "entered";
 
@@ -254,7 +256,7 @@ function Main() {
 }
 `);
       withExperimentalRewalk(document, "Main.Child");
-      const runtime = new Runtime().add("n11-arc", document);
+      const runtime = new Runtime().add("n11-arc", document).init();
       const seeded = runtime.newTraversal(arc("n11-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -266,7 +268,7 @@ function Main() {
 
       // Reporting the effect resolves the child, which commits the staged
       // `returns.verdict` write back to the caller.
-      const confirmed = progressBrief(runtime, brief, {
+      const confirmed = progressTerminal(runtime, brief, {
         move: "proceed",
         hostEffects: appliedHostEffects(brief),
       });
@@ -301,7 +303,7 @@ function Main() {
 }
 `);
       withExperimentalRewalk(document, "Main.Child");
-      const runtime = new Runtime().add("n12-arc", document);
+      const runtime = new Runtime().add("n12-arc", document).init();
       const seeded = runtime.newTraversal(arc("n12-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -337,7 +339,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("n15-arc", document);
+      const runtime = new Runtime().add("n15-arc", document).init();
       const seeded = runtime.newTraversal(arc("n15-arc", "Main"));
       seeded.phase = "entered";
 
@@ -385,7 +387,7 @@ function Main() {
 }
 `);
       withExperimentalRewalk(document, "Main");
-      const runtime = new Runtime().add("enter-rewalk-arc", document);
+      const runtime = new Runtime().add("enter-rewalk-arc", document).init();
       const seeded = runtime.newTraversal(arc("enter-rewalk-arc", "Main"));
       seeded.phase = "entered";
 
@@ -429,7 +431,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("enter-advance-arc", document);
+      const runtime = new Runtime().add("enter-advance-arc", document).init();
       const seeded = runtime.newTraversal(arc("enter-advance-arc", "Main"));
       seeded.phase = "entered";
 
@@ -480,7 +482,7 @@ function Main() {
 }
 `);
       withExperimentalRewalk(document, "Main");
-      const runtime = new Runtime().add("bug-a-arc", document);
+      const runtime = new Runtime().add("bug-a-arc", document).init();
       const seeded = runtime.newTraversal(arc("bug-a-arc", "Main"));
       seeded.phase = "entered";
 
@@ -542,7 +544,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("bug-a-neg-arc", document);
+      const runtime = new Runtime().add("bug-a-neg-arc", document).init();
       const seeded = runtime.newTraversal(arc("bug-a-neg-arc", "Main"));
       seeded.phase = "entered";
 
@@ -781,7 +783,7 @@ function Main() {
 }
 `);
       withExperimentalRewalk(document, "Main");
-      const runtime = new Runtime().add("nested-bug-a-arc", document);
+      const runtime = new Runtime().add("nested-bug-a-arc", document).init();
       const seeded = runtime.newTraversal(arc("nested-bug-a-arc", "Main"));
       seeded.phase = "entered";
 
@@ -835,7 +837,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("nested-bug-a-neg-arc", document);
+      const runtime = new Runtime()
+        .add("nested-bug-a-neg-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("nested-bug-a-neg-arc", "Main"));
       seeded.phase = "entered";
 
@@ -881,7 +885,7 @@ function Main() {
 }
 `);
       withExperimentalRewalk(document, "Main");
-      const runtime = new Runtime().add("alt-owner-arc", document);
+      const runtime = new Runtime().add("alt-owner-arc", document).init();
       const seeded = runtime.newTraversal(arc("alt-owner-arc", "Main"));
       seeded.phase = "entered";
 
@@ -924,7 +928,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("nested-point5-arc", document);
+      const runtime = new Runtime().add("nested-point5-arc", document).init();
       const seeded = runtime.newTraversal(arc("nested-point5-arc", "Main"));
       seeded.phase = "entered";
 
@@ -938,7 +942,7 @@ function Main() {
       // change: the enter's read-set diff sees nothing moved, the caller
       // advances past it, and the gated branch never re-fires — Main
       // completes without "noticed".
-      const second = progressBrief(
+      const second = progressTerminal(
         runtime,
         first,
         {
@@ -949,7 +953,7 @@ function Main() {
         },
         { cursor: { user: 1, self: 1 }, lastTurns: [] },
       );
-      expect(second.instructions).toEqual([]);
+      expect("instructions" in second).toBe(false);
       expect(rootTraversal(second).phase).toBe("completed");
     });
 
@@ -976,7 +980,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("nested-point5-clean-arc", document);
+      const runtime = new Runtime()
+        .add("nested-point5-clean-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("nested-point5-clean-arc", "Main"),
       );
@@ -1023,7 +1029,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("alt-enter-arc", document);
+      const runtime = new Runtime().add("alt-enter-arc", document).init();
       const seeded = runtime.newTraversal(arc("alt-enter-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1058,7 +1064,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("after-at-end-arc", document);
+      const runtime = new Runtime().add("after-at-end-arc", document).init();
       const seeded = runtime.newTraversal(arc("after-at-end-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1103,7 +1109,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("nested-enterloop-arc", document);
+      const runtime = new Runtime()
+        .add("nested-enterloop-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("nested-enterloop-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1171,7 +1179,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("deep-nesting-arc", document);
+      const runtime = new Runtime().add("deep-nesting-arc", document).init();
       const seeded = runtime.newTraversal(arc("deep-nesting-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1241,7 +1249,7 @@ function Main() {
 }
 `);
       withExperimentalRewalk(document, "Main");
-      const runtime = new Runtime().add("n10-arc", document);
+      const runtime = new Runtime().add("n10-arc", document).init();
       const seeded = runtime.newTraversal(arc("n10-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1289,7 +1297,7 @@ function Main() {
 }
 `);
       withExperimentalRewalk(document, "Main");
-      const runtime = new Runtime().add("n16-arc", document);
+      const runtime = new Runtime().add("n16-arc", document).init();
       const seeded = runtime.newTraversal(arc("n16-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1325,7 +1333,9 @@ function Main() {
     $instruct(\`child done\`);  }
 }
 `);
-      const runtime = new Runtime().add("enter-insulation-arc", document);
+      const runtime = new Runtime()
+        .add("enter-insulation-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("enter-insulation-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1374,7 +1384,9 @@ function Main() {
 }
 `);
       withExperimentalRewalk(document, "Main", "Main.Child");
-      const runtime = new Runtime().add("enter-capture-seg-arc", document);
+      const runtime = new Runtime()
+        .add("enter-capture-seg-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("enter-capture-seg-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1443,7 +1455,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("point5-arc", document);
+      const runtime = new Runtime().add("point5-arc", document).init();
       const seeded = runtime.newTraversal(arc("point5-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1461,7 +1473,7 @@ function Main() {
       // ancestor branch keeps the walk's pinned cursor read and Main completes
       // without the ancestor instruction. Per-turn reactivity belongs to
       // trigger consultations, not to suspended body walks.
-      const second = progressBrief(
+      const second = progressTerminal(
         runtime,
         first,
         {
@@ -1472,7 +1484,7 @@ function Main() {
         },
         { cursor: { user: 1, self: 1 }, lastTurns: [] },
       );
-      expect(second.instructions).toEqual([]);
+      expect("instructions" in second).toBe(false);
       expect(rootTraversal(second).phase).toBe("completed");
     });
 
@@ -1498,7 +1510,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("point5-clean-arc", document);
+      const runtime = new Runtime().add("point5-clean-arc", document).init();
       const seeded = runtime.newTraversal(arc("point5-clean-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1542,10 +1554,10 @@ function Main() {
   };
 }
 `);
-      const runtime = new Runtime().add("n9-arc", document);
+      const runtime = new Runtime().add("n9-arc", document).init();
       const seeded = runtime.newTraversal(arc("n9-arc", "Main"));
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).cells.stage).toBe("end");
       expect(rootTraversal(brief).phase).toBe("completed");
@@ -1555,7 +1567,7 @@ function Main() {
   describe("defl.propagation", () => {
     it("marks the active node deflected when the report deflects", () => {
       const document = parse(METAL_SOURCE);
-      const runtime = new Runtime().add("metal-arc", document);
+      const runtime = new Runtime().add("metal-arc", document).init();
       const triggerBrief = startTrigger(runtime, {
         cursor: { user: 0, self: 0 },
         lastTurns: [{ role: "user", message: "what music are you into?" }],
@@ -1578,9 +1590,9 @@ function Main() {
         cursor: { user: 0, self: 0 },
         lastTurns: [],
       });
-      const nextBrief = progressBrief(runtime, brief, { move: "deflect" });
+      const nextBrief = progressTerminal(runtime, brief, { move: "deflect" });
 
-      expect(nextBrief.active).toEqual(node("metal-arc", "Metal.Surface"));
+      expect(nextBrief.root).toEqual(arc("metal-arc", "Metal"));
       expect(nextBrief.canProgress).toBe(false);
       expect(ownedChild(rootTraversal(nextBrief), "Metal.Surface")?.state).toBe(
         "deflected",
@@ -1608,14 +1620,15 @@ function Intro() {
 `);
       const runtime = new Runtime()
         .add("main-import-deflect-arc", main)
-        .add("intro-arc", intro);
+        .add("intro-arc", intro)
+        .init();
       const seeded = runtime.newTraversal(
         arc("main-import-deflect-arc", "Main"),
       );
       seeded.phase = "entered";
 
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
-      const deflected = progressBrief(runtime, brief, { move: "deflect" });
+      const deflected = progressTerminal(runtime, brief, { move: "deflect" });
 
       expect(traversalByRef(deflected, arc("intro-arc", "Intro"))?.state).toBe(
         "deflected",
@@ -1661,7 +1674,9 @@ function Main() {
 `);
 
       withExperimentalRewalk(document, "Main");
-      const runtime = new Runtime().add("catch-deflection-arc", document);
+      const runtime = new Runtime()
+        .add("catch-deflection-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("catch-deflection-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1769,7 +1784,8 @@ function Intro() {
 `);
       const runtime = new Runtime()
         .add("main-import-catch-arc", main)
-        .add("intro-arc", intro);
+        .add("intro-arc", intro)
+        .init();
       const seeded = runtime.newTraversal(arc("main-import-catch-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1809,7 +1825,7 @@ function Main() {
     $instruct(\`after \${topic}\`);  }
 }
 `);
-      const runtime = new Runtime().add("retry-arc", retryDocument);
+      const runtime = new Runtime().add("retry-arc", retryDocument).init();
       const firstOutcome = runtime.progressTrigger(
         startTrigger(runtime, EMPTY_DIALOG),
         {
@@ -1821,7 +1837,9 @@ function Main() {
         cursor: { user: 0, self: 0 },
         lastTurns: [],
       });
-      const deflected = progressBrief(runtime, firstBrief, { move: "deflect" });
+      const deflected = progressTerminal(runtime, firstBrief, {
+        move: "deflect",
+      });
 
       expect(ownedChild(deflected.traversals[0]!, "Main.Intro")?.state).toBe(
         "deflected",
@@ -1855,7 +1873,9 @@ function Main() {
     $instruct(\`intro\`);  }
 }
 `);
-      const coveredRuntime = new Runtime().add("covered-arc", coveredDocument);
+      const coveredRuntime = new Runtime()
+        .add("covered-arc", coveredDocument)
+        .init();
       const coveredOutcome = coveredRuntime.progressTrigger(
         startTrigger(coveredRuntime, EMPTY_DIALOG),
         {
@@ -1889,7 +1909,7 @@ function Main() {
         "after",
       ]);
 
-      const completedCoveredBrief = progressBrief(
+      const completedCoveredBrief = progressTerminal(
         coveredRuntime,
         secondCoveredBrief,
         {
@@ -1936,7 +1956,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("suspend-reenter-arc", document);
+      const runtime = new Runtime().add("suspend-reenter-arc", document).init();
       const firstOutcome = runtime.progressTrigger(
         startTrigger(runtime, EMPTY_DIALOG),
         { preferredMatch: arc("suspend-reenter-arc", "Main") },
@@ -1946,7 +1966,9 @@ function Main() {
         cursor: { user: 0, self: 0 },
         lastTurns: [],
       });
-      const deflected = progressBrief(runtime, firstBrief, { move: "deflect" });
+      const deflected = progressTerminal(runtime, firstBrief, {
+        move: "deflect",
+      });
 
       const suspendedRoot = rootTraversal(deflected);
       expect(suspendedRoot.phase).toBe("suspended");
@@ -1997,7 +2019,9 @@ function Main() {
 }
 `);
 
-      const runtime = new Runtime().add("deflect-parent-effects-arc", document);
+      const runtime = new Runtime()
+        .add("deflect-parent-effects-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("deflect-parent-effects-arc", "Main"),
       );
@@ -2050,12 +2074,12 @@ function Main() {
         finalizing: { reason: "deflected", phase: "effects" },
       });
 
-      const suspended = progressBrief(runtime, parentBrief, {
+      const suspended = progressTerminal(runtime, parentBrief, {
         move: "proceed",
         hostEffects: appliedHostEffects(parentBrief),
       });
 
-      expect(suspended.hostEffects).toEqual([]);
+      expect("hostEffects" in suspended).toBe(false);
       expect(rootTraversal(suspended).phase).toBe("suspended");
       expect(rootTraversal(suspended).state).toBe("deflected");
     });

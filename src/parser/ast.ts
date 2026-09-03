@@ -2,9 +2,11 @@ import type * as acorn from "acorn";
 
 import {
   UNSTAMPED_ID,
+  type ArithmeticOperator,
   type ArrayReference,
-  type BinaryOperator,
+  type ArtifactConstructExpression,
   type CellTarget,
+  type ComparisonOperator,
   type HostCallArgument,
   type LocalExpression,
   type SemanticString,
@@ -13,7 +15,9 @@ import {
   type TemplateStringPart,
   type ValueExpression,
   type ValueStringPart,
-} from "../types.js";
+} from "../types/parser.js";
+import { classifyArtifactPath } from "../types/value.js";
+import { describeArtifactPathIssue } from "../value-utils.js";
 import { parseTarget, type TargetParseContext } from "./targets.js";
 
 export type ExpressionParseContext = {
@@ -138,6 +142,41 @@ export function expressionToLocalExpression(
     return { kind: "cell", name: node.name };
   }
 
+  if (node.type === "BinaryExpression") {
+    if (!isArithmeticOperator(node.operator)) {
+      throw new Error(`Unsupported local binary operator: ${node.operator}`);
+    }
+    return {
+      kind: "arithmetic",
+      op: node.operator,
+      left: expressionToLocalExpression(
+        node.left as acorn.Expression,
+        availableHostModules,
+        briefable,
+        context,
+      ),
+      right: expressionToLocalExpression(
+        node.right as acorn.Expression,
+        availableHostModules,
+        briefable,
+        context,
+      ),
+    };
+  }
+
+  if (node.type === "UnaryExpression" && node.operator === "-") {
+    return {
+      kind: "numericUnary",
+      op: "-",
+      argument: expressionToLocalExpression(
+        node.argument as acorn.Expression,
+        availableHostModules,
+        briefable,
+        context,
+      ),
+    };
+  }
+
   if (node.type === "MemberExpression") {
     if (node.computed) {
       // Bracket indexing `items[index]` / `args.items[index]` is an element
@@ -238,13 +277,20 @@ export function expressionToLocalExpression(
       node.callee.property.name === "lastTurns"
     ) {
       const arg = node.arguments[0];
-      const count =
-        arg &&
-        arg.type !== "SpreadElement" &&
-        arg.type === "Literal" &&
-        typeof arg.value === "number"
-          ? arg.value
-          : undefined;
+      if (
+        node.arguments.length !== 1 ||
+        !arg ||
+        arg.type === "SpreadElement" ||
+        arg.type !== "Literal" ||
+        typeof arg.value !== "number" ||
+        !Number.isSafeInteger(arg.value) ||
+        arg.value < 0
+      ) {
+        throw new Error(
+          "Dialog.lastTurns() count must be a non-negative safe-integer literal",
+        );
+      }
+      const count = arg.value;
       return { kind: "scope", name: "lastTurns", count };
     }
   }
@@ -412,6 +458,18 @@ export function parseExpression(
   }
 
   if (node.type === "UnaryExpression") {
+    if (node.operator === "-") {
+      return {
+        kind: "numericUnary",
+        op: "-",
+        argument: parseExpression(
+          node.argument as acorn.Expression,
+          availableHostModules,
+          briefable,
+          context,
+        ),
+      };
+    }
     if (node.operator !== "!") {
       throw new Error(`Unsupported unary operator: ${node.operator}`);
     }
@@ -428,9 +486,30 @@ export function parseExpression(
   }
 
   if (node.type === "BinaryExpression") {
+    if (isArithmeticOperator(node.operator)) {
+      return {
+        kind: "arithmetic",
+        op: node.operator,
+        left: parseExpression(
+          node.left as acorn.Expression,
+          availableHostModules,
+          briefable,
+          context,
+        ),
+        right: parseExpression(
+          node.right as acorn.Expression,
+          availableHostModules,
+          briefable,
+          context,
+        ),
+      };
+    }
+    if (!isComparisonOperator(node.operator)) {
+      throw new Error(`Unsupported binary operator: ${node.operator}`);
+    }
     return {
-      kind: "binary",
-      op: node.operator as BinaryOperator,
+      kind: "comparison",
+      op: node.operator,
       left: parseExpression(
         node.left as acorn.Expression,
         availableHostModules,
@@ -471,6 +550,30 @@ export function parseExpression(
   }
 
   if (node.type === "CallExpression") {
+    if (node.callee.type === "Identifier" && node.callee.name === "Artifact") {
+      return parseArtifactConstructCall(
+        node,
+        "Artifact value",
+        availableHostModules,
+        briefable,
+        context,
+      );
+    }
+    if (isNumIsFiniteCall(node, availableHostModules)) {
+      const arg = node.arguments[0];
+      if (node.arguments.length !== 1 || !arg || arg.type === "SpreadElement") {
+        throw new Error("Num.isFinite() accepts exactly one argument");
+      }
+      return {
+        kind: "numIsFinite",
+        argument: parseExpression(
+          arg,
+          availableHostModules,
+          briefable,
+          context,
+        ),
+      };
+    }
     if (
       node.callee.type === "MemberExpression" &&
       !node.callee.computed &&
@@ -615,6 +718,77 @@ export function parseExpression(
     availableHostModules,
     briefable,
     context,
+  );
+}
+
+/** Parses the shared declaration- and value-site Artifact constructor. */
+export function parseArtifactConstructCall(
+  call: acorn.CallExpression,
+  owner: string,
+  availableHostModules: ReadonlyMap<string, string>,
+  briefable: boolean | undefined,
+  context?: ExpressionParseContext,
+): ArtifactConstructExpression {
+  if (call.arguments.length !== 1) {
+    throw new Error(`${owner} requires one path argument`);
+  }
+  const argument = call.arguments[0];
+  if (!argument || argument.type === "SpreadElement") {
+    throw new Error(`${owner} path does not support spread`);
+  }
+  let path: ValueExpression;
+  try {
+    path = parseExpression(argument, availableHostModules, briefable, context);
+  } catch (error) {
+    const detail = error instanceof Error ? `: ${error.message}` : "";
+    throw new Error(`${owner} path must be a value expression${detail}`);
+  }
+  if (path.kind === "literal" && typeof path.value === "string") {
+    const issue = classifyArtifactPath(path.value);
+    if (issue !== undefined) {
+      throw new Error(`${owner} path ${describeArtifactPathIssue(issue)}`);
+    }
+  }
+  return { kind: "artifact", path };
+}
+
+function isArithmeticOperator(
+  operator: string,
+): operator is ArithmeticOperator {
+  return (
+    operator === "+" ||
+    operator === "-" ||
+    operator === "*" ||
+    operator === "/" ||
+    operator === "%"
+  );
+}
+
+function isComparisonOperator(
+  operator: string,
+): operator is ComparisonOperator {
+  return (
+    operator === "==" ||
+    operator === "!=" ||
+    operator === ">" ||
+    operator === ">=" ||
+    operator === "<" ||
+    operator === "<="
+  );
+}
+
+function isNumIsFiniteCall(
+  node: acorn.CallExpression,
+  availableHostModules: ReadonlyMap<string, string>,
+): boolean {
+  return (
+    !availableHostModules.has("Num") &&
+    node.callee.type === "MemberExpression" &&
+    !node.callee.computed &&
+    node.callee.object.type === "Identifier" &&
+    node.callee.object.name === "Num" &&
+    node.callee.property.type === "Identifier" &&
+    node.callee.property.name === "isFinite"
   );
 }
 
@@ -871,7 +1045,8 @@ export function containsBriefableExpression(
       return true;
     case "regexTest":
       return containsBriefableExpression(expression.target);
-    case "binary":
+    case "comparison":
+    case "arithmetic":
     case "logical":
       return (
         containsBriefableExpression(expression.left) ||
@@ -884,6 +1059,8 @@ export function containsBriefableExpression(
         containsBriefableExpression(expression.alternate)
       );
     case "unary":
+    case "numericUnary":
+    case "numIsFinite":
       return containsBriefableExpression(expression.argument);
     case "template-string":
       return expression.parts.some(
@@ -891,6 +1068,8 @@ export function containsBriefableExpression(
           part.kind === "expression" &&
           containsBriefableExpression(part.expression),
       );
+    case "artifact":
+      return containsBriefableExpression(expression.path);
     case "arrayElementRead":
       return containsBriefableExpression(expression.index);
     case "arrayLiteral":

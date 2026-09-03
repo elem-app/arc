@@ -11,15 +11,17 @@ import { describe, expect, it } from "vitest";
 
 import { analyzeDocument, parse, validate } from "../src/parser/index.js";
 import { Runtime } from "../src/runtime/index.js";
-import type { InvokeAction } from "../src/types.js";
-import { invokeSegKey, nodeSegKey } from "../src/types.js";
+import type { InvokeAction } from "../src/types/index.js";
+import { invokeSegKey, nodeSegKey } from "../src/types/index.js";
 import {
+  actionProgress,
   arc,
   EMPTY_DIALOG,
   node,
   progressBrief,
   rootTraversal,
   startRun,
+  startTerminal,
   withExperimentalRewalk,
 } from "./helpers.js";
 
@@ -27,10 +29,25 @@ function startInvoke(source: string, id: string, experimentalRewalk = false) {
   const document = experimentalRewalk
     ? withExperimentalRewalk(parse(source), "Main")
     : parse(source);
-  const runtime = new Runtime().add(id, document);
+  const runtime = new Runtime().add(id, document).init();
   const seeded = runtime.newTraversal(arc(id, "Main"));
   seeded.phase = "entered";
   const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+  return { runtime, brief };
+}
+
+function startInvokeTerminal(
+  source: string,
+  id: string,
+  experimentalRewalk = false,
+) {
+  const document = experimentalRewalk
+    ? withExperimentalRewalk(parse(source), "Main")
+    : parse(source);
+  const runtime = new Runtime().add(id, document).init();
+  const seeded = runtime.newTraversal(arc(id, "Main"));
+  seeded.phase = "entered";
+  const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
   return { runtime, brief };
 }
 
@@ -42,7 +59,7 @@ describe("Invokes", () => {
 "arc";
 
 function Main() {
-  let v = RangedInt(0, 100);
+  let v = Num();
   let hit = Bool();
   v.$set(2);
   invoke(() => {
@@ -264,7 +281,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("invoke-write-advance-arc", document);
+      const runtime = new Runtime()
+        .add("invoke-write-advance-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("invoke-write-advance-arc", "Main"),
       );
@@ -309,7 +328,7 @@ function Main() {
         true,
       );
 
-      // First walk: mirror = (undefined === true) = false, then $enter(Child) blocks.
+      // First walk: mirror = (undefined == true) = false, then $enter(Child) blocks.
       expect(brief.active).toEqual(node("invoke-d1-arc", "Main.Child"));
       expect(rootTraversal(brief).cells.mirror).toBe(false);
 
@@ -333,7 +352,7 @@ function Main() {
 
   describe("invoke.convergence", () => {
     it("poisons a non-convergent invoke body instead of hanging", () => {
-      const { brief } = startInvoke(
+      const { brief } = startInvokeTerminal(
         `
 "arc";
 
@@ -389,7 +408,7 @@ function Main() {
       // The nested invoke re-runs every re-walk, and its write reads x and
       // inverts it, so the value flips each pass and keeps re-walking until
       // the SEG re-walk limit poisons the traversal.
-      const { brief } = startInvoke(
+      const { brief } = startInvokeTerminal(
         `
 "arc";
 
@@ -1288,7 +1307,7 @@ function Main() {
         "invoke-deflect-arc",
       );
 
-      // First run: caught is unset, so draft = (undefined === true) = false.
+      // First run: caught is unset, so draft = (undefined == true) = false.
       expect(brief.observations).toHaveLength(1);
       expect(rootTraversal(brief).cells.draft).toBe(false);
       expect(brief.active).toEqual(node("invoke-deflect-arc", "Main"));
@@ -1353,7 +1372,7 @@ function Main() {
 "arc";
 
 function Main() {
-  let attempts = RangedInt(0, 9);
+  let attempts = Num();
   let caught = Bool();
 
   this.catchDeflection = () => {
@@ -1486,11 +1505,13 @@ function Main() {
   });
   $instruct(\`work\`);}
 `);
-      const runtime = new Runtime().add("transition-invoke-arc", document);
+      const runtime = new Runtime()
+        .add("transition-invoke-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("transition-invoke-arc", "Main"));
       seeded.phase = "entered";
 
-      const brief = runtime.start([seeded], EMPTY_DIALOG);
+      const brief = actionProgress(runtime.start([seeded], EMPTY_DIALOG));
       expect(brief.transition).toBeUndefined();
       expect(brief.instructions.map((item) => item.text)).toEqual(["work"]);
     });

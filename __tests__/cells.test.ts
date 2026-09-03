@@ -9,19 +9,24 @@ import { parseExpressionAt } from "acorn";
 import { describe, expect, it } from "vitest";
 
 import { parseCellTarget } from "../src/parser/ast.js";
-import { analyzeDocument, parse } from "../src/parser/index.js";
-import { Runtime } from "../src/runtime/index.js";
-import type { Dialog, SetAction } from "../src/types.js";
-import { nodeSegKey } from "../src/types.js";
+import { analyzeDocument, parse, validate } from "../src/parser/index.js";
+import { createArtifactValue } from "../src/runtime/index.js";
+import type { ArcTraversalSet, Dialog, SetAction } from "../src/types/index.js";
+import { nodeSegKey } from "../src/types/index.js";
 import {
+  actionProgress,
+  actionTerminal,
   appliedInstructions,
   arc,
   EMPTY_DIALOG,
   progressBrief,
+  progressTerminal,
   renderSemanticTextForTest,
   rootTraversal,
+  TestRuntime as Runtime,
   singleObservations,
   startRun,
+  startTerminal,
   startTrigger,
 } from "./helpers.js";
 
@@ -46,7 +51,7 @@ function Main() {
         { name: "interest", type: "enum" },
         { name: "ready", type: "boolean" },
         { name: "note", type: "string" },
-        { name: "score", type: "rangedInt" },
+        { name: "score", type: "number" },
         { name: "cursor", type: "dialogCursor" },
         { name: "log", type: "artifact" },
       ]);
@@ -100,7 +105,7 @@ function Main() {
   });
 
   describe("cell.enum", () => {
-    it("compares enum values with <= and !== by ordinal position", () => {
+    it("uses ordinal Enum ordering and ordinary string inequality", () => {
       const document = parse(`
 "arc";
 
@@ -118,7 +123,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("enum-le-ne-arc", document);
+      const runtime = new Runtime().add("enum-le-ne-arc", document).init();
       const seeded = runtime.newTraversal(arc("enum-le-ne-arc", "Main"));
       seeded.phase = "entered";
 
@@ -155,7 +160,7 @@ function Main() {
 }
 `);
 
-      const runtime = new Runtime().add("ordinal-arc", document);
+      const runtime = new Runtime().add("ordinal-arc", document).init();
       const seeded = runtime.newTraversal(arc("ordinal-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], {
@@ -163,7 +168,7 @@ function Main() {
         lastTurns: [{ role: "user", message: "kinda" }],
       });
 
-      const lukewarmBrief = progressBrief(runtime, brief, {
+      const lukewarmBrief = progressTerminal(runtime, brief, {
         move: "proceed",
         observations: {
           [brief.observations[0]!.id]: {
@@ -175,9 +180,9 @@ function Main() {
 
       expect(rootTraversal(lukewarmBrief).cells.interest).toBe("lukewarm");
       expect(rootTraversal(lukewarmBrief).cells.topic).toBeUndefined();
-      expect(lukewarmBrief.hostEffects).toEqual([]);
+      expect("hostEffects" in lukewarmBrief).toBe(false);
 
-      const runtime2 = new Runtime().add("ordinal-arc", document);
+      const runtime2 = new Runtime().add("ordinal-arc", document).init();
       const seeded2 = runtime2.newTraversal(arc("ordinal-arc", "Main"));
       seeded2.phase = "entered";
       const brief2 = startRun(runtime2, [seeded2], {
@@ -225,7 +230,7 @@ function Main() {
     $instruct(\`above cold\`);  }
 }
 `);
-      const runtime = new Runtime().add("enum-arc", document);
+      const runtime = new Runtime().add("enum-arc", document).init();
       const seeded = runtime.newTraversal(arc("enum-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], {
@@ -244,6 +249,98 @@ function Main() {
         "above cold",
       ]);
     });
+
+    it("uses one proven Enum domain for another matching Enum producer", () => {
+      const document = parse(`
+"arc";
+function Main() {
+  let left = Enum(["z", "a"]);
+  let right = Enum(["z", "a"]);
+  let ordered = Bool();
+  left.$set("a");
+  right.$set("z");
+  ordered.$set(left > right);
+}
+`);
+      const runtime = new Runtime().add("enum-domain", document).init();
+      const seeded = runtime.newTraversal(arc("enum-domain", "Main"));
+      seeded.phase = "entered";
+
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
+      expect(rootTraversal(brief).cells.ordered).toBe(true);
+    });
+
+    it("uses ordinary string equality across Enum domains and nonmember literals", () => {
+      const document = parse(`
+"arc";
+function Main() {
+  let left = Enum(["same", "left"]);
+  let right = Enum(["same", "right"]);
+  let domainsDiffer = Bool();
+  let outsideMatches = Bool();
+  left.$set("left");
+  right.$set("right");
+  domainsDiffer.$set(left != right);
+  outsideMatches.$set(left == "outside");
+}
+`);
+      const runtime = new Runtime().add("enum-equality", document).init();
+      const seeded = runtime.newTraversal(arc("enum-equality", "Main"));
+      seeded.phase = "entered";
+
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
+      expect(rootTraversal(brief).cells.domainsDiffer).toBe(true);
+      expect(rootTraversal(brief).cells.outsideMatches).toBe(false);
+    });
+
+    it.each([
+      ["a nonmember literal", 'let value = Enum(["a"]); if (value <= "b") {}'],
+      [
+        "a Str site",
+        'let value = Enum(["a"]); let text = Str(); if (value <= text) {}',
+      ],
+      [
+        "a conflicting Enum domain",
+        'let left = Enum(["a", "b"]); let right = Enum(["a", "c"]); if (left <= right) {}',
+      ],
+    ])("rejects Enum ordering against %s", (_case, body) => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  ${body}
+}
+`),
+      ).toThrow(/COMPARISON_VALUE_TYPE/);
+    });
+
+    it("rejects an out-of-domain typed Enum host result before ordering", () => {
+      const document = parse(`
+"arc";
+import Values from "host:values";
+function Main() {
+  let value = Enum(["cold", "warm"]);
+  let ordered = Bool();
+  value.$set("cold");
+  ordered.$set(value <= Values.nextEnum());
+}
+`);
+      const runtime = new Runtime().add("enum-dynamic-domain", document).init();
+      const seeded = runtime.newTraversal(arc("enum-dynamic-domain", "Main"));
+      seeded.phase = "entered";
+
+      const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const retried = progressBrief(runtime, first, {
+        move: "proceed",
+        hostCalls: { [first.hostCalls[0]!.id]: "outside" },
+      });
+
+      expect(rootTraversal(retried).phase).toBe("entered");
+      expect(retried.hostCalls[0]?.id).toBe(first.hostCalls[0]!.id);
+      expect(retried.issues).toContainEqual(
+        expect.objectContaining({ reasonCode: "host-call-result-type" }),
+      );
+    });
   });
 
   describe("cell.enum-invalid", () => {
@@ -257,7 +354,7 @@ function Main() {
   $observe(interest);
 }
 `);
-      const runtime = new Runtime().add("observe-type-arc", document);
+      const runtime = new Runtime().add("observe-type-arc", document).init();
       const seeded = runtime.newTraversal(arc("observe-type-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], {
@@ -314,7 +411,7 @@ function Other() {
   };
 }
 `);
-      const runtime = new Runtime().add("enum-subset-arc", document);
+      const runtime = new Runtime().add("enum-subset-arc", document).init();
       const dialog: Dialog = {
         cursor: { user: 0, self: 0 },
         lastTurns: [{ role: "user", message: "metal is great" }],
@@ -387,7 +484,7 @@ function Main() {
   let interest = Enum(["cold", "warm"], {
     observing: \`how interested is \${user}\`,
   });
-  let skill = RangedInt(1, 10, {
+  let skill = Num({
     observing: \`how skilled is \${user}\`,
   });
 }
@@ -459,7 +556,7 @@ function Main() {
     $instruct(\`topic matched\`);  }
 }
 `);
-      const runtime = new Runtime().add("str-observe-arc", document);
+      const runtime = new Runtime().add("str-observe-arc", document).init();
       const seeded = runtime.newTraversal(arc("str-observe-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], {
@@ -504,7 +601,9 @@ function Main() {
   $observe(topic);
 }
 `);
-      const runtime = new Runtime().add("str-observe-type-arc", document);
+      const runtime = new Runtime()
+        .add("str-observe-type-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("str-observe-type-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], {
@@ -535,13 +634,13 @@ function Main() {
     });
   });
 
-  describe("cell.ranged-int", () => {
-    it("compares RangedInt values at the declared boundaries", () => {
+  describe("cell.numeric-observation-spec", () => {
+    it("compares finite Num values exactly", () => {
       const document = parse(`
 "arc";
 
 function Main() {
-  let score = RangedInt(1, 20);
+  let score = Num();
   score.$set(20);
   if (score >= 20) {
     $instruct(\`at max\`);
@@ -554,7 +653,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("ranged-int-compare-arc", document);
+      const runtime = new Runtime()
+        .add("ranged-int-compare-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("ranged-int-compare-arc", "Main"),
       );
@@ -577,7 +678,9 @@ function Main() {
   $observe(score);
 }
 `);
-      const runtime = new Runtime().add("ranged-int-observe-arc", document);
+      const runtime = new Runtime()
+        .add("ranged-int-observe-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("ranged-int-observe-arc", "Main"),
       );
@@ -611,7 +714,7 @@ function Main() {
   });
 
   describe("cell.ranged-int-bounds", () => {
-    it("poisons traversal when set() writes a RangedInt outside its bounds", () => {
+    it("treats RangedInt bounds as observation constraints, not write constraints", () => {
       const document = parse(`
 "arc";
 
@@ -620,20 +723,17 @@ function Main() {
   score.$set(11);
 }
 `);
-      const runtime = new Runtime().add("ranged-int-bounds-arc", document);
+      const runtime = new Runtime()
+        .add("ranged-int-bounds-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("ranged-int-bounds-arc", "Main"));
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
-      expect(rootTraversal(brief).phase).toBe("poisoned");
-      expect(brief.issues).toEqual([
-        expect.objectContaining({
-          kind: "poisoned-traversal",
-          reasonCode: "cell-out-of-range",
-          reason: expect.stringContaining("outside 0..10"),
-        }),
-      ]);
+      expect(rootTraversal(brief).phase).toBe("completed");
+      expect(rootTraversal(brief).cells.score).toBe(11);
+      expect(brief.issues).toEqual([]);
     });
   });
 
@@ -660,32 +760,17 @@ function Main() {
       ).toThrow(/observeOrAsk\(\) requires an observable cell: startedAt/);
     });
 
-    it("poisons traversal for non-cursor assignments to cursor cells", () => {
-      const numberAssignment = parse(`
+    it("statically rejects non-cursor assignments to cursor cells", () => {
+      expect(() =>
+        parse(`
 "arc";
 
 function Main() {
   let startedAt = Dialog.Cursor();
   startedAt.$set(1);
 }
-`);
-      const runtime2 = new Runtime().add(
-        "dialog-number-cursor-arc",
-        numberAssignment,
-      );
-      const seeded2 = runtime2.newTraversal(
-        arc("dialog-number-cursor-arc", "Main"),
-      );
-      seeded2.phase = "entered";
-      const invalidAssignment = startRun(runtime2, [seeded2], EMPTY_DIALOG);
-      expect(rootTraversal(invalidAssignment).phase).toBe("poisoned");
-      expect(invalidAssignment.issues).toEqual([
-        expect.objectContaining({
-          kind: "poisoned-traversal",
-          reasonCode: "invalid-dialog-cursor",
-          reason: expect.stringContaining("must be a valid Dialog cursor"),
-        }),
-      ]);
+`),
+      ).toThrow(/CELL_VALUE_TYPE/);
     });
 
     it("snapshots Dialog.cursor and counts scoped turns locally", () => {
@@ -705,10 +790,11 @@ function Main() {
         Dialog.cursor.totalTurnsSince(startedAt) >= 3;
     },
   });
+
 }
 `);
 
-      const runtime = new Runtime().add("dialog-cursor-arc", document);
+      const runtime = new Runtime().add("dialog-cursor-arc", document).init();
       const seeded = runtime.newTraversal(arc("dialog-cursor-arc", "Main"));
       seeded.phase = "entered";
 
@@ -723,15 +809,305 @@ function Main() {
         self: 0,
       });
 
-      const second = progressBrief(
+      const second = progressTerminal(
         runtime,
         first,
         { move: "proceed" },
         { cursor: { user: 2, self: 1 }, lastTurns: [] },
       );
-      expect(second.hostCalls).toEqual([]);
-      expect(second.instructions.map((item) => item.text)).toEqual([]);
+      expect("hostCalls" in second).toBe(false);
+      expect("instructions" in second).toBe(false);
       expect(rootTraversal(second).phase).toBe("completed");
+    });
+  });
+
+  describe("cell.static-assignment-type", () => {
+    it.each([
+      [
+        "number literal to Str",
+        "let target = Str();",
+        "target.$set(1);",
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "string literal to Num",
+        "let target = Num();",
+        'target.$set("x");',
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "number literal to Bool",
+        "let target = Bool();",
+        "target.$set(1);",
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "typed cell read",
+        "let source = Num(); let target = Str();",
+        "target.$set(source);",
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "numeric compound",
+        "let target = Str();",
+        "target.$set(1 + 2);",
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "boolean compound",
+        "let target = Num();",
+        "target.$set(true && false);",
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "value template to Artifact",
+        'let target = Artifact("target.md");',
+        "target.$set(`source.md`);",
+        "ARTIFACT_VALUE_TYPE",
+      ],
+      [
+        "string conditional to Num",
+        "let target = Num();",
+        'target.$set(true ? "left" : "right");',
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "Dialog cursor value to Str",
+        "let target = Str();",
+        "target.$set(Dialog.cursor);",
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "typed array element read",
+        "let source = Array(Bool()); let target = Str();",
+        "target.$set(source[0]);",
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "homogeneous boolean array literal",
+        "let target = Array(Str());",
+        "target.$set([true, false]);",
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "empty array literal to Str",
+        "let target = Str();",
+        "target.$set([]);",
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "empty array branch to Artifact",
+        'let target = Artifact("target.md");',
+        'target.$set(true ? [] : Artifact("source.md"));',
+        "ARTIFACT_VALUE_TYPE",
+      ],
+      [
+        "heterogeneous array literal",
+        "let target = Array(Str());",
+        'target.$set(["valid", false]);',
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "null literal",
+        "let target = Str();",
+        "target.$set(null);",
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "Artifact cell to Str",
+        'let source = Artifact("source.md"); let target = Str();',
+        "target.$set(source);",
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "Artifact constructor to Str",
+        "let target = Str();",
+        'target.$set(Artifact("source.md"));',
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "string to Artifact",
+        'let target = Artifact("target.md");',
+        'target.$set("source.md");',
+        "ARTIFACT_VALUE_TYPE",
+      ],
+      [
+        "cursor to Artifact",
+        'let source = Dialog.Cursor(); let target = Artifact("target.md");',
+        "target.$set(source);",
+        "ARTIFACT_VALUE_TYPE",
+      ],
+      [
+        "array to cursor",
+        "let source = Array(Str()); let target = Dialog.Cursor();",
+        "target.$set(source);",
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "incompatible arrays",
+        "let source = Array(Bool()); let target = Array(Str());",
+        "target.$set(source);",
+        "CELL_VALUE_TYPE",
+      ],
+    ])(
+      "statically rejects a known-incompatible $set source: %s",
+      (_case, declarations, write, code) => {
+        expect(() =>
+          parse(`
+"arc";
+function Main() {
+  ${declarations}
+  ${write}
+}
+`),
+        ).toThrow(new RegExp(code));
+      },
+    );
+
+    it("accepts compatible scalar, exact, and recursively compatible array value families", () => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let enumSource = Enum(["a"]);
+  let stringTarget = Str();
+  let numberSource = Num();
+  let indexTarget = Num();
+  let artifactTarget = Artifact("target.md");
+  let cursorSource = Dialog.Cursor();
+  let cursorTarget = Dialog.Cursor();
+  let arraySource = Array(Enum(["a"]));
+  let arrayTarget = Array(Enum(["a", "b"]));
+  let booleanArrayTarget = Array(Bool());
+  let emptyStringArrayTarget = Array(Str());
+  let booleanElementTarget = Bool();
+  let conditionalStringTarget = Str();
+  stringTarget.$set(enumSource);
+  stringTarget.$set(\`value template\`);
+  indexTarget.$set(numberSource);
+  artifactTarget.$set(Artifact("source.md"));
+  cursorTarget.$set(cursorSource);
+  arrayTarget.$set(arraySource);
+  booleanArrayTarget.$set([true, false]);
+  emptyStringArrayTarget.$set([]);
+  booleanElementTarget.$set(booleanArrayTarget[0]);
+  conditionalStringTarget.$set(true ? "literal" : enumSource);
+}
+`),
+      ).not.toThrow();
+    });
+
+    it("rejects a conditional landing when any branch is incompatible", () => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let target = Num();
+  target.$set(true ? 1 : "incompatible");
+}
+`),
+      ).toThrow(/CELL_VALUE_TYPE/);
+    });
+
+    it("rejects an invalid typed host result before a conditional landing", () => {
+      const document = parse(`
+"arc";
+import Values from "host:values";
+function Main() {
+  let target = Num();
+  target.$set(false ? 1 : Values.next());
+}
+`);
+      const runtime = new Runtime()
+        .add("conditional-dynamic-landing", document)
+        .init();
+      const seeded = runtime.newTraversal(
+        arc("conditional-dynamic-landing", "Main"),
+      );
+      seeded.phase = "entered";
+
+      const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const retried = progressBrief(runtime, first, {
+        move: "proceed",
+        hostCalls: { [first.hostCalls[0]!.id]: "incompatible" },
+      });
+
+      expect(rootTraversal(retried).phase).toBe("entered");
+      expect(retried.hostCalls[0]?.id).toBe(first.hostCalls[0]!.id);
+      expect(retried.issues).toContainEqual(
+        expect.objectContaining({
+          reasonCode: "host-call-result-type",
+        }),
+      );
+    });
+  });
+
+  describe("expr.artifact-construction", () => {
+    it("artifact.construct validates public IR path shapes", () => {
+      const base = parse(`
+"arc";
+function Main() {
+  let artifact = Artifact("initial.md");
+  artifact.$set(Artifact("next.md"));
+}
+`);
+      const malformed = [
+        { kind: "artifact" },
+        { kind: "artifact", path: 42 },
+        { kind: "artifact", path: "next.md" },
+        { kind: "artifact", path: { kind: "unknown" } },
+        { kind: "artifact", path: { kind: "literal", value: 42 } },
+        { kind: "artifact", path: { kind: "literal", value: "" } },
+        { kind: "artifact", path: { kind: "template-string", parts: {} } },
+        {
+          kind: "artifact",
+          path: {
+            kind: "template-string",
+            parts: [{ kind: "text", value: 42 }],
+          },
+        },
+        {
+          kind: "artifact",
+          path: {
+            kind: "template-string",
+            parts: [{ kind: "ref", name: "user" }],
+          },
+        },
+        {
+          kind: "artifact",
+          path: {
+            kind: "template-string",
+            parts: [{ kind: "expression", expression: { kind: "unknown" } }],
+          },
+        },
+      ];
+
+      for (const value of malformed) {
+        const document = JSON.parse(JSON.stringify(base)) as typeof base;
+        const statement = document.roots[0]!.statements[0]!;
+        if (statement.kind !== "set") throw new Error("expected set statement");
+        statement.value = value as never;
+        expect(validate(document).length).toBeGreaterThan(0);
+      }
+
+      const ordinaryTemplate = parse(`
+"arc";
+function Main() {
+  let text = Str();
+  text.$set(\`valid\`);
+}
+`);
+      const ordinarySet = ordinaryTemplate.roots[0]!.statements[0]!;
+      if (ordinarySet.kind !== "set") throw new Error("expected set statement");
+      ordinarySet.value = {
+        kind: "template-string",
+        parts: {} as never,
+      };
+      expect(validate(ordinaryTemplate)).toContainEqual(
+        expect.objectContaining({ code: "INVALID_EXPRESSION_STRATUM" }),
+      );
+
+      expect(validate(base)).toEqual([]);
     });
   });
 
@@ -743,7 +1119,7 @@ function Main() {
 function Main() {
   let ready = Bool();
   let note = Str();
-  let count = RangedInt(0, 10);
+  let count = Num();
   let mark = Dialog.Cursor();
 
   if (
@@ -782,7 +1158,7 @@ function Main() {
         expect.arrayContaining(["ready", "note", "count", "mark"]),
       );
 
-      const runtime = new Runtime().add("is-unset-arc", document);
+      const runtime = new Runtime().add("is-unset-arc", document).init();
       const seeded = runtime.newTraversal(arc("is-unset-arc", "Main"));
       seeded.phase = "entered";
 
@@ -821,7 +1197,7 @@ function Main() {
 `);
 
       const run = (name: string) => {
-        const runtime = new Runtime().add(name, document);
+        const runtime = new Runtime().add(name, document).init();
         const seeded = runtime.newTraversal(arc(name, "Main"));
         seeded.phase = "entered";
         return { runtime, first: startRun(runtime, [seeded], EMPTY_DIALOG) };
@@ -853,7 +1229,7 @@ function Main() {
       ]);
     });
 
-    it("rejects arguments, unknown cells, and mention-only Artifact cells", () => {
+    it("rejects arguments and unknown cells while Artifact cells expose isUnset", () => {
       expect(() =>
         parse(`
 "arc";
@@ -881,7 +1257,7 @@ function Main() {
   if (report.isUnset()) {}
 }
 `),
-      ).toThrow(/Cell cannot be used as an expression value: report/);
+      ).not.toThrow();
     });
   });
 
@@ -898,13 +1274,80 @@ function Main() {
         {
           name: "note",
           type: "artifact",
-          path: "research-log.md",
+          initializer: {
+            kind: "artifact",
+            path: { kind: "literal", value: "research-log.md" },
+          },
           loc: expect.any(Object),
         },
       ]);
     });
 
-    it("rejects artifacts in scalar value positions", () => {
+    it("artifact.cell uninitialized declaration starts unset and accepts a later Artifact value", () => {
+      const document = parse(`
+"arc";
+function Main() {
+  let note = Artifact();
+  let initiallyUnset = Bool();
+  initiallyUnset.$set(note.isUnset());
+  note.$set(Artifact("assigned.md"));
+  if (initiallyUnset && !note.isUnset()) {
+    $instruct(\`assigned\`);
+  }
+}
+`);
+      expect(document.roots[0]?.cells[0]).toEqual({
+        name: "note",
+        type: "artifact",
+        loc: expect.any(Object),
+      });
+
+      const runtime = new Runtime()
+        .add("unset-artifact-declaration", document)
+        .init();
+      const brief = actionProgress(
+        runtime.enterArc(
+          arc("unset-artifact-declaration", "Main"),
+          EMPTY_DIALOG,
+        ),
+      );
+      expect(rootTraversal(brief).cells).toMatchObject({
+        initiallyUnset: true,
+        note: createArtifactValue("assigned.md"),
+      });
+      expect(brief.instructions.map((item) => item.text)).toEqual(["assigned"]);
+    });
+
+    it("artifact.cell validates optional public initializer shapes", () => {
+      const document = parse(`
+"arc";
+function Main() {
+  let note = Artifact("note.md");
+}
+`);
+      expect(validate(document)).toEqual([]);
+
+      const malformed = JSON.parse(JSON.stringify(document)) as typeof document;
+      const cell = malformed.roots[0]!.cells[0]!;
+      if (cell.type !== "artifact") throw new Error("expected Artifact cell");
+      cell.initializer = 42 as never;
+      expect(validate(malformed)).toContainEqual(
+        expect.objectContaining({ code: "INVALID_ARTIFACT_CELL_SPEC" }),
+      );
+
+      const legacy = parse(`
+"arc";
+function Main() {
+  let note = Artifact();
+}
+`);
+      Object.assign(legacy.roots[0]!.cells[0]!, { path: "note.md" });
+      expect(validate(legacy)).toContainEqual(
+        expect.objectContaining({ code: "INVALID_ARTIFACT_CELL_SPEC" }),
+      );
+    });
+
+    it("rejects artifacts in boolean positions and non-Artifact assignments", () => {
       expect(() =>
         parse(`
 "arc";
@@ -914,7 +1357,7 @@ function Bad() {
     $instruct(\`bad\`);  }
 }
 `),
-      ).toThrow(/NON_VALUE_CELL/);
+      ).toThrow(/NON_BOOLEAN_CONDITION/);
 
       expect(() =>
         parse(`
@@ -924,7 +1367,7 @@ function Bad() {
   note.$set("bad");
 }
 `),
-      ).toThrow(/NON_SETTABLE_CELL/);
+      ).toThrow(/ARTIFACT_VALUE_TYPE/);
     });
 
     it("rejects artifacts inside activation triggers", () => {
@@ -976,10 +1419,9 @@ function Main() {
   $instruct(\`Tell \${user} to update \${note} with \${topic}.\`);
 }
 `);
-      const instructionRuntime = new Runtime().add(
-        "semantic-text-instruction-arc",
-        instructionDocument,
-      );
+      const instructionRuntime = new Runtime()
+        .add("semantic-text-instruction-arc", instructionDocument)
+        .init();
       const instructionTraversal = instructionRuntime.newTraversal(
         arc("semantic-text-instruction-arc", "Main"),
       );
@@ -1006,10 +1448,9 @@ function Main() {
   $observe(ready, \`Is \${user} ready after reading \${note}?\`);
 }
 `);
-      const observationRuntime = new Runtime().add(
-        "semantic-text-observation-arc",
-        observationDocument,
-      );
+      const observationRuntime = new Runtime()
+        .add("semantic-text-observation-arc", observationDocument)
+        .init();
       const observationTraversal = observationRuntime.newTraversal(
         arc("semantic-text-observation-arc", "Main"),
       );
@@ -1036,10 +1477,9 @@ function Main() {
     $instruct(\`Proceed.\`);  }
 }
 `);
-      const judgmentRuntime = new Runtime().add(
-        "semantic-text-judgment-arc",
-        judgmentDocument,
-      );
+      const judgmentRuntime = new Runtime()
+        .add("semantic-text-judgment-arc", judgmentDocument)
+        .init();
       const judgmentTraversal = judgmentRuntime.newTraversal(
         arc("semantic-text-judgment-arc", "Main"),
       );
@@ -1056,6 +1496,254 @@ function Main() {
         { kind: "artifact", path: "research-log.md" },
         { kind: "text", value: "?" },
       ]);
+    });
+
+    it("artifact.cell.set replaces the initialized value and isUnset observes stored state", () => {
+      const runtime = new Runtime()
+        .add(
+          "artifact-cell-set",
+          parse(`
+"arc";
+function Main(args = { input: Artifact() }) {
+  let note = Artifact("initial.md");
+  note.$set(args.input);
+  if (!note.isUnset()) {
+    $instruct(\`Use \${note}\`);
+  }
+}
+`),
+        )
+        .init();
+      const brief = actionProgress(
+        runtime.enterArc(arc("artifact-cell-set", "Main"), EMPTY_DIALOG, {
+          args: {
+            input: { path: "assigned.md" },
+          },
+        }),
+      );
+
+      expect(rootTraversal(brief).cells.note).toEqual({ path: "assigned.md" });
+      expect(brief.instructions[0]?.text).toEqual([
+        { kind: "text", value: "Use " },
+        { kind: "artifact", path: "assigned.md" },
+      ]);
+    });
+
+    it("artifact.semantic-expression projects an Artifact-valued conditional", () => {
+      const runtime = new Runtime()
+        .add(
+          "artifact-conditional-semantic",
+          parse(`
+"arc";
+function Main() {
+  let useFirst = Bool();
+  let first = Artifact("first.md");
+  let second = Artifact("second.md");
+  useFirst.$set(false);
+  $instruct(\`Use \${useFirst ? first : second}\`);
+}
+`),
+        )
+        .init();
+      const brief = actionProgress(
+        runtime.enterArc(
+          arc("artifact-conditional-semantic", "Main"),
+          EMPTY_DIALOG,
+        ),
+      );
+
+      expect(brief.instructions[0]?.text).toEqual([
+        { kind: "text", value: "Use " },
+        { kind: "artifact", path: "second.md" },
+      ]);
+    });
+
+    it("artifact.value-template projects local, channel, and conditional values to ordinary strings", () => {
+      const runtime = new Runtime()
+        .add(
+          "artifact-value-template",
+          parse(`
+"arc";
+function Main(args = { input: Artifact() }) {
+  let local = Artifact("source/input.md");
+  let fallback = Artifact("fallback.md");
+  let chooseFallback = Bool();
+  let exact = Str();
+  let composed = Str();
+  let selected = Str();
+  let matches = Bool();
+
+  chooseFallback.$set(false);
+  exact.$set(\`\${local}\`);
+  composed.$set(\`prefix/\${args.input}/suffix\`);
+  selected.$set(\`\${chooseFallback ? fallback : args.input}\`);
+  matches.$set(
+    exact == "source/input.md" &&
+      /incoming/.test(composed) &&
+      selected == "incoming/data.md"
+  );
+  if (matches) {
+    $instruct(\`projected\`);
+  }
+}
+`),
+        )
+        .init();
+
+      const brief = actionProgress(
+        runtime.enterArc(arc("artifact-value-template", "Main"), EMPTY_DIALOG, {
+          args: { input: createArtifactValue("incoming/data.md") },
+        }),
+      );
+
+      expect(rootTraversal(brief).cells).toMatchObject({
+        exact: "source/input.md",
+        composed: "prefix/incoming/data.md/suffix",
+        selected: "incoming/data.md",
+        matches: true,
+      });
+      expect(brief.instructions.map((item) => item.text)).toEqual([
+        "projected",
+      ]);
+    });
+
+    it("artifact.equality compares logical paths without coercion", () => {
+      const runtime = new Runtime()
+        .add(
+          "artifact-equality",
+          parse(`
+"arc";
+function Main(args = { same: Artifact(), different: Artifact() }) {
+  let local = Artifact("same.md");
+  let equal = Bool();
+  let unequal = Bool();
+  let unset = Artifact("unset.md");
+  let unsetEqual = Bool();
+  let unsetUnequal = Bool();
+
+  unset.$unset();
+  equal.$set(local == args.same);
+  unequal.$set(local != args.different);
+  unsetEqual.$set(unset == local);
+  unsetUnequal.$set(unset != local);
+}
+`),
+        )
+        .init();
+
+      const brief = actionTerminal(
+        runtime.enterArc(arc("artifact-equality", "Main"), EMPTY_DIALOG, {
+          args: {
+            same: createArtifactValue("same.md"),
+            different: createArtifactValue("different.md"),
+          },
+        }),
+      );
+      expect(rootTraversal(brief).cells).toMatchObject({
+        equal: true,
+        unequal: true,
+        unsetEqual: false,
+        unsetUnequal: true,
+      });
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let note = Artifact("same.md");
+  let equal = Bool();
+  equal.$set(note == "same.md");
+}
+`),
+      ).toThrow(/COMPARISON_VALUE_TYPE/);
+    });
+
+    it("artifact.direct-operations reject ordering, arithmetic, regex, and property access", () => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let note = Artifact("note.md");
+  if (note < note) {}
+}
+`),
+      ).toThrow(/INVALID_ARTIFACT_OPERATION/);
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let note = Artifact("note.md");
+  if (/note/.test(note)) {}
+}
+`),
+      ).toThrow(/INVALID_ARTIFACT_OPERATION/);
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let note = Artifact("note.md");
+  let count = Num();
+  count.$set(note + 1);
+}
+`),
+      ).toThrow(/NON_NUMERIC_ARITHMETIC_OPERAND/);
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let note = Artifact("note.md");
+  $instruct(\`\${note.path}\`);
+}
+`),
+      ).toThrow(/Unsupported value expression: MemberExpression/);
+    });
+
+    it("artifact.cell.unset survives reconstruction and template interpolation rejects the unset value", () => {
+      const source = `
+"arc";
+function Main() {
+  let note = Artifact("initial.md");
+  note.$unset();
+  if (note.isUnset()) {
+    $instruct(\`unset state\`);
+  }
+  $instruct(\`Use \${note}\`);
+}
+`;
+      const firstRuntime = new Runtime()
+        .add("artifact-cell-unset", parse(source))
+        .init();
+      const first = actionProgress(
+        firstRuntime.enterArc(arc("artifact-cell-unset", "Main"), EMPTY_DIALOG),
+      );
+      expect(first.instructions.map((item) => item.text)).toEqual([
+        "unset state",
+      ]);
+      expect(rootTraversal(first).cells.note).toBeUndefined();
+
+      const secondRuntime = new Runtime()
+        .add("artifact-cell-unset", parse(source))
+        .init();
+      const restored = actionProgress(
+        secondRuntime.start(
+          JSON.parse(JSON.stringify(first.traversals)) as ArcTraversalSet,
+          EMPTY_DIALOG,
+        ),
+      );
+      const terminal = actionTerminal(
+        secondRuntime.progress(
+          restored,
+          {
+            move: "proceed",
+            instructions: appliedInstructions(restored),
+          },
+          EMPTY_DIALOG,
+        ),
+      );
+
+      expect(terminal.outcome).toBe("poisoned");
+      expect(terminal.issues[0]).toMatchObject({
+        reasonCode: "invalid-template-interpolation",
+      });
     });
   });
 
@@ -1078,15 +1766,18 @@ function Main() {
         {
           name: "note",
           type: "artifact",
-          path: {
-            kind: "template-string",
-            parts: [
-              {
-                kind: "expression",
-                expression: { kind: "cell", name: "slug" },
-              },
-              { kind: "text", value: ".md" },
-            ],
+          initializer: {
+            kind: "artifact",
+            path: {
+              kind: "template-string",
+              parts: [
+                {
+                  kind: "expression",
+                  expression: { kind: "cell", name: "slug" },
+                },
+                { kind: "text", value: ".md" },
+              ],
+            },
           },
           loc: expect.any(Object),
         },
@@ -1138,24 +1829,25 @@ function Bad() {
       ).toThrow(/Artifact note path cannot contain judge\(\) or host call/);
     });
 
-    it("renders dynamic Artifact path templates from cell state", () => {
+    it("initializes dynamic Artifact path templates from entry args before the body", () => {
       const document = parse(`
 "arc";
 
-function Main() {
-  let slug = Str();
-  let note = Artifact(\`notes/\${slug}.md\`);
-  slug.$set("pricing");
+function Main(args = { slug: Str() }) {
+  let note = Artifact(\`notes/\${args.slug}.md\`);
   $instruct(\`Update \${note}.\`);
 }
 `);
-      const runtime = new Runtime().add("dynamic-artifact-path-arc", document);
-      const traversal = runtime.newTraversal(
-        arc("dynamic-artifact-path-arc", "Main"),
+      const runtime = new Runtime()
+        .add("dynamic-artifact-path-arc", document)
+        .init();
+      const brief = actionProgress(
+        runtime.enterArc(
+          arc("dynamic-artifact-path-arc", "Main"),
+          EMPTY_DIALOG,
+          { args: { slug: "pricing" } },
+        ),
       );
-      traversal.phase = "entered";
-
-      const brief = startRun(runtime, [traversal], EMPTY_DIALOG);
 
       expect(brief.instructions[0]?.text).toEqual([
         { kind: "text", value: "Update " },
@@ -1164,27 +1856,166 @@ function Main() {
       ]);
     });
 
-    it("poisons traversal when a dynamic Artifact path renders invalid", () => {
-      const document = parse(`
+    it("artifact.initializer derives from earlier and bound Artifacts and survives reconstruction", () => {
+      const source = `
 "arc";
+function Main(
+  args = { input: Artifact(), replacement: Artifact() },
+) {
+  let source = Artifact("source/input.md");
+  let derived = Artifact(\`root/\${source}\`);
+  let fromArg = Artifact(\`copied/\${args.input}\`);
+  source.$set(args.replacement);
+  $instruct(\`Use \${derived} and \${fromArg}\`);
+}
+`;
+      const firstRuntime = new Runtime()
+        .add("artifact-derived-initializers", parse(source))
+        .init();
+      const first = actionProgress(
+        firstRuntime.enterArc(
+          arc("artifact-derived-initializers", "Main"),
+          EMPTY_DIALOG,
+          {
+            args: {
+              input: createArtifactValue("incoming/data.md"),
+              replacement: createArtifactValue("changed.md"),
+            },
+          },
+        ),
+      );
 
+      expect(rootTraversal(first).cells).toMatchObject({
+        source: createArtifactValue("changed.md"),
+        derived: createArtifactValue("root/source/input.md"),
+        fromArg: createArtifactValue("copied/incoming/data.md"),
+      });
+      expect(first.instructions[0]?.text).toEqual([
+        { kind: "text", value: "Use " },
+        { kind: "artifact", path: "root/source/input.md" },
+        { kind: "text", value: " and " },
+        { kind: "artifact", path: "copied/incoming/data.md" },
+      ]);
+
+      const secondRuntime = new Runtime()
+        .add("artifact-derived-initializers", parse(source))
+        .init();
+      const restored = actionProgress(
+        secondRuntime.start(
+          JSON.parse(JSON.stringify(first.traversals)) as ArcTraversalSet,
+          EMPTY_DIALOG,
+        ),
+      );
+      expect(rootTraversal(restored).cells).toMatchObject({
+        source: createArtifactValue("changed.md"),
+        derived: createArtifactValue("root/source/input.md"),
+        fromArg: createArtifactValue("copied/incoming/data.md"),
+      });
+    });
+
+    it("artifact.initializer rejects an unset later Artifact interpolation", () => {
+      const runtime = new Runtime()
+        .add(
+          "artifact-forward-initializer",
+          parse(`
+"arc";
+function Main() {
+  let derived = Artifact(\`root/\${later}\`);
+  let later = Artifact("later.md");
+}
+`),
+        )
+        .init();
+
+      const terminal = actionTerminal(
+        runtime.enterArc(
+          arc("artifact-forward-initializer", "Main"),
+          EMPTY_DIALOG,
+        ),
+      );
+      expect(terminal.issues[0]).toMatchObject({
+        reasonCode: "invalid-template-interpolation",
+      });
+    });
+
+    it("artifact.initializer validates the complete path after Artifact projection", () => {
+      const runtime = new Runtime()
+        .add(
+          "artifact-projected-invalid-path",
+          parse(`
+"arc";
+function Main() {
+  let source = Artifact("source.md");
+  let derived = Artifact(\`../\${source}\`);
+}
+`),
+        )
+        .init();
+
+      const terminal = actionTerminal(
+        runtime.enterArc(
+          arc("artifact-projected-invalid-path", "Main"),
+          EMPTY_DIALOG,
+        ),
+      );
+      expect(terminal.issues[0]).toMatchObject({
+        reasonCode: "invalid-artifact-path",
+        reason: expect.stringContaining('cannot contain "." or ".." segments'),
+      });
+    });
+
+    it("artifact.initializer evaluates once even when its path dependency changes in the body", () => {
+      const runtime = new Runtime()
+        .add(
+          "stable-artifact-initializer",
+          parse(`
+"arc";
 function Main() {
   let slug = Str();
   let note = Artifact(\`notes/\${slug}.md\`);
-  slug.$set("../escape");
+  slug.$set("changed");
+  $instruct(\`Use \${note}\`);
+}
+`),
+        )
+        .init();
+      const seeded = runtime.newTraversal(
+        arc("stable-artifact-initializer", "Main"),
+      );
+      seeded.phase = "entered";
+      seeded.enterCount = 1;
+      seeded.cells.slug = "initial";
+
+      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      expect(rootTraversal(brief).cells.slug).toBe("changed");
+      expect(rootTraversal(brief).cells.note).toEqual({
+        path: "notes/initial.md",
+      });
+      expect(brief.instructions[0]?.text).toEqual([
+        { kind: "text", value: "Use " },
+        { kind: "artifact", path: "notes/initial.md" },
+      ]);
+    });
+
+    it("poisons traversal when an initialized Artifact path is invalid", () => {
+      const document = parse(`
+"arc";
+
+function Main(args = { slug: Str() }) {
+  let note = Artifact(\`notes/\${args.slug}.md\`);
   $instruct(\`Update \${note}.\`);
 }
 `);
-      const runtime = new Runtime().add(
-        "invalid-dynamic-artifact-path-arc",
-        document,
+      const runtime = new Runtime()
+        .add("invalid-dynamic-artifact-path-arc", document)
+        .init();
+      const brief = actionTerminal(
+        runtime.enterArc(
+          arc("invalid-dynamic-artifact-path-arc", "Main"),
+          EMPTY_DIALOG,
+          { args: { slug: "../escape" } },
+        ),
       );
-      const traversal = runtime.newTraversal(
-        arc("invalid-dynamic-artifact-path-arc", "Main"),
-      );
-      traversal.phase = "entered";
-
-      const brief = startRun(runtime, [traversal], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).phase).toBe("poisoned");
       expect(brief.issues).toEqual([
@@ -1192,7 +2023,7 @@ function Main() {
           kind: "poisoned-traversal",
           reasonCode: "invalid-artifact-path",
           reason: expect.stringContaining(
-            'Artifact note path cannot contain "." or ".." segments',
+            'Artifact path cannot contain "." or ".." segments',
           ),
         }),
       ]);
@@ -1202,19 +2033,21 @@ function Main() {
       const empty = parse(`
 "arc";
 
-function Main() {
-  let slug = Str();
-  let note = Artifact(\`\${slug}\`);
-  slug.$set("");
+function Main(args = { slug: Str() }) {
+  let note = Artifact(\`\${args.slug}\`);
   $instruct(\`Update \${note}.\`);
 }
 `);
-      const emptyRuntime = new Runtime().add("empty-artifact-path-arc", empty);
-      const emptySeeded = emptyRuntime.newTraversal(
-        arc("empty-artifact-path-arc", "Main"),
+      const emptyRuntime = new Runtime()
+        .add("empty-artifact-path-arc", empty)
+        .init();
+      const emptyBrief = actionTerminal(
+        emptyRuntime.enterArc(
+          arc("empty-artifact-path-arc", "Main"),
+          EMPTY_DIALOG,
+          { args: { slug: "" } },
+        ),
       );
-      emptySeeded.phase = "entered";
-      const emptyBrief = startRun(emptyRuntime, [emptySeeded], EMPTY_DIALOG);
       expect(rootTraversal(emptyBrief).phase).toBe("poisoned");
       expect(emptyBrief.issues).toEqual([
         expect.objectContaining({
@@ -1226,25 +2059,20 @@ function Main() {
       const absolute = parse(`
 "arc";
 
-function Main() {
-  let slug = Str();
-  let note = Artifact(\`/\${slug}.md\`);
-  slug.$set("report");
+function Main(args = { slug: Str() }) {
+  let note = Artifact(\`/\${args.slug}.md\`);
   $instruct(\`Update \${note}.\`);
 }
 `);
-      const absoluteRuntime = new Runtime().add(
-        "absolute-artifact-path-arc",
-        absolute,
-      );
-      const absoluteSeeded = absoluteRuntime.newTraversal(
-        arc("absolute-artifact-path-arc", "Main"),
-      );
-      absoluteSeeded.phase = "entered";
-      const absoluteBrief = startRun(
-        absoluteRuntime,
-        [absoluteSeeded],
-        EMPTY_DIALOG,
+      const absoluteRuntime = new Runtime()
+        .add("absolute-artifact-path-arc", absolute)
+        .init();
+      const absoluteBrief = actionTerminal(
+        absoluteRuntime.enterArc(
+          arc("absolute-artifact-path-arc", "Main"),
+          EMPTY_DIALOG,
+          { args: { slug: "report" } },
+        ),
       );
       expect(rootTraversal(absoluteBrief).phase).toBe("poisoned");
       expect(absoluteBrief.issues).toEqual([
@@ -1335,7 +2163,9 @@ function Main() {
   $observeOrAsk(ready, \`override ask\`);
 }
 `);
-      const runtime = new Runtime().add("observe-override-arc", document);
+      const runtime = new Runtime()
+        .add("observe-override-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("observe-override-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1468,7 +2298,7 @@ function Main() {
 
     it.each([
       ["a Str cell", `let x = Str(); x.$set('a');`],
-      ["a RangedInt cell", `let x = RangedInt(1, 10); x.$set(3);`],
+      ["a Num cell", `let x = Num(); x.$set(3);`],
       ["an Enum cell", `let x = Enum(['low', 'high']); x.$set('high');`],
       [
         "a Dialog.Cursor cell",
@@ -1490,7 +2320,7 @@ function Main() {
 
     it("accepts an explicit comparison of a non-Bool cell", () => {
       expect(() =>
-        parse(booleanTest(`let x = RangedInt(1, 10); x.$set(3);`, "x > 0")),
+        parse(booleanTest(`let x = Num(); x.$set(3);`, "x > 0")),
       ).not.toThrow();
     });
 
@@ -1561,7 +2391,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("host-boolean-position-arc", document);
+      const runtime = new Runtime()
+        .add("host-boolean-position-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("host-boolean-position-arc", "Main"),
       );
@@ -1570,16 +2402,17 @@ function Main() {
       const first = startRun(runtime, [seeded], EMPTY_DIALOG);
       expect(first.hostCalls).toHaveLength(1);
 
-      const poisoned = progressBrief(runtime, first, {
+      const retried = progressBrief(runtime, first, {
         move: "proceed",
         hostCalls: { [first.hostCalls[0]!.id]: "enabled" },
       });
 
-      expect(rootTraversal(poisoned).phase).toBe("poisoned");
-      expect(poisoned.issues).toEqual([
+      expect(rootTraversal(retried).phase).toBe("entered");
+      expect(retried.hostCalls[0]?.id).toBe(first.hostCalls[0]!.id);
+      expect(retried.issues).toEqual([
         expect.objectContaining({
-          kind: "poisoned-traversal",
-          reasonCode: "non-boolean-value",
+          kind: "invalid-item",
+          reasonCode: "host-call-result-type",
         }),
       ]);
     });
@@ -1658,7 +2491,7 @@ function Main() {
 "arc";
 function Main() {
   let items = Array(Str());
-  let index = RangedInt(0, 1);
+  let index = Num();
   items.$set(["a", "b"]);
   items[index].$set("x");
 }
@@ -1852,37 +2685,67 @@ function Main() {
       expect(lintIssues).toEqual([]);
     });
 
-    it("poisons traversal when value-template interpolation is unset", () => {
-      const document = parse(`
-"arc";
+    it("reports invalid-template-interpolation for unset ordinary and Artifact values in value templates", () => {
+      const cases = [
+        {
+          name: "ordinary",
+          declaration: "let topic = Str();",
+          setup: "",
+        },
+        {
+          name: "artifact",
+          declaration: 'let topic = Artifact("topic.md");',
+          setup: "topic.$unset();",
+        },
+      ];
 
+      for (const testCase of cases) {
+        const runtime = new Runtime()
+          .add(
+            `value-string-unset-${testCase.name}`,
+            parse(`
+"arc";
 function Main() {
-  let topic = Str();
+  ${testCase.declaration}
   let summary = Str();
+  ${testCase.setup}
   summary.$set(\`topic-\${topic}\`);
 }
-`);
-
-      const runtime = new Runtime().add("value-string-unset-arc", document);
-      const seeded = runtime.newTraversal(
-        arc("value-string-unset-arc", "Main"),
-      );
-      seeded.phase = "entered";
-
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
-
-      expect(rootTraversal(brief).phase).toBe("poisoned");
-      expect(brief.issues).toEqual([
-        expect.objectContaining({
-          kind: "poisoned-traversal",
-          reason: expect.stringContaining(
-            "Template interpolation must resolve to a primitive value",
+`),
+          )
+          .init();
+        const terminal = actionTerminal(
+          runtime.enterArc(
+            arc(`value-string-unset-${testCase.name}`, "Main"),
+            EMPTY_DIALOG,
           ),
-        }),
-      ]);
+        );
+
+        expect(rootTraversal(terminal).phase).toBe("poisoned");
+        expect(terminal.issues).toEqual([
+          expect.objectContaining({
+            kind: "poisoned-traversal",
+            reasonCode: "invalid-template-interpolation",
+          }),
+        ]);
+      }
     });
 
-    it("poisons traversal when semantic-text interpolation is unset", () => {
+    it("rejects a dialog cursor producer in a value template", () => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let cursor = Dialog.Cursor();
+  let text = Str();
+  cursor.$set(Dialog.cursor);
+  text.$set(\`cursor-\${cursor}\`);
+}
+`),
+      ).toThrow(/INVALID_TEMPLATE_INTERPOLATION/);
+    });
+
+    it("reports invalid-template-interpolation for unset semantic-text interpolation", () => {
       const document = parse(`
 "arc";
 
@@ -1893,13 +2756,15 @@ function Main() {
 }
 `);
 
-      const runtime = new Runtime().add("semantic-string-unset-arc", document);
+      const runtime = new Runtime()
+        .add("semantic-string-unset-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("semantic-string-unset-arc", "Main"),
       );
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).phase).toBe("poisoned");
       expect(brief.issues).toEqual([
@@ -1920,11 +2785,11 @@ function Main() {
   copy.$set(source);
 }
 `);
-      const runtime = new Runtime().add("dead-read-set-arc", document);
+      const runtime = new Runtime().add("dead-read-set-arc", document).init();
       const seeded = runtime.newTraversal(arc("dead-read-set-arc", "Main"));
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).phase).toBe("poisoned");
       expect(brief.issues).toEqual([
@@ -1975,7 +2840,10 @@ function Main() {
         {
           name: "scores",
           type: "array",
-          element: { type: "rangedInt", min: 1, max: 5 },
+          element: {
+            type: "number",
+            observeAs: { kind: "integer", min: 1, max: 5 },
+          },
           loc: expect.any(Object),
         },
       ]);
@@ -1998,7 +2866,7 @@ function Main() {
 "arc";
 function Main() {
   let items = Array(Str());
-  let index = RangedInt(0, 10);
+  let index = Num();
   items.$set(["a", "b"]);
   items[0].$set("x");
   items[index].$set("y");
@@ -2108,10 +2976,10 @@ function Main() {
   items.$set(["a", "b", "c"]);
 }
 `);
-      const runtime = new Runtime().add("array-set-arc", document);
+      const runtime = new Runtime().add("array-set-arc", document).init();
       const seeded = runtime.newTraversal(arc("array-set-arc", "Main"));
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).cells.items).toEqual(["a", "b", "c"]);
     });
@@ -2125,11 +2993,13 @@ function Main() {
   items[1].$set("B");
 }
 `);
-      const runtime = new Runtime().add("array-element-set-arc", document);
+      const runtime = new Runtime()
+        .add("array-element-set-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("array-element-set-arc", "Main"));
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).cells.items).toEqual(["a", "B", "c"]);
     });
@@ -2139,22 +3009,21 @@ function Main() {
 "arc";
 function Main() {
   let items = Array(Str());
-  let index = RangedInt(0, 10);
+  let index = Num();
   items.$set(["a", "b", "c"]);
   index.$set(2);
   items[index].$set("C");
 }
 `);
-      const runtime = new Runtime().add(
-        "array-element-dynamic-set-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("array-element-dynamic-set-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("array-element-dynamic-set-arc", "Main"),
       );
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).cells.items).toEqual(["a", "b", "C"]);
     });
@@ -2174,16 +3043,15 @@ function Main() {
   items[${index}].$set("x");
 }
 `);
-        const runtime = new Runtime().add(
-          `array-element-${_caseName}-arc`,
-          document,
-        );
+        const runtime = new Runtime()
+          .add(`array-element-${_caseName}-arc`, document)
+          .init();
         const seeded = runtime.newTraversal(
           arc(`array-element-${_caseName}-arc`, "Main"),
         );
         seeded.phase = "entered";
 
-        const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+        const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
         expect(rootTraversal(brief).phase).toBe("poisoned");
         expect(brief.issues).toEqual([
@@ -2206,13 +3074,15 @@ function Main() {
 `);
       const action = document.roots[0]!.statements[1] as SetAction;
       action.target[1] = { kind: "literal", value: -1 };
-      const runtime = new Runtime().add("array-element-negative-arc", document);
+      const runtime = new Runtime()
+        .add("array-element-negative-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("array-element-negative-arc", "Main"),
       );
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).phase).toBe("poisoned");
       expect(brief.issues).toEqual([
@@ -2234,16 +3104,15 @@ function Main() {
   items[index].$set("x");
 }
 `);
-      const runtime = new Runtime().add(
-        "array-element-string-index-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("array-element-string-index-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("array-element-string-index-arc", "Main"),
       );
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).phase).toBe("poisoned");
       expect(brief.issues).toEqual([
@@ -2254,7 +3123,7 @@ function Main() {
       ]);
     });
 
-    it("validates an array-element write against the element bounds", () => {
+    it("does not apply array-element observation bounds to direct writes", () => {
       const document = parse(`
 "arc";
 function Main() {
@@ -2263,21 +3132,18 @@ function Main() {
   scores[0].$set(6);
 }
 `);
-      const runtime = new Runtime().add("array-element-bounds-arc", document);
+      const runtime = new Runtime()
+        .add("array-element-bounds-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("array-element-bounds-arc", "Main"),
       );
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
-      expect(rootTraversal(brief).phase).toBe("poisoned");
-      expect(brief.issues).toEqual([
-        expect.objectContaining({
-          kind: "poisoned-traversal",
-          reasonCode: "cell-out-of-range",
-        }),
-      ]);
+      expect(rootTraversal(brief).phase).toBe("completed");
+      expect(rootTraversal(brief).cells.scores).toEqual([6]);
     });
 
     it("clears a set array via $unset", () => {
@@ -2293,10 +3159,10 @@ function Main() {
   items.$unset();
 }
 `);
-      const runtime = new Runtime().add("array-unset-arc", document);
+      const runtime = new Runtime().add("array-unset-arc", document).init();
       const seeded = runtime.newTraversal(arc("array-unset-arc", "Main"));
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       // `wasSet` witnesses the array held a value; `$unset()` then cleared it.
       expect(rootTraversal(brief).cells.wasSet).toBe(true);
@@ -2323,10 +3189,10 @@ function Main() {
   if (items != ["b", "a"]) { neqReordered.$set(true); } else { neqReordered.$set(false); }
 }
 `);
-      const runtime = new Runtime().add("array-eq-arc", document);
+      const runtime = new Runtime().add("array-eq-arc", document).init();
       const seeded = runtime.newTraversal(arc("array-eq-arc", "Main"));
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       const cells = rootTraversal(brief).cells;
       // Only the identical list matches; reordered, shorter, and value-different
@@ -2335,12 +3201,61 @@ function Main() {
       expect(cells.reordered).toBe(false);
       expect(cells.shorter).toBe(false);
       expect(cells.different).toBe(false);
-      // `!==` between two set arrays is the negation, distinguishing values —
+      // `!=` between two set arrays is the negation, distinguishing values —
       // an impl returning false for every set-array inequality would fail
       // `neqReordered`.
       expect(cells.neqSame).toBe(false);
       expect(cells.neqReordered).toBe(true);
     });
+
+    it("rejects equality between arrays with incompatible element guarantees", () => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let numbers = Array(Num());
+  let strings = Array(Str());
+  let same = Bool();
+  same.$set(numbers == strings);
+}
+`),
+      ).toThrow(/COMPARISON_VALUE_TYPE/);
+    });
+
+    it.each([
+      ["string", ["1"]],
+      ["object", [{ path: "one" }]],
+    ])(
+      "rejects a dynamic %s array against a numeric array before equality",
+      (caseName, reported) => {
+        const document = parse(`
+"arc";
+import Values from "host:values";
+function Main() {
+  let numbers = Array(Num());
+  let same = Bool();
+  numbers.$set([1]);
+  same.$set(numbers == Values.nextNumbers());
+}
+`);
+        const source = `array-dynamic-${caseName}`;
+        const runtime = new Runtime().add(source, document).init();
+        const seeded = runtime.newTraversal(arc(source, "Main"));
+        seeded.phase = "entered";
+
+        const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+        const retried = progressBrief(runtime, first, {
+          move: "proceed",
+          hostCalls: { [first.hostCalls[0]!.id]: reported },
+        });
+
+        expect(rootTraversal(retried).phase).toBe("entered");
+        expect(retried.hostCalls[0]?.id).toBe(first.hostCalls[0]!.id);
+        expect(retried.issues).toContainEqual(
+          expect.objectContaining({ reasonCode: "host-call-result-type" }),
+        );
+      },
+    );
 
     it("applies the unset-comparison rule to an unset array", () => {
       const document = parse(`
@@ -2353,10 +3268,10 @@ function Main() {
   neqUnset.$set(items != ["a"]);
 }
 `);
-      const runtime = new Runtime().add("array-unset-cmp-arc", document);
+      const runtime = new Runtime().add("array-unset-cmp-arc", document).init();
       const seeded = runtime.newTraversal(arc("array-unset-cmp-arc", "Main"));
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).cells.eqUnset).toBe(false);
       expect(rootTraversal(brief).cells.neqUnset).toBe(true);
@@ -2372,10 +3287,10 @@ function Main() {
   summary.$set(\`items: \${items}\`);
 }
 `);
-      const runtime = new Runtime().add("array-template-arc", document);
+      const runtime = new Runtime().add("array-template-arc", document).init();
       const seeded = runtime.newTraversal(arc("array-template-arc", "Main"));
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).cells.summary).toBe("items: a,b,c");
     });
@@ -2398,7 +3313,7 @@ function Main() {
       ).toThrow(/NON_BOOLEAN_CONDITION/);
     });
 
-    it("poisons the traversal when a fractional value writes a ranged-int element", () => {
+    it("allows a fractional direct write through RangedInt array shorthand", () => {
       const document = parse(`
 "arc";
 function Main() {
@@ -2406,21 +3321,16 @@ function Main() {
   scores.$set([1, 2.5]);
 }
 `);
-      const runtime = new Runtime().add("array-frac-arc", document);
+      const runtime = new Runtime().add("array-frac-arc", document).init();
       const seeded = runtime.newTraversal(arc("array-frac-arc", "Main"));
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
-      expect(rootTraversal(brief).phase).toBe("poisoned");
-      expect(brief.issues).toEqual([
-        expect.objectContaining({
-          kind: "poisoned-traversal",
-          reasonCode: "invalid-cell-assignment",
-        }),
-      ]);
+      expect(rootTraversal(brief).phase).toBe("completed");
+      expect(rootTraversal(brief).cells.scores).toEqual([1, 2.5]);
     });
 
-    it("poisons the traversal when an out-of-range value writes an element", () => {
+    it("allows an out-of-observation-range direct array write", () => {
       const document = parse(`
 "arc";
 function Main() {
@@ -2428,18 +3338,13 @@ function Main() {
   scores.$set([1, 9]);
 }
 `);
-      const runtime = new Runtime().add("array-range-arc", document);
+      const runtime = new Runtime().add("array-range-arc", document).init();
       const seeded = runtime.newTraversal(arc("array-range-arc", "Main"));
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
-      expect(rootTraversal(brief).phase).toBe("poisoned");
-      expect(brief.issues).toEqual([
-        expect.objectContaining({
-          kind: "poisoned-traversal",
-          reasonCode: "cell-out-of-range",
-        }),
-      ]);
+      expect(rootTraversal(brief).phase).toBe("completed");
+      expect(rootTraversal(brief).cells.scores).toEqual([1, 9]);
     });
   });
 
@@ -2450,16 +3355,16 @@ function Main() {
 function Main() {
   let items = Array(Str());
   let first = Str();
-  let count = RangedInt(0, 100);
+  let count = Num();
   items.$set(["x", "y", "z"]);
   first.$set(items[0]);
   count.$set(items.length);
 }
 `);
-      const runtime = new Runtime().add("array-read-arc", document);
+      const runtime = new Runtime().add("array-read-arc", document).init();
       const seeded = runtime.newTraversal(arc("array-read-arc", "Main"));
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).cells.first).toBe("x");
       expect(rootTraversal(brief).cells.count).toBe(3);
@@ -2475,10 +3380,10 @@ function Main() {
   first.$set(items[3]);
 }
 `);
-      const runtime = new Runtime().add("array-oob-arc", document);
+      const runtime = new Runtime().add("array-oob-arc", document).init();
       const seeded = runtime.newTraversal(arc("array-oob-arc", "Main"));
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).phase).toBe("poisoned");
       expect(brief.issues).toEqual([
@@ -2494,14 +3399,14 @@ function Main() {
 "arc";
 function Main() {
   let items = Array(Str());
-  let count = RangedInt(0, 100);
+  let count = Num();
   count.$set(items.length);
 }
 `);
-      const runtime = new Runtime().add("array-unset-arc", document);
+      const runtime = new Runtime().add("array-unset-arc", document).init();
       const seeded = runtime.newTraversal(arc("array-unset-arc", "Main"));
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).phase).toBe("poisoned");
       expect(brief.issues).toEqual([
@@ -2515,7 +3420,7 @@ function Main() {
     it("rejects reading length of a non-array cell at parse", () => {
       expect(() =>
         parse(
-          `"arc";\nfunction Main() { let note = Str(); let n = RangedInt(0, 9); n.$set(note.length); }`,
+          `"arc";\nfunction Main() { let note = Str(); let n = Num(); n.$set(note.length); }`,
         ),
       ).toThrow(/LENGTH_NON_ARRAY/);
     });

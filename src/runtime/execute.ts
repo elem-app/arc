@@ -1,59 +1,73 @@
 import type {
+  HostEffectBrief,
+  InstructionBrief,
+  InstructionPostcheck,
+} from "../types/host-interaction.js";
+import type {
   ActionStatement,
-  ArcRef,
-  ArcTraversal,
-  BriefId,
   CatchDeflectionStatement,
-  CellValue,
-  DeflectionContext,
   EffectStatement,
   ElementId,
   EnterChannelBindings,
-  EnterChannelLink,
   GuardStatement,
-  HostEffectBrief,
   InstructionAction,
-  InstructionBrief,
-  InstructionPostcheck,
   InvokeAction,
   MapAction,
-  MapActionState,
   Node,
-  NodeRef,
-  NodeState,
-  PayloadValue,
-  PinTape,
-  PrimitiveValue,
   ResolutionStatement,
-  SegId,
   SegKey,
   SetSpanAction,
-  StateSnapshot,
   Statement,
-  Traversal,
   TriggerStatement,
-} from "../types.js";
+} from "../types/parser.js";
+import type {
+  ArcRef,
+  ArcTraversal,
+  BriefId,
+  DeflectionContext,
+  EnterChannelLink,
+  MapActionState,
+  NodeRef,
+  NodeState,
+  PinTape,
+  SegId,
+  StateSnapshot,
+  Traversal,
+} from "../types/runtime.js";
 import {
   catchSegKey,
   hookSegKey,
   invokeSegKey,
-  isPrimitiveValue,
   mapMemberSegKey,
   nodeSegKey,
   qualifiedBriefSite,
-} from "../types.js";
+} from "../types/runtime.js";
+import type { ArrayElementSpec } from "../types/spec.js";
+import {
+  type ArrayElementValue,
+  type ArrayValue,
+  type CellValue,
+  type PayloadValue,
+} from "../types/value.js";
+import {
+  cloneWithCanonicalNumbers,
+  firstNonFiniteNumberPath,
+  mergeAndClonePayload,
+} from "../value-utils.js";
 import { resolveReturnChannelBinding } from "./enter-channels.js";
 import {
   type ActionOutcome,
   assertAssignableValue,
   evaluateValueExpression,
   findCellOwner,
+  initializeArtifactCells,
   renderHostEffect,
   renderSemanticText,
   requireArrayValue,
   resolveRefInTraversal,
   truthy,
   writeOwnedCell,
+  writeOwnedCellValue,
 } from "./evaluate.js";
 import {
   evaluatorNarrowScope,
@@ -61,7 +75,6 @@ import {
   nodeNarrowScope,
   stepNarrowLeaf,
 } from "./narrow-leaf.js";
-import { mergeAndClonePayload } from "./payload.js";
 import {
   beginPinForElement,
   dropAllPinTapes,
@@ -112,6 +125,7 @@ import {
   clearEnteredByForAction,
   clearEvaluatorActionStates,
   clearFrame,
+  cloneCellValue,
   cloneEnterChannelLink,
   cloneInstructionPostcheck,
   createEmptyArcTraversal,
@@ -513,6 +527,9 @@ export function continueArc(accum: Accumulator): void {
     throw new Error(
       `Unknown root traversal node: ${formatRef(accum.traversal.ref)}`,
     );
+  if (shouldInitializeRootArtifactCells(accum.traversal, rootNode)) {
+    initializeArtifactCells(accum.traversal, rootNode, accum);
+  }
   runTraversal(accum.traversal, rootNode, accum, true);
 }
 
@@ -828,6 +845,21 @@ function runTraversal(
       phase: "effects",
     };
   }
+}
+
+function shouldInitializeRootArtifactCells(
+  traversal: Traversal,
+  node: Node,
+): boolean {
+  return (
+    traversal.enterCount <= 1 &&
+    traversal.state === undefined &&
+    traversal.finalizing === undefined &&
+    (!("activeFrame" in traversal) || traversal.activeFrame === undefined) &&
+    node.cells.some(
+      (cell) => cell.type === "artifact" && cell.initializer !== undefined,
+    )
+  );
 }
 
 /**
@@ -1322,7 +1354,7 @@ function runEnterIteration(
       target.ref,
       target.entry.root,
     );
-    prepareTraversalForEntry(
+    const firstEntry = prepareTraversalForEntry(
       referencedTraversal,
       target.entry.root,
       statement.target,
@@ -1334,6 +1366,9 @@ function runEnterIteration(
       referencedTraversal,
       accum,
     );
+    if (firstEntry) {
+      initializeArtifactCells(referencedTraversal, target.entry.root, accum);
+    }
     // Mark the referenced arc as owned by this enter so completion bubbles back
     // to the exact caller node and action (replacing `returnTo`).
     stampEnteredBy(referencedTraversal, callerRef, statement.id);
@@ -1351,7 +1386,11 @@ function runEnterIteration(
     target.kind === "owned"
       ? ensureOwnedTraversal(accum, target.ref, target.node)
       : ensureEphemeralTraversal(callerTraversal, target.ref, target.node);
-  prepareTraversalForEntry(childTraversal, target.node, statement.target);
+  const firstEntry = prepareTraversalForEntry(
+    childTraversal,
+    target.node,
+    statement.target,
+  );
   applyEnterChannels(
     callerTraversal,
     callerNode,
@@ -1359,6 +1398,9 @@ function runEnterIteration(
     childTraversal,
     accum,
   );
+  if (firstEntry) {
+    initializeArtifactCells(childTraversal, target.node, accum);
+  }
   stampEnteredBy(childTraversal, callerRef, statement.id);
   latchEnterTransition(accum, statement, childTraversal);
 
@@ -1631,12 +1673,14 @@ function stepMap(
     // rewalk-vs-advance decision when the action resolves.
     preSnapshot = captureReadSet(traversal, node, accum);
     arena = {
-      pinnedInput: requireArrayValue(
-        statement.receiver,
-        traversal,
-        accum,
-        "$map receiver",
-      ),
+      pinnedInput: cloneCellValue(
+        requireArrayValue(
+          statement.receiver,
+          traversal,
+          accum,
+          "$map receiver",
+        ),
+      ) as ArrayValue,
       results: statement.results,
       nextIndex: 0,
       terminals: [],
@@ -1663,7 +1707,7 @@ function stepMap(
   // Every member is terminal: construct the output in index order and commit it
   // to `results` in one write (absent for the forEach shape).
   if (statement.results !== undefined) {
-    const output: PrimitiveValue[] = arena.terminals.map((value) => {
+    const output: ArrayValue = arena.terminals.map((value) => {
       if (value === undefined) {
         throw runtimeError(
           "map-missing-result",
@@ -1708,7 +1752,21 @@ function runMapMember(
   const item = arena.pinnedInput[index]!;
   arena.staged ??= { set: false };
   const previousMember = accum.mapMember;
-  accum.mapMember = { mapId: statement.id, index, item };
+  accum.mapMember = {
+    mapId: statement.id,
+    index,
+    item,
+    receiverSpec: runtimeArrayElementSpec(
+      statement.receiver,
+      traversal,
+      node,
+      accum,
+    ),
+    resultSpec:
+      statement.results === undefined
+        ? undefined
+        : runtimeArrayCellElementSpec(statement.results, traversal, accum),
+  };
   accum.activeSeg = { kind: "mapMember", owner: statement.id, index };
   const tape = pinTapeFor(traversal, mapMemberSegKey(statement.id, index));
   let outcome: SegOutcome<void>;
@@ -1745,6 +1803,28 @@ function runMapMember(
   return outcome;
 }
 
+function runtimeArrayElementSpec(
+  reference: MapAction["receiver"],
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): ArrayElementSpec | undefined {
+  if (reference.kind === "channel") {
+    const spec = node.signature?.[reference.namespace][reference.key];
+    return spec?.type === "array" ? spec.element : undefined;
+  }
+  return runtimeArrayCellElementSpec(reference.name, traversal, accum);
+}
+
+function runtimeArrayCellElementSpec(
+  name: string,
+  traversal: Traversal,
+  accum: Accumulator,
+): ArrayElementSpec | undefined {
+  const cell = findCellOwner(name, traversal, accum)?.cell;
+  return cell?.type === "array" ? cell.element : undefined;
+}
+
 /**
  * Applies `span.result.$set(...)` inside a `$map` callback: evaluates the value
  * and stages it as the current member's `span.result`. Multiple writes stage in
@@ -1770,14 +1850,30 @@ function stepSetSpan(
     accum,
   );
   if (value.status === "blocked") return blockSeg(accum, traversal);
-  if (!isPrimitiveValue(value.value)) {
+  if (!member.resultSpec) {
     throw runtimeError(
       "invalid-span-result",
-      "span.result must be a primitive value",
+      "span.result is unavailable because this $map has no results cell",
+    );
+  }
+  if (firstNonFiniteNumberPath(value.value) !== undefined) {
+    throw runtimeError(
+      "non-finite-number",
+      "Numeric value must be finite before span result write",
+    );
+  }
+  assertAssignableValue("span.result", member.resultSpec, value.value);
+  const staged = cloneCellValue(value.value);
+  if (staged === undefined || Array.isArray(staged)) {
+    throw new Error(
+      "Internal invariant: admitted span result is not an element",
     );
   }
   const arena = getMapArena(traversal, member.mapId);
-  arena.staged = { set: true, value: value.value };
+  arena.staged = {
+    set: true,
+    value: staged as ArrayElementValue,
+  };
   markActionResolved(traversal, statement);
   return { status: "advance" };
 }
@@ -2338,24 +2434,24 @@ function prepareTraversalForEntry(
   traversal: Traversal,
   node: Node,
   target: { mode: "canonical" | "forgetful" | "newcopy" },
-): void {
+): boolean {
   if (traversal.finalizing) {
-    return;
+    return false;
   }
 
   if (target.mode === "forgetful") {
-    prepareForgetfulTraversalEntry(traversal, node);
-    return;
+    return prepareForgetfulTraversalEntry(traversal, node);
   }
 
   if (traversal.enterCount === 0) {
     resetTraversalForEntry(traversal, node, 1);
-    return;
+    return true;
   }
 
   if (traversal.state === "deflected" || isSuspendedArcTraversal(traversal)) {
     resetTraversalForEntry(traversal, node, traversal.enterCount + 1);
   }
+  return false;
 }
 
 function restartTraversalForEntry(
@@ -2374,14 +2470,15 @@ function restartTraversalForEntry(
 function prepareForgetfulTraversalEntry(
   traversal: Traversal,
   node: Node,
-): void {
+): boolean {
   if (traversal.enterCount > 0 && isEnteredTraversal(traversal)) {
-    return;
+    return false;
   }
 
   const nextEnterCount =
     traversal.enterCount === 0 ? 1 : traversal.enterCount + 1;
   resetTraversalForEntry(traversal, node, nextEnterCount, true);
+  return nextEnterCount === 1;
 }
 
 function resolveEnterTarget(
@@ -2511,9 +2608,9 @@ function resolveEnterChannelLinks(
       );
     }
     if (source.key === "item") {
-      resolved[key] = { kind: "spanValue", value: member.item };
+      resolved[key] = { kind: "value", value: member.item };
     } else if (source.key === "index") {
-      resolved[key] = { kind: "spanValue", value: member.index };
+      resolved[key] = { kind: "value", value: member.index };
     } else {
       resolved[key] = {
         kind: "spanResult",
@@ -2538,7 +2635,7 @@ function sameEnterChannelLinks(
     if (!l || !r || l.kind !== r.kind) return false;
     if (l.kind === "callerCell" && r.kind === "callerCell") {
       if (l.ownerRef !== r.ownerRef || l.cell !== r.cell) return false;
-    } else if (l.kind === "spanValue" && r.kind === "spanValue") {
+    } else if (l.kind === "value" && r.kind === "value") {
       if (!cellValuesEqual(l.value, r.value)) return false;
     } else if (l.kind === "spanResult" && r.kind === "spanResult") {
       if (l.ownerRef !== r.ownerRef || l.mapId !== r.mapId) return false;
@@ -2572,7 +2669,14 @@ function commitEnterReturnChannels(
     );
     // Route through the single write path so the enter's wide snapshot reads a
     // consistently-cloned before/after across the return commit.
-    writeOwnedCell(callerTraversal, callerCellRef.cell, value);
+    const owner = findCellOwner(callerCellRef.cell, callerTraversal, accum);
+    if (!owner) {
+      throw runtimeError(
+        "invalid-channel-binding",
+        `Return sink cell not found: ${callerCellRef.cell}`,
+      );
+    }
+    writeOwnedCellValue(owner.traversal, callerCellRef.cell, owner.cell, value);
   }
   channelState.stagedReturns = {};
 }
@@ -2590,13 +2694,57 @@ function commitSpanResult(
       `span.result sink owner traversal not found: ${formatRef(link.ownerRef)}`,
     );
   }
-  if (!isPrimitiveValue(value)) {
+  const node = nodeForTraversal(accum, owner);
+  const map = findMapAction(node.statements, link.mapId);
+  if (!map || map.results === undefined) {
     throw runtimeError(
       "invalid-span-result",
-      "span.result must be a primitive value",
+      `span.result sink map not found: ${link.mapId}`,
     );
   }
-  getMapArena(owner, link.mapId).staged = { set: true, value };
+  const resultSpec = runtimeArrayCellElementSpec(map.results, owner, accum);
+  if (!resultSpec) {
+    throw runtimeError(
+      "invalid-span-result",
+      `span.result sink ${map.results} has no array element spec`,
+    );
+  }
+  assertAssignableValue("span.result", resultSpec, value);
+  const staged = cloneCellValue(value);
+  if (staged === undefined || Array.isArray(staged)) {
+    throw new Error(
+      "Internal invariant: admitted child return is not an element",
+    );
+  }
+  getMapArena(owner, link.mapId).staged = {
+    set: true,
+    value: staged as ArrayElementValue,
+  };
+}
+
+function findMapAction(
+  statements: readonly Statement[],
+  id: ElementId,
+): MapAction | undefined {
+  for (const statement of statements) {
+    if (statement.kind === "map" && statement.id === id) return statement;
+    if (statement.kind === "if") {
+      const found =
+        findMapAction(statement.consequent, id) ??
+        findMapAction(statement.alternate ?? [], id);
+      if (found) return found;
+      continue;
+    }
+    if (
+      statement.kind === "label" ||
+      statement.kind === "invoke" ||
+      statement.kind === "map"
+    ) {
+      const found = findMapAction(statement.body, id);
+      if (found) return found;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -2773,9 +2921,22 @@ function emitInstruction(
     mode: statement.mode,
     phase,
     text: renderSemanticText(statement.template, traversal, node, accum),
-    hostParams: mergeAndClonePayload(node.hostParams, statement.hostParams),
+    hostParams: admitBriefPayload(
+      mergeAndClonePayload(node.hostParams, statement.hostParams),
+    ),
     postcheck: cloneInstructionPostcheck(postcheck),
   });
+}
+
+function admitBriefPayload(value: PayloadValue): PayloadValue {
+  const path = firstNonFiniteNumberPath(value);
+  if (path !== undefined) {
+    throw runtimeError(
+      "non-finite-number",
+      `Numeric value must be finite before brief/effect emission${path === "$" ? "" : ` at ${path}`}`,
+    );
+  }
+  return cloneWithCanonicalNumbers(value);
 }
 
 function toEnterActionOutcome(
@@ -2839,7 +3000,6 @@ function hostEffectDedupKey(
 }
 
 function stableStringifyPayload(value: PayloadValue | HostEffectBrief): string {
-  if (value === null) return "null";
   if (value === undefined) return "undefined";
   if (typeof value === "string") return JSON.stringify(value);
   if (typeof value === "number" || typeof value === "boolean") {

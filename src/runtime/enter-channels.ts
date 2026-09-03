@@ -1,4 +1,4 @@
-import type { CallerCellRef, Traversal } from "../types.js";
+import type { CallerCellRef, Traversal } from "../types/runtime.js";
 import { findTraversalInSet, formatRef, traversalToNodeRef } from "./refs.js";
 import { runtimeError } from "./report-validation.js";
 import type { Accumulator } from "./state.js";

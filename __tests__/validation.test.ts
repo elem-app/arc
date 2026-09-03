@@ -1,8 +1,17 @@
 import { describe, expect, it } from "vitest";
 
 import { parse, validate } from "../src/parser/index.js";
-import { Runtime, toArcRef } from "../src/runtime/index.js";
-import type { Document, ElementId, Node, WriteDiffMode } from "../src/types.js";
+import {
+  Runtime,
+  RuntimeRegistrationError,
+  toArcRef,
+} from "../src/runtime/index.js";
+import type {
+  Document,
+  ElementId,
+  Node,
+  WriteDiffMode,
+} from "../src/types/index.js";
 import { EMPTY_DIALOG, startRun } from "./helpers.js";
 
 function cloneDocument(document: Document): Document {
@@ -226,13 +235,41 @@ function Main() {
           kind: "enter-node",
           target: { identifier: "Main", imported: false, mode: "canonical" },
         },
+        {
+          id: "body/1" as ElementId,
+          kind: "set",
+          target: ["missing"],
+          value: { kind: "literal", value: true },
+        },
       ];
 
       const runtime = new Runtime();
 
-      expect(() => runtime.add("invalid-doc-arc", invalid)).toThrow(
-        /SELF_ENTRY/,
+      let thrown: unknown;
+      try {
+        runtime.add("invalid-doc-arc", invalid);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(RuntimeRegistrationError);
+      const registration = thrown as RuntimeRegistrationError;
+      expect(registration.operation).toBe("add");
+      expect(registration.issues).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            phase: "document",
+            source: "invalid-doc-arc",
+            code: "SELF_ENTRY",
+          }),
+          expect.objectContaining({
+            phase: "document",
+            source: "invalid-doc-arc",
+            code: "UNKNOWN_CELL",
+          }),
+        ]),
       );
+      expect(registration.message).toMatch(/SELF_ENTRY/);
+      expect(registration.message).toMatch(/UNKNOWN_CELL/);
       expect(runtime.has(toArcRef("invalid-doc-arc", "Main"))).toBe(false);
 
       runtime.add("invalid-doc-arc", valid);
@@ -248,7 +285,7 @@ function Main() {
   $instruct(\`original\`);
 }
 `);
-      const runtime = new Runtime().add("snapshot-doc-arc", document);
+      const runtime = new Runtime().add("snapshot-doc-arc", document).init();
       const statement = root(document).statements[0];
       if (!statement || statement.kind !== "instruction") {
         throw new Error("Expected instruction");

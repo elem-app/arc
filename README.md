@@ -71,11 +71,13 @@ This package exposes:
 
 - `arc/parser` — parses Arc source into a structured document
 - `arc/runtime` — executes parsed documents with a host
+- `arc/host-utils` — constructs host-module declarations
 
 ## Deeper reference
 
-The spec documents cover precise language and runtime details:
+The reference documents cover precise language, runtime, and host-integration details:
 
 - [Arc Scripts](./specs/arc-scripts.md)
 - [Arc Runtime API](./specs/arc-runtime-api.md)
+- [Host Module Declarations](./docs/host-module-declarations.md)
 - [Internal Semantics](./specs/internal-semantics.md)

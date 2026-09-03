@@ -9,9 +9,10 @@
 import { describe, expect, it } from "vitest";
 
 import { parse, validate } from "../src/parser/index.js";
-import { Runtime } from "../src/runtime/index.js";
-import type { EnterNodeAction } from "../src/types.js";
+import { createArtifactValue, Runtime } from "../src/runtime/index.js";
+import type { ArcTraversalSet, EnterNodeAction } from "../src/types/index.js";
 import {
+  actionProgress,
   appliedInstructions,
   arc,
   EMPTY_DIALOG,
@@ -19,9 +20,12 @@ import {
   node,
   ownedChild,
   progressBrief,
+  progressTerminal,
   rootTraversal,
+  settleTransitions,
   singleObservations,
   startRun,
+  startTerminal,
   withExperimentalRewalk,
 } from "./helpers.js";
 
@@ -42,7 +46,7 @@ function Outer() {
   }
 }
 `);
-      const runtime = new Runtime().add("outer-arc", document);
+      const runtime = new Runtime().add("outer-arc", document).init();
       const seeded = runtime.newTraversal(arc("outer-arc", "Outer"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], {
@@ -77,7 +81,7 @@ function A() {
   }
 }
 `);
-      const runtime = new Runtime().add("owner-arc", document);
+      const runtime = new Runtime().add("owner-arc", document).init();
       const seeded = runtime.newTraversal(arc("owner-arc", "A"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], {
@@ -125,7 +129,8 @@ function AnotherArc() {
       const runtime = new Runtime()
         .add("main-arc", main)
         .add("another-arc", expected)
-        .add("wrong-arc", wrong);
+        .add("wrong-arc", wrong)
+        .init();
 
       const seeded = runtime.newTraversal(arc("main-arc", "Main"));
       seeded.phase = "entered";
@@ -170,7 +175,8 @@ function Intro() {
 `);
       const runtime = new Runtime()
         .add("import-state-arc", main)
-        .add("intro-arc", intro);
+        .add("intro-arc", intro)
+        .init();
       const seeded = runtime.newTraversal(arc("import-state-arc", "Main"));
       seeded.phase = "entered";
 
@@ -216,7 +222,8 @@ function Topic() {
 `);
       const runtime = new Runtime()
         .add("main-arc", main)
-        .add("topic-arc", topic);
+        .add("topic-arc", topic)
+        .init();
       const seeded = runtime.newTraversal(arc("main-arc", "Main"));
       seeded.phase = "entered";
 
@@ -279,7 +286,8 @@ function Topic() {
 `);
       const runtime = new Runtime()
         .add("main-deflect-arc", main)
-        .add("topic-arc", topic);
+        .add("topic-arc", topic)
+        .init();
       const seeded = runtime.newTraversal(arc("main-deflect-arc", "Main"));
       seeded.phase = "entered";
 
@@ -322,7 +330,7 @@ function Main() {
     $instruct(\`child body\`);  }
 }
 `);
-      const runtime = new Runtime().add("forgetful-state-arc", document);
+      const runtime = new Runtime().add("forgetful-state-arc", document).init();
       const traversal = runtime.newTraversal(
         arc("forgetful-state-arc", "Main"),
       );
@@ -368,7 +376,7 @@ function Main() {
 `),
         "Main",
       );
-      const runtime = new Runtime().add("n5-arc", document);
+      const runtime = new Runtime().add("n5-arc", document).init();
       const seeded = runtime.newTraversal(arc("n5-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -451,10 +459,10 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("enter-channels-arc", document);
+      const runtime = new Runtime().add("enter-channels-arc", document).init();
       const seeded = runtime.newTraversal(arc("enter-channels-arc", "Main"));
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], {
+      const brief = startTerminal(runtime, [seeded], {
         cursor: { user: 0, self: 0 },
         lastTurns: [],
       });
@@ -484,7 +492,8 @@ function Intro() {
 `);
       const runtime = new Runtime()
         .add("main-arc", main)
-        .add("intro-arc", intro);
+        .add("intro-arc", intro)
+        .init();
       const seeded = runtime.newTraversal(arc("main-arc", "Main"));
       seeded.phase = "entered";
 
@@ -534,7 +543,7 @@ function Main() {
       // must not latch a transition, or the interposing transition brief
       // swallows the observation report and the host loops forever:
       // observation, answer eaten, transition, re-ask.
-      const runtime = new Runtime().add("rederive-commit-arc", document);
+      const runtime = new Runtime().add("rederive-commit-arc", document).init();
       const seeded = runtime.newTraversal(arc("rederive-commit-arc", "Main"));
       seeded.phase = "entered";
 
@@ -604,45 +613,51 @@ function Main() {
       // — Child never runs — so no transition may ride the answer's brief.
       // Driven with raw progress: the shared drivers acknowledge transitions
       // silently and would hide a spurious one.
-      const runtime = new Runtime().add("second-site-covered-arc", document);
+      const runtime = new Runtime()
+        .add("second-site-covered-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("second-site-covered-arc", "Main"),
       );
       seeded.phase = "entered";
 
-      const entry = runtime.start([seeded], EMPTY_DIALOG);
+      const entry = actionProgress(runtime.start([seeded], EMPTY_DIALOG));
       expect(entry.transition).toBeDefined();
-      const intro = runtime.progress(entry, { move: "proceed" }, EMPTY_DIALOG);
+      const intro = actionProgress(
+        runtime.progress(entry, { move: "proceed" }, EMPTY_DIALOG),
+      );
       expect(intro.instructions.map((item) => item.text)).toEqual([
         "child intro",
       ]);
-      const exit = runtime.progress(
-        intro,
-        { move: "proceed", instructions: appliedInstructions(intro) },
-        EMPTY_DIALOG,
+      const exit = actionProgress(
+        runtime.progress(
+          intro,
+          { move: "proceed", instructions: appliedInstructions(intro) },
+          EMPTY_DIALOG,
+        ),
       );
       expect(exit.transition).toBeDefined();
-      const observing = runtime.progress(
-        exit,
-        { move: "proceed" },
-        EMPTY_DIALOG,
+      const observing = actionProgress(
+        runtime.progress(exit, { move: "proceed" }, EMPTY_DIALOG),
       );
       expect(singleObservations(observing).map((item) => item.cell)).toEqual([
         "go",
       ]);
 
-      const revisited = runtime.progress(
-        observing,
-        {
-          move: "proceed",
-          observations: {
-            [observing.observations[0]!.id]: {
-              status: "resolved",
-              value: true,
+      const revisited = actionProgress(
+        runtime.progress(
+          observing,
+          {
+            move: "proceed",
+            observations: {
+              [observing.observations[0]!.id]: {
+                status: "resolved",
+                value: true,
+              },
             },
           },
-        },
-        EMPTY_DIALOG,
+          EMPTY_DIALOG,
+        ),
       );
 
       expect(revisited.transition).toBeUndefined();
@@ -703,7 +718,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("enter-loop-transaction-arc", document);
+      const runtime = new Runtime()
+        .add("enter-loop-transaction-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("enter-loop-transaction-arc", "Main"),
       );
@@ -744,7 +761,7 @@ function Main() {
       });
       expect(secondResolution.judgments).toHaveLength(1);
 
-      const afterDeflect = progressBrief(runtime, secondResolution, {
+      const afterDeflect = progressTerminal(runtime, secondResolution, {
         move: "proceed",
         judgments: {
           [secondResolution.judgments[0]!.id]: true,
@@ -780,7 +797,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("enter-loop-commit-arc", document);
+      const runtime = new Runtime()
+        .add("enter-loop-commit-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("enter-loop-commit-arc", "Main"));
       seeded.phase = "entered";
 
@@ -792,6 +811,52 @@ function Main() {
 
       expect(rootTraversal(resolved).cells.verdict).toBe(true);
       expect(resolved.instructions.map((item) => item.text)).toEqual(["after"]);
+    });
+
+    it("revalidates a restored enterLoop return transaction against the target signature", () => {
+      const source = `
+"arc";
+function Main() {
+  let verdict = Bool();
+  $enterLoop(newcopy(Child), {
+    resolveWhen: () => judge(\`stop now\`),
+    returns: { verdict },
+  });
+  function Child(returns = { verdict: Bool() }) {
+    this.effects = () => {
+      returns.verdict.$set(true);
+    };
+  }
+}
+`;
+      const runtime = new Runtime()
+        .add("enter-loop-restored-transaction-arc", parse(source))
+        .init();
+      const seeded = runtime.newTraversal(
+        arc("enter-loop-restored-transaction-arc", "Main"),
+      );
+      seeded.phase = "entered";
+      const blocked = startRun(runtime, [seeded], EMPTY_DIALOG);
+      expect(blocked.judgments).toHaveLength(1);
+
+      const restored = JSON.parse(
+        JSON.stringify(blocked.traversals),
+      ) as ArcTraversalSet;
+      const state = Object.values(restored[0]!.frame.actionStates).find(
+        (candidate) =>
+          candidate?.kind === "enter-loop" && candidate.stagedReturns,
+      );
+      if (state?.kind !== "enter-loop" || !state.stagedReturns) {
+        throw new Error("expected a persisted enterLoop return transaction");
+      }
+      state.stagedReturns.verdict = "wrong";
+
+      const restarted = new Runtime()
+        .add("enter-loop-restored-transaction-arc", parse(source))
+        .init();
+      expect(() => restarted.start(restored, EMPTY_DIALOG)).toThrow(
+        /staged returns\.verdict violates its boolean guarantee/i,
+      );
     });
   });
 
@@ -869,7 +934,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("newcopy-owned-arc", document);
+      const runtime = new Runtime().add("newcopy-owned-arc", document).init();
       const traversal = runtime.newTraversal(arc("newcopy-owned-arc", "Main"));
       traversal.phase = "entered";
 
@@ -904,7 +969,8 @@ function Intro() {
 `);
       const runtime = new Runtime()
         .add("main-arc", main)
-        .add("intro-arc", intro);
+        .add("intro-arc", intro)
+        .init();
       const traversal = runtime.newTraversal(arc("main-arc", "Main"));
       traversal.phase = "entered";
 
@@ -938,7 +1004,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("nested-newcopy-arc", document);
+      const runtime = new Runtime().add("nested-newcopy-arc", document).init();
       const traversal = runtime.newTraversal(arc("nested-newcopy-arc", "Main"));
       traversal.phase = "entered";
 
@@ -970,7 +1036,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("newcopy-resolution-arc", document);
+      const runtime = new Runtime()
+        .add("newcopy-resolution-arc", document)
+        .init();
       const traversal = runtime.newTraversal(
         arc("newcopy-resolution-arc", "Main"),
       );
@@ -1030,7 +1098,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("newcopy-reentry-arc", document);
+      const runtime = new Runtime().add("newcopy-reentry-arc", document).init();
       const seeded = runtime.newTraversal(arc("newcopy-reentry-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1129,7 +1197,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("forgetful-covered-arc", document);
+      const runtime = new Runtime()
+        .add("forgetful-covered-arc", document)
+        .init();
       const traversal = runtime.newTraversal(
         arc("forgetful-covered-arc", "Main"),
       );
@@ -1197,7 +1267,8 @@ function Intro() {
 `);
       const runtime = new Runtime()
         .add("forgetful-import-arc", main)
-        .add("intro-arc", intro);
+        .add("intro-arc", intro)
+        .init();
       const seeded = runtime.newTraversal(arc("forgetful-import-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1258,7 +1329,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("loop-forgetful-arc", document);
+      const runtime = new Runtime().add("loop-forgetful-arc", document).init();
       const seeded = runtime.newTraversal(arc("loop-forgetful-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1336,7 +1407,7 @@ function Main() {
         throw new Error("expected child effects if statement");
       }
       expect(child.effects[0].test).toMatchObject({
-        kind: "binary",
+        kind: "comparison",
         left: { kind: "channel", namespace: "args", key: "ready" },
         right: { kind: "literal", value: true },
       });
@@ -1396,7 +1467,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("enter-renamed-args-arc", document);
+      const runtime = new Runtime()
+        .add("enter-renamed-args-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("enter-renamed-args-arc", "Main"),
       );
@@ -1481,7 +1554,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("enter-args-action-arc", document);
+      const runtime = new Runtime()
+        .add("enter-args-action-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("enter-args-action-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], {
@@ -1513,10 +1588,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add(
-        "enter-args-action-false-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("enter-args-action-false-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("enter-args-action-false-arc", "Main"),
       );
@@ -1548,13 +1622,15 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("enter-missing-args-arc", document);
+      const runtime = new Runtime()
+        .add("enter-missing-args-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("enter-missing-args-arc", "Main"),
       );
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], {
+      const brief = startTerminal(runtime, [seeded], {
         cursor: { user: 0, self: 0 },
         lastTurns: [],
       });
@@ -1582,16 +1658,15 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add(
-        "enter-missing-args-action-arc",
-        document,
-      );
+      const runtime = new Runtime()
+        .add("enter-missing-args-action-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("enter-missing-args-action-arc", "Main"),
       );
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], {
+      const brief = startTerminal(runtime, [seeded], {
         cursor: { user: 0, self: 0 },
         lastTurns: [],
       });
@@ -1613,7 +1688,7 @@ function Main() {
 function Main() {
   $enter(Op);
   function Op(args = { label: Str() }) {
-    let n = RangedInt(0, 9);
+    let n = Num();
     n.$set(args.label);
   }
 }
@@ -1638,6 +1713,155 @@ function Main() {
   });
 
   describe("compose.returns", () => {
+    it("artifact.construct rejects incompatible cell and return destinations", () => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let text = Str();
+  text.$set(Artifact("note.md"));
+}
+`),
+      ).toThrow(/CELL_VALUE_TYPE/);
+
+      expect(() =>
+        parse(`
+"arc";
+function Main(returns = { text: Str() }) {
+  this.effects = () => {
+    returns.text.$set(Artifact("note.md"));
+  };
+}
+`),
+      ).toThrow(/CHANNEL_VALUE_TYPE/);
+    });
+
+    it("artifact.channel.child forwards an Artifact through child args, shared settlement, and root returns", () => {
+      const source = `
+"arc";
+function Main(
+  args = { input: Artifact() },
+  returns = { output: Artifact() },
+) {
+  let source = Artifact("placeholder-source.md");
+  let result = Artifact("placeholder.md");
+  source.$set(args.input);
+  $enter(Child, {
+    args: { input: source },
+    returns: { output: result },
+  });
+  this.effects = () => {
+    returns.output.$set(result);
+  };
+
+  function Child(
+    args = { input: Artifact() },
+    returns = { output: Artifact() },
+  ) {
+    $instruct(\`copy Artifact\`);
+    this.effects = () => {
+      returns.output.$set(args.input);
+    };
+  }
+}
+`;
+      const firstRuntime = new Runtime()
+        .add("artifact-child-forwarding", parse(source))
+        .init();
+      const first = actionProgress(
+        settleTransitions(
+          firstRuntime,
+          firstRuntime.enterArc(
+            arc("artifact-child-forwarding", "Main"),
+            EMPTY_DIALOG,
+            { args: { input: createArtifactValue("incoming.md") } },
+          ),
+          EMPTY_DIALOG,
+        ),
+      );
+      expect(first.instructions.map((item) => item.text)).toEqual([
+        "copy Artifact",
+      ]);
+
+      const secondRuntime = new Runtime()
+        .add("artifact-child-forwarding", parse(source))
+        .init();
+      const restored = actionProgress(
+        settleTransitions(
+          secondRuntime,
+          secondRuntime.start(
+            JSON.parse(JSON.stringify(first.traversals)) as ArcTraversalSet,
+            EMPTY_DIALOG,
+          ),
+          EMPTY_DIALOG,
+        ),
+      );
+      const terminal = progressTerminal(secondRuntime, restored, {
+        move: "proceed",
+        instructions: appliedInstructions(restored),
+      });
+
+      expect(rootTraversal(terminal).cells.result).toEqual(
+        createArtifactValue("incoming.md"),
+      );
+      expect(terminal.returns?.output).toEqual(
+        createArtifactValue("incoming.md"),
+      );
+    });
+
+    it("artifact.initializer never reruns on a later child entry after unset", () => {
+      const runtime = new Runtime()
+        .add(
+          "artifact-child-reentry",
+          parse(`
+"arc";
+function Main() {
+  $enter(forgetful(Child));
+  $enter(forgetful(Child));
+
+  function Child() {
+    let note = Artifact("initial.md");
+    if (this.enterCount == 1) {
+      note.$unset();
+    }
+    if (note.isUnset()) {
+      $instruct(\`entry \${this.enterCount} remains unset\`);
+    }
+  }
+}
+`),
+        )
+        .init();
+      const first = actionProgress(
+        settleTransitions(
+          runtime,
+          runtime.enterArc(arc("artifact-child-reentry", "Main"), EMPTY_DIALOG),
+          EMPTY_DIALOG,
+        ),
+      );
+      expect(first.instructions.map((item) => item.text)).toEqual([
+        "entry 1 remains unset",
+      ]);
+
+      const second = actionProgress(
+        settleTransitions(
+          runtime,
+          runtime.progress(
+            first,
+            {
+              move: "proceed",
+              instructions: appliedInstructions(first),
+            },
+            EMPTY_DIALOG,
+          ),
+          EMPTY_DIALOG,
+        ),
+      );
+      expect(second.instructions.map((item) => item.text)).toEqual([
+        "entry 2 remains unset",
+      ]);
+    });
+
     it("rejects returns.*.$set(...) outside this.effects", () => {
       expect(() =>
         parse(`
@@ -1688,12 +1912,14 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("enter-renamed-returns-arc", document);
+      const runtime = new Runtime()
+        .add("enter-renamed-returns-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("enter-renamed-returns-arc", "Main"),
       );
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], {
+      const brief = startTerminal(runtime, [seeded], {
         cursor: { user: 0, self: 0 },
         lastTurns: [],
       });
@@ -1763,12 +1989,14 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("enter-channels-skip-arc", document);
+      const runtime = new Runtime()
+        .add("enter-channels-skip-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("enter-channels-skip-arc", "Main"),
       );
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], {
+      const brief = startTerminal(runtime, [seeded], {
         cursor: { user: 0, self: 0 },
         lastTurns: [],
       });
@@ -1799,7 +2027,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("enter-channels-deflect-arc", document);
+      const runtime = new Runtime()
+        .add("enter-channels-deflect-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("enter-channels-deflect-arc", "Main"),
       );
@@ -1808,7 +2038,7 @@ function Main() {
         cursor: { user: 0, self: 0 },
         lastTurns: [],
       });
-      const afterDeflect = progressBrief(runtime, firstBrief, {
+      const afterDeflect = progressTerminal(runtime, firstBrief, {
         move: "deflect",
       });
 
@@ -1840,7 +2070,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("partial-returns-arc", document);
+      const runtime = new Runtime().add("partial-returns-arc", document).init();
       const seeded = runtime.newTraversal(arc("partial-returns-arc", "Main"));
       seeded.phase = "entered";
 
@@ -1867,13 +2097,15 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("enter-missing-returns-arc", document);
+      const runtime = new Runtime()
+        .add("enter-missing-returns-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("enter-missing-returns-arc", "Main"),
       );
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], {
+      const brief = startTerminal(runtime, [seeded], {
         cursor: { user: 0, self: 0 },
         lastTurns: [],
       });
@@ -1900,6 +2132,21 @@ function Main() {
   function Child(returns = { out: Str() }) {
     this.effects = () => {
       returns.out.$set(0);
+    };
+  }
+}
+`),
+      ).toThrow(/CHANNEL_VALUE_TYPE/);
+
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let out = Artifact("initial.md");
+  $enter(Child, { returns: { out } });
+  function Child(returns = { out: Artifact() }) {
+    this.effects = () => {
+      returns.out.$set(\`not-an-artifact\`);
     };
   }
 }
@@ -1961,6 +2208,48 @@ function Main() {
         parse(`"arc";\nfunction Main() { let n = Index(); }`),
       ).toThrow(/Index\(\) is a channel-only type/);
     });
+
+    it("artifact.channel.schema admits one-level Artifact arrays and keeps constructors zero-argument", () => {
+      const document = parse(`
+"arc";
+function Main(
+  args = { input: Artifact() },
+  returns = { output: Artifact() },
+) {}
+`);
+      expect(document.roots[0]?.signature).toEqual({
+        args: { input: { type: "artifact" } },
+        returns: { output: { type: "artifact" } },
+      });
+
+      expect(() =>
+        parse(`"arc"; function Main(args = { input: Artifact("x.md") }) {}`),
+      ).toThrow(/Artifact\(\) channel spec takes no arguments/);
+      expect(() =>
+        parse(`"arc"; function Main() { let item = Artifact(); }`),
+      ).not.toThrow();
+      expect(() =>
+        parse(
+          `"arc"; function Main() { let item = Artifact("a.md", "b.md"); }`,
+        ),
+      ).toThrow(/Artifact item requires one path argument/);
+      expect(() =>
+        parse(`"arc"; function Main(args = { input: Array(Artifact()) }) {}`),
+      ).not.toThrow();
+      expect(() =>
+        parse(`"arc"; function Main() { let items = Array(Artifact()); }`),
+      ).not.toThrow();
+      expect(() =>
+        parse(
+          `"arc"; function Main(args = { input: Array(Artifact("x.md")) }) {}`,
+        ),
+      ).toThrow(/Artifact\(\) channel spec takes no arguments/);
+      expect(() =>
+        parse(
+          `"arc"; function Main() { let items = Array(Artifact("x.md")); }`,
+        ),
+      ).toThrow(/Artifact\(\) element takes no arguments/);
+    });
   });
 
   describe("compose.typed-binding", () => {
@@ -1989,6 +2278,30 @@ function Main() {
 `),
       ).toThrow(/UNDECLARED_ARGS_KEY/);
     });
+
+    it("artifact.channel.binding requires Artifact providers and sinks", () => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let text = Str();
+  $enter(Op, { args: { input: text } });
+  function Op(args = { input: Artifact() }) {}
+}
+`),
+      ).toThrow(/ENTER_CHANNEL_INCOMPATIBLE/);
+
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let output = Str();
+  $enter(Op, { returns: { output } });
+  function Op(returns = { output: Artifact() }) {}
+}
+`),
+      ).toThrow(/ENTER_CHANNEL_INCOMPATIBLE/);
+    });
   });
 
   describe("compose.unbound-channel", () => {
@@ -2007,7 +2320,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("unbound-args-arc", document);
+      const runtime = new Runtime().add("unbound-args-arc", document).init();
       const seeded = runtime.newTraversal(arc("unbound-args-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -2029,7 +2342,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("unbound-returns-arc", document);
+      const runtime = new Runtime().add("unbound-returns-arc", document).init();
       const seeded = runtime.newTraversal(arc("unbound-returns-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -2058,7 +2371,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("args-projection-arc", document);
+      const runtime = new Runtime().add("args-projection-arc", document).init();
       const seeded = runtime.newTraversal(arc("args-projection-arc", "Main"));
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
@@ -2081,10 +2394,10 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("cursor-returns-arc", document);
+      const runtime = new Runtime().add("cursor-returns-arc", document).init();
       const seeded = runtime.newTraversal(arc("cursor-returns-arc", "Main"));
       seeded.phase = "entered";
-      const brief = startRun(runtime, [seeded], {
+      const brief = startTerminal(runtime, [seeded], {
         cursor: { user: 2, self: 1 },
         lastTurns: [],
       });
@@ -2095,7 +2408,7 @@ function Main() {
       });
     });
 
-    it("rejects an incompatible imported-target binding at registration", () => {
+    it("rejects an incompatible imported-target binding at initialization", () => {
       const caller = parse(`
 "arc";
 import { Op } from "op-arc";
@@ -2108,10 +2421,10 @@ function Main() {
 "arc";
 function Op(args = { flag: Bool() }) {}
 `);
-      const runtime = new Runtime().add("op-arc", opDoc);
-      expect(() => runtime.add("caller-arc", caller)).toThrow(
-        /ENTER_CHANNEL_INCOMPATIBLE/,
-      );
+      const runtime = new Runtime()
+        .add("op-arc", opDoc)
+        .add("caller-arc", caller);
+      expect(() => runtime.init()).toThrow(/ENTER_CHANNEL_INCOMPATIBLE/);
     });
 
     it("rejects an incompatible imported binding regardless of registration order", () => {
@@ -2127,17 +2440,23 @@ function Main() {
 "arc";
 function Op(args = { flag: Bool() }) {}
 `);
-      // Caller registered first (import unresolved), then the target arrives.
-      const runtime = new Runtime().add("caller2-arc", caller);
-      expect(() => runtime.add("op2-arc", opDoc)).toThrow(
-        /ENTER_CHANNEL_INCOMPATIBLE/,
-      );
-      // The failed add left the runtime unchanged: a compatible target registers.
+      // Caller is collected first, then the target arrives. The complete
+      // prospective registry rejects at initialization.
+      const runtime = new Runtime()
+        .add("caller2-arc", caller)
+        .add("op2-arc", opDoc);
+      expect(() => runtime.init()).toThrow(/ENTER_CHANNEL_INCOMPATIBLE/);
+      // A separate caller-first registry with a compatible target initializes.
       const compatible = parse(`
 "arc";
 function Op(args = { flag: Str() }) {}
 `);
-      expect(() => runtime.add("op2-arc", compatible)).not.toThrow();
+      expect(() =>
+        new Runtime()
+          .add("caller2-arc", caller)
+          .add("op2-arc", compatible)
+          .init(),
+      ).not.toThrow();
     });
 
     it("rejects a length read on a non-array channel", () => {
@@ -2147,7 +2466,7 @@ function Op(args = { flag: Str() }) {}
 function Main() {
   $enter(Op);
   function Op(args = { flag: Bool() }) {
-    let n = RangedInt(0, 9);
+    let n = Num();
     n.$set(args.flag.length);
   }
 }
@@ -2231,8 +2550,10 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("shadow-op-arc", opDoc);
-      expect(() => runtime.add("good-caller-arc", goodCaller)).not.toThrow();
+      const runtime = new Runtime()
+        .add("shadow-op-arc", opDoc)
+        .add("good-caller-arc", goodCaller);
+      expect(() => runtime.init()).not.toThrow();
 
       // The ancestor Str() would pass against a Str() channel, but the innermost
       // Bool() must be used — so an incompatible Str() channel is rejected.
@@ -2251,10 +2572,10 @@ function Main() {
   }
 }
 `);
-      const runtime2 = new Runtime().add("shadow-op2-arc", opStr);
-      expect(() => runtime2.add("bad-caller-arc", badCaller)).toThrow(
-        /ENTER_CHANNEL_INCOMPATIBLE/,
-      );
+      const runtime2 = new Runtime()
+        .add("shadow-op2-arc", opStr)
+        .add("bad-caller-arc", badCaller);
+      expect(() => runtime2.init()).toThrow(/ENTER_CHANNEL_INCOMPATIBLE/);
     });
   });
 });

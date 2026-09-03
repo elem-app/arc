@@ -9,7 +9,6 @@
 import { describe, expect, it } from "vitest";
 
 import { parse, validate } from "../src/parser/index.js";
-import { Runtime } from "../src/runtime/index.js";
 import {
   appliedInstructions,
   arc,
@@ -17,7 +16,9 @@ import {
   node,
   progressBrief,
   rootTraversal,
+  TestRuntime as Runtime,
   startRun,
+  startTerminal,
   startTrigger,
 } from "./helpers.js";
 
@@ -37,7 +38,7 @@ function Main() {
   ready.$set(true);
 }
 `);
-      const runtime = new Runtime().add("unset-equality-arc", document);
+      const runtime = new Runtime().add("unset-equality-arc", document).init();
       const seeded = runtime.newTraversal(arc("unset-equality-arc", "Main"));
       seeded.phase = "entered";
 
@@ -67,11 +68,11 @@ function Main() {
   ready.$set(true);
 }
 `);
-      const runtime = new Runtime().add("unset-boolean-arc", document);
+      const runtime = new Runtime().add("unset-boolean-arc", document).init();
       const seeded = runtime.newTraversal(arc("unset-boolean-arc", "Main"));
       seeded.phase = "entered";
 
-      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
 
       expect(rootTraversal(brief).phase).toBe("poisoned");
       expect(brief.issues).toEqual([
@@ -105,7 +106,7 @@ function Main() {
   score.$set("high");
 }
 `);
-      const runtime = new Runtime().add("unset-ordering-arc", document);
+      const runtime = new Runtime().add("unset-ordering-arc", document).init();
       const seeded = runtime.newTraversal(arc("unset-ordering-arc", "Main"));
       seeded.phase = "entered";
 
@@ -132,7 +133,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("regex-str-arc", document);
+      const runtime = new Runtime().add("regex-str-arc", document).init();
       const seeded = runtime.newTraversal(arc("regex-str-arc", "Main"));
       seeded.phase = "entered";
 
@@ -155,7 +156,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("ternary-branch-arc", document);
+      const runtime = new Runtime().add("ternary-branch-arc", document).init();
       const seeded = runtime.newTraversal(arc("ternary-branch-arc", "Main"));
       seeded.phase = "entered";
 
@@ -176,7 +177,7 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("last-turns-arc", document);
+      const runtime = new Runtime().add("last-turns-arc", document).init();
       const seeded = runtime.newTraversal(arc("last-turns-arc", "Main"));
       seeded.phase = "entered";
 
@@ -279,7 +280,9 @@ function Main() {
     $instruct(\`after\`);  }
 }
 `);
-      const runtime = new Runtime().add("break-outside-if-arc", document);
+      const runtime = new Runtime()
+        .add("break-outside-if-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("break-outside-if-arc", "Main"));
       seeded.phase = "entered";
 
@@ -319,7 +322,7 @@ function Main() {
     $instruct(\`after\`);  }
 }
 `);
-      const runtime = new Runtime().add("break-inside-if-arc", document);
+      const runtime = new Runtime().add("break-inside-if-arc", document).init();
       const seeded = runtime.newTraversal(arc("break-inside-if-arc", "Main"));
       seeded.phase = "entered";
 
@@ -359,7 +362,7 @@ function Main() {
     $instruct(\`after\`);  }
 }
 `);
-      const runtime = new Runtime().add("nested-break-arc", document);
+      const runtime = new Runtime().add("nested-break-arc", document).init();
       const seeded = runtime.newTraversal(arc("nested-break-arc", "Main"));
       seeded.phase = "entered";
 
@@ -400,20 +403,19 @@ function Main() {
   };
 }
 `);
-      const effectsRuntime = new Runtime().add(
-        "break-effects-arc",
-        effectsDocument,
-      );
+      const effectsRuntime = new Runtime()
+        .add("break-effects-arc", effectsDocument)
+        .init();
       const effectsSeeded = effectsRuntime.newTraversal(
         arc("break-effects-arc", "Main"),
       );
       effectsSeeded.phase = "entered";
-      const effectsBrief = startRun(
+      const effectsBrief = startTerminal(
         effectsRuntime,
         [effectsSeeded],
         EMPTY_DIALOG,
       );
-      expect(effectsBrief.hostEffects).toEqual([]);
+      expect("hostEffects" in effectsBrief).toBe(false);
       expect(rootTraversal(effectsBrief).phase).toBe("completed");
 
       const triggerDocument = parse(`
@@ -437,10 +439,9 @@ function Main() {
   };
 }
 `);
-      const triggerRuntime = new Runtime().add(
-        "break-trigger-arc",
-        triggerDocument,
-      );
+      const triggerRuntime = new Runtime()
+        .add("break-trigger-arc", triggerDocument)
+        .init();
       const triggerBrief = startTrigger(triggerRuntime, EMPTY_DIALOG);
       expect(triggerBrief.observations).toEqual([]);
       expect(triggerBrief.judgments).toHaveLength(1);
@@ -467,10 +468,9 @@ function Main() {
   }
 }
 `);
-      const invokeRuntime = new Runtime().add(
-        "break-invoke-arc",
-        invokeDocument,
-      );
+      const invokeRuntime = new Runtime()
+        .add("break-invoke-arc", invokeDocument)
+        .init();
       const invokeSeeded = invokeRuntime.newTraversal(
         arc("break-invoke-arc", "Main"),
       );
@@ -500,7 +500,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("break-after-resume-arc", document);
+      const runtime = new Runtime()
+        .add("break-after-resume-arc", document)
+        .init();
       const seeded = runtime.newTraversal(
         arc("break-after-resume-arc", "Main"),
       );
@@ -572,7 +574,9 @@ function Main() {
   }
 }
 `);
-      const runtime = new Runtime().add("unreached-branch-arc", document);
+      const runtime = new Runtime()
+        .add("unreached-branch-arc", document)
+        .init();
       const seeded = runtime.newTraversal(arc("unreached-branch-arc", "Main"));
       seeded.phase = "entered";
 

@@ -5,8 +5,10 @@
  * exported for reuse. The original monolith test files keep their own copies
  * untouched while the migration mapping in `MIGRATION.md` is completed.
  */
+import { hmd } from "../src/host-utils/index.js";
 import {
   Runtime,
+  type RuntimeOptions,
   toArcRef,
   toNodeRef,
   toNodeRefParts,
@@ -21,13 +23,104 @@ import type {
   Dialog,
   Document,
   HostEffectReport,
+  HostModuleSpec,
   NodeRef,
   NodeTraversal,
   ObservationBrief,
   ObservationGroupBrief,
   PayloadValue,
   SemanticText,
-} from "../src/types.js";
+  TerminalBrief,
+} from "../src/types/index.js";
+
+/** Explicit declarations shared by pre-existing host-boundary fixtures. */
+export const TEST_HOST_MODULES: ReadonlyMap<string, HostModuleSpec> = new Map([
+  [
+    "api",
+    hmd.define({
+      value: () => hmd.Num(),
+      number: (value = hmd.Num()) => hmd.Num(),
+      numbers: (values = hmd.Array(hmd.Num())) => hmd.Num(),
+      values: () => hmd.Array(hmd.Num()),
+      left: () => hmd.Num(),
+      right: () => hmd.Num(),
+      apply: (values = hmd.Array(hmd.Num())) => {},
+      record: (text = hmd.SemanticText()) => {},
+    }),
+  ],
+  ["audience", hmd.define({})],
+  [
+    "files",
+    hmd.define({
+      path: () => hmd.Str(),
+      save: (path = hmd.Str()) => {},
+    }),
+  ],
+  ["flags", hmd.define({ enabled: () => hmd.Bool() })],
+  ["gate", hmd.define({ isOpen: () => hmd.Bool(), ready: () => hmd.Bool() })],
+  ["mail", hmd.define({})],
+  [
+    "memoir",
+    hmd.define({
+      facts: {
+        apply: (text = hmd.SemanticText()) => {},
+        audit: { apply: (text = hmd.SemanticText()) => {} },
+      },
+    }),
+  ],
+  ["missing", hmd.define({ call: () => hmd.Str() })],
+  ["mod", hmd.define({ doSomething: () => {} })],
+  ["reader", hmd.define({ check: (text = hmd.SemanticText()) => hmd.Bool() })],
+  [
+    "rng",
+    hmd.define({
+      roll: (sides = hmd.Num()) => hmd.Num(),
+      table: { roller: { roll: (sides = hmd.Num()) => hmd.Num() } },
+    }),
+  ],
+  [
+    "scorer",
+    hmd.define({
+      check: () => hmd.Str(),
+      score: (roll = hmd.Num(), mode = hmd.Str()) => hmd.Num(),
+    }),
+  ],
+  ["sink", hmd.define({ accept: (artifact = hmd.Artifact()) => hmd.Bool() })],
+  ["slugs", hmd.define({ next: () => hmd.Str() })],
+  [
+    "store",
+    hmd.define({
+      accept: (artifact = hmd.Artifact()) => hmd.Bool(),
+      accepts: (text = hmd.Str()) => hmd.Bool(),
+      archive: (artifact = hmd.Artifact()) => {},
+      lookup: () => hmd.Artifact(),
+      missing: () => hmd.Str(),
+      record: (artifact = hmd.Artifact()) => {},
+      send: (
+        artifact = hmd.Artifact(),
+        rendered = hmd.SemanticText(),
+        path = hmd.Str(),
+      ) => hmd.Bool(),
+    }),
+  ],
+  ["test", hmd.define({})],
+  [
+    "values",
+    hmd.define({
+      next: () => hmd.Num(),
+      nextEnum: () => hmd.Enum(["cold", "warm"]),
+      nextNumbers: () => hmd.Array(hmd.Num()),
+    }),
+  ],
+  ["writer", hmd.define({ save: (text = hmd.SemanticText()) => {} })],
+]);
+
+/** Runtime with the explicit fixture registry unless a test supplies another. */
+export class TestRuntime extends Runtime {
+  constructor(options: RuntimeOptions = {}) {
+    super({ hostModules: options.hostModules ?? TEST_HOST_MODULES });
+  }
+}
 
 export function withExperimentalRewalk(
   document: Document,
@@ -106,7 +199,9 @@ export function ephemeralChild(
   );
 }
 
-export function rootTraversal(brief: ActionBrief): ArcTraversal {
+export function rootTraversal(
+  brief: ActionBrief | TerminalBrief,
+): ArcTraversal {
   const root = brief.traversals.find(
     (traversal) => traversal.enteredBy === undefined,
   );
@@ -115,7 +210,7 @@ export function rootTraversal(brief: ActionBrief): ArcTraversal {
 }
 
 export function traversalByRef(
-  brief: ActionBrief,
+  brief: ActionBrief | TerminalBrief,
   ref: ArcRef,
 ): ArcTraversal | undefined {
   return brief.traversals.find((traversal) => traversal.ref === ref);
@@ -134,14 +229,38 @@ export const EMPTY_DIALOG: Dialog = {
  */
 export function settleTransitions(
   runtime: Runtime,
-  brief: ActionBrief,
+  brief: ActionBrief | TerminalBrief,
   dialog: Dialog,
-): ActionBrief {
+): ActionBrief | TerminalBrief {
   let current = brief;
-  while (current.transition && current.allowedMoves.includes("proceed")) {
+  while (
+    current.canProgress &&
+    current.transition &&
+    current.allowedMoves.includes("proceed")
+  ) {
     current = runtime.progress(current, { move: "proceed" }, dialog);
   }
   return current;
+}
+
+export function actionProgress(
+  brief: ActionBrief | TerminalBrief,
+): ActionBrief {
+  if (!brief.canProgress) {
+    throw new Error(
+      `Expected an action progress brief, got terminal ${brief.outcome}`,
+    );
+  }
+  return brief;
+}
+
+export function actionTerminal(
+  brief: ActionBrief | TerminalBrief,
+): TerminalBrief {
+  if (brief.canProgress) {
+    throw new Error("Expected a terminal action result brief");
+  }
+  return brief;
 }
 
 export function startRun(
@@ -149,19 +268,40 @@ export function startRun(
   traversals: ArcTraversalSet,
   dialog: Dialog,
 ): ActionBrief {
-  return settleTransitions(runtime, runtime.start(traversals, dialog), dialog);
+  return actionProgress(
+    settleTransitions(runtime, runtime.start(traversals, dialog), dialog),
+  );
+}
+
+export function startTerminal(
+  runtime: Runtime,
+  traversals: ArcTraversalSet,
+  dialog: Dialog,
+): TerminalBrief {
+  return actionTerminal(
+    settleTransitions(runtime, runtime.start(traversals, dialog), dialog),
+  );
 }
 
 export function progressBrief(
   runtime: Runtime,
-  brief: ReturnType<Runtime["start"]>,
+  brief: ActionBrief,
   report: ActionReport,
   dialog: Dialog = EMPTY_DIALOG,
 ): ActionBrief {
-  return settleTransitions(
-    runtime,
-    runtime.progress(brief, report, dialog),
-    dialog,
+  return actionProgress(
+    settleTransitions(runtime, runtime.progress(brief, report, dialog), dialog),
+  );
+}
+
+export function progressTerminal(
+  runtime: Runtime,
+  brief: ActionBrief,
+  report: ActionReport,
+  dialog: Dialog = EMPTY_DIALOG,
+): TerminalBrief {
+  return actionTerminal(
+    settleTransitions(runtime, runtime.progress(brief, report, dialog), dialog),
   );
 }
 
@@ -199,7 +339,7 @@ export function payloadObject(
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Expected payload object");
   }
-  return value;
+  return value as Record<string, PayloadValue>;
 }
 
 export function payloadArray(value: PayloadValue): PayloadValue[] {
@@ -217,6 +357,7 @@ export function renderSemanticTextForTest(
       if (!part || typeof part !== "object" || Array.isArray(part)) {
         return String(part);
       }
+      if (!("kind" in part)) return String(part);
       if (part.kind === "text") return String(part.value);
       if (part.kind === "entity") return String(part.name);
       if (part.kind === "artifact") return String(part.path);

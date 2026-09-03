@@ -1,15 +1,12 @@
+import type { ElementId, Node, NodeReadSet, SegKey } from "../types/parser.js";
 import type {
-  CellValue,
-  ElementId,
-  Node,
-  NodeReadSet,
   NodeRef,
   NodeState,
-  SegKey,
   StateSnapshot,
   Traversal,
-} from "../types.js";
-import { invokeSegKey, nodeSegKey } from "../types.js";
+} from "../types/runtime.js";
+import { invokeSegKey, nodeSegKey } from "../types/runtime.js";
+import type { CellValue } from "../types/value.js";
 import {
   channelIsDeclared,
   findCellOwner,
