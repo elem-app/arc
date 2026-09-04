@@ -21,6 +21,7 @@ import {
   actionProgress,
   EMPTY_DIALOG,
   progressBrief,
+  resolvedHostCalls,
   rootTraversal,
   startRun,
   startTerminal,
@@ -362,7 +363,57 @@ describe("host module declarations", () => {
 });
 
 describe("host action source forms", () => {
-  it("host effects require a dollar sigil at every authored effect use site", () => {
+  it("uses the same host-call IR throughout the action graph", () => {
+    const document = parse(`
+"arc";
+import Store from "host:store";
+function Main() {
+  let items = Array(Str());
+  Store.$archive(Artifact("direct.md"));
+  if (true) { Store.$archive(Artifact("if.md")); }
+  named: { Store.$archive(Artifact("label.md")); }
+  invoke(() => { Store.$archive(Artifact("invoke.md")); });
+  items.$map(() => { Store.$archive(Artifact("map.md")); });
+  this.effects = () => { Store.$archive(Artifact("effects.md")); };
+}
+`);
+    const root = document.roots[0]!;
+    expect(root.statements[0]).toMatchObject({
+      kind: "host-call",
+      operation: "archive",
+    });
+    expect(root.statements[1]).toMatchObject({
+      kind: "if",
+      consequent: [{ kind: "host-call", operation: "archive" }],
+    });
+    expect(root.statements[2]).toMatchObject({
+      kind: "label",
+      body: [{ kind: "host-call", operation: "archive" }],
+    });
+    expect(root.statements[3]).toMatchObject({
+      kind: "invoke",
+      body: [{ kind: "host-call", operation: "archive" }],
+    });
+    expect(root.statements[4]).toMatchObject({
+      kind: "map",
+      body: [{ kind: "host-call", operation: "archive" }],
+    });
+    expect(root.effects).toMatchObject([
+      { kind: "host-call", operation: "archive" },
+    ]);
+  });
+
+  it("rejects an unsigiled host call used as a standalone statement", () => {
+    expect(() =>
+      parse(`
+"arc";
+import Store from "host:store";
+function Main() { Store.archive(Artifact("notes/a.md")); }
+`),
+    ).toThrow(/Standalone host calls require a \$-prefixed operation/);
+  });
+
+  it("standalone host calls require a dollar sigil at every authored use site", () => {
     expect(() =>
       parse(`
 "arc";
@@ -373,10 +424,10 @@ function Main() {
   };
 }
 `),
-    ).toThrow(/Unsupported this\.effects call/);
+    ).toThrow(/Standalone host calls require a \$-prefixed operation/);
   });
 
-  it("nested host effects strip only the final action sigil in IR", () => {
+  it("nested host calls strip only the final action sigil in IR", () => {
     const document = parse(`
 "arc";
 import Store from "host:store";
@@ -395,7 +446,7 @@ function Main() {
     });
   });
 
-  it("operations with returns may be used as calls or effects", () => {
+  it("operations with returns may be used as expressions or standalone calls", () => {
     const runtime = new Runtime({ hostModules: hostModules() });
     expect(() =>
       runtime.add(
@@ -415,7 +466,45 @@ function Main() {
     ).not.toThrow();
   });
 
-  it("operations without returns are rejected only in value position", () => {
+  it("standalone calls discard a declared result and block later work", () => {
+    const modules = new Map([["store", hmd.define({ next: () => hmd.Num() })]]);
+    const runtime = new Runtime({ hostModules: modules })
+      .add(
+        "standalone-result-discard",
+        parse(`
+"arc";
+import Store from "host:store";
+function Main() {
+  Store.$next();
+  $instruct(\`after call\`);
+}
+`),
+      )
+      .init();
+    const traversal = runtime.newTraversal(
+      toArcRef("standalone-result-discard", "Main"),
+    );
+    traversal.phase = "entered";
+
+    const call = startRun(runtime, [traversal], EMPTY_DIALOG);
+    expect(call.instructions).toEqual([]);
+    expect(call.hostCalls).toHaveLength(1);
+
+    const instruction = progressBrief(runtime, call, {
+      move: "proceed",
+      hostCalls: {
+        [call.hostCalls[0]!.id]: {
+          status: "resolved",
+          value: "ignored despite the declared Num result",
+        },
+      },
+    });
+    expect(instruction.instructions.map((item) => item.text)).toEqual([
+      "after call",
+    ]);
+  });
+
+  it("operations without returns are rejected by value-demanding consumers only", () => {
     const modules = hostModules();
     expect(() =>
       new Runtime({ hostModules: modules }).add(
@@ -432,20 +521,85 @@ function Main() {
       ),
     ).not.toThrow();
 
-    const issues = registrationIssues(
+    const demanded = [
+      [
+        "cell",
+        `
+  let value = Bool();
+  value.$set(Store.archive(Artifact("notes/a.md")));
+`,
+        "CELL_VALUE_TYPE",
+      ],
+      [
+        "boolean",
+        `
+  if (Store.archive(Artifact("notes/a.md"))) {}
+`,
+        "NON_BOOLEAN_CONDITION",
+      ],
+      [
+        "arithmetic",
+        `
+  let value = Num();
+  value.$set(Store.archive(Artifact("notes/a.md")) + 1);
+`,
+        "NON_NUMERIC_ARITHMETIC_OPERAND",
+      ],
+      [
+        "artifact",
+        `
+  let value = Artifact();
+  value.$set(Artifact(Store.archive(Artifact("notes/a.md"))));
+`,
+        "ARTIFACT_PATH_TYPE",
+      ],
+    ] as const;
+    for (const [name, body, code] of demanded) {
+      const issues = registrationIssues(
+        new Runtime({ hostModules: modules }),
+        `no-result-${name}`,
+        parse(`
+"arc";
+import Store from "host:store";
+function Main() {
+${body}
+}
+`),
+      );
+      expect(issues).toContainEqual(expect.objectContaining({ code }));
+    }
+
+    const channelIssues = registrationIssues(
       new Runtime({ hostModules: modules }),
-      "effect-as-value",
+      "no-result-channel",
+      parse(`
+"arc";
+import Store from "host:store";
+function Main(args = {}, returns = { ok: Bool() }) {
+  this.effects = () => {
+    returns.ok.$set(Store.archive(Artifact("notes/a.md")));
+  };
+}
+`),
+    );
+    expect(channelIssues).toContainEqual(
+      expect.objectContaining({ code: "CHANNEL_VALUE_TYPE" }),
+    );
+
+    const interpolationIssues = registrationIssues(
+      new Runtime({ hostModules: modules }),
+      "no-result-interpolation",
       parse(`
 "arc";
 import Store from "host:store";
 function Main() {
-  let value = Artifact();
-  value.$set(Store.archive(Artifact("notes/a.md")));
+  let text = Str();
+  text.$set(\`result: \${Store.archive(Artifact("notes/a.md"))}\`);
 }
 `),
     );
-    expect(issues).toContainEqual(
-      expect.objectContaining({ code: "HOST_CALL_RESULT_UNDECLARED" }),
+    expect(interpolationIssues).toContainEqual(
+      expect.objectContaining({ code: "INVALID_TEMPLATE_INTERPOLATION" }),
     );
   });
 });
@@ -687,7 +841,7 @@ function Op(args = { value: Bool() }) {}
     expect(() => runtime.init()).toThrowError(RuntimeRegistrationError);
   });
 
-  it("accepts declared calls and sigiled effects with admitted operands", () => {
+  it("accepts declared expression and standalone calls with admitted operands", () => {
     const document = parse(`
 "arc";
 import Store from "host:store";
@@ -710,7 +864,7 @@ function Main() {
 });
 
 describe("runtime host module boundaries", () => {
-  it("host call and effect briefs carry unsigiled operation names", () => {
+  it("all host-call briefs carry unsigiled operation names", () => {
     const modules = new Map([
       ["service", hmd.define({ run: () => hmd.Bool(), finish: () => {} })],
     ]);
@@ -737,9 +891,11 @@ function Main() {
     expect(call.hostCalls[0]?.operation).toBe("run");
     const effect = progressBrief(runtime, call, {
       move: "proceed",
-      hostCalls: { [call.hostCalls[0]!.id]: true },
+      hostCalls: {
+        [call.hostCalls[0]!.id]: { status: "resolved", value: true },
+      },
     });
-    expect(effect.hostEffects[0]?.operation).toBe("finish");
+    expect(effect.hostCalls[0]?.operation).toBe("finish");
   });
 
   it("host calls admit concrete arguments before emitting a brief", () => {
@@ -786,7 +942,7 @@ function Main() {
     );
   });
 
-  it("host effects admit the complete effects batch before returning its brief", () => {
+  it("this.effects stops at the first standalone host call", () => {
     const modules = new Map([
       [
         "paint",
@@ -816,9 +972,23 @@ function Main() {
       toArcRef("effect-batch-admission", "Main"),
     );
     traversal.phase = "entered";
-    const terminal = startTerminal(runtime, [traversal], EMPTY_DIALOG);
+    const first = startRun(runtime, [traversal], EMPTY_DIALOG);
 
-    expect("hostEffects" in terminal).toBe(false);
+    expect(first.hostCalls).toHaveLength(1);
+    expect(first.hostCalls[0]).toMatchObject({
+      module: "paint",
+      operation: "record",
+      arguments: ["red"],
+    });
+    expect(first.issues).toEqual([]);
+
+    const terminal = runtime.progress(
+      first,
+      { move: "proceed", hostCalls: resolvedHostCalls(first) },
+      EMPTY_DIALOG,
+    );
+
+    expect(terminal.canProgress).toBe(false);
     expect(terminal.issues).toContainEqual(
       expect.objectContaining({ reasonCode: "invalid-host-argument" }),
     );
@@ -958,7 +1128,12 @@ function Right() {
     const right = first.hostCalls.find((call) => call.operation === "right")!;
     const retried = runtime.progressTrigger(
       first,
-      { hostCalls: { [left.id]: false, [right.id]: "invalid" } },
+      {
+        hostCalls: {
+          [left.id]: { status: "resolved", value: false },
+          [right.id]: { status: "resolved", value: "invalid" },
+        },
+      },
       EMPTY_DIALOG,
     );
 
@@ -1000,8 +1175,8 @@ function Right() {
       first,
       {
         hostCalls: {
-          [left.id]: false,
-          [right.id]: Number.POSITIVE_INFINITY,
+          [left.id]: { status: "resolved", value: false },
+          [right.id]: { status: "resolved", value: Number.POSITIVE_INFINITY },
         },
       },
       EMPTY_DIALOG,
@@ -1016,7 +1191,7 @@ function Right() {
     );
     const matched = runtime.progressTrigger(
       retried,
-      { hostCalls: { [right.id]: true } },
+      { hostCalls: { [right.id]: { status: "resolved", value: true } } },
       EMPTY_DIALOG,
     );
     expect(matched.matched).toBe(
@@ -1049,7 +1224,9 @@ function Main() {
       first,
       {
         move: "proceed",
-        hostCalls: { [first.hostCalls[0]!.id]: undefined },
+        hostCalls: {
+          [first.hostCalls[0]!.id]: { status: "resolved", value: undefined },
+        },
       },
       EMPTY_DIALOG,
     );
@@ -1106,7 +1283,10 @@ function Main() {
       {
         move: "proceed",
         hostCalls: {
-          [artifactCall.hostCalls[0]!.id]: createArtifactValue("notes/a.md"),
+          [artifactCall.hostCalls[0]!.id]: {
+            status: "resolved",
+            value: createArtifactValue("notes/a.md"),
+          },
         },
       },
       EMPTY_DIALOG,
@@ -1137,7 +1317,10 @@ function Main() {
     const rejected = progressBrief(stringRuntime, stringCall, {
       move: "proceed",
       hostCalls: {
-        [stringCall.hostCalls[0]!.id]: createArtifactValue("notes/a.md"),
+        [stringCall.hostCalls[0]!.id]: {
+          status: "resolved",
+          value: createArtifactValue("notes/a.md"),
+        },
       },
     });
     expect(rejected.hostCalls[0]?.id).toBe(stringCall.hostCalls[0]!.id);
@@ -1166,7 +1349,11 @@ function Main() {
     const trigger = runtime.startTrigger([], EMPTY_DIALOG);
     const triggerRetry = runtime.progressTrigger(
       trigger,
-      { hostCalls: { [trigger.hostCalls[0]!.id]: "invalid" } },
+      {
+        hostCalls: {
+          [trigger.hostCalls[0]!.id]: { status: "resolved", value: "invalid" },
+        },
+      },
       EMPTY_DIALOG,
     );
     expect(triggerRetry.issues).toContainEqual(
@@ -1180,7 +1367,9 @@ function Main() {
     const action = startRun(runtime, [traversal], EMPTY_DIALOG);
     const actionRetry = progressBrief(runtime, action, {
       move: "proceed",
-      hostCalls: { [action.hostCalls[0]!.id]: "invalid" },
+      hostCalls: {
+        [action.hostCalls[0]!.id]: { status: "resolved", value: "invalid" },
+      },
     });
     expect(actionRetry.issues).toContainEqual(
       expect.objectContaining({ reasonCode: "host-call-result-type" }),
@@ -1212,7 +1401,9 @@ function Main() {
     );
     const blocked = progressBrief(runtime, call, {
       move: "proceed",
-      hostCalls: { [call.hostCalls[0]!.id]: true },
+      hostCalls: {
+        [call.hostCalls[0]!.id]: { status: "resolved", value: true },
+      },
     });
     expect(blocked.observations).toHaveLength(1);
 
@@ -1264,7 +1455,10 @@ function Main() {
     const blocked = progressBrief(runtime, call, {
       move: "proceed",
       hostCalls: {
-        [call.hostCalls[0]!.id]: createArtifactValue("notes/current.md"),
+        [call.hostCalls[0]!.id]: {
+          status: "resolved",
+          value: createArtifactValue("notes/current.md"),
+        },
       },
     });
     expect(blocked.observations).toHaveLength(1);

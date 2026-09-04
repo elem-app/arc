@@ -383,7 +383,9 @@ function Main() {
         const first = startRun(runtime, [traversal], EMPTY_DIALOG);
         return progressBrief(runtime, first, {
           move: "proceed",
-          hostCalls: { [first.hostCalls[0]!.id]: "text" },
+          hostCalls: {
+            [first.hostCalls[0]!.id]: { status: "resolved", value: "text" },
+          },
         });
       };
 
@@ -812,7 +814,9 @@ function Main() {
       const first = startRun(runtime, [traversal], EMPTY_DIALOG);
       const retried = progressBrief(runtime, first, {
         move: "proceed",
-        hostCalls: { [first.hostCalls[0]!.id]: "text" },
+        hostCalls: {
+          [first.hostCalls[0]!.id]: { status: "resolved", value: "text" },
+        },
       });
       expect(retried.hostCalls[0]?.id).toBe(first.hostCalls[0]!.id);
       expect(retried.issues).toContainEqual(
@@ -843,7 +847,9 @@ function Main() {
       const first = startRun(runtime, [traversal], EMPTY_DIALOG);
       const retried = progressBrief(runtime, first, {
         move: "proceed",
-        hostCalls: { [first.hostCalls[0]!.id]: { value: 1 } },
+        hostCalls: {
+          [first.hostCalls[0]!.id]: { status: "resolved", value: { value: 1 } },
+        },
       });
       expect(retried.hostCalls[0]?.id).toBe(first.hostCalls[0]!.id);
       expect(retried.issues).toContainEqual(
@@ -879,7 +885,9 @@ function Main() {
         const first = startRun(runtime, [traversal], EMPTY_DIALOG);
         const retried = progressBrief(runtime, first, {
           move: "proceed",
-          hostCalls: { [first.hostCalls[0]!.id]: value },
+          hostCalls: {
+            [first.hostCalls[0]!.id]: { status: "resolved", value: value },
+          },
         });
         expect(retried.hostCalls[0]?.id).toBe(first.hostCalls[0]!.id);
         expect(retried.issues).toContainEqual(
@@ -916,7 +924,9 @@ function Main() {
         const first = startRun(runtime, [traversal], EMPTY_DIALOG);
         const retried = progressBrief(runtime, first, {
           move: "proceed",
-          hostCalls: { [first.hostCalls[0]!.id]: value },
+          hostCalls: {
+            [first.hostCalls[0]!.id]: { status: "resolved", value: value },
+          },
         });
         expect(retried.hostCalls[0]?.id).toBe(first.hostCalls[0]!.id);
         expect(retried.issues).toContainEqual(
@@ -1294,7 +1304,9 @@ function Main() {
 
       const poisoned = progressTerminal(restarted, rebuilt, {
         move: "proceed",
-        hostCalls: { [rebuilt.hostCalls[0]!.id]: [1] },
+        hostCalls: {
+          [rebuilt.hostCalls[0]!.id]: { status: "resolved", value: [1] },
+        },
       });
       expect(poisoned.issues).toContainEqual(
         expect.objectContaining({ reasonCode: "non-finite-number" }),
@@ -1325,7 +1337,9 @@ function Main() {
 
       const poisoned = progressTerminal(runtime, first, {
         move: "proceed",
-        hostCalls: { [first.hostCalls[0]!.id]: 1 },
+        hostCalls: {
+          [first.hostCalls[0]!.id]: { status: "resolved", value: 1 },
+        },
       });
       expect("hostCalls" in poisoned).toBe(false);
       expect(poisoned.issues).toContainEqual(
@@ -1371,7 +1385,9 @@ function Main() {
         expect(first.hostCalls).toHaveLength(1);
         const second = progressBrief(runtime, first, {
           move: "proceed",
-          hostCalls: { [first.hostCalls[0]!.id]: left },
+          hostCalls: {
+            [first.hostCalls[0]!.id]: { status: "resolved", value: left },
+          },
         });
         expect(second.hostCalls).toHaveLength(1);
         expect(second.hostCalls[0]!.id).toBe(first.hostCalls[0]!.id);
@@ -1392,12 +1408,19 @@ function Main() {
 
         const rightPending = progressBrief(restarted, replayed, {
           move: "proceed",
-          hostCalls: { [replayed.hostCalls[0]!.id]: 1 },
+          hostCalls: {
+            [replayed.hostCalls[0]!.id]: { status: "resolved", value: 1 },
+          },
         });
         expect(rightPending.hostCalls).toHaveLength(1);
         const completed = progressTerminal(restarted, rightPending, {
           move: "proceed",
-          hostCalls: { [rightPending.hostCalls[0]!.id]: right },
+          hostCalls: {
+            [rightPending.hostCalls[0]!.id]: {
+              status: "resolved",
+              value: right,
+            },
+          },
         });
         expect(rootTraversal(completed).phase).toBe("completed");
       },
@@ -1688,7 +1711,12 @@ function Main() {
       const id = first.hostCalls[0]!.id;
       const rejected = progressBrief(runtime, first, {
         move: "proceed",
-        hostCalls: { [id]: { nested: [1, Number.POSITIVE_INFINITY] } },
+        hostCalls: {
+          [id]: {
+            status: "resolved",
+            value: { nested: [1, Number.POSITIVE_INFINITY] },
+          },
+        },
       });
       expect(rejected.issues).toContainEqual({
         kind: "invalid-item",
@@ -1700,7 +1728,7 @@ function Main() {
 
       const accepted = progressTerminal(runtime, rejected, {
         move: "proceed",
-        hostCalls: { [id]: -0 },
+        hostCalls: { [id]: { status: "resolved", value: -0 } },
       });
       expect(rootTraversal(accepted).cells.n).toBe(0);
       expect(Object.is(rootTraversal(accepted).cells.n, -0)).toBe(false);
@@ -1728,7 +1756,9 @@ function Main() {
       const reportValue = [-0, 1];
       const accepted = progressTerminal(runtime, first, {
         move: "proceed",
-        hostCalls: { [first.hostCalls[0]!.id]: reportValue },
+        hostCalls: {
+          [first.hostCalls[0]!.id]: { status: "resolved", value: reportValue },
+        },
       });
       expect(Object.is(reportValue[0], -0)).toBe(true);
       const stored = rootTraversal(accepted).cells.values as number[];
@@ -1767,7 +1797,10 @@ function Main() {
         const rejected = progressBrief(runtime, first, {
           move: "proceed",
           hostCalls: {
-            [id]: { [key]: Number.NaN } as unknown as PayloadValue,
+            [id]: {
+              status: "resolved",
+              value: { [key]: Number.NaN } as unknown as PayloadValue,
+            },
           },
         });
         expect(rejected.issues).toContainEqual(
@@ -1797,7 +1830,11 @@ function Main() {
       const id = first.hostCalls[0]!.id;
       const rejected = runtime.progressTrigger(
         first,
-        { hostCalls: { [id]: Number.NEGATIVE_INFINITY } },
+        {
+          hostCalls: {
+            [id]: { status: "resolved", value: Number.NEGATIVE_INFINITY },
+          },
+        },
         EMPTY_DIALOG,
       );
       expect(rejected.matched).toBeUndefined();
@@ -1869,7 +1906,7 @@ function Main() {
       expect(Object.is(brief.hostCalls[0]!.arguments[0], -0)).toBe(false);
     });
 
-    it("rejects a nested non-finite host-effect payload before emission", () => {
+    it("rejects a nested non-finite host-call payload before emission", () => {
       const { brief } = runTerminal(
         `
 "arc";
@@ -1880,9 +1917,9 @@ function Main() {
   };
 }
 `,
-        "numeric-host-effect",
+        "numeric-host-call",
       );
-      expect("hostEffects" in brief).toBe(false);
+      expect("hostCalls" in brief).toBe(false);
       expect(brief.issues).toContainEqual(
         expect.objectContaining({
           reasonCode: "invalid-host-argument",
@@ -1901,10 +1938,10 @@ function Main() {
   };
 }
 `,
-        "numeric-host-effect-negative-zero",
+        "numeric-host-call-negative-zero",
       ).brief;
-      expect(normalized.hostEffects).toHaveLength(1);
-      const argument = normalized.hostEffects[0]!.arguments[0] as number[];
+      expect(normalized.hostCalls).toHaveLength(1);
+      const argument = normalized.hostCalls[0]!.arguments[0] as number[];
       expect(argument[0]).toBe(0);
       expect(Object.is(argument[0], -0)).toBe(false);
     });

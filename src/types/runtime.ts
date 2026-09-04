@@ -6,7 +6,6 @@
 import type {
   ActionStatement,
   ElementId,
-  HostEffectStatement,
   SegKey,
   SourceRange,
 } from "./parser.js";
@@ -263,9 +262,7 @@ export type PendingActionExtras = EnterContinuation &
   Partial<InstructionContinuation> & { map?: MapActionState };
 
 /** Every action kind that can hold resolution state on a node frame. */
-export type ActionStateKind =
-  | ActionStatement["kind"]
-  | HostEffectStatement["kind"];
+export type ActionStateKind = ActionStatement["kind"];
 
 /** The kinds that transfer control to a child traversal. */
 export type EnterActionKind = Extract<
@@ -300,9 +297,19 @@ export type ActionState =
       map?: MapActionState;
     } & SubtreeBracket)
   | {
+      kind: "host-call";
+      status: "pending";
+      /** Rendered invocation captured when this call is first reached. */
+      call: {
+        arguments: PayloadValue[];
+        hostParams?: PayloadValue;
+      };
+    }
+  | { kind: "host-call"; status: "resolved" }
+  | {
       kind: Exclude<
         ActionStateKind,
-        EnterActionKind | "invoke" | "instruction" | "map"
+        EnterActionKind | "invoke" | "instruction" | "map" | "host-call"
       >;
       status: ActionStatus;
     };
@@ -491,8 +498,6 @@ export type TraversalBase<TRef extends ArcRef | NodeRef> = {
   ephemeralChildren: NodeTraversal[];
   /** Referenced/imported arcs managed elsewhere in the traversal set. */
   refChildren: ArcRef[];
-  /** Idempotency keys for host effects already emitted from this traversal. */
-  appliedHostCallKeys: string[];
   /** Enter-time channels set by `$enter(..., { args, returns })`. */
   enterChannels: EnterChannelState;
   /**

@@ -221,7 +221,7 @@ function Bad() {
       ).toThrow(/host module imports must use a default import/);
     });
 
-    it("requires host effects to be declared by host module import", () => {
+    it("requires standalone host calls to be declared by host module import", () => {
       expect(() =>
         parse(`
 "arc";
@@ -231,7 +231,7 @@ function Bad() {
   };
 }
 `),
-      ).toThrow(/declared host effect/);
+      ).toThrow(/declared host module/);
     });
   });
 

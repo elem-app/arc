@@ -84,7 +84,12 @@ function Main() {
 
       const terminal = progressTerminal(runtime, first, {
         move: "proceed",
-        hostCalls: { [first.hostCalls[0]!.id]: "docs/current.md" },
+        hostCalls: {
+          [first.hostCalls[0]!.id]: {
+            status: "resolved",
+            value: "docs/current.md",
+          },
+        },
       });
       expect(rootTraversal(terminal).cells.artifact).toEqual({
         path: "docs/current.md",
@@ -358,7 +363,9 @@ function Main() {
 
       const third = progressBrief(runtime, second, {
         move: "proceed",
-        hostCalls: { [second.hostCalls[0]!.id]: "ok" },
+        hostCalls: {
+          [second.hostCalls[0]!.id]: { status: "resolved", value: "ok" },
+        },
       });
       expect(third.instructions.map((item) => item.text)).toEqual(["in"]);
       const fourth = progressBrief(runtime, third, {
@@ -428,7 +435,9 @@ function Main() {
       expect(answered.hostCalls).toHaveLength(1);
       const called = progressBrief(runtime, answered, {
         move: "proceed",
-        hostCalls: { [answered.hostCalls[0]!.id]: "ok" },
+        hostCalls: {
+          [answered.hostCalls[0]!.id]: { status: "resolved", value: "ok" },
+        },
       });
       expect(called.observations).toHaveLength(1);
 
@@ -468,7 +477,9 @@ function Main() {
       const first = startRun(runtime, [seeded], EMPTY_DIALOG);
       const blocked = progressBrief(runtime, first, {
         move: "proceed",
-        hostCalls: { [first.hostCalls[0]!.id]: "ok" },
+        hostCalls: {
+          [first.hostCalls[0]!.id]: { status: "resolved", value: "ok" },
+        },
       });
       const restored = JSON.parse(
         JSON.stringify(blocked.traversals),

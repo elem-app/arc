@@ -31,9 +31,9 @@ Each arc is a top-level function in an Arc script. An arc defines a self-contain
 - **Cells** — typed state that persists across turns: enums, booleans, and bounded integers. Each can carry an observation question for the host to evaluate against conversation context.
 - **A trigger** — conditions under which the arc activates: pattern matches on recent messages, semantic checks via `judge()`, enter-count guards.
 - **An action graph** — the sequential body: observations that extract state from conversation, instructions for the host to follow, conditional branches, and entries into child nodes or imported arcs.
-- **Effects** — post-resolution work: final observations and emitted host effects (e.g., writing to memory, updating external systems).
+- **Effects** — post-resolution work: final observations and emitted standalone host calls (e.g., writing to memory, updating external systems).
 
-The runtime walks the action graph top-down on host calls, skipping actions resolved in prior walks and stopping at the first unresolved one. This host-driven progression is what makes arcs stateful.
+The runtime walks the action graph top-down, skipping resolved-once actions settled in prior walks and stopping at the first unresolved frontier. This host-driven progression is what makes arcs stateful.
 
 ## Example
 

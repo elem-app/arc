@@ -12,11 +12,11 @@ import type {
 import {
   actionProgress,
   actionTerminal,
-  appliedHostEffects,
   appliedInstructions,
   arc,
   EMPTY_DIALOG,
   progressTerminal,
+  resolvedHostCalls,
   rootTraversal,
   TestRuntime as Runtime,
   settleTransitions,
@@ -566,7 +566,7 @@ function Main() {
       "active",
       "allowedMoves",
       "hostCalls",
-      "hostEffects",
+      "hostCalls",
       "judgments",
       "observations",
       "instructions",
@@ -698,7 +698,7 @@ function HostPoison(returns = { output: Str() }) {
       deflectedEffects,
       {
         move: "proceed",
-        hostEffects: appliedHostEffects(deflectedEffects),
+        hostCalls: resolvedHostCalls(deflectedEffects),
       },
       EMPTY_DIALOG,
     );

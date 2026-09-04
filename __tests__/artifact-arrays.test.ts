@@ -687,7 +687,10 @@ function Main() {
     const resultBrief = progressBrief(resultRuntime, resultCall, {
       move: "proceed",
       hostCalls: {
-        [resultCall.hostCalls[0]!.id]: [createArtifactValue("loaded.md")],
+        [resultCall.hostCalls[0]!.id]: {
+          status: "resolved",
+          value: [createArtifactValue("loaded.md")],
+        },
       },
     });
     expect(rootTraversal(resultBrief).cells.values).toEqual([
@@ -720,7 +723,12 @@ function Main() {
     );
     const retried = progressBrief(invalidRuntime, invalidCall, {
       move: "proceed",
-      hostCalls: { [invalidCall.hostCalls[0]!.id]: [{ path: "/bad.md" }] },
+      hostCalls: {
+        [invalidCall.hostCalls[0]!.id]: {
+          status: "resolved",
+          value: [{ path: "/bad.md" }],
+        },
+      },
     });
     expect(retried.hostCalls[0]?.id).toBe(invalidCall.hostCalls[0]!.id);
     expect(retried.issues).toContainEqual(
@@ -756,7 +764,10 @@ function Main() {
     const blocked = progressBrief(runtime, call, {
       move: "proceed",
       hostCalls: {
-        [call.hostCalls[0]!.id]: [createArtifactValue("replayed.md")],
+        [call.hostCalls[0]!.id]: {
+          status: "resolved",
+          value: [createArtifactValue("replayed.md")],
+        },
       },
     });
     const serialized = JSON.stringify(blocked.traversals);

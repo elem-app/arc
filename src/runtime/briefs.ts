@@ -1,8 +1,6 @@
 import type {
   ActionBrief,
   ActionReport,
-  HostEffectBrief,
-  HostEffectReport,
   InstructionBrief,
   InstructionReport,
   TerminalBrief,
@@ -55,7 +53,6 @@ import {
   clearEvaluatorActionStates,
   cloneCellValue,
   cloneHostCallBrief,
-  cloneHostEffect,
   cloneInstructionBrief,
   cloneJudgmentBrief,
   cloneObservationOrGroupBrief,
@@ -474,10 +471,12 @@ export function buildTriggerBrief(
 }
 
 function allowedMovesForActionBrief(
-  accum: Pick<Accumulator, "judgments" | "observations" | "hostCalls">,
+  accum: Pick<
+    Accumulator,
+    "judgments" | "observations" | "hostCalls" | "hostCallValueDemands"
+  >,
   traversal: ArcTraversal,
   instructions: readonly InstructionBrief[],
-  hostEffects: readonly HostEffectBrief[],
   transition: NodeTransition | undefined,
 ): ActionMove[] {
   const allowedMoves = new Set<ActionMove>();
@@ -492,13 +491,15 @@ function allowedMovesForActionBrief(
   }
   if (
     instructions.length > 0 ||
-    hostEffects.length > 0 ||
     accum.judgments.length > 0 ||
     accum.observations.length > 0 ||
     accum.hostCalls.length > 0
   ) {
     allowedMoves.add("proceed");
-    if (instructions.length === 0 && hostEffects.length === 0) {
+    const hasStandaloneHostCall = accum.hostCalls.some(
+      (call) => !accum.hostCallValueDemands.has(call.id),
+    );
+    if (instructions.length === 0 && !hasStandaloneHostCall) {
       allowedMoves.add("deflect");
     }
   }
@@ -510,7 +511,6 @@ export function buildActionBrief(
   entry: RegistryEntry,
   traversals: ArcTraversalSet,
   dialog: Dialog,
-  leadingHostEffects: HostEffectBrief[] = [],
   leadingIssues: RuntimeIssue[] = [],
 ): BuiltActionOutput {
   const workingTraversals = cloneTraversalSet(traversals);
@@ -551,12 +551,10 @@ export function buildActionBrief(
   }
   const actionRoot = selectActionRootTraversal(workingTraversals, entry.arc);
   const instructions = mergeInstructionBriefs(accum.instructions);
-  const hostEffects = mergeHostEffects(leadingHostEffects, accum.hostEffects);
   const transition = buildTransitionPayload(entries, entry, accum);
   if (
     transition &&
     (instructions.length > 0 ||
-      hostEffects.length > 0 ||
       accum.judgments.length > 0 ||
       accum.observations.length > 0 ||
       accum.hostCalls.length > 0)
@@ -575,7 +573,6 @@ export function buildActionBrief(
   if (actionRoot.phase !== "entered") {
     if (
       instructions.length > 0 ||
-      hostEffects.length > 0 ||
       accum.judgments.length > 0 ||
       accum.observations.length > 0 ||
       accum.hostCalls.length > 0 ||
@@ -643,14 +640,12 @@ export function buildActionBrief(
     judgments: accum.judgments,
     observations: accum.observations,
     hostCalls: accum.hostCalls,
-    hostEffects,
     instructions,
     transition,
     allowedMoves: allowedMovesForActionBrief(
       accum,
       actionRoot,
       instructions,
-      hostEffects,
       transition,
     ),
   };
@@ -661,6 +656,7 @@ export function buildActionBrief(
     },
     traversals: workingTraversals,
     snapshot,
+    hostCallValueDemands: new Set(accum.hostCallValueDemands),
   };
 }
 
@@ -668,6 +664,7 @@ export type BuiltActionBrief = {
   brief: ActionBrief;
   traversals: ArcTraversalSet;
   snapshot: ActionBriefSnapshot;
+  hostCallValueDemands: ReadonlySet<BriefId>;
 };
 
 export type BuiltTerminalBrief = {
@@ -703,26 +700,6 @@ function buildTransitionPayload(
   };
 }
 
-/**
- * Merges effects emitted while applying the prior report with effects
- * re-briefed by the plan walk. An effect emitted during report application is
- * still pending when the plan walk re-steps it, so the same id arrives from
- * both sides; the first (earlier) emission wins.
- */
-function mergeHostEffects(
-  leading: readonly HostEffectBrief[],
-  planned: readonly HostEffectBrief[],
-): HostEffectBrief[] {
-  const merged: HostEffectBrief[] = [];
-  const seen = new Set<BriefId>();
-  for (const effect of [...leading, ...planned]) {
-    if (seen.has(effect.id)) continue;
-    seen.add(effect.id);
-    merged.push(cloneHostEffect(effect));
-  }
-  return merged;
-}
-
 export function buildPoisonedActionBrief(
   entries: ReadonlyMap<ArcRef, RegistryEntry>,
   entry: RegistryEntry,
@@ -738,22 +715,15 @@ export function buildPoisonedActionBrief(
   rootTraversal.finalizing = undefined;
   rootTraversal.pendingTransition = undefined;
   const message = error instanceof Error ? error.message : String(error);
-  const built = buildActionBrief(
-    entries,
-    entry,
-    working,
-    dialog,
-    [],
-    [
-      buildPoisonedTraversalIssue(
-        entry.arc,
-        active,
-        entry.root.loc,
-        message,
-        reasonCode ?? runtimeErrorReasonCode(error),
-      ),
-    ],
-  );
+  const built = buildActionBrief(entries, entry, working, dialog, [
+    buildPoisonedTraversalIssue(
+      entry.arc,
+      active,
+      entry.root.loc,
+      message,
+      reasonCode ?? runtimeErrorReasonCode(error),
+    ),
+  ]);
   if ("snapshot" in built) {
     throw new Error("Poisoned action root produced a progress brief");
   }
@@ -770,7 +740,6 @@ function cloneActionBriefSnapshot(
     judgments: plan.judgments.map(cloneJudgmentBrief),
     observations: plan.observations.map(cloneObservationOrGroupBrief),
     hostCalls: plan.hostCalls.map(cloneHostCallBrief),
-    hostEffects: plan.hostEffects.map(cloneHostEffect),
     instructions: plan.instructions.map(cloneInstructionBrief),
     transition: plan.transition
       ? {
@@ -863,20 +832,6 @@ export function validateActionReport(
     };
   }
 
-  const hostEffectIdIssue = findUnknownReportIdIssue(
-    "host effect",
-    plan.hostEffects.map((item) => item.id),
-    report.hostEffects,
-    "action report",
-  );
-  if (hostEffectIdIssue) {
-    return {
-      accepted: buildAcceptedActionReport(report),
-      issues: [hostEffectIdIssue],
-      rejected: true,
-    };
-  }
-
   if (report.judgments) {
     const judgments: Record<string, boolean> = {};
     for (const [id, value] of Object.entries(report.judgments)) {
@@ -949,26 +904,6 @@ export function validateActionReport(
     issues.push(...result.issues);
   }
 
-  if (report.hostEffects) {
-    const hostEffects: Record<string, HostEffectReport> = {};
-    for (const [id, value] of Object.entries(report.hostEffects)) {
-      if (value?.status !== "applied") {
-        issues.push(
-          buildInvalidItemIssue(
-            id,
-            "host-effect-status",
-            `Invalid host effect report for ${id}: expected status "applied"`,
-          ),
-        );
-        continue;
-      }
-      hostEffects[id] = { status: "applied" };
-    }
-    if (Object.keys(hostEffects).length > 0) {
-      accepted.hostEffects = hostEffects;
-    }
-  }
-
   return { accepted, issues, rejected: false };
 }
 
@@ -978,7 +913,6 @@ export function acceptActionReport(
   report: ActionReport,
 ): {
   traversals: ArcTraversalSet;
-  hostEffects: HostEffectBrief[];
 } {
   const working = cloneTraversalSet(state.traversals);
   const rootTraversal = selectActionRootTraversal(working, state.entry.arc);
@@ -1028,10 +962,7 @@ export function acceptActionReport(
     };
     rootTraversal.activeFrame = { activeRef, activeSeg: { kind: "catch" } };
     resumeActiveFrame(accum);
-    return {
-      traversals: working,
-      hostEffects: accum.hostEffects,
-    };
+    return { traversals: working };
   }
 
   for (const id of Object.keys(report.instructions ?? {})) {
@@ -1039,18 +970,12 @@ export function acceptActionReport(
   }
   applyReportResults(accum, report);
   resumeActiveFrame(accum);
-  return {
-    traversals: working,
-    hostEffects: accum.hostEffects,
-  };
+  return { traversals: working };
 }
 
 function applyReportResults(
   accum: Accumulator,
-  report: Pick<
-    ActionReport,
-    "judgments" | "observations" | "hostCalls" | "hostEffects"
-  >,
+  report: Pick<ActionReport, "judgments" | "observations" | "hostCalls">,
 ): void {
   for (const [id, value] of Object.entries(report.judgments ?? {})) {
     accum.judgmentResults.set(id, value);
@@ -1068,8 +993,5 @@ function applyReportResults(
   }
   for (const [id, value] of Object.entries(report.hostCalls ?? {})) {
     accum.hostCallResults.set(id, value);
-  }
-  for (const [id, value] of Object.entries(report.hostEffects ?? {})) {
-    accum.hostEffectResults.set(id, value);
   }
 }

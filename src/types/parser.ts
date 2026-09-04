@@ -244,15 +244,15 @@ export type JudgeExpression = {
   loc?: SourceRange;
 };
 
-/** Structured argument shape accepted by authored host calls and effects. */
+/** Structured argument shape accepted by authored host calls. */
 export type HostCallArgument =
   | { kind: "semantic"; value: SemanticString }
   | { kind: "value"; value: ValueExpression }
   | { kind: "array"; elements: HostCallArgument[] }
   | { kind: "object"; value: Record<string, HostCallArgument> };
 
-/** Host-backed value lookup that may suspend on the brief/report boundary. */
-export type HostCallExpression = {
+/** Host-backed operation consumed either as a value or a resolved-once action. */
+export type HostCall = {
   id: ElementId;
   kind: "host-call";
   module: string;
@@ -278,7 +278,7 @@ export type ArtifactConstructExpression = {
 export type ValueExpression =
   | LocalExpression
   | JudgeExpression
-  | HostCallExpression
+  | HostCall
   | ArtifactConstructExpression
   | ValueString
   | { kind: "arrayLiteral"; elements: ValueExpression[] }
@@ -500,17 +500,6 @@ export type SetSpanAction = {
   loc?: SourceRange;
 };
 
-/** Host effect emitted from `this.effects` and held pending acknowledgment. */
-export type HostEffectStatement = {
-  id: ElementId;
-  kind: "host-call";
-  module: string;
-  target: string[];
-  operation: string;
-  arguments: HostCallArgument[];
-  loc?: SourceRange;
-};
-
 /** Labeled break in the action graph. */
 export type BreakStatement = {
   id: ElementId;
@@ -583,11 +572,9 @@ export type CatchDeflectionStatement = HookStatement<
 
 /**
  * Statement subset allowed in `this.effects`: the shared hook skeleton plus
- * staged returns and host effects.
+ * staged returns and standalone host calls.
  */
-export type EffectStatement = HookStatement<
-  SetReturnAction | HostEffectStatement
->;
+export type EffectStatement = HookStatement<SetReturnAction | HostCall>;
 
 /**
  * Enter a child node or imported arc from the current action graph.
@@ -709,7 +696,8 @@ export type ActionStatement =
   | InstructionAction
   | InvokeAction
   | MapAction
-  | SetSpanAction;
+  | SetSpanAction
+  | HostCall;
 
 /** Control-flow statement in the action graph. */
 export type IfStatement = {

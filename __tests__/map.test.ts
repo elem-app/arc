@@ -13,13 +13,13 @@ import { parse } from "../src/parser/index.js";
 import type { ArcTraversalSet, MapActionState } from "../src/types/index.js";
 import {
   actionProgress,
-  appliedHostEffects,
   appliedInstructions,
   arc,
   EMPTY_DIALOG,
   ownedChild,
   progressBrief,
   progressTerminal,
+  resolvedHostCalls,
   rootTraversal,
   TestRuntime as Runtime,
   startRun,
@@ -51,6 +51,37 @@ function runTerminal(source: string, id: string, experimentalRewalk = false) {
 }
 
 describe("Map and Span", () => {
+  describe("map.host-call", () => {
+    it("resolves one host-call action per member under member-qualified ids", () => {
+      const { runtime, brief } = run(
+        `
+"arc";
+import Memoir from "host:memoir";
+function Main() {
+  let items = Array(Str());
+  items.$set(["a", "b"]);
+  items.$map(() => { Memoir.facts.$apply(\`member \${span.item}\`); });
+}
+`,
+        "map-host-call-members",
+      );
+      expect(brief.hostCalls[0]).toMatchObject({ arguments: ["member a"] });
+
+      const second = progressBrief(runtime, brief, {
+        move: "proceed",
+        hostCalls: resolvedHostCalls(brief),
+      });
+      expect(second.hostCalls[0]).toMatchObject({ arguments: ["member b"] });
+      expect(second.hostCalls[0]!.id).not.toBe(brief.hostCalls[0]!.id);
+
+      const done = progressTerminal(runtime, second, {
+        move: "proceed",
+        hostCalls: resolvedHostCalls(second),
+      });
+      expect(rootTraversal(done).phase).toBe("completed");
+    });
+  });
+
   describe("map.value-transform", () => {
     it("commits the callback output array to results in input order", () => {
       const { brief } = runTerminal(
@@ -1565,7 +1596,7 @@ function Main() {
       expect(rootTraversal(deflected).cells.out).toBeUndefined();
     });
 
-    it("keeps an earlier member's applied host effect after the arena is abandoned", () => {
+    it("keeps an earlier member's resolved host call after the arena is abandoned", () => {
       const { runtime, brief } = run(
         `
 "arc";
@@ -1596,25 +1627,25 @@ function Main() {
   }
 }
 `,
-        "map-deflect-host-effect-arc",
+        "map-deflect-host-call-arc",
       );
 
-      // Member 0 enters Op, whose effects emit the host effect.
-      expect(brief.hostEffects.map((effect) => effect.arguments[0])).toEqual([
+      // Member 0 enters Op, whose effects emit the host call.
+      expect(brief.hostCalls.map((call) => call.arguments[0])).toEqual([
         "applied",
       ]);
 
       // Apply it: member 0's child covers and member 1 reaches its observation.
       const member1 = progressBrief(runtime, brief, {
         move: "proceed",
-        hostEffects: appliedHostEffects(brief),
+        hostCalls: resolvedHostCalls(brief),
       });
       expect(member1.observations).toHaveLength(1);
 
       // Deflect member 1 (which entered nothing): the arena is abandoned, but
-      // member 0's applied host effect is neither re-emitted nor rolled back.
+      // member 0's resolved host call is neither re-emitted nor rolled back.
       const deflected = progressTerminal(runtime, member1, { move: "deflect" });
-      expect("hostEffects" in deflected).toBe(false);
+      expect("hostCalls" in deflected).toBe(false);
     });
 
     it("aborts the map when a deflection escapes an entered child", () => {

@@ -415,7 +415,7 @@ function Main() {
         [effectsSeeded],
         EMPTY_DIALOG,
       );
-      expect("hostEffects" in effectsBrief).toBe(false);
+      expect("hostCalls" in effectsBrief).toBe(false);
       expect(rootTraversal(effectsBrief).phase).toBe("completed");
 
       const triggerDocument = parse(`

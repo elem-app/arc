@@ -1,5 +1,9 @@
 import { analyzeDocument, stampElementIds } from "../parser/index.js";
-import { admitValue } from "../spec/resolution.js";
+import {
+  admitHostArgument,
+  admitValue,
+  resolveHostOperation,
+} from "../spec/resolution.js";
 import type {
   ActionBrief,
   ActionReport,
@@ -10,7 +14,9 @@ import type {
 import type {
   ActionStatement,
   Document,
+  EffectStatement,
   ElementId,
+  HostCall,
   MapAction,
   Node,
   NodeReadSet,
@@ -327,6 +333,7 @@ export class Runtime {
       state.snapshot.hostCalls,
       validation.accepted.hostCalls ?? {},
       this.#hostModules,
+      new Set(state.snapshot.hostCalls.map((call) => call.id)),
     );
     if (typed.accepted) validation.accepted.hostCalls = typed.accepted;
     else delete validation.accepted.hostCalls;
@@ -427,7 +434,6 @@ export class Runtime {
           state.entry,
           state.traversals,
           dialog,
-          [],
           validation.issues,
         ),
       );
@@ -436,6 +442,7 @@ export class Runtime {
       state.snapshot.hostCalls,
       validation.accepted.hostCalls ?? {},
       this.#hostModules,
+      state.hostCallValueDemands,
     );
     if (typed.accepted) validation.accepted.hostCalls = typed.accepted;
     else delete validation.accepted.hostCalls;
@@ -448,7 +455,6 @@ export class Runtime {
           state.entry,
           state.traversals,
           dialog,
-          [],
           validation.issues,
         ),
       );
@@ -487,7 +493,6 @@ export class Runtime {
             state.entry,
             working,
             dialog,
-            [],
             validation.issues,
           ),
         );
@@ -516,7 +521,6 @@ export class Runtime {
           state.entry,
           applied.traversals,
           dialog,
-          applied.hostEffects,
           validation.issues,
         ),
       );
@@ -591,6 +595,7 @@ export class Runtime {
         entry,
         traversals: built.traversals,
         snapshot: built.snapshot,
+        hostCallValueDemands: new Set(built.hostCallValueDemands),
       });
     }
 
@@ -734,6 +739,22 @@ function assertPersistedActionState(
 ): void {
   const action = findStatefulAction(node.statements, id as ElementId);
 
+  if (state.kind === "host-call") {
+    const hostCall =
+      findHostCall(node.statements, id as ElementId) ??
+      findHostCallInEffects(node.effects ?? [], id as ElementId);
+    if (!hostCall) {
+      throw invalidPersistedState(
+        `host-call state ${JSON.stringify(id)} has no matching action`,
+      );
+    }
+    assertPersistedHostCallState(
+      entryForTraversal(entries, traversal),
+      hostCall,
+      state,
+    );
+  }
+
   if (state.kind === "map" && state.map) {
     if (action?.kind !== "map") {
       throw invalidPersistedState(
@@ -772,6 +793,110 @@ function assertPersistedActionState(
       }
       assertPersistedAdmitted(`staged returns.${key}`, spec, value);
     }
+  }
+}
+
+function entryForTraversal(
+  entries: ReadonlyMap<ArcRef, RegistryEntry>,
+  traversal: Traversal,
+): RegistryEntry {
+  const entry = getEntryForRef(entries, traversal.ref);
+  if (!entry) {
+    throw invalidPersistedState(
+      `traversal ${formatRef(traversal.ref)} has no registered Arc`,
+    );
+  }
+  return entry;
+}
+
+function assertPersistedHostCallState(
+  entry: RegistryEntry,
+  action: HostCall,
+  state: Extract<ActionState, { kind: "host-call" }>,
+): void {
+  if (state.status === "resolved") {
+    assertExactPersistedKeys(
+      state,
+      ["kind", "status"],
+      "resolved host-call state",
+    );
+    return;
+  }
+  if (state.status !== "pending") {
+    throw invalidPersistedState("host-call state has an invalid status");
+  }
+  assertExactPersistedKeys(
+    state,
+    ["kind", "status", "call"],
+    "pending host-call state",
+  );
+  if (
+    !state.call ||
+    typeof state.call !== "object" ||
+    Array.isArray(state.call)
+  ) {
+    throw invalidPersistedState("pending host-call capture is not an object");
+  }
+  assertExactPersistedKeys(
+    state.call,
+    ["arguments", "hostParams"],
+    "pending host-call capture",
+    ["arguments"],
+  );
+
+  if (!Array.isArray(state.call.arguments)) {
+    throw invalidPersistedState("pending host-call arguments are not an array");
+  }
+  const resolution = resolveHostOperation(entry.hostModules, action);
+  if (resolution.kind === "unresolved") {
+    throw invalidPersistedState(
+      `pending host call ${[action.module, ...action.target, action.operation].join(".")} has no registered operation`,
+    );
+  }
+  if (
+    state.call.arguments.length !== action.arguments.length ||
+    state.call.arguments.length !== resolution.operation.parameters.length
+  ) {
+    throw invalidPersistedState(
+      "pending host-call arguments do not match the operation arity",
+    );
+  }
+  state.call.arguments.forEach((argument, index) => {
+    assertPersistedDurableCarrier(
+      `pending host-call argument[${index}]`,
+      argument,
+    );
+    const admission = admitHostArgument(
+      action.arguments[index]!,
+      argument,
+      resolution.operation.parameters[index]!,
+      `$[${index}]`,
+    );
+    if (!admission.admitted) {
+      throw invalidPersistedState(
+        `pending host-call argument violates its operation parameter at ${admission.violation.path}: ${admission.violation.detail}`,
+      );
+    }
+  });
+  assertPersistedDurableCarrier(
+    "pending host-call hostParams",
+    state.call.hostParams,
+  );
+}
+
+function assertExactPersistedKeys(
+  value: object,
+  allowed: readonly string[],
+  label: string,
+  required: readonly string[] = allowed,
+): void {
+  const keys = Object.keys(value);
+  const allowedKeys = new Set(allowed);
+  if (
+    keys.some((key) => !allowedKeys.has(key)) ||
+    required.some((key) => !Object.hasOwn(value, key))
+  ) {
+    throw invalidPersistedState(`${label} has an invalid shape`);
   }
 }
 
@@ -1026,6 +1151,48 @@ function findStatefulAction(
   return undefined;
 }
 
+function findHostCall(
+  statements: readonly Statement[],
+  id: ElementId,
+): HostCall | undefined {
+  for (const statement of statements) {
+    if (statement.id === id && statement.kind === "host-call") return statement;
+    const nested =
+      statement.kind === "if"
+        ? [statement.consequent, statement.alternate ?? []]
+        : statement.kind === "label" ||
+            statement.kind === "invoke" ||
+            statement.kind === "map"
+          ? [statement.body]
+          : [];
+    for (const body of nested) {
+      const found = findHostCall(body, id);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
+function findHostCallInEffects(
+  statements: readonly EffectStatement[],
+  id: ElementId,
+): HostCall | undefined {
+  for (const statement of statements) {
+    if (statement.id === id && statement.kind === "host-call") return statement;
+    const nested =
+      statement.kind === "if"
+        ? [statement.consequent, statement.alternate ?? []]
+        : statement.kind === "label"
+          ? [statement.body]
+          : [];
+    for (const body of nested) {
+      const found = findHostCallInEffects(body, id);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
 function assertPersistedPinEntry(entry: PinEntry): void {
   if (entry.kind === "judgment") {
     if (entry.resolved && typeof entry.value !== "boolean") {
@@ -1094,8 +1261,7 @@ export type {
   ActionPoisonReason,
   ActionReport,
   HostCallBrief,
-  HostEffectBrief,
-  HostEffectReport,
+  HostCallReport,
   InstructionBrief,
   InstructionPostcheck,
   InstructionReport,

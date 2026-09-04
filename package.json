@@ -1,6 +1,6 @@
 {
   "name": "@elem-app/arc",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Parser and runtime for Arc scripts",
   "private": true,
   "type": "module",

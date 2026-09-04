@@ -32,9 +32,8 @@ import type {
   EnterChannelBindings,
   EnterTarget,
   GuardStatement,
+  HostCall,
   HostCallArgument,
-  HostCallExpression,
-  HostEffectStatement,
   HostModuleBinding,
   IfStatement,
   InstructionAction,
@@ -2813,6 +2812,9 @@ function parseActionExpression(
       "action",
     );
     if (mutation) return mutation;
+
+    const hostCall = parseStandaloneHostCall(expression, availableHostModules);
+    if (hostCall) return hostCall;
   }
 
   return undefined;
@@ -4261,23 +4263,23 @@ function parseEffectStatements(
     );
     if (mutation) return [mutation];
 
-    const hostEffect = parseHostEffect(
+    const hostCall = parseStandaloneHostCall(
       expression,
       availableHostModules,
       expressionContext,
     );
-    if (hostEffect) return [hostEffect];
+    if (hostCall) return [hostCall];
 
     throw new Error("Unsupported this.effects call");
   });
 }
 
-function parseHostEffect(
+function parseStandaloneHostCall(
   expression: acorn.CallExpression,
 
   availableHostModules: Map<string, string>,
-  expressionContext: ExpressionParseContext,
-): HostEffectStatement | undefined {
+  expressionContext?: ExpressionParseContext,
+): HostCall | undefined {
   if (expression.callee.type === "Super") return undefined;
   const target = parseHostCallTarget(expression.callee, availableHostModules);
   if (!target) {
@@ -4294,12 +4296,15 @@ function parseHostEffect(
           : undefined;
     if (operation?.startsWith("$")) {
       throw new Error(
-        "Host effects must be rooted in a declared host effect module import",
+        "Standalone host calls must be rooted in a declared host module import",
       );
     }
     return undefined;
   }
   if (!target.operation.startsWith("$") || target.operation.length === 1) {
+    if (!target.operation.startsWith("$")) {
+      throw new Error("Standalone host calls require a $-prefixed operation");
+    }
     return undefined;
   }
 
@@ -5332,6 +5337,14 @@ function validateStatement(
     return;
   }
 
+  if (statement.kind === "host-call") {
+    for (const argument of statement.arguments) {
+      validateHostCallArgument(argument, cells, nodes, issues, options);
+    }
+    validateHostCall(statement, cells, issues, options);
+    return;
+  }
+
   validateSemanticString(statement.template, cells, nodes, issues, options);
   for (const entry of statement.resolveWhen ?? []) {
     validateTriggerStatement(entry, cells, nodes, issues, [], options);
@@ -6106,12 +6119,12 @@ function validateEffectStatement(
   }
 
   for (const arg of statement.arguments) {
-    validateHostEffectArgument(arg, cells, nodes, issues, options);
+    validateHostCallArgument(arg, cells, nodes, issues, options);
   }
-  validateHostAction(statement, "effect", cells, issues, options);
+  validateHostCall(statement, cells, issues, options);
 }
 
-function validateHostEffectArgument(
+function validateHostCallArgument(
   arg: HostCallArgument,
   cells: Cell[],
   nodes: string[],
@@ -6136,18 +6149,17 @@ function validateHostEffectArgument(
   }
   if (arg.kind === "array") {
     arg.elements.forEach((item) =>
-      validateHostEffectArgument(item, cells, nodes, issues, options),
+      validateHostCallArgument(item, cells, nodes, issues, options),
     );
     return;
   }
   for (const item of Object.values(arg.value)) {
-    validateHostEffectArgument(item, cells, nodes, issues, options);
+    validateHostCallArgument(item, cells, nodes, issues, options);
   }
 }
 
-function validateHostAction(
-  action: HostCallExpression | HostEffectStatement,
-  mode: "call" | "effect",
+function validateHostCall(
+  action: HostCall,
   cells: Cell[],
   issues: ValidationIssue[],
   options: ValidationOptions,
@@ -6180,13 +6192,6 @@ function validateHostAction(
   }
 
   const operation = resolution.operation;
-  if (mode === "call" && operation.returns === undefined) {
-    issues.push({
-      code: "HOST_CALL_RESULT_UNDECLARED",
-      message: `Host operation ${path} does not declare a result`,
-      loc: action.loc,
-    });
-  }
   if (action.arguments.length !== operation.parameters.length) {
     issues.push({
       code: "HOST_ARGUMENT_ARITY",
@@ -6570,9 +6575,9 @@ function validateExpression(
       return;
     case "host-call":
       for (const arg of expression.arguments) {
-        validateHostEffectArgument(arg, cells, nodes, issues, options);
+        validateHostCallArgument(arg, cells, nodes, issues, options);
       }
-      validateHostAction(expression, "call", cells, issues, options);
+      validateHostCall(expression, cells, issues, options);
       return;
     case "regexTest":
       validateExpression(expression.target, cells, nodes, issues, options);

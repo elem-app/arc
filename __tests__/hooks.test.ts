@@ -11,7 +11,6 @@ import { parse } from "../src/parser/index.js";
 import type { Dialog } from "../src/types/index.js";
 import {
   actionProgress,
-  appliedHostEffects,
   appliedInstructions,
   arc,
   EMPTY_DIALOG,
@@ -21,6 +20,7 @@ import {
   progressBrief,
   progressTerminal,
   renderSemanticTextForTest,
+  resolvedHostCalls,
   rootTraversal,
   TestRuntime as Runtime,
   singleObservations,
@@ -149,7 +149,7 @@ function Main() {
       const bogus = runtime.progressTrigger(
         triggerBrief,
         {
-          hostCalls: { "bogus-id": true },
+          hostCalls: { "bogus-id": { status: "resolved", value: true } },
         },
         EMPTY_DIALOG,
       );
@@ -163,7 +163,9 @@ function Main() {
       const accepted = runtime.progressTrigger(
         triggerBrief,
         {
-          hostCalls: { [triggerBrief.hostCalls[0]!.id]: 11 },
+          hostCalls: {
+            [triggerBrief.hostCalls[0]!.id]: { status: "resolved", value: 11 },
+          },
         },
         EMPTY_DIALOG,
       );
@@ -732,14 +734,22 @@ function Pending() {
 
       const unmatched = runtime.progressTrigger(
         brief,
-        { hostCalls: { [brief.hostCalls[0]!.id]: false } },
+        {
+          hostCalls: {
+            [brief.hostCalls[0]!.id]: { status: "resolved", value: false },
+          },
+        },
         EMPTY_DIALOG,
       );
       expect(unmatched.matched).toEqual(immediateRef);
 
       const ambiguous = runtime.progressTrigger(
         brief,
-        { hostCalls: { [brief.hostCalls[0]!.id]: true } },
+        {
+          hostCalls: {
+            [brief.hostCalls[0]!.id]: { status: "resolved", value: true },
+          },
+        },
         EMPTY_DIALOG,
       );
       expect(ambiguous.matched).toBeUndefined();
@@ -1716,9 +1726,9 @@ function Main() {
 
       // The child's deflection effect is reported first; only then does the
       // deflection bubble into the parent's own effects.
-      expect(
-        childEffects.hostEffects.map((effect) => effect.arguments[0]),
-      ).toEqual(["child effect"]);
+      expect(childEffects.hostCalls.map((call) => call.arguments[0])).toEqual([
+        "child effect",
+      ]);
       expect(
         ownedChild(rootTraversal(childEffects), "Main.Intro"),
       ).toMatchObject({
@@ -1728,12 +1738,12 @@ function Main() {
 
       const parentEffects = progressBrief(runtime, childEffects, {
         move: "proceed",
-        hostEffects: appliedHostEffects(childEffects),
+        hostCalls: resolvedHostCalls(childEffects),
       });
 
-      expect(
-        parentEffects.hostEffects.map((effect) => effect.arguments[0]),
-      ).toEqual(["parent effect"]);
+      expect(parentEffects.hostCalls.map((call) => call.arguments[0])).toEqual([
+        "parent effect",
+      ]);
       expect(rootTraversal(parentEffects)).toMatchObject({
         state: undefined,
         finalizing: { reason: "deflected", phase: "effects" },
@@ -1741,10 +1751,10 @@ function Main() {
 
       const deflected = progressTerminal(runtime, parentEffects, {
         move: "proceed",
-        hostEffects: appliedHostEffects(parentEffects),
+        hostCalls: resolvedHostCalls(parentEffects),
       });
 
-      expect("hostEffects" in deflected).toBe(false);
+      expect("hostCalls" in deflected).toBe(false);
       expect(rootTraversal(deflected).state).toBe("deflected");
     });
 
@@ -1994,17 +2004,17 @@ function Main() {
         judgments: { [judging.judgments[0]!.id]: false },
       });
 
-      expect(emitted.hostEffects.map((effect) => effect.arguments[0])).toEqual([
+      expect(emitted.hostCalls.map((call) => call.arguments[0])).toEqual([
         "root deflected",
       ]);
       expect(rootTraversal(emitted).phase).toBe("entered");
 
       const deflected = progressTerminal(runtime, emitted, {
         move: "proceed",
-        hostEffects: appliedHostEffects(emitted),
+        hostCalls: resolvedHostCalls(emitted),
       });
 
-      expect("hostEffects" in deflected).toBe(false);
+      expect("hostCalls" in deflected).toBe(false);
       expect(rootTraversal(deflected).state).toBe("deflected");
       expect(rootTraversal(deflected).phase).toBe("suspended");
     });
@@ -2053,17 +2063,17 @@ function Main() {
         },
       });
 
-      expect(
-        deflected.hostEffects.map((effect) => effect.arguments[0]),
-      ).toEqual(["root deflected"]);
+      expect(deflected.hostCalls.map((call) => call.arguments[0])).toEqual([
+        "root deflected",
+      ]);
       expect(rootTraversal(deflected).phase).toBe("entered");
 
       const suspended = progressTerminal(runtime, deflected, {
         move: "proceed",
-        hostEffects: appliedHostEffects(deflected),
+        hostCalls: resolvedHostCalls(deflected),
       });
 
-      expect("hostEffects" in suspended).toBe(false);
+      expect("hostCalls" in suspended).toBe(false);
       expect(rootTraversal(suspended).state).toBe("deflected");
       expect(rootTraversal(suspended).phase).toBe("suspended");
     });
@@ -2324,12 +2334,12 @@ function Main() {
         finalizing: { reason: "covered", phase: "effects" },
       });
       expect(
-        renderSemanticTextForTest(effects.hostEffects[0]!.arguments[0]!),
+        renderSemanticTextForTest(effects.hostCalls[0]!.arguments[0]!),
       ).toBe("pending: covered; stored: covered");
 
       const completed = progressTerminal(runtime, effects, {
         move: "proceed",
-        hostEffects: appliedHostEffects(effects),
+        hostCalls: resolvedHostCalls(effects),
       });
 
       expect(rootTraversal(completed)).toMatchObject({
@@ -2386,12 +2396,12 @@ function Main() {
           : "unreachable",
       ).toBeUndefined();
       expect(
-        renderSemanticTextForTest(effects.hostEffects[0]!.arguments[0]!),
+        renderSemanticTextForTest(effects.hostCalls[0]!.arguments[0]!),
       ).toBe("pending: deflected");
 
       const suspended = progressTerminal(runtime, effects, {
         move: "proceed",
-        hostEffects: appliedHostEffects(effects),
+        hostCalls: resolvedHostCalls(effects),
       });
 
       expect(rootTraversal(suspended)).toMatchObject({
@@ -2444,7 +2454,7 @@ function Main() {
 
       expect(rootTraversal(nextBrief).cells.interest).toBe("warm");
       expect(rootTraversal(nextBrief).cells.topic).toBe("metal");
-      expect(nextBrief.hostEffects).toMatchObject([
+      expect(nextBrief.hostCalls).toMatchObject([
         {
           module: "memoir",
           target: ["facts"],
@@ -2452,16 +2462,16 @@ function Main() {
         },
       ]);
       expect(
-        renderSemanticTextForTest(nextBrief.hostEffects[0]!.arguments[0]!),
+        renderSemanticTextForTest(nextBrief.hostCalls[0]!.arguments[0]!),
       ).toBe("user likes metal");
       expect(rootTraversal(nextBrief).phase).toBe("entered");
 
       const completed = progressTerminal(runtime, nextBrief, {
         move: "proceed",
-        hostEffects: appliedHostEffects(nextBrief),
+        hostCalls: resolvedHostCalls(nextBrief),
       });
 
-      expect("hostEffects" in completed).toBe(false);
+      expect("hostCalls" in completed).toBe(false);
       expect(rootTraversal(completed).phase).toBe("completed");
     });
 
@@ -2496,7 +2506,7 @@ function Main() {
       });
       const nextBrief = progressBrief(runtime, brief, { move: "deflect" });
 
-      expect(nextBrief.hostEffects).toMatchObject([
+      expect(nextBrief.hostCalls).toMatchObject([
         {
           module: "memoir",
           target: ["facts"],
@@ -2504,7 +2514,7 @@ function Main() {
         },
       ]);
       expect(
-        renderSemanticTextForTest(nextBrief.hostEffects[0]!.arguments[0]!),
+        renderSemanticTextForTest(nextBrief.hostCalls[0]!.arguments[0]!),
       ).toBe("user deflected intro");
       expect(ownedChild(rootTraversal(nextBrief), "Main.Intro")).toMatchObject({
         state: undefined,
@@ -2514,10 +2524,10 @@ function Main() {
 
       const suspended = progressTerminal(runtime, nextBrief, {
         move: "proceed",
-        hostEffects: appliedHostEffects(nextBrief),
+        hostCalls: resolvedHostCalls(nextBrief),
       });
 
-      expect("hostEffects" in suspended).toBe(false);
+      expect("hostCalls" in suspended).toBe(false);
       expect(rootTraversal(suspended).state).toBe("deflected");
       expect(rootTraversal(suspended).phase).toBe("suspended");
     });
@@ -2558,7 +2568,7 @@ function Main() {
 
       const effects = progressBrief(runtime, brief, { move: "deflect" });
 
-      expect(effects.hostEffects.map((effect) => effect.arguments[0])).toEqual([
+      expect(effects.hostCalls.map((call) => call.arguments[0])).toEqual([
         "intro deflected",
       ]);
       expect(rootTraversal(effects)).toMatchObject({
@@ -2656,16 +2666,16 @@ function Main() {
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
       const childEffects = progressBrief(runtime, brief, { move: "deflect" });
 
-      expect(
-        childEffects.hostEffects.map((effect) => effect.arguments[0]),
-      ).toEqual(["child effect"]);
+      expect(childEffects.hostCalls.map((call) => call.arguments[0])).toEqual([
+        "child effect",
+      ]);
 
       const caught = progressBrief(runtime, childEffects, {
         move: "proceed",
-        hostEffects: appliedHostEffects(childEffects),
+        hostCalls: resolvedHostCalls(childEffects),
       });
 
-      expect(caught.hostEffects).toEqual([]);
+      expect(caught.hostCalls).toEqual([]);
       expect(rootTraversal(caught).state).toBeUndefined();
       expect(caught.instructions.map((item) => item.text)).toEqual([
         "after catch",
@@ -2736,7 +2746,7 @@ function Main() {
         },
       });
 
-      expect(nextBrief.hostEffects).toMatchObject([
+      expect(nextBrief.hostCalls).toMatchObject([
         {
           module: "memoir",
           target: ["facts"],
@@ -2744,17 +2754,17 @@ function Main() {
         },
       ]);
       expect(
-        renderSemanticTextForTest(nextBrief.hostEffects[0]!.arguments[0]!),
+        renderSemanticTextForTest(nextBrief.hostCalls[0]!.arguments[0]!),
       ).toBe("user left with warm interest");
       expect(nextBrief.canProgress).toBe(true);
       expect(rootTraversal(nextBrief).phase).toBe("entered");
 
       const suspended = progressTerminal(runtime, nextBrief, {
         move: "proceed",
-        hostEffects: appliedHostEffects(nextBrief),
+        hostCalls: resolvedHostCalls(nextBrief),
       });
 
-      expect("hostEffects" in suspended).toBe(false);
+      expect("hostCalls" in suspended).toBe(false);
       expect(suspended.canProgress).toBe(false);
       expect(rootTraversal(suspended).phase).toBe("suspended");
     });
@@ -2775,7 +2785,7 @@ function Bad() {
   });
 
   describe("hook.effects-host", () => {
-    it("re-surfaces an unreported host effect under one id until it is reported", () => {
+    it("re-surfaces an unreported host call under one id until it is reported", () => {
       const document = parse(`
 "arc";
 
@@ -2803,7 +2813,7 @@ function Main() {
         lastTurns: [],
       });
 
-      expect(firstBrief.hostEffects).toEqual([
+      expect(firstBrief.hostCalls).toEqual([
         {
           id: expect.any(String),
           sourceRef: node("idempotent-effects-arc", "Main"),
@@ -2813,30 +2823,27 @@ function Main() {
           arguments: ["idempotent effect"],
         },
       ]);
-      expect(firstBrief.observations).toHaveLength(1);
+      expect(firstBrief.observations).toEqual([]);
 
-      // A progress that carries no effect feedback re-briefs the effect under
-      // the same id instead of dropping or re-emitting it.
+      // A progress that carries no call report re-briefs the same pending
+      // invocation without admitting the later observation.
       const secondBrief = progressBrief(runtime, firstBrief, {
         move: "proceed",
-        observations: {
-          [firstBrief.observations[0]!.id]: { status: "needs-user" },
-        },
       });
 
-      expect(secondBrief.hostEffects).toEqual(firstBrief.hostEffects);
-      expect(secondBrief.observations).toHaveLength(1);
+      expect(secondBrief.hostCalls).toEqual(firstBrief.hostCalls);
+      expect(secondBrief.observations).toEqual([]);
 
       const thirdBrief = progressBrief(runtime, secondBrief, {
         move: "proceed",
-        hostEffects: appliedHostEffects(secondBrief),
+        hostCalls: resolvedHostCalls(secondBrief),
       });
 
-      expect(thirdBrief.hostEffects).toEqual([]);
+      expect(thirdBrief.hostCalls).toEqual([]);
       expect(thirdBrief.observations).toHaveLength(1);
     });
 
-    it("a reported effects host-call advances", () => {
+    it("a resolved this.effects host call advances", () => {
       const document = parse(`
 "arc";
 
@@ -2853,27 +2860,27 @@ function Main() {
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
 
-      expect(brief.hostEffects).toHaveLength(1);
-      expect(brief.hostEffects[0]!.operation).toBe("apply");
+      expect(brief.hostCalls).toHaveLength(1);
+      expect(brief.hostCalls[0]!.operation).toBe("apply");
       expect(brief.allowedMoves).toEqual(["poison", "proceed"]);
       expect(rootTraversal(brief).phase).toBe("entered");
 
-      // A bare proceed leaves the unreported effect on the frontier.
+      // A bare proceed leaves the unresolved standalone call on the frontier.
       const unreported = progressBrief(runtime, brief, { move: "proceed" });
 
-      expect(unreported.hostEffects).toEqual(brief.hostEffects);
+      expect(unreported.hostCalls).toEqual(brief.hostCalls);
       expect(rootTraversal(unreported).phase).toBe("entered");
 
       const confirmed = progressTerminal(runtime, unreported, {
         move: "proceed",
-        hostEffects: appliedHostEffects(unreported),
+        hostCalls: resolvedHostCalls(unreported),
       });
 
-      expect("hostEffects" in confirmed).toBe(false);
+      expect("hostCalls" in confirmed).toBe(false);
       expect(rootTraversal(confirmed).phase).toBe("completed");
     });
 
-    it("accepts poison move for an unconfirmed host-effect frontier", () => {
+    it("accepts poison move for an unconfirmed host-call frontier", () => {
       const document = parse(`
 "arc";
 
@@ -2890,31 +2897,31 @@ function Main() {
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
 
-      expect(brief.hostEffects).toHaveLength(1);
+      expect(brief.hostCalls).toHaveLength(1);
       expect(brief.allowedMoves).toEqual(["poison", "proceed"]);
       expect(rootTraversal(brief).phase).toBe("entered");
 
       const poisoned = progressTerminal(runtime, brief, {
         move: "poison",
         poisonReason: {
-          reasonCode: "unsupported-host-effect",
+          reasonCode: "unsupported-host-call",
           reason: "Unsupported host module memoir.facts.apply.",
         },
       });
 
       expect(rootTraversal(poisoned).phase).toBe("poisoned");
-      expect("hostEffects" in poisoned).toBe(false);
+      expect("hostCalls" in poisoned).toBe(false);
       expect("allowedMoves" in poisoned).toBe(false);
       expect(poisoned.issues).toEqual([
         expect.objectContaining({
           kind: "poisoned-traversal",
-          reasonCode: "unsupported-host-effect",
+          reasonCode: "unsupported-host-call",
           reason: "Unsupported host module memoir.facts.apply.",
         }),
       ]);
     });
 
-    it("waits for host-effect confirmation before entering the next node", () => {
+    it("waits for host-call confirmation before entering the next node", () => {
       const document = parse(`
 "arc";
 
@@ -2940,7 +2947,7 @@ function Main() {
       seeded.phase = "entered";
       const effectBrief = startRun(runtime, [seeded], EMPTY_DIALOG);
 
-      expect(effectBrief.hostEffects).toEqual([
+      expect(effectBrief.hostCalls).toEqual([
         {
           id: expect.any(String),
           sourceRef: node("n8c-arc", "Main.NonTail"),
@@ -2961,10 +2968,10 @@ function Main() {
 
       const tailBrief = progressBrief(runtime, effectBrief, {
         move: "proceed",
-        hostEffects: appliedHostEffects(effectBrief),
+        hostCalls: resolvedHostCalls(effectBrief),
       });
 
-      expect(tailBrief.hostEffects).toEqual([]);
+      expect(tailBrief.hostCalls).toEqual([]);
       expect(tailBrief.instructions.map((item) => item.text)).toEqual(["tail"]);
       expect(ownedChild(rootTraversal(tailBrief), "Main.NonTail")?.state).toBe(
         "covered",
@@ -2974,7 +2981,7 @@ function Main() {
       );
     });
 
-    it("parses static bracket host effect targets", () => {
+    it("parses static bracket host call targets", () => {
       const document = parse(`
 "arc";
 
@@ -2995,7 +3002,7 @@ function Main() {
       });
     });
 
-    it("treats host effect string literals as semantic arguments", () => {
+    it("treats host call string literals as semantic arguments", () => {
       const document = parse(`
 "arc";
 

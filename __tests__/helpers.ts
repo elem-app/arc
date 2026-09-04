@@ -22,14 +22,13 @@ import type {
   BriefId,
   Dialog,
   Document,
-  HostEffectReport,
+  HostCallReport,
   HostModuleSpec,
   NodeRef,
   NodeTraversal,
   ObservationBrief,
   ObservationGroupBrief,
   PayloadValue,
-  SemanticText,
   TerminalBrief,
 } from "../src/types/index.js";
 
@@ -314,12 +313,12 @@ export function startTrigger(
   return runtime.startTrigger(traversals, dialog, opts);
 }
 
-/** Builds an "applied" report entry for every host effect on the brief. */
-export function appliedHostEffects(
+/** Builds a void resolution report entry for every host call on the brief. */
+export function resolvedHostCalls(
   brief: ActionBrief,
-): Record<string, HostEffectReport> {
+): Record<string, HostCallReport> {
   return Object.fromEntries(
-    brief.hostEffects.map((effect) => [effect.id, { status: "applied" }]),
+    brief.hostCalls.map((call) => [call.id, { status: "resolved" }]),
   );
 }
 
@@ -347,9 +346,7 @@ export function payloadArray(value: PayloadValue): PayloadValue[] {
   return value;
 }
 
-export function renderSemanticTextForTest(
-  value: PayloadValue | SemanticText,
-): string {
+export function renderSemanticTextForTest(value: PayloadValue): string {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return String(value);
   return value

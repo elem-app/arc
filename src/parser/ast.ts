@@ -644,7 +644,7 @@ export function parseExpression(
       if (hostCallTarget) {
         if (hostCallTarget.operation.startsWith("$")) {
           throw new Error(
-            "$-prefixed host operations are only valid as host effects inside this.effects",
+            "$-prefixed host operations are only valid as standalone action statements",
           );
         }
         if (!briefable) {

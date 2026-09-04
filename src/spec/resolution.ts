@@ -2,8 +2,8 @@ import type {
   ArrayReference,
   Cell,
   ComparisonOperator,
+  HostCall,
   HostCallArgument,
-  HostCallExpression,
   NodeSignature,
   SemanticString,
   ValueExpression,
@@ -304,9 +304,7 @@ export type ProducerContext = {
     receiverSpec?: ArrayElementSpec;
     resultSpec?: ArrayElementSpec;
   };
-  resolveHostOperation?: (
-    call: HostCallExpression,
-  ) => HostOperationSpec | undefined;
+  resolveHostOperation?: (call: HostCall) => HostOperationSpec | undefined;
 };
 
 /** Facts derived from an expression producer without accompanying its value. */
@@ -416,12 +414,10 @@ export function resolveProducer(
           };
     case "host-call": {
       const operation = context.resolveHostOperation?.(expression);
-      return operation?.returns
-        ? {
-            kind: "fact",
-            fact: { kind: "site", spec: operation.returns },
-          }
-        : { kind: "dynamic" };
+      if (!operation) return { kind: "dynamic" };
+      return operation.returns
+        ? { kind: "fact", fact: { kind: "site", spec: operation.returns } }
+        : { kind: "unusable" };
     }
   }
 }
@@ -506,7 +502,7 @@ export type HostArgumentAdmission =
 /** Admits one rendered host argument under its declared parameter spec. */
 export function admitHostArgument(
   argument: HostCallArgument,
-  rendered: PayloadValue | SemanticText,
+  rendered: PayloadValue,
   destination: HostParameterSpec,
   path = "$",
 ): HostArgumentAdmission {
@@ -559,7 +555,8 @@ export function admitHostArgument(
     return { admitted: true };
   }
   if (destination.type === "semanticText") {
-    return argument.kind === "semantic" || typeof rendered === "string"
+    return (argument.kind === "semantic" && isRenderedSemanticText(rendered)) ||
+      typeof rendered === "string"
       ? { admitted: true }
       : hostArgumentViolation(
           "SemanticText requires an authored semantic argument or string value",
@@ -577,6 +574,58 @@ export function admitHostArgument(
         admission.violation.detail,
         admission.violation.path,
       );
+}
+
+function isRenderedSemanticText(value: unknown): value is SemanticText {
+  if (typeof value === "string") return true;
+  if (!Array.isArray(value)) return false;
+  return value.every((part) => {
+    if (!part || typeof part !== "object" || Array.isArray(part)) return false;
+    const record = part as Record<string, unknown>;
+    switch (record.kind) {
+      case "text":
+        return (
+          hasExactKeys(record, ["kind", "value"]) &&
+          typeof record.value === "string"
+        );
+      case "entity":
+        return (
+          hasExactKeys(record, ["kind", "name"]) &&
+          (record.name === "user" || record.name === "self")
+        );
+      case "artifact":
+        return (
+          hasExactKeys(record, ["kind", "path"]) &&
+          typeof record.path === "string" &&
+          classifyArtifactPath(record.path) === undefined
+        );
+      case "hostVar":
+        return (
+          hasExactKeys(record, ["kind", "module", "path"]) &&
+          typeof record.module === "string" &&
+          record.module.length > 0 &&
+          Array.isArray(record.path) &&
+          record.path.length > 0 &&
+          record.path.every(
+            (segment: unknown) =>
+              typeof segment === "string" && segment.length > 0,
+          )
+        );
+      default:
+        return false;
+    }
+  });
+}
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  const actual = Object.keys(value);
+  return (
+    actual.length === keys.length &&
+    keys.every((key) => Object.hasOwn(value, key))
+  );
 }
 
 /** Applies the generic one-time landing relation to producer evidence. */

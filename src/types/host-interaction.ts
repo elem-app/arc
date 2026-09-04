@@ -149,31 +149,15 @@ export type InstructionBrief = {
   postcheck?: InstructionPostcheck;
 };
 
-/**
- * A host-backed value request emitted from an expression frontier.
- *
- * The runtime is blocked until the host reports a value for this call id.
- */
+/** A host operation invocation awaiting resolution by the host. */
 export type HostCallBrief = {
   id: BriefId;
   sourceRef: NodeRef;
   module: string;
   target: string[];
   operation: string;
-  arguments: (PayloadValue | SemanticText)[];
+  arguments: PayloadValue[];
   hostParams: PayloadValue;
-};
-
-/**
- * Rendered host effect payload ready for host handling.
- */
-export type HostEffectBrief = {
-  id: BriefId;
-  sourceRef: NodeRef;
-  module: string;
-  target: string[];
-  operation: string;
-  arguments: (PayloadValue | SemanticText)[];
 };
 
 /**
@@ -249,10 +233,8 @@ export type ActionBrief = {
   canProgress: true;
   /** Protocol or authored-execution issues surfaced after the previous yield. */
   issues: RuntimeIssue[];
-  /** Pending host-backed value requests produced before this yield. */
+  /** Pending host operation invocations produced before this yield. */
   hostCalls: HostCallBrief[];
-  /** Host effects awaiting a report; unreported effects hold the frontier. */
-  hostEffects: HostEffectBrief[];
   judgments: JudgmentBrief[];
   /**
    * Pending observations, single and grouped on one channel. A single
@@ -325,15 +307,11 @@ export type InstructionReport = {
   status: "applied";
 };
 
-/**
- * Outcome for one host effect reported back by the host.
- *
- * `applied` acknowledges that the emitted effect was handled. There is no
- * per-effect failure status: a host that cannot accept an emitted effect
- * rejects the frontier with `move: "poison"` instead.
- */
-export type HostEffectReport = {
-  status: "applied";
+/** Resolution of one host operation invocation. */
+export type HostCallReport = {
+  status: "resolved";
+  /** Present when the operation produced a value. */
+  value?: PayloadValue;
 };
 
 /** Host-supplied diagnostic for `ActionReport.move = "poison"`. */
@@ -356,7 +334,7 @@ export type TriggerReport = {
   preferredMatch?: ArcRef;
   judgments?: Record<BriefId, boolean>;
   observations?: Record<BriefId, ObservationReport | ObservationGroupReport>;
-  hostCalls?: Record<BriefId, PayloadValue>;
+  hostCalls?: Record<BriefId, HostCallReport>;
 };
 
 /**
@@ -372,6 +350,5 @@ export type ActionReport = {
   instructions?: Record<BriefId, InstructionReport>;
   judgments?: Record<BriefId, boolean>;
   observations?: Record<BriefId, ObservationReport | ObservationGroupReport>;
-  hostCalls?: Record<BriefId, PayloadValue>;
-  hostEffects?: Record<BriefId, HostEffectReport>;
+  hostCalls?: Record<BriefId, HostCallReport>;
 };

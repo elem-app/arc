@@ -3,10 +3,13 @@ import { describe, expect, it } from "vitest";
 import { parse, type DocumentAnalysis } from "../src/parser/index.js";
 import { Runtime, type ActionBrief } from "../src/runtime/index.js";
 import type {
+  ActionStatement,
   CellSpec,
   Dialog,
-  HostCallExpression,
+  EffectStatement,
+  HostCall,
   RuntimeIssue,
+  ValueExpression,
 } from "../src/types/index.js";
 
 describe("public type surface", () => {
@@ -22,7 +25,10 @@ describe("public type surface", () => {
       cursor: { user: 0, self: 0 },
       lastTurns: [],
     };
-    const hostCall = undefined as HostCallExpression | undefined;
+    const hostCall = undefined as HostCall | undefined;
+    const hostCallValue = hostCall as ValueExpression | undefined;
+    const hostCallAction = hostCall as ActionStatement | undefined;
+    const hostCallEffect = hostCall as EffectStatement | undefined;
     const brief = undefined as ActionBrief | undefined;
     const issue = undefined as RuntimeIssue | undefined;
 
@@ -31,6 +37,9 @@ describe("public type surface", () => {
     expect(spec.type).toBe("number");
     expect(dialog.cursor).toEqual({ user: 0, self: 0 });
     expect(hostCall).toBeUndefined();
+    expect(hostCallValue).toBeUndefined();
+    expect(hostCallAction).toBeUndefined();
+    expect(hostCallEffect).toBeUndefined();
     expect(brief).toBeUndefined();
     expect(issue).toBeUndefined();
     expect(new Runtime()).toBeInstanceOf(Runtime);

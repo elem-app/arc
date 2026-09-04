@@ -14,7 +14,7 @@ One walk of an arc proceeds in two stages:
 
 There is only one active arc being traversed at a time.
 
-After the action graph resolves, the node's effects block runs. Effects may require additional resolution rounds. Once effects finish, any emitted host effects are surfaced in a brief for the host to handle.
+After the action graph resolves, the node's `this.effects` finalization graph runs. It uses the same actions and host-call protocol as the main graph and may require additional resolution rounds before the node settles.
 
 ## Payload Values
 
@@ -127,7 +127,7 @@ On re-entry with `this.forgetfulEntry = true`, or on entry via `forgetful(Refere
 
 The runtime communicates with the host exclusively through briefs and reports. When the runtime reaches a point requiring host involvement, it yields a **brief** describing the pending work and carrying contextual information. The host resolves the pending items, chooses a move, and sends back a **report**. The runtime uses the report to advance.
 
-Briefs also carry information the host may use at its discretion — traversal snapshots, instructions to follow, host effects to apply. Hosts must treat brief objects as immutable:
+Briefs also carry information the host may use at its discretion — traversal snapshots, instructions to follow, and host calls to resolve. Hosts must treat brief objects as immutable:
 
 - Do not mutate brief fields in place.
 - Do not reconstruct or clone a brief and pass the copy back.
@@ -146,14 +146,13 @@ An **execution walk** is one top-down pass through the active arc's action graph
 
 The runtime emits briefs under these conditions:
 
-- **Trigger brief** — trigger evaluation encounters unresolved semantic work (`judge()`, `$observe()`, expression-position host calls), or triggers finish with matchable arcs for the host to choose from.
-- **Semantic-work action brief** — action traversal encounters unresolved `judge()`, `$observe()`, `$observeOrAsk()`, or expression-position host calls.
-- **Instruction brief** — action traversal reaches one or more reachable instruction actions in the current node body.
+- **Trigger brief** — trigger evaluation encounters unresolved semantic work (`judge()`, `$observe()`, or host calls), or triggers finish with matchable arcs for the host to choose from.
+- **Action brief** — action traversal encounters unresolved `judge()`, `$observe()`, `$observeOrAsk()`, host calls, or instructions.
 - **Transition brief** — the walk's position moved between nodes and evaluation is about to continue at the new position (see Transitions below). A transition brief carries no other work.
 
 Batching:
 
-- Semantic work may batch when multiple unresolved items are reachable at the same frontier.
+- Semantic work may batch when multiple unresolved items are reachable before a blocking action at the same frontier.
 - Instruction actions batch only within the **currently executing node body**.
 - Instruction actions batch only when their effective merged `hostParams`, mode, `resolveWhen`, and `deflectWhen` match.
 - Entering a child with `$enter(ReferenceName)`, returning to a caller, or beginning `this.effects` ends an instruction batch.
@@ -187,7 +186,7 @@ type TriggerBrief = {
    * `ObservationGroupBrief`. Discriminate on the `kind` property.
    */
   observations: (ObservationBrief | ObservationGroupBrief)[];
-  /** Unresolved host-backed value requests from trigger bodies. */
+  /** Unresolved host operation invocations from trigger bodies. */
   hostCalls: HostCallBrief[];
   /** Arcs whose triggers currently evaluate `true`. */
   matchableArcs: ArcRef[];
@@ -208,8 +207,8 @@ type TriggerReport = {
    * `ObservationGroupReport`.
    */
   observations?: Record<BriefId, ObservationReport | ObservationGroupReport>;
-  /** Resolved host-call values, keyed by brief id. */
-  hostCalls?: Record<BriefId, PayloadValue>;
+  /** Resolved host calls, keyed by brief id. */
+  hostCalls?: Record<BriefId, HostCallReport>;
 };
 ```
 
@@ -235,12 +234,10 @@ type ActionBrief = {
    * one atomic report. Discriminate on the `kind` property.
    */
   observations: (ObservationBrief | ObservationGroupBrief)[];
-  /** Pending host-backed value requests. */
+  /** Pending host operation invocations. */
   hostCalls: HostCallBrief[];
   /** Host-directed guidance text (typically used to steer host LLM output). */
   instructions: InstructionBrief[];
-  /** Host effects emitted during this step. */
-  hostEffects: HostEffectBrief[];
   /** The walk's position moved; exclusive of all other work (see Transitions). */
   transition?: NodeTransition;
   /** Valid moves for the report. */
@@ -283,14 +280,12 @@ type ActionReport = {
    *   message since the prior brief. It does not imply that any instruction was
    *   applied; application is reported per instruction id below.
    * "deflect" — user changed topic; the active node becomes deflected and is
-   *   eligible for re-entry. Pending effects still run. Only available when
-   *   `allowedMoves` includes it: a brief whose pending work is semantic —
-   *   judgments, observations, or host calls — carrying no instruction, host
-   *   effect, or transition.
+   *   eligible for re-entry. Pending finalization actions still run. Only
+   *   available when `allowedMoves` includes it: a brief carrying no
+   *   instruction, unresolved host-call action, or transition.
    * "poison" — host cannot execute the current frontier contract. The active
    *   arc becomes terminally poisoned. Available while the action traversal can
-   *   progress, including frontiers that are blocked on unreported host
-   *   effects.
+   *   progress, including frontiers blocked on an unresolved host call.
    */
   move: ActionMove;
   /** Optional diagnostic used when `move` is "poison". */
@@ -308,10 +303,8 @@ type ActionReport = {
    * `ObservationGroupReport`.
    */
   observations?: Record<BriefId, ObservationReport | ObservationGroupReport>;
-  /** Resolved host-call values, keyed by brief id. */
-  hostCalls?: Record<BriefId, PayloadValue>;
-  /** Resolved host effects, keyed by brief id. */
-  hostEffects?: Record<BriefId, HostEffectReport>;
+  /** Resolved host calls, keyed by brief id. */
+  hostCalls?: Record<BriefId, HostCallReport>;
 };
 ```
 
@@ -338,9 +331,9 @@ type NodeTransition = {
 
 One transition describes one stretch of position changes with no intervening authored evaluation. A guarded child or a branch condition between hops forces a per-hop transition — that evaluation is precisely what needs the new view — while guard-less enter chains and uncaught deflections through hookless, effect-less ancestors coalesce into one multi-element transition.
 
-A transition brief is **exclusive**: it carries no judgments, observations, host calls, instructions, or host effects. Any work that could ride along would have been produced under the old view, so it surfaces only after acknowledgment, posed under the fresh projection — which may also change what is posed. The runtime enforces this; a transition brief with work is a runtime defect, not a host concern. The resulting invariant is that reports are **view-pure**: a work report answers work under the current view (same view, possibly newer content), and a transition proceed changes the view and answers nothing.
+A transition brief is **exclusive**: it carries no judgments, observations, host calls, or instructions. Any work that could ride along would have been produced under the old view, so it surfaces only after acknowledgment, posed under the fresh projection — which may also change what is posed. The runtime enforces this; a transition brief with work is a runtime defect, not a host concern. The resulting invariant is that reports are **view-pure**: a work report answers work under the current view (same view, possibly newer content), and a transition proceed changes the view and answers nothing.
 
-`allowedMoves` for a transition brief is `["poison", "proceed"]`. The host may rely on exclusivity without checking: when `transition` is present the work arrays are empty, and the report is the bare move — no judgment, observation, host-call, or host-effect entries, since there is nothing they could answer, and the runtime applies no itemized results when acknowledging a transition. The proceed's significance is the dialog argument that accompanies it, which the host projects for `position` — the runtime interprets no host params, so `hostParams` hands the host whatever its own projection rule reads. A host that cannot produce the projection fails the same way it fails a host call: it poisons the frontier rather than letting the walk continue on a wrong view. An unacknowledged transition persists with the traversal set and re-yields after a restart, and a rejected report re-carries it.
+`allowedMoves` for a transition brief is `["poison", "proceed"]`. The host may rely on exclusivity without checking: when `transition` is present the work arrays are empty, and the report is the bare move — no judgment, observation, host-call, or instruction entries, since there is nothing they could answer, and the runtime applies no itemized results when acknowledging a transition. The proceed's significance is the dialog argument that accompanies it, which the host projects for `position` — the runtime interprets no host params, so `hostParams` hands the host whatever its own projection rule reads. A host that cannot produce the projection fails the same way it fails a host call: it poisons the frontier rather than letting the walk continue on a wrong view. An unacknowledged transition persists with the traversal set and re-yields after a restart, and a rejected report re-carries it.
 
 Transitions surface only during the action stage; trigger probing evaluates against the single projection of the activating inbound and never announces position changes.
 
@@ -492,9 +485,9 @@ type ObservationGroupReport = {
 
 When every field is `resolved` or `unknown`, the runtime writes all `resolved` values together and resolves the group. When any field is `needs-user`, the group re-emits and nothing is written.
 
-#### Host Calls and Host Effects
+#### Host Calls
 
-`HostCallBrief` represents a request by the runtime to get a value from a host module — from an expression-position host call like `Dice.roll(20)` or `Dice["tables"].roll(20)`. The runtime is blocked until the host reports a value. Built-in `Dialog` snapshot and cursor helpers are resolved locally by the runtime and do not emit host calls.
+`HostCallBrief` represents one host operation invocation. A host call may be consumed as an expression, as in `Dice.roll(20)`, or as an action, as in `Memoir.facts.$apply(text)`. Action use is accepted throughout action graphs, including `invoke(...)`, `$map(...)`, and `this.effects`. Every use shares the same brief shape and report channel. Built-in `Dialog` snapshot and cursor helpers are resolved locally and do not emit host calls.
 
 ```typescript
 type HostCallBrief = {
@@ -515,45 +508,29 @@ type HostCallBrief = {
 };
 ```
 
-The runtime resolves the call's `module + target + operation` path through its injected host-module registry. The operation must declare a result, and its rendered arguments must pass the declared parameter specs before the brief is emitted. Static document analysis rejects provably incompatible operands; concrete admission still checks every emitted value, including Enum membership, finite numbers, Artifact paths, recursive arrays, tuples, and `SemanticText`. If argument admission fails, the traversal poisons with `invalid-host-argument` and no invalid call is emitted.
+The runtime resolves the call's `module + target + operation` path through its injected host-module registry and admits every rendered argument against the declared parameter specs before emitting the brief. Static document analysis rejects provably incompatible operands; concrete admission checks every emitted value, including Enum membership, finite numbers, Artifact paths, recursive arrays, tuples, and `SemanticText`. If argument admission fails, the traversal poisons with `invalid-host-argument` and emits no invalid call. Nested host calls remain unavailable as arguments because arguments must be renderable without additional host work.
 
-A host-call report first passes transport sanitation. Only top-level `undefined` is admitted; every nested value must satisfy the durable payload-shape rules above, and every number must be finite. A report item containing a non-finite number is rejected as an `invalid-item` with `reasonCode: "host-call-non-finite-number"`; a malformed recursive shape uses `invalid-struct-value`. It then passes concrete admission against the operation's declared result. A mismatch is rejected as an `invalid-item` with `reasonCode: "host-call-result-type"`. Top-level `undefined` is an explicit unset result and is accepted independently of the result spec. Each invalid item is removed from the accepted report subset, valid siblings remain accepted, and the rejected host call reappears under the same id. Negative zero is accepted and subsequently represented as zero.
+The consumer decides whether a result is required. An expression consumer requires the operation to declare a result compatible with the demanded spec. An action consumer imposes no result requirement; it accepts an operation with or without a declared result and discards any value the host reports. There is no consumer marker in the brief. The `$` sigil is consumed by parsing, and `operation` is always unsigiled.
 
-Artifact interpretation follows the resolved result spec. A `{ path: "x" }` result is admitted only where that spec supplies Artifact authority, including through an array element; the same payload reported for `Str()` is a result mismatch. No payload object shape selects Artifact semantics by itself.
+The host must not infer the originating consumer from a `HostCallBrief`. `ActionBrief.allowedMoves` is authoritative for control: a call awaiting action resolution withholds `"deflect"`, while a call awaiting an expression value does not by itself withhold it. The runtime derives this distinction from the consumer while building the brief.
 
-`HostEffectBrief` represents a statement-position host call emitted from a node's `this.effects` body — the runtime does not execute it; the host does, and reports back. An unreported effect keeps its node unfinished and its terminal state unset: the run cannot cover or deflect that node or continue into later nodes, and every subsequent brief re-surfaces the effect under the same id until the host reports it or rejects the frontier with `move: "poison"`. Other briefable work from the same effects body may surface alongside the effect on the same brief; work from later nodes cannot.
-
-Authored host-effect targets may use dot segments or static string-literal bracket segments. The runtime emits the same `module`, `target`, and `operation` shape either way.
+Every host-call report has an explicit resolution envelope:
 
 ```typescript
-type HostEffectBrief = {
-  /** Opaque key. Echo back in the report. */
-  id: BriefId;
-  /** Source node whose effects body emitted this effect. */
-  sourceRef: NodeRef;
-  /** Host module name from `host:*`. */
-  module: string;
-  /** Member path before the operation, e.g. `["facts"]`. */
-  target: string[];
-  /** Final called member name, e.g. `"apply"`. */
-  operation: string;
-  /** Rendered call arguments. Semantic arguments may preserve semantic text parts. */
-  arguments: PayloadValue[];
+type HostCallReport = {
+  status: "resolved";
+  /** Present when the operation produced a value. */
+  value?: PayloadValue;
 };
 ```
 
-The runtime resolves and admits host-effect arguments through the same operation declaration used for calls. An operation need not declare a result to be used as an effect, and an effect discards any declared result. If any effect argument in one effects batch fails concrete admission, the runtime emits none of that batch. Each admitted effect statement is emitted once — re-briefs of a still-unreported effect reuse its id, so the host can deduplicate deliveries by id. `operation` is always unsigiled; the `$`-sigil before a host effect's operation name in Arc source exists only in the authored Arc spelling.
+This envelope represents a void resolution without using `undefined` as the acknowledgment: `{ status: "resolved" }` is resolved with no produced value. For an expression consumer, an absent or `undefined` value becomes the existing unset result and a concrete value is admitted against the declared result before use. A mismatch is rejected as an `invalid-item` with `reasonCode: "host-call-result-type"`. Artifact interpretation follows that result spec, so a `{ path: "x" }` payload acquires Artifact authority only through an Artifact result. An action consumer ignores the `value` member.
 
-Every `PayloadValue` emitted in a host-call brief, instruction or observation `hostParams`, or host-effect brief contains only finite numbers, including inside arrays and objects. Negative zero is represented as ordinary zero.
+Report values first pass transport sanitation. Every nested value must satisfy the durable payload-shape rules and every number must be finite. A non-finite number is rejected with `reasonCode: "host-call-non-finite-number"`; a malformed recursive shape uses `invalid-struct-value`. Each invalid item is removed from the accepted report subset, valid siblings remain accepted, and the rejected call reappears under the same id. Negative zero is accepted and represented as zero.
 
-The host reports a handled effect as a `HostEffectReport`:
+A host call used as an action follows resolved-once action-state lifetime. On first reach, the runtime captures its admitted arguments and `hostParams` and suspends at that action. It re-emits the captured invocation under the same brief id without reevaluating its inputs until it receives `{ status: "resolved" }` or the host poisons the frontier. Once resolved, the action slot stays resolved through ordinary retries and re-entry. A new `invoke(...)` run, a different `$map(...)` member, or a forgetful entry clears the applicable action state, so the call executes again when reached.
 
-```typescript
-type HostEffectReport = {
-  /** "applied" — the host handled the effect. */
-  status: "applied";
-};
-```
+Persisted action state includes pending captured invocations. Restoration validates pending and resolved state shapes, call identity, captured argument admission, and captured `hostParams` before traversal resumes.
 
 #### Instructions
 
@@ -717,7 +694,7 @@ Document intake uses this exact order:
 4. Analyze the stamped private clone again under the runtime's definitive host-module registry and reject every issue. The runtime retains this analysis's rewalk plan.
 5. Canonicalize negative zero in the private clone only after the second analysis succeeds, then collect every root atomically.
 
-If raw analysis finds issues, `add()` reports all non-`ELEMENT_ID` issues together and does not clone. Environment-free analysis treats a host call without declaration evidence as dynamic; this preserves raw public-IR validation without guessing a host environment. If the stamped private analysis finds issues, it reports all of them together and does not collect. The definitive pass requires every imported host module and action path, exact operation arity, compatible parameter operands, a declared result for value calls, and compatibility between that result and all consumers. The second pass runs only after raw validation succeeds because malformed descriptors, cycles, and other invalid graph shapes cannot safely cross the clone boundary. Duplicate sources, duplicate Arc refs, and validation failures collect nothing from that call. `add()` performs every document-local and host-environment check, but it does not require imported Arc documents to have been added yet.
+If raw analysis finds issues, `add()` reports all non-`ELEMENT_ID` issues together and does not clone. Environment-free analysis treats a host call without declaration evidence as dynamic; this preserves raw public-IR validation without guessing a host environment. If the stamped private analysis finds issues, it reports all of them together and does not collect. The definitive pass requires every imported host module and action path, exact operation arity, compatible parameter operands, and satisfaction of each consumer's result demand. An action consumer creates no result demand. The second pass runs only after raw validation succeeds because malformed descriptors, cycles, and other invalid graph shapes cannot safely cross the clone boundary. Duplicate sources, duplicate Arc refs, and validation failures collect nothing from that call. `add()` performs every document-local and host-environment check, but it does not require imported Arc documents to have been added yet.
 
 **`init()`** — resolve and validate the complete prospective registry. Initialization resolves every import and imported node-entry endpoint, then walks imported bindings with the caller's lexical cells, current node signature, and enclosing `$map` receiver/result element specs. Args bindings are checked provider-to-receiver; returns bindings are checked declared-return-to-local-receiver. It collects unresolved imports and every independently checkable undeclared, unresolved, or incompatible binding. A binding dependent on an unresolved import is skipped rather than reported as a cascade. Issues are returned in canonical source/position/binding order, independent of document-add order, and one `RuntimeRegistrationError` reports the complete result.
 
@@ -808,5 +785,5 @@ A typical host turn:
 3. Action stage (if an arc is active):
    1. `start(traversals, dialog)` → `ActionBrief | TerminalBrief`.
    1. Persist `brief.traversals`.
-   1. While `brief.canProgress`, inspect its instructions and pending work, choose when to hand control back, resolve available items, and call `progress(brief, { move, instructions, judgments, observations, hostCalls, hostEffects }, latestDialog)`. Unresolved or unreported work re-surfaces on later `ActionBrief`s under the same ids. Report `move: "poison"` instead if the host cannot accept the frontier contract or fails a resolution fatally. Persist each returned `brief.traversals`.
+   1. While `brief.canProgress`, inspect its instructions, pending work, and `allowedMoves`; choose when to hand control back; resolve available items; and call `progress(brief, { move, instructions, judgments, observations, hostCalls }, latestDialog)`. Unresolved or unreported work re-surfaces on later `ActionBrief`s under the same ids. Report `move: "poison"` instead if the host cannot accept the frontier contract or fails a resolution fatally. Persist each returned `brief.traversals`.
    1. When `canProgress` is false, settle from `brief.root`, `brief.outcome`, `brief.returns`, and `brief.issues`.

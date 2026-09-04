@@ -14,7 +14,7 @@ graph TD
   Host --> Runtime
   Runtime --> State[Traversal state]
   Runtime --> Issues[Runtime issues]
-  Runtime --> Effects[Host effects]
+  Runtime --> Calls[Host calls]
 ```
 
 ## Parser Behavior
@@ -76,7 +76,7 @@ Arc applies three distinct spec judgments as a document moves from analysis thro
 2. **Reusable compatibility** is used for channel bindings. Document analysis applies it when both endpoints are available in the same document; `Runtime.init()` applies the same relation after resolving imported Arc targets against the complete registry. It succeeds only when every value guaranteed by the provider site is acceptable to the receiver site, because the binding may carry many future values.
 3. **Concrete admission** is the final runtime check when an actual value reaches a `CellSpec` or `ChannelSpec`. It enforces Bool, Str, Enum membership, finite `Num`, `Index` bounds, recursive arrays, Artifact, and cursor invariants before the value is used or stored. Analysis may apply the same predicate early when it has an exact literal, but every constrained runtime landing still admits its concrete value.
 
-Injected host-module specs participate at those same stages. A declared host parameter is the destination of one authored argument operand: analysis judges that occurrence from its `HostCallArgument` IR and runtime evaluation admits the rendered value immediately before emitting the call or effect. A declared host-call result is producer evidence for every surrounding consumer. When the host reports a result, transport sanitation runs first and concrete admission against the declared result runs before the value can hydrate a pin. Artifact authority therefore comes from the resolved result spec rather than the payload's object shape.
+Injected host-module specs participate at those same stages. A declared host parameter is the destination of one authored argument operand: analysis judges that occurrence from its `HostCallArgument` IR and runtime evaluation admits the rendered value immediately before emitting the call. A declared host-call result is producer evidence only when a surrounding consumer demands a value. When the host reports an expression result, transport sanitation runs first and concrete admission against the declared result runs before the value can hydrate a pin. Artifact authority therefore comes from the resolved result spec rather than the payload's object shape. Action consumers demand no value and perform no result admission.
 
 Environment-free document analysis has no host-operation resolver, so host calls remain dynamic there. `Runtime.add()` repeats analysis on its private document under the runtime's immutable host-module registry and is definitive for module paths, arity, parameter operands, declared results, and result consumers. `Runtime.init()` retains the separate reusable-compatibility pass that requires the complete Arc document registry.
 
@@ -251,7 +251,7 @@ Host report protocol problems do not throw once a known brief is supplied. Illeg
 
 Authored execution failures are caught at runtime advancement boundaries and converted to `RuntimeIssue { kind: "poisoned-traversal" }`. A known throw site supplies a stable cause-specific `reasonCode`; an uncategorized exception uses `other-runtime-error`. In action progression, the active root traversal becomes `phase: "poisoned"`. In trigger probing, the poisoned candidate is recorded and probing continues for other arcs.
 
-The runtime does not execute host effects, so handler execution and delivery failures are host-owned. The emitted effect record is still part of the action frontier contract: if the host cannot accept that contract at all, for example because no implementation exists for the referenced host module, it may report `move: "poison"`. Once the host handles an effect, it reports the effect's brief id with `status: "applied"` and the runtime resolves the effect statement.
+The runtime describes every host operation with a `HostCallBrief`; executing the handler and delivering its result are host-owned. If the host cannot accept that frontier, for example because no implementation exists for the referenced module, it may report `move: "poison"`. Otherwise it reports the call's brief id with `{ status: "resolved", value? }`. Expression consumers use and validate the value; action consumers resolve without demanding one.
 
 ## SEG Semantics
 
@@ -261,7 +261,7 @@ A smallest enclosing graph, or SEG, is the smallest local statement graph that o
 
 A SEG walks its statements through an explicit frame stack. `if`, `label`, and `break` shape that stack; leaf statements act at the current position. When an action resolves, the walk advances to the following statement. Decisions and evaluations already crossed remain pinned, while later evaluations observe updated state and append to the same tape.
 
-Each resolved-once action occurrence has one frame slot: absent before reach, pending while blocked at the frontier, and resolved after settlement. Authored `$` forms such as `$enter(...)`, `$observe(...)`, `cell.$set(...)`, and host effect `Memoir.facts.$apply(...)` use these slots and resolve once per SEG instance. A grouped `$observe({ ... })` is one slot and writes all `resolved` fields atomically before advancing; an invalid or incomplete report writes nothing and re-emits the group.
+Each resolved-once action occurrence has one frame slot: absent before reach, pending while blocked at the frontier, and resolved after settlement. Authored `$` forms such as `$enter(...)`, `$observe(...)`, `cell.$set(...)`, and `Memoir.facts.$apply(...)` use these slots and resolve once per logical action instance. For a host call, the pending slot stores its rendered arguments and `hostParams`; retries re-emit that capture under the same id without reevaluation. A grouped `$observe({ ... })` is one slot and writes all `resolved` fields atomically before advancing; an invalid or incomplete report writes nothing and re-emits the group.
 
 Expressions have no resolved-once slot. Every non-constant sigil-less evaluation — including judgments, host calls, `Dialog.*`, cell/channel/outcome reads, and invocation completions — reserves its position on the SEG's pin tape when first reached. The tape is keyed by statement element id and evaluation order, so resume can replay the exact route without re-reading state that may have changed while frontier work settled. Accepted judgment and host-call results fill their pending tape entries. Action-traversal tapes persist with traversal state and therefore survive runtime reconstruction.
 
@@ -281,7 +281,7 @@ Values bind when their evaluation is first reached. A later brief may therefore 
 
 ### Boundaries
 
-A fresh SEG instance starts with empty resolved-once state and an empty tape. Fresh instances include a `forgetful` / `newcopy` entry, a new hook consultation, a new invoke, and a new map member. Explicit restart boundaries are separate from ordinary write continuation: a caught deflection restarts the catching node body and drops that body tape.
+A fresh SEG instance starts with empty resolved-once state and an empty tape. Fresh instances include a `forgetful` / `newcopy` entry, a new hook consultation, a new invoke, and a new map member. A host-call action reached in a fresh instance executes again, while a retry of a pending instance preserves its captured inputs and brief id. Explicit restart boundaries are separate from ordinary write continuation: a caught deflection restarts the catching node body and drops that body tape.
 
 Trigger evaluation uses the same pin-and-seek model per candidate consultation. Retries on one trigger brief chain retain answered pins and re-emit only blocked work. A fresh `startTrigger(...)` starts fresh consultations, while terminal candidate outcomes remain stable within a retry chain. A terminal match can therefore coexist with work from open candidates. Without an effective `preferredMatch`, implicit sole-match selection waits until no consultation work remains. An explicit preference for a terminal match selects immediately and discards the other candidates' pending work from the matched brief; a preference for an open candidate remains pending until it either matches or settles unmatched. An unmatched request is rejected rather than falling back to another match or reporting ambiguity. Trigger consultation state lives in the in-memory brief chain rather than persisted traversal state, so process reconstruction begins fresh consultations.
 
@@ -325,7 +325,7 @@ Lifetimes follow the frontier model, as an invoke's do:
 - **A blocked member resumes itself.** The block records the member SEG (`{ kind: "mapMember", owner, index }`) or, for a briefing leaf inside it, that leaf's own hook; resume routes the node body AT the `$map` — the outermost enclosing wide-body owner — and the driver re-enters the member, whose body seeks from its top against the member tape.
 - **The enclosing SEG continues after the map.** Member writes and the final `results` commit are visible to later statements. `results` may be the receiver: evaluation reads the pinned old value, and resolution performs one replacement.
 
-Deflection boundaries: a deflection raised in a member — including a host `move: "deflect"` on a frontier blocked inside it — abandons the member and, crossing the `$map`, clears the whole arena (arena, terminal rows, pinned input), then routes to the enclosing node's own catch, reusing the wide-body crossing precedent. A caught restart reaches a virgin `$map`; an uncaught deflection deflects the node with no `results` commit. Cell mutations and host effects earlier members already applied stay applied — the atomic construction is of the output array, not of member execution.
+Deflection boundaries: a deflection raised in a member — including a host `move: "deflect"` on a frontier blocked inside it — abandons the member and, crossing the `$map`, clears the whole arena (arena, terminal rows, pinned input), then routes to the enclosing node's own catch, reusing the wide-body crossing precedent. A caught restart reaches a virgin `$map`; an uncaught deflection deflects the node with no `results` commit. Cell mutations and host-call actions earlier members already resolved stay resolved — the atomic construction is of the output array, not of member execution.
 
 ## Traversal Finalizing
 
@@ -357,7 +357,7 @@ The persisted pending-deflection context stores `origin` and an optional `from` 
 
 Brief objects are ephemeral capability objects. The host must pass the exact brief object instance back to `progressTrigger(...)` or `progress(...)`; cloned or reconstructed objects are invalid.
 
-The traversal set included in each brief is the persistence boundary. Hosts should persist traversal state after each brief is issued, including briefs that contain host effects or runtime issues.
+The traversal set included in each brief is the persistence boundary. Hosts should persist traversal state after each brief is issued, including briefs that contain host calls or runtime issues.
 
 Reports are interpreted against the originating brief snapshot. Unknown ids are protocol issues, not dynamic lookups into the current traversal.
 
@@ -365,7 +365,9 @@ An accepted host-call `PayloadValue` contains only finite numbers, with negative
 
 `allowedMoves` is authoritative. A host may only report moves listed on the brief. The runtime validates this before applying report data.
 
-`hostEffects` are ordered, id-keyed work items like judgments, observations, and host calls. An unreported effect keeps its node unfinished and re-surfaces under the same brief id on every later brief until the host reports it `applied` in `ActionReport.hostEffects` or rejects the frontier with `poison`.
+Host-call briefs are carried in `hostCalls`, and reports address them by brief id. Expression consumers retain the result through their pin tape. Action consumers use resolved-once state: the runtime captures the invocation, suspends at that action, withholds host deflection, and re-emits the same brief id until the host reports `{ status: "resolved" }` or poisons the frontier.
+
+Persisted traversal restoration validates host-call state before any walk resumes. Every pending or resolved action-state shape must match a host call in either the main action graph or `this.effects`, and captured arguments and `hostParams` must remain durable and valid against the registered operation declaration.
 
 An unacknowledged transition persists on the action root as `pendingTransition`, written at the transition block sink beside the active frame and cleared when a report on the transition brief is accepted. It carries the stretch (`exited`/`entered`) only; the transition's `position` is a view coordinate stamped by the gate on each walk that blocks there, and may differ from the frame's `activeRef` resume coordinate: an exit records the frame at the terminal child (so resume redoes the bubble-up) while the position names the caller about to evaluate. Because the plan walk seeds its latch from `pendingTransition` and blocks at the first gate, a rebuilt brief re-carries the same exclusive transition; the brief-build path asserts that a transition brief collected no work, as a tripwire for gate-placement regressions. Acknowledging a transition applies no results; the runtime treats the accepted proceed as a re-plan under the freshly supplied dialog.
 

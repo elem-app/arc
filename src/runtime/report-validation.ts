@@ -3,6 +3,7 @@ import type {
   ActionPoisonReason,
   ActionReport,
   HostCallBrief,
+  HostCallReport,
   ObservationBrief,
   ObservationGroupBrief,
   ObservationGroupReport,
@@ -211,13 +212,31 @@ export function filterObservationReports(
   };
 }
 
-export function filterHostCallResults(provided: Record<string, PayloadValue>): {
-  accepted?: Record<string, PayloadValue>;
+export function filterHostCallResults(
+  provided: Record<string, HostCallReport>,
+): {
+  accepted?: Record<string, HostCallReport>;
   issues: RuntimeIssue[];
 } {
-  const accepted: Record<string, PayloadValue> = {};
+  const accepted: Record<string, HostCallReport> = {};
   const issues: RuntimeIssue[] = [];
-  for (const [id, value] of Object.entries(provided)) {
+  for (const [id, raw] of Object.entries(provided)) {
+    const inspected = inspectHostCallReport(raw);
+    if (!inspected) {
+      issues.push(
+        buildInvalidItemIssue(
+          id,
+          "host-call-report-shape",
+          `Invalid host call report for ${id}: expected status "resolved" and an optional value`,
+        ),
+      );
+      continue;
+    }
+    if (!inspected.hasValue) {
+      accepted[id] = { status: "resolved" };
+      continue;
+    }
+    const value = inspected.value;
     const payloadIssue = firstInvalidPayloadValue(value);
     if (payloadIssue) {
       issues.push(
@@ -229,7 +248,8 @@ export function filterHostCallResults(provided: Record<string, PayloadValue>): {
       );
       continue;
     }
-    const path = firstNonFiniteNumberPath(value);
+    const cloned = clonePayloadValue(value as PayloadValue);
+    const path = firstNonFiniteNumberPath(cloned);
     if (path !== undefined) {
       issues.push(
         buildInvalidItemIssue(
@@ -240,7 +260,10 @@ export function filterHostCallResults(provided: Record<string, PayloadValue>): {
       );
       continue;
     }
-    accepted[id] = clonePayloadValue(cloneWithCanonicalNumbers(value));
+    accepted[id] = {
+      status: "resolved",
+      value: cloneWithCanonicalNumbers(cloned),
+    };
   }
   return {
     accepted: Object.keys(accepted).length > 0 ? accepted : undefined,
@@ -248,22 +271,63 @@ export function filterHostCallResults(provided: Record<string, PayloadValue>): {
   };
 }
 
+function inspectHostCallReport(
+  raw: unknown,
+): { hasValue: false } | { hasValue: true; value: unknown } | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(raw);
+  } catch {
+    return undefined;
+  }
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    keys.some((key) => key !== "status" && key !== "value") ||
+    keys.length < 1 ||
+    keys.length > 2
+  ) {
+    return undefined;
+  }
+  const status = descriptors.status;
+  if (
+    !status ||
+    !("value" in status) ||
+    !status.enumerable ||
+    status.value !== "resolved"
+  ) {
+    return undefined;
+  }
+  const value = descriptors.value;
+  if (!value) return { hasValue: false };
+  if (!("value" in value) || !value.enumerable) return undefined;
+  return { hasValue: true, value: value.value };
+}
+
 /** Applies declared result specs to the transport-valid host-call subset. */
 export function admitHostCallResults(
   calls: readonly HostCallBrief[],
-  values: Readonly<Record<string, PayloadValue>>,
+  reports: Readonly<Record<string, HostCallReport>>,
   modules: ReadonlyMap<string, HostModuleSpec>,
+  valueDemands: ReadonlySet<string>,
 ): {
-  accepted?: Record<string, PayloadValue>;
+  accepted?: Record<string, HostCallReport>;
   issues: RuntimeIssue[];
 } {
   const callsById = new Map(calls.map((call) => [call.id, call]));
-  const accepted: Record<string, PayloadValue> = {};
+  const accepted: Record<string, HostCallReport> = {};
   const issues: RuntimeIssue[] = [];
 
-  for (const [id, value] of Object.entries(values)) {
+  for (const [id, report] of Object.entries(reports)) {
     const call = callsById.get(id);
     if (!call) continue;
+    if (!valueDemands.has(id)) {
+      accepted[id] =
+        "value" in report
+          ? { status: "resolved", value: clonePayloadValue(report.value) }
+          : { status: "resolved" };
+      continue;
+    }
     const path = [call.module, ...call.target, call.operation].join(".");
     const resolution = resolveHostOperation(modules, call);
     if (
@@ -271,13 +335,14 @@ export function admitHostCallResults(
       resolution.operation.returns === undefined
     ) {
       throw new Error(
-        `Registered host call ${path} no longer resolves to an operation with a result`,
+        `Value-demanding host call ${path} no longer resolves to an operation with a result`,
       );
     }
-    if (value === undefined) {
-      accepted[id] = undefined;
+    if (!("value" in report) || report.value === undefined) {
+      accepted[id] = { status: "resolved" };
       continue;
     }
+    const value = report.value;
     const admission = admitValue(resolution.operation.returns, value);
     if (!admission.admitted) {
       issues.push(
@@ -289,7 +354,7 @@ export function admitHostCallResults(
       );
       continue;
     }
-    accepted[id] = value;
+    accepted[id] = { status: "resolved", value: clonePayloadValue(value) };
   }
 
   return {

@@ -13,7 +13,6 @@ import { resumePath } from "../src/runtime/execute.js";
 import type { SegFrame } from "../src/runtime/seg.js";
 import type { ElementId, Statement } from "../src/types/index.js";
 import {
-  appliedHostEffects,
   appliedInstructions,
   arc,
   EMPTY_DIALOG,
@@ -23,6 +22,7 @@ import {
   progressBrief,
   progressTerminal,
   renderSemanticTextForTest,
+  resolvedHostCalls,
   rootTraversal,
   TestRuntime as Runtime,
   startRun,
@@ -261,16 +261,16 @@ function Main() {
       seeded.phase = "entered";
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
 
-      expect(brief.hostEffects).toHaveLength(1);
-      expect(brief.hostEffects[0]!.operation).toBe("apply");
+      expect(brief.hostCalls).toHaveLength(1);
+      expect(brief.hostCalls[0]!.operation).toBe("apply");
       expect(rootTraversal(brief).phase).toBe("entered");
       expect(rootTraversal(brief).cells.verdict).toBeUndefined();
 
-      // Reporting the effect resolves the child, which commits the staged
+      // Reporting the host call resolves the child, which commits the staged
       // `returns.verdict` write back to the caller.
       const confirmed = progressTerminal(runtime, brief, {
         move: "proceed",
-        hostEffects: appliedHostEffects(brief),
+        hostCalls: resolvedHostCalls(brief),
       });
 
       expect(rootTraversal(confirmed).cells.verdict).toBe(true);
@@ -2032,7 +2032,7 @@ function Main() {
       });
       const childBrief = progressBrief(runtime, brief, { move: "deflect" });
 
-      expect(childBrief.hostEffects).toEqual([
+      expect(childBrief.hostCalls).toEqual([
         {
           id: expect.any(String),
           sourceRef: node("deflect-parent-effects-arc", "Main.Intro"),
@@ -2052,10 +2052,10 @@ function Main() {
 
       const parentBrief = progressBrief(runtime, childBrief, {
         move: "proceed",
-        hostEffects: appliedHostEffects(childBrief),
+        hostCalls: resolvedHostCalls(childBrief),
       });
 
-      expect(parentBrief.hostEffects).toEqual([
+      expect(parentBrief.hostCalls).toEqual([
         {
           id: expect.any(String),
           sourceRef: node("deflect-parent-effects-arc", "Main"),
@@ -2076,10 +2076,10 @@ function Main() {
 
       const suspended = progressTerminal(runtime, parentBrief, {
         move: "proceed",
-        hostEffects: appliedHostEffects(parentBrief),
+        hostCalls: resolvedHostCalls(parentBrief),
       });
 
-      expect("hostEffects" in suspended).toBe(false);
+      expect("hostCalls" in suspended).toBe(false);
       expect(rootTraversal(suspended).phase).toBe("suspended");
       expect(rootTraversal(suspended).state).toBe("deflected");
     });

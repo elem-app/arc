@@ -12,11 +12,11 @@ import { parse } from "../src/parser/index.js";
 import type { Dialog } from "../src/types/index.js";
 import {
   actionProgress,
-  appliedHostEffects,
   appliedInstructions,
   arc,
   EMPTY_DIALOG,
   node,
+  resolvedHostCalls,
   rootTraversal,
   TestRuntime as Runtime,
   startTrigger,
@@ -74,7 +74,7 @@ function Main() {
       expect(brief.judgments).toEqual([]);
       expect(brief.observations).toEqual([]);
       expect(brief.hostCalls).toEqual([]);
-      expect(brief.hostEffects).toEqual([]);
+      expect(brief.hostCalls).toEqual([]);
       expect(brief.instructions).toEqual([]);
     });
 
@@ -323,7 +323,7 @@ function Main() {
 
       const entry = actionProgress(runtime.start([seeded], EMPTY_DIALOG));
       expect(entry.transition).toBeDefined();
-      expect(entry.hostEffects).toEqual([]);
+      expect(entry.hostCalls).toEqual([]);
 
       const work = actionProgress(
         runtime.progress(entry, { move: "proceed" }, EMPTY_DIALOG),
@@ -342,12 +342,12 @@ function Main() {
         ),
       );
       expect(effects.transition).toBeUndefined();
-      expect(effects.hostEffects).toHaveLength(1);
+      expect(effects.hostCalls).toHaveLength(1);
 
       const exit = actionProgress(
         runtime.progress(
           effects,
-          { move: "proceed", hostEffects: appliedHostEffects(effects) },
+          { move: "proceed", hostCalls: resolvedHostCalls(effects) },
           EMPTY_DIALOG,
         ),
       );

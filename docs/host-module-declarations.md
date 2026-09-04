@@ -70,7 +70,7 @@ Declaration functions must be synchronous. Ordinary async functions are rejected
 The returned declaration participates at three existing runtime boundaries:
 
 1. `Runtime.add()` resolves imported operations and rejects unknown paths, wrong arity, missing call results, and provably incompatible operands or consumers. A whole `Array(Artifact())` cell or channel satisfies a matching immediate host-array parameter under its registered element authority.
-2. Before emitting a call or effect brief, the runtime admits each concrete argument against its declared parameter spec. Recursive parameter arrays and tuples report the first failing payload path.
+2. Before emitting a host-call brief, the runtime admits each concrete argument against its declared parameter spec. Recursive parameter arrays and tuples report the first failing payload path.
 3. Before accepting a reported call result, the runtime admits it against the declared result spec. An `Array(Artifact())` result admits every exact Artifact member, reports the first invalid index, and retains its result authority through downstream landing and replay without serialized provenance.
 
 `Runtime` accepts normalized `HostModuleSpec` values directly. Using `hmd` is the public host-authoring utility; it does not become part of runtime evaluation.

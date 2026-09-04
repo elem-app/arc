@@ -19,7 +19,6 @@ import type { ArcTraversalSet, Dialog } from "../src/types/index.js";
 import {
   actionProgress,
   actionTerminal,
-  appliedHostEffects,
   appliedInstructions,
   arc,
   EMPTY_DIALOG,
@@ -30,6 +29,7 @@ import {
   progressBrief,
   progressTerminal,
   renderSemanticTextForTest,
+  resolvedHostCalls,
   rootTraversal,
   TestRuntime as Runtime,
   singleObservation,
@@ -299,7 +299,7 @@ function Main() {
 
       expect(rootTraversal(nextBrief).cells.interest).toBeUndefined();
       expect(rootTraversal(nextBrief).cells.topic).toBeUndefined();
-      expect("hostEffects" in nextBrief).toBe(false);
+      expect("hostCalls" in nextBrief).toBe(false);
       expect(rootTraversal(nextBrief).phase).toBe("completed");
     });
 
@@ -1665,7 +1665,7 @@ function Main() {
       ).toThrow(/Host call arguments cannot contain briefable expressions/);
     });
 
-    it("rejects a resolved-once host-effect spelling in value position", () => {
+    it("rejects a resolved-once host-call spelling in value position", () => {
       expect(() =>
         parse(`
 "arc";
@@ -1677,7 +1677,9 @@ function Main() {
   lucky.$set(Dice.$roll());
 }
 `),
-      ).toThrow(/\$-prefixed host operations are only valid as host effects/);
+      ).toThrow(
+        /\$-prefixed host operations are only valid as standalone action statements/,
+      );
     });
 
     it("reuses computed cells across value expression positions", () => {
@@ -1727,7 +1729,7 @@ function Main() {
       const second = progressBrief(runtime, first, {
         move: "proceed",
         hostCalls: {
-          [first.hostCalls[0]!.id]: 17,
+          [first.hostCalls[0]!.id]: { status: "resolved", value: 17 },
         },
       });
 
@@ -1743,7 +1745,7 @@ function Main() {
       const third = progressBrief(runtime, second, {
         move: "proceed",
         hostCalls: {
-          [second.hostCalls[0]!.id]: 88,
+          [second.hostCalls[0]!.id]: { status: "resolved", value: 88 },
         },
       });
 
@@ -1757,7 +1759,7 @@ function Main() {
         instructions: appliedInstructions(third),
       });
 
-      expect(emitted.hostEffects).toEqual([
+      expect(emitted.hostCalls).toEqual([
         {
           id: expect.any(String),
           sourceRef: node("value-expression-arc", "Main"),
@@ -1771,10 +1773,10 @@ function Main() {
 
       const completed = progressTerminal(runtime, emitted, {
         move: "proceed",
-        hostEffects: appliedHostEffects(emitted),
+        hostCalls: resolvedHostCalls(emitted),
       });
 
-      expect("hostEffects" in completed).toBe(false);
+      expect("hostCalls" in completed).toBe(false);
       expect(rootTraversal(completed).phase).toBe("completed");
     });
 
@@ -1797,7 +1799,9 @@ function Main() {
       const unmatched = runtime.progressTrigger(
         first,
         {
-          hostCalls: { [first.hostCalls[0]!.id]: false },
+          hostCalls: {
+            [first.hostCalls[0]!.id]: { status: "resolved", value: false },
+          },
         },
         EMPTY_DIALOG,
       );

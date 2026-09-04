@@ -18,19 +18,18 @@ import {
   runtimeError,
   runtimeErrorReasonCode,
 } from "../src/runtime/report-validation.js";
-import { cloneHostCallBrief, cloneHostEffect } from "../src/runtime/state.js";
+import { cloneHostCallBrief } from "../src/runtime/state.js";
 import type {
   ActionReport,
+  ActionState,
   ArcTraversalSet,
   Dialog,
   HostCallBrief,
-  HostEffectBrief,
   PayloadValue,
 } from "../src/types/index.js";
 import { mergeAndClonePayload } from "../src/value-utils.js";
 import {
   actionProgress,
-  appliedHostEffects,
   appliedInstructions,
   arc,
   EMPTY_DIALOG,
@@ -41,6 +40,7 @@ import {
   progressBrief,
   progressTerminal,
   renderSemanticTextForTest,
+  resolvedHostCalls,
   rootTraversal,
   TestRuntime as Runtime,
   singleObservations,
@@ -250,23 +250,25 @@ function Other() {
       expect(base).toEqual({ consumer: { id: "node" } });
     });
 
-    it("deep-clones nested payloads in host effects and host-call briefs", () => {
-      const effectPayload: PayloadValue = { nested: { list: ["a"] } };
-      const effect: HostEffectBrief = {
-        id: "host-effect:test",
+    it("deep-clones nested payloads in host calls and host-call briefs", () => {
+      const standalonePayload: PayloadValue = { nested: { list: ["a"] } };
+      const standalone: HostCallBrief = {
+        id: "host-call:test",
         sourceRef: node("clone-arc", "Main"),
         module: "memoir",
         target: ["facts"],
         operation: "apply",
-        arguments: [effectPayload],
+        arguments: [standalonePayload],
+        hostParams: undefined,
       };
-      const clonedEffect = cloneHostEffect(effect);
+      const clonedStandalone = cloneHostCallBrief(standalone);
 
       payloadArray(
-        payloadObject(payloadObject(clonedEffect.arguments[0]!).nested).list,
+        payloadObject(payloadObject(clonedStandalone.arguments[0]!).nested)
+          .list,
       ).push("b");
 
-      expect(effect.arguments[0]).toEqual({ nested: { list: ["a"] } });
+      expect(standalone.arguments[0]).toEqual({ nested: { list: ["a"] } });
 
       const callPayload: PayloadValue = { nested: { list: ["x"] } };
       const call: HostCallBrief = {
@@ -309,21 +311,20 @@ function Other() {
           judgments: [],
           observations: [],
           hostCalls: [hostCall],
-          hostEffects: [],
           instructions: [],
           allowedMoves: ["poison", "proceed"],
         },
         {
           move: "proceed",
-          hostCalls: { [hostCall.id]: actionPayload },
+          hostCalls: {
+            [hostCall.id]: { status: "resolved", value: actionPayload },
+          },
         },
       );
 
+      const actionResult = actionValidation.accepted.hostCalls![hostCall.id]!;
       payloadArray(
-        payloadObject(
-          payloadObject(actionValidation.accepted.hostCalls![hostCall.id]!)
-            .nested,
-        ).list,
+        payloadObject(payloadObject(actionResult.value).nested).list,
       ).push("b");
 
       expect(actionPayload).toEqual({ nested: { list: ["a"] } });
@@ -339,15 +340,15 @@ function Other() {
           matchableArcs: [],
         },
         {
-          hostCalls: { [hostCall.id]: triggerPayload },
+          hostCalls: {
+            [hostCall.id]: { status: "resolved", value: triggerPayload },
+          },
         },
       );
 
+      const triggerResult = triggerValidation.accepted.hostCalls![hostCall.id]!;
       payloadArray(
-        payloadObject(
-          payloadObject(triggerValidation.accepted.hostCalls![hostCall.id]!)
-            .nested,
-        ).list,
+        payloadObject(payloadObject(triggerResult.value).nested).list,
       ).push("y");
 
       expect(triggerPayload).toEqual({ nested: { list: ["x"] } });
@@ -480,7 +481,7 @@ function Main() {
       ]);
     });
 
-    it("rejects deflect move while a host effect is unreported", () => {
+    it("rejects deflect move while a host call is unreported", () => {
       const document = parse(`
 "arc";
 
@@ -502,8 +503,8 @@ function Main() {
         cursor: { user: 0, self: 0 },
         lastTurns: [],
       });
-      // An emitted host effect suppresses deflect the same way an instruction does.
-      expect(brief.hostEffects).toHaveLength(1);
+      // An emitted host call suppresses deflect the same way an instruction does.
+      expect(brief.hostCalls).toHaveLength(1);
       expect(brief.allowedMoves).toEqual(["poison", "proceed"]);
 
       const nextBrief = progressBrief(runtime, brief, { move: "deflect" });
@@ -514,13 +515,88 @@ function Main() {
         }),
       ]);
     });
+
+    it("retains deflect while an expression host call is unresolved", () => {
+      const document = parse(`
+"arc";
+import Rng from "host:rng";
+function Main() {
+  let roll = Num();
+  roll.$set(Rng.roll(6));
+}
+`);
+      const runtime = new Runtime()
+        .add("expression-host-call-move", document)
+        .init();
+      const traversal = runtime.newTraversal(
+        arc("expression-host-call-move", "Main"),
+      );
+      traversal.phase = "entered";
+
+      const brief = startRun(runtime, [traversal], EMPTY_DIALOG);
+      expect(brief.hostCalls).toHaveLength(1);
+      expect(brief.allowedMoves).toContain("deflect");
+    });
   });
 
   describe("proto.report-validation", () => {
+    it("requires the exact resolved host-call envelope and admits void resolution", () => {
+      const result = filterHostCallResults({
+        void: { status: "resolved" },
+        wrong: { status: "applied" } as unknown as { status: "resolved" },
+        extra: {
+          status: "resolved",
+          extra: true,
+        } as unknown as { status: "resolved" },
+      });
+
+      expect(result.accepted).toEqual({ void: { status: "resolved" } });
+      expect(result.issues).toEqual([
+        expect.objectContaining({
+          briefId: "wrong",
+          reasonCode: "host-call-report-shape",
+        }),
+        expect.objectContaining({
+          briefId: "extra",
+          reasonCode: "host-call-report-shape",
+        }),
+      ]);
+    });
+
+    it("rejects host-call value accessors without invoking them", () => {
+      let reads = 0;
+      const report = { status: "resolved" } as unknown as {
+        status: "resolved";
+        value: PayloadValue;
+      };
+      Object.defineProperty(report, "value", {
+        enumerable: true,
+        get() {
+          reads += 1;
+          return reads < 3 ? 1 : null;
+        },
+      });
+
+      const result = filterHostCallResults({ call: report });
+
+      expect(reads).toBe(0);
+      expect(result.accepted).toBeUndefined();
+      expect(result.issues).toEqual([
+        expect.objectContaining({
+          kind: "invalid-item",
+          briefId: "call",
+          reasonCode: "host-call-report-shape",
+        }),
+      ]);
+    });
+
     it("rejects null host-call results at the payload boundary", () => {
       const result = filterHostCallResults({
-        call: null,
-      } as unknown as Record<string, PayloadValue>);
+        call: {
+          status: "resolved",
+          value: null as unknown as PayloadValue,
+        },
+      });
 
       expect(result.accepted).toBeUndefined();
       expect(result.issues).toContainEqual(
@@ -694,7 +770,7 @@ function Main() {
       expect(brief.hostCalls).toHaveLength(1);
       const retried = progressBrief(runtime, brief, {
         move: "proceed",
-        hostCalls: { "bogus-id": false },
+        hostCalls: { "bogus-id": { status: "resolved", value: false } },
       });
       expect(retried.issues).toEqual([
         expect.objectContaining({
@@ -1195,14 +1271,14 @@ function Main() {
       expect(instructionBrief.instructions.map((item) => item.text)).toEqual([
         "body instruction",
       ]);
-      expect(instructionBrief.hostEffects).toEqual([]);
+      expect(instructionBrief.hostCalls).toEqual([]);
 
       const effectsBrief = progressBrief(runtime, instructionBrief, {
         move: "proceed",
         instructions: appliedInstructions(instructionBrief),
       });
       expect(effectsBrief.instructions).toEqual([]);
-      expect(effectsBrief.hostEffects).toMatchObject([
+      expect(effectsBrief.hostCalls).toMatchObject([
         {
           module: "memoir",
           target: ["facts"],
@@ -1238,7 +1314,10 @@ function Main() {
       const rejected = progressBrief(runtime, first, {
         move: "proceed",
         hostCalls: {
-          [callId]: { nested: undefined } as unknown as PayloadValue,
+          [callId]: {
+            status: "resolved",
+            value: { nested: undefined } as unknown as PayloadValue,
+          },
         },
       });
       expect(rejected.issues).toContainEqual(
@@ -1249,7 +1328,7 @@ function Main() {
       const hostValue = createArtifactValue("host.md");
       const instruction = progressBrief(runtime, rejected, {
         move: "proceed",
-        hostCalls: { [callId]: hostValue },
+        hostCalls: { [callId]: { status: "resolved", value: hostValue } },
       });
       (hostValue as { path: string }).path = "mutated.md";
       expect(instruction.instructions[0]?.text).toEqual([
@@ -1261,7 +1340,7 @@ function Main() {
         move: "proceed",
         instructions: appliedInstructions(instruction),
       });
-      expect(effect.hostEffects[0]?.arguments[0]).toEqual(
+      expect(effect.hostCalls[0]?.arguments[0]).toEqual(
         createArtifactValue("host.md"),
       );
 
@@ -1291,8 +1370,11 @@ function Main() {
             move: "proceed",
             hostCalls: {
               [structuralCall.hostCalls[0]!.id]: {
-                kind: "artifact",
-                path: "structural.md",
+                status: "resolved",
+                value: {
+                  kind: "artifact",
+                  path: "structural.md",
+                },
               },
             },
           },
@@ -1307,7 +1389,7 @@ function Main() {
       });
     });
 
-    it("preserves semantic text parts in host-call briefs and host effects", () => {
+    it("preserves semantic text parts in host-call briefs and host calls", () => {
       const hostCallDocument = parse(`
 "arc";
 
@@ -1362,7 +1444,7 @@ function Main() {
         [effectTraversal],
         EMPTY_DIALOG,
       );
-      expect(effectBrief.hostEffects[0]?.arguments[0]).toEqual([
+      expect(effectBrief.hostCalls[0]?.arguments[0]).toEqual([
         { kind: "text", value: "Update " },
         { kind: "artifact", path: "research-log.md" },
         { kind: "text", value: " for " },
@@ -1972,6 +2054,186 @@ function Main() {
       lastTurns: [{ role: "user", message: "go ahead" }],
     };
 
+    function pendingHostCallFixture() {
+      const source = `
+"arc";
+import Memoir from "host:memoir";
+function Main() {
+  this.hostParams = { route: "primary" };
+  Memoir.facts.$apply(\`remember \${user}\`);
+}
+`;
+      const runtime = new Runtime()
+        .add("pending-host-call-persistence", parse(source))
+        .init();
+      const traversal = runtime.newTraversal(
+        arc("pending-host-call-persistence", "Main"),
+      );
+      traversal.phase = "entered";
+      return {
+        source,
+        runtime,
+        brief: startRun(runtime, [traversal], EMPTY_DIALOG),
+      };
+    }
+
+    function pendingHostCallState(traversals: ArcTraversalSet) {
+      const actionStates = traversals[0]!.frame.actionStates;
+      const found = Object.entries(actionStates).find(
+        ([, state]) =>
+          state?.kind === "host-call" && state.status === "pending",
+      );
+      if (!found) throw new Error("Expected pending host-call state");
+      return {
+        id: found[0],
+        state: found[1] as Extract<
+          ActionState,
+          { kind: "host-call"; status: "pending" }
+        >,
+      };
+    }
+
+    it("round-trips a captured host call with the same id and inputs", () => {
+      const { source, runtime, brief } = pendingHostCallFixture();
+      expect(brief.hostCalls[0]).toMatchObject({
+        arguments: [
+          [
+            { kind: "text", value: "remember " },
+            { kind: "entity", name: "user" },
+          ],
+        ],
+        hostParams: { route: "primary" },
+      });
+
+      const retry = progressBrief(
+        runtime,
+        brief,
+        { move: "proceed" },
+        {
+          cursor: { user: 1, self: 1 },
+          lastTurns: [
+            { role: "user", message: "different" },
+            { role: "self", message: "dialog" },
+          ],
+        },
+      );
+      expect(retry.hostCalls).toEqual(brief.hostCalls);
+
+      const restored = JSON.parse(
+        JSON.stringify(retry.traversals),
+      ) as ArcTraversalSet;
+      const resumed = startRun(
+        new Runtime()
+          .add("pending-host-call-persistence", parse(source))
+          .init(),
+        restored,
+        EMPTY_DIALOG,
+      );
+      expect(resumed.hostCalls).toEqual(brief.hostCalls);
+    });
+
+    it("restores a captured standalone call from this.effects", () => {
+      const source = `
+"arc";
+import Memoir from "host:memoir";
+function Main() {
+  this.hostParams = { route: "finalize" };
+  this.effects = () => {
+    Memoir.facts.$apply(\`remember \${user}\`);
+  };
+}
+`;
+      const firstRuntime = new Runtime()
+        .add("pending-effects-host-call", parse(source))
+        .init();
+      const traversal = firstRuntime.newTraversal(
+        arc("pending-effects-host-call", "Main"),
+      );
+      traversal.phase = "entered";
+      const pending = startRun(firstRuntime, [traversal], EMPTY_DIALOG);
+
+      const restored = JSON.parse(
+        JSON.stringify(pending.traversals),
+      ) as ArcTraversalSet;
+      const resumed = startRun(
+        new Runtime().add("pending-effects-host-call", parse(source)).init(),
+        restored,
+        EMPTY_DIALOG,
+      );
+      expect(resumed.hostCalls).toEqual(pending.hostCalls);
+    });
+
+    it.each([
+      [
+        "invalid captured state shape",
+        (traversals: ArcTraversalSet) => {
+          const { state } = pendingHostCallState(traversals);
+          (state.call as { extra?: boolean }).extra = true;
+        },
+      ],
+      [
+        "invalid captured argument arity",
+        (traversals: ArcTraversalSet) => {
+          pendingHostCallState(traversals).state.call.arguments = [];
+        },
+      ],
+      [
+        "invalid captured argument value",
+        (traversals: ArcTraversalSet) => {
+          pendingHostCallState(traversals).state.call.arguments = [42];
+        },
+      ],
+      [
+        "invalid captured host params",
+        (traversals: ArcTraversalSet) => {
+          pendingHostCallState(traversals).state.call.hostParams = {
+            nested: undefined,
+          };
+        },
+      ],
+      [
+        "invalid pending state shape",
+        (traversals: ArcTraversalSet) => {
+          const state = pendingHostCallState(traversals)
+            .state as ActionState & {
+            extra?: boolean;
+          };
+          state.extra = true;
+        },
+      ],
+      [
+        "invalid resolved state shape",
+        (traversals: ArcTraversalSet) => {
+          const { state } = pendingHostCallState(traversals);
+          (state as { status: string }).status = "resolved";
+        },
+      ],
+      [
+        "unmatched action id",
+        (traversals: ArcTraversalSet) => {
+          const states = traversals[0]!.frame.actionStates as Record<
+            string,
+            ActionState | undefined
+          >;
+          const { id, state } = pendingHostCallState(traversals);
+          delete states[id];
+          states["missing/action"] = state;
+        },
+      ],
+    ])("rejects restored host-call state with %s", (_label, tamper) => {
+      const { source, brief } = pendingHostCallFixture();
+      const restored = JSON.parse(
+        JSON.stringify(brief.traversals),
+      ) as ArcTraversalSet;
+      tamper(restored);
+      const runtime = new Runtime()
+        .add("pending-host-call-persistence", parse(source))
+        .init();
+      expect(() => runtime.start(restored, EMPTY_DIALOG)).toThrow(
+        /Invalid persisted traversal state/,
+      );
+    });
+
     function guardedChildRuntime() {
       const document = parse(`
 "arc";
@@ -2129,7 +2391,7 @@ function Main() {
           state: undefined,
           finalizing: { reason: pendingState, phase: "effects" },
         });
-        expect(effects.hostEffects).toHaveLength(1);
+        expect(effects.hostCalls).toHaveLength(1);
 
         const restored = JSON.parse(JSON.stringify(effects.traversals));
         const second = new Runtime()
@@ -2137,7 +2399,7 @@ function Main() {
           .init();
         const resumed = startRun(second, restored, EMPTY_DIALOG);
 
-        expect(resumed.hostEffects).toEqual(effects.hostEffects);
+        expect(resumed.hostCalls).toEqual(effects.hostCalls);
         expect(rootTraversal(resumed)).toMatchObject({
           phase: "entered",
           state: undefined,
@@ -2146,7 +2408,7 @@ function Main() {
 
         const finished = progressTerminal(second, resumed, {
           move: "proceed",
-          hostEffects: appliedHostEffects(resumed),
+          hostCalls: resolvedHostCalls(resumed),
         });
 
         expect(rootTraversal(finished)).toMatchObject({
@@ -2201,7 +2463,7 @@ function Main() {
         },
       });
       expect(
-        renderSemanticTextForTest(effects.hostEffects[0]!.arguments[0]!),
+        renderSemanticTextForTest(effects.hostCalls[0]!.arguments[0]!),
       ).toBe("intro deflected");
 
       const restored = JSON.parse(JSON.stringify(effects.traversals));
@@ -2210,14 +2472,14 @@ function Main() {
         .init();
       const resumed = startRun(second, restored, EMPTY_DIALOG);
 
-      expect(resumed.hostEffects).toEqual(effects.hostEffects);
+      expect(resumed.hostCalls).toEqual(effects.hostCalls);
       expect(rootTraversal(resumed).finalizing).toEqual(
         rootTraversal(effects).finalizing,
       );
 
       const finished = progressTerminal(second, resumed, {
         move: "proceed",
-        hostEffects: appliedHostEffects(resumed),
+        hostCalls: resolvedHostCalls(resumed),
       });
       expect(rootTraversal(finished)).toMatchObject({
         phase: "suspended",

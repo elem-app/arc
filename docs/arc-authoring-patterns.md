@@ -295,7 +295,7 @@ A deflection escaping any element aborts the whole `$map` and discards the outpu
 
 ### Keep callback effects idempotent
 
-A `$map` can run an element twice: a deflection escaping an element abandons the run, and if the node catches it the map runs again from the first element. Write any host effects the callback applies so that a repeat leaves the same result — earlier applied effects are not rolled back when the run aborts or starts again.
+A `$map` can run an element twice: a deflection escaping an element abandons the run, and if the node catches it the map runs again from the first element. Write host-call actions so that repeating the map run leaves an acceptable result — calls resolved for earlier members are not rolled back when the run aborts or starts again.
 
 ## Anti-pattern gallery
 

@@ -180,7 +180,7 @@ function Main() {
 
       expect(rootTraversal(lukewarmBrief).cells.interest).toBe("lukewarm");
       expect(rootTraversal(lukewarmBrief).cells.topic).toBeUndefined();
-      expect("hostEffects" in lukewarmBrief).toBe(false);
+      expect("hostCalls" in lukewarmBrief).toBe(false);
 
       const runtime2 = new Runtime().add("ordinal-arc", document).init();
       const seeded2 = runtime2.newTraversal(arc("ordinal-arc", "Main"));
@@ -202,7 +202,7 @@ function Main() {
 
       expect(rootTraversal(curiousBrief).cells.interest).toBe("curious");
       expect(rootTraversal(curiousBrief).cells.topic).toBe("metal");
-      expect(curiousBrief.hostEffects).toMatchObject([
+      expect(curiousBrief.hostCalls).toMatchObject([
         {
           module: "memoir",
           target: ["facts"],
@@ -210,7 +210,7 @@ function Main() {
         },
       ]);
       expect(
-        renderSemanticTextForTest(curiousBrief.hostEffects[0]!.arguments[0]!),
+        renderSemanticTextForTest(curiousBrief.hostCalls[0]!.arguments[0]!),
       ).toBe("user is engaged");
     });
 
@@ -332,7 +332,9 @@ function Main() {
       const first = startRun(runtime, [seeded], EMPTY_DIALOG);
       const retried = progressBrief(runtime, first, {
         move: "proceed",
-        hostCalls: { [first.hostCalls[0]!.id]: "outside" },
+        hostCalls: {
+          [first.hostCalls[0]!.id]: { status: "resolved", value: "outside" },
+        },
       });
 
       expect(rootTraversal(retried).phase).toBe("entered");
@@ -1029,7 +1031,12 @@ function Main() {
       const first = startRun(runtime, [seeded], EMPTY_DIALOG);
       const retried = progressBrief(runtime, first, {
         move: "proceed",
-        hostCalls: { [first.hostCalls[0]!.id]: "incompatible" },
+        hostCalls: {
+          [first.hostCalls[0]!.id]: {
+            status: "resolved",
+            value: "incompatible",
+          },
+        },
       });
 
       expect(rootTraversal(retried).phase).toBe("entered");
@@ -2404,7 +2411,9 @@ function Main() {
 
       const retried = progressBrief(runtime, first, {
         move: "proceed",
-        hostCalls: { [first.hostCalls[0]!.id]: "enabled" },
+        hostCalls: {
+          [first.hostCalls[0]!.id]: { status: "resolved", value: "enabled" },
+        },
       });
 
       expect(rootTraversal(retried).phase).toBe("entered");
@@ -3246,7 +3255,9 @@ function Main() {
         const first = startRun(runtime, [seeded], EMPTY_DIALOG);
         const retried = progressBrief(runtime, first, {
           move: "proceed",
-          hostCalls: { [first.hostCalls[0]!.id]: reported },
+          hostCalls: {
+            [first.hostCalls[0]!.id]: { status: "resolved", value: reported },
+          },
         });
 
         expect(rootTraversal(retried).phase).toBe("entered");

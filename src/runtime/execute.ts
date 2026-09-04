@@ -1,5 +1,5 @@
 import type {
-  HostEffectBrief,
+  HostCallBrief,
   InstructionBrief,
   InstructionPostcheck,
 } from "../types/host-interaction.js";
@@ -10,6 +10,7 @@ import type {
   ElementId,
   EnterChannelBindings,
   GuardStatement,
+  HostCall,
   InstructionAction,
   InvokeAction,
   MapAction,
@@ -21,6 +22,7 @@ import type {
   TriggerStatement,
 } from "../types/parser.js";
 import type {
+  ActionState,
   ArcRef,
   ArcTraversal,
   BriefId,
@@ -61,7 +63,7 @@ import {
   evaluateValueExpression,
   findCellOwner,
   initializeArtifactCells,
-  renderHostEffect,
+  renderHostCallInvocation,
   renderSemanticText,
   requireArrayValue,
   resolveRefInTraversal,
@@ -127,6 +129,7 @@ import {
   clearFrame,
   cloneCellValue,
   cloneEnterChannelLink,
+  cloneHostCallBrief,
   cloneInstructionPostcheck,
   createEmptyArcTraversal,
   createEmptyEnterChannelState,
@@ -145,9 +148,11 @@ import {
   isSuspendedArcTraversal,
   latchEnteredTransition,
   latchExitedTransition,
+  makeHostCallId,
   makeInstructionId,
   markActionResolved,
   markPendingActionState,
+  markPendingHostCall,
   markResolvedActionState,
   noteBriefYield,
   recordPendingTransition,
@@ -991,7 +996,7 @@ function continueFinalizingTraversal(
   }
 
   accum.activeSeg = { kind: "effects" };
-  // Same rule for declared effects: they run (and their host effects surface)
+  // Same rule for declared effects: they run (and their host calls surface)
   // only under the node's own acknowledged view.
   if (node.effects && node.effects.length > 0) {
     const gated = maybeBlockForTransition(accum, traversal);
@@ -1034,6 +1039,7 @@ function isResolvedActionLeaf(
     statement.kind !== "set" &&
     statement.kind !== "set-return" &&
     statement.kind !== "set-span" &&
+    statement.kind !== "host-call" &&
     statement.kind !== "instruction" &&
     statement.kind !== "enter-node" &&
     statement.kind !== "enter-loop"
@@ -1079,6 +1085,10 @@ function stepActionLeaf(
     return stepSetSpan(traversal, node, statement, accum);
   }
 
+  if (statement.kind === "host-call") {
+    return stepStandaloneHostCall(traversal, node, statement, accum);
+  }
+
   if (
     statement.kind === "instruction" ||
     statement.kind === "enter-node" ||
@@ -1099,6 +1109,79 @@ function stepActionLeaf(
   }
 
   throw new Error("Unsupported action leaf statement");
+}
+
+function stepStandaloneHostCall(
+  traversal: Traversal,
+  node: Node,
+  statement: HostCall,
+  accum: Accumulator,
+): LeafStep<void> {
+  const existing = getActionState(traversal, statement);
+  if (existing?.status === "resolved") return { status: "advance" };
+
+  if (existing?.status === "pending") {
+    const id = standaloneHostCallId(statement, traversal, accum);
+    if (accum.hostCallResults.has(id)) {
+      markActionResolved(traversal, statement);
+      return { status: "advance" };
+    }
+    if (accum.phase === "plan") {
+      emitStandaloneHostCall(statement, existing.call, id, traversal, accum);
+    }
+    return blockSeg(accum, traversal);
+  }
+
+  // Apply walks cannot introduce work that was absent from the accepted brief.
+  // The following plan walk captures and emits the fresh logical invocation.
+  if (accum.phase === "apply") return blockSeg(accum, traversal);
+
+  const rendered = renderHostCallInvocation(statement, traversal, node, accum);
+  const call = {
+    arguments: rendered.arguments,
+    ...(rendered.hostParams === undefined
+      ? {}
+      : { hostParams: rendered.hostParams }),
+  };
+  markPendingHostCall(traversal, statement.id, call);
+  emitStandaloneHostCall(
+    statement,
+    call,
+    standaloneHostCallId(statement, traversal, accum),
+    traversal,
+    accum,
+  );
+  return blockSeg(accum, traversal);
+}
+
+function standaloneHostCallId(
+  statement: HostCall,
+  traversal: Traversal,
+  accum: Accumulator,
+): BriefId {
+  const site = qualifiedBriefSite(briefSiteQualifiers(accum), statement.id);
+  return makeHostCallId(accum.entry.arc, traversal, site);
+}
+
+function emitStandaloneHostCall(
+  statement: HostCall,
+  call: Extract<ActionState, { kind: "host-call"; status: "pending" }>["call"],
+  id: BriefId,
+  traversal: Traversal,
+  accum: Accumulator,
+): void {
+  noteBriefYield(accum, traversal);
+  accum.hostCalls.push(
+    cloneHostCallBrief({
+      id,
+      sourceRef: traversalToNodeRef(traversal),
+      module: statement.module,
+      target: [...statement.target],
+      operation: statement.operation,
+      arguments: call.arguments,
+      hostParams: call.hostParams,
+    } satisfies HostCallBrief),
+  );
 }
 
 /**
@@ -2820,10 +2903,6 @@ function runEffects(
 
   const scope = nodeNarrowScope(traversal);
   const tape = pinTapeFor(traversal, nodeSegKey("effects"));
-  // Effect statements briefed on this walk, so a set-driven re-walk re-steps
-  // them without re-briefing them a second time.
-  const briefedEffects = new Set<ElementId>();
-  let unreported = false;
   const outcome = runPinnedSeg<EffectStatement, void>(
     accum,
     tape,
@@ -2846,52 +2925,13 @@ function runEffects(
           scope,
         );
         if (step) return step;
-
         if (statement.kind !== "host-call") {
           throw new Error("Unsupported effects leaf statement");
         }
-
-        const actionState = getActionState(traversal, statement);
-        if (actionState?.status === "pending") {
-          const effect = renderHostEffect(statement, traversal, node, accum);
-          if (accum.hostEffectResults.has(effect.id)) {
-            markActionResolved(traversal, statement);
-            return { status: "advance" };
-          }
-          // Still unreported: re-surface it and keep walking — it gates this
-          // SEG's completion below, not the statements after it.
-          if (accum.phase === "plan" && !briefedEffects.has(statement.id)) {
-            briefedEffects.add(statement.id);
-            accum.hostEffects.push(effect);
-            noteBriefYield(accum, traversal);
-          }
-          unreported = true;
-          return { status: "advance" };
-        }
-
-        const effect = renderHostEffect(statement, traversal, node, accum);
-        const key = hostEffectDedupKey(statement.id, effect);
-        if (!traversal.appliedHostCallKeys.includes(key)) {
-          // A host effect is a host commitment: emit it once, then keep it on
-          // every brief until the host reports it back.
-          traversal.appliedHostCallKeys.push(key);
-          accum.hostEffects.push(effect);
-          briefedEffects.add(statement.id);
-          markPendingActionState(traversal, statement.id, statement.kind);
-          noteBriefYield(accum, traversal);
-          unreported = true;
-          return { status: "advance" };
-        }
-        markActionResolved(traversal, statement);
-        return { status: "advance" };
+        return stepStandaloneHostCall(traversal, node, statement, accum);
       },
     },
   );
-  if (outcome.status === "done" && unreported) {
-    // Unreported effects hold the SEG at its frontier; the report that carries
-    // their feedback resumes here and resolves them.
-    return blockSeg(accum, traversal);
-  }
   if (outcome.status === "done") dropPinTape(traversal, nodeSegKey("effects"));
   return outcome;
 }
@@ -2933,7 +2973,7 @@ function admitBriefPayload(value: PayloadValue): PayloadValue {
   if (path !== undefined) {
     throw runtimeError(
       "non-finite-number",
-      `Numeric value must be finite before brief/effect emission${path === "$" ? "" : ` at ${path}`}`,
+      `Numeric value must be finite before host-bound emission${path === "$" ? "" : ` at ${path}`}`,
     );
   }
   return cloneWithCanonicalNumbers(value);
@@ -2980,41 +3020,4 @@ function resetTraversalForEntry(
   // `$` slots stay (unless the entry is forgetful, which clears them too).
   dropAllPinTapes(traversal);
   if (forceForgetfulEntry || node.forgetfulEntry) clearFrame(traversal);
-}
-
-function hostEffectDedupKey(
-  statementId: ElementId,
-  effect: HostEffectBrief,
-): string {
-  // Ref-free by construction: the key persists in traversal state, which
-  // replay compares modulo ref renames, so it must not embed arc/node refs.
-  // The key list is already scoped to one traversal, and `id`/`sourceRef`
-  // derive from that traversal, so beyond `statementId` only the ref-free
-  // payload fields discriminate.
-  return `${statementId}:${stableStringifyPayload({
-    module: effect.module,
-    target: effect.target,
-    operation: effect.operation,
-    arguments: effect.arguments,
-  })}`;
-}
-
-function stableStringifyPayload(value: PayloadValue | HostEffectBrief): string {
-  if (value === undefined) return "undefined";
-  if (typeof value === "string") return JSON.stringify(value);
-  if (typeof value === "number" || typeof value === "boolean") {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableStringifyPayload(item)).join(",")}]`;
-  }
-
-  const objectValue = value as Record<string, PayloadValue>;
-  const keys = Object.keys(objectValue).sort();
-  return `{${keys
-    .map(
-      (key) =>
-        `${JSON.stringify(key)}:${stableStringifyPayload(objectValue[key])}`,
-    )
-    .join(",")}}`;
 }

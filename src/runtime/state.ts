@@ -1,8 +1,7 @@
 import type {
   ActionBrief,
   HostCallBrief,
-  HostEffectBrief,
-  HostEffectReport,
+  HostCallReport,
   InstructionBrief,
   JudgmentBrief,
   ObservationBrief,
@@ -21,7 +20,6 @@ import type {
   DocumentRewalkPlan,
   ElementId,
   HostCallArgument,
-  HostEffectStatement,
   InstructionAction,
   Node,
   ObserveAction,
@@ -127,8 +125,9 @@ export type Accumulator = {
   judgments: JudgmentBrief[];
   observations: (ObservationBrief | ObservationGroupBrief)[];
   hostCalls: HostCallBrief[];
+  /** Brief ids whose expression consumers demand a declared result value. */
+  hostCallValueDemands: Set<BriefId>;
   instructions: InstructionBrief[];
-  hostEffects: HostEffectBrief[];
   hostParams?: PayloadValue;
   hostParamsActive: boolean;
   blocked: boolean;
@@ -159,8 +158,7 @@ export type Accumulator = {
   judgmentResults: Map<string, boolean>;
   observationResults: Map<string, ObservationReport>;
   observationGroupResults: Map<string, ObservationGroupReport>;
-  hostCallResults: Map<string, PayloadValue>;
-  hostEffectResults: Map<string, HostEffectReport>;
+  hostCallResults: Map<string, HostCallReport>;
   /**
    * The active pin cursor: the current statement's entries on the walking SEG's
    * pin tape. Opened per statement visit by the SEG executors and saved/
@@ -231,6 +229,7 @@ export type ActionBriefState = {
   entry: RegistryEntry;
   traversals: ArcTraversalSet;
   snapshot: ActionBriefSnapshot;
+  hostCallValueDemands: ReadonlySet<BriefId>;
 };
 
 /**
@@ -277,8 +276,8 @@ export function createAccumulator(
     judgments: [],
     observations: [],
     hostCalls: [],
+    hostCallValueDemands: new Set(),
     instructions: [],
-    hostEffects: [],
     hostParamsActive: false,
     blocked: false,
     transition: undefined,
@@ -295,7 +294,6 @@ export function createAccumulator(
     observationResults: new Map(),
     observationGroupResults: new Map(),
     hostCallResults: new Map(),
-    hostEffectResults: new Map(),
   };
 }
 
@@ -329,7 +327,6 @@ export function createEmptyArcTraversal(
     ownedChildren: [],
     ephemeralChildren: [],
     refChildren: [],
-    appliedHostCallKeys: [],
     enterChannels: createEmptyEnterChannelState(),
   };
 }
@@ -347,7 +344,6 @@ export function createEmptyNodeTraversal(
     ownedChildren: [],
     ephemeralChildren: [],
     refChildren: [],
-    appliedHostCallKeys: [],
     enterChannels: createEmptyEnterChannelState(),
   };
 }
@@ -455,7 +451,6 @@ function cloneTraversalBase<T extends Traversal>(traversal: T) {
       cloneNodeTraversal(child),
     ),
     refChildren: [...traversal.refChildren],
-    appliedHostCallKeys: [...traversal.appliedHostCallKeys],
     enteredBy: traversal.enteredBy ? { ...traversal.enteredBy } : undefined,
     enterChannels: {
       args: Object.fromEntries(
@@ -649,17 +644,6 @@ export function findActiveRoot(
   );
 }
 
-export function cloneHostEffect(call: HostEffectBrief): HostEffectBrief {
-  return {
-    id: call.id,
-    sourceRef: call.sourceRef,
-    module: call.module,
-    target: [...call.target],
-    operation: call.operation,
-    arguments: call.arguments.map((arg) => clonePayloadValue(arg)),
-  };
-}
-
 export function cloneHostCallBrief(brief: HostCallBrief): HostCallBrief {
   return {
     id: brief.id,
@@ -702,6 +686,20 @@ function cloneActionState(state: ActionState): ActionState {
         ...state,
         map: state.map ? cloneMapActionState(state.map) : undefined,
       };
+    case "host-call":
+      return state.status === "pending"
+        ? {
+            ...state,
+            call: {
+              arguments: state.call.arguments.map((argument) =>
+                clonePayloadValue(argument),
+              ),
+              ...(state.call.hostParams === undefined
+                ? {}
+                : { hostParams: clonePayloadValue(state.call.hostParams) }),
+            },
+          }
+        : { ...state };
     default:
       return { ...state };
   }
@@ -1167,7 +1165,7 @@ export function resolveTraversalForBrief(
   return found;
 }
 
-export function getActionState<S extends ActionStatement | HostEffectStatement>(
+export function getActionState<S extends ActionStatement>(
   traversal: Traversal,
   action: S,
 ): ActionStateOf<S["kind"]> | undefined {
@@ -1302,9 +1300,26 @@ export function markPendingActionState(
   } as ActionState;
 }
 
+export function markPendingHostCall(
+  traversal: Traversal,
+  actionId: ElementId,
+  call: Extract<ActionState, { kind: "host-call"; status: "pending" }>["call"],
+): void {
+  traversal.frame.actionStates[actionId] = {
+    kind: "host-call",
+    status: "pending",
+    call: {
+      arguments: call.arguments.map((argument) => clonePayloadValue(argument)),
+      ...(call.hostParams === undefined
+        ? {}
+        : { hostParams: clonePayloadValue(call.hostParams) }),
+    },
+  };
+}
+
 export function markActionResolved(
   traversal: Traversal,
-  action: ActionStatement | HostEffectStatement,
+  action: ActionStatement,
 ): void {
   markResolvedActionState(traversal, action.id, action.kind);
 }
@@ -1417,13 +1432,7 @@ export function childState(
 }
 
 export function makeBriefId(
-  kind:
-    | "observe"
-    | "observe-group"
-    | "judge"
-    | "host-call"
-    | "host-effect"
-    | "instruction",
+  kind: "observe" | "observe-group" | "judge" | "host-call" | "instruction",
   arc: ArcRef,
   traversal: Traversal,
   actionId: ElementId,
@@ -1461,14 +1470,6 @@ export function makeHostCallId(
   actionId: ElementId,
 ): BriefId {
   return makeBriefId("host-call", arc, traversal, actionId);
-}
-
-export function makeHostEffectId(
-  arc: ArcRef,
-  traversal: Traversal,
-  actionId: ElementId,
-): BriefId {
-  return makeBriefId("host-effect", arc, traversal, actionId);
 }
 
 export function makeInstructionId(

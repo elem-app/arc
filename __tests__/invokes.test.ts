@@ -10,7 +10,6 @@
 import { describe, expect, it } from "vitest";
 
 import { analyzeDocument, parse, validate } from "../src/parser/index.js";
-import { Runtime } from "../src/runtime/index.js";
 import type { InvokeAction } from "../src/types/index.js";
 import { invokeSegKey, nodeSegKey } from "../src/types/index.js";
 import {
@@ -19,7 +18,9 @@ import {
   EMPTY_DIALOG,
   node,
   progressBrief,
+  resolvedHostCalls,
   rootTraversal,
+  TestRuntime as Runtime,
   startRun,
   startTerminal,
   withExperimentalRewalk,
@@ -53,6 +54,49 @@ function startInvokeTerminal(
 
 describe("Invokes", () => {
   describe("invoke.rerun", () => {
+    it("retains one pending call and executes it again on a fresh invoke", () => {
+      const { runtime, brief } = startInvoke(
+        `
+"arc";
+import Memoir from "host:memoir";
+function Main() {
+  let value = Num();
+  let changed = Bool();
+  value.$set(1);
+  invoke(() => {
+    Memoir.facts.$apply(\`inside invoke\`);
+    changed.$set(value > 1);
+  });
+  $observeOrAsk(value);
+}
+`,
+        "invoke-host-call-state",
+        true,
+      );
+      expect(brief.hostCalls).toHaveLength(1);
+
+      const retry = progressBrief(runtime, brief, { move: "proceed" });
+      expect(retry.hostCalls).toEqual(brief.hostCalls);
+
+      const observation = progressBrief(runtime, retry, {
+        move: "proceed",
+        hostCalls: resolvedHostCalls(retry),
+      });
+      expect(observation.observations).toHaveLength(1);
+
+      const rerun = progressBrief(runtime, observation, {
+        move: "proceed",
+        observations: {
+          [observation.observations[0]!.id]: {
+            status: "resolved",
+            value: 2,
+          },
+        },
+      });
+      expect(rerun.hostCalls).toHaveLength(1);
+      expect(rerun.hostCalls[0]!.id).toBe(brief.hostCalls[0]!.id);
+    });
+
     it("re-runs a completed invoke only after a later sibling resolves with a changed read-set", () => {
       const { runtime, brief } = startInvoke(
         `

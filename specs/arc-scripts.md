@@ -90,7 +90,7 @@ Arc uses arrow functions for hooks and authored resolution logic. An arrow may u
 | `this.deflectWhen` | string literal, template literal, or arrow function | Default deflection policy inherited by instruction actions in this node subtree. See [DeflectWhen](#thisdeflectwhen). |
 | `this.catchDeflection` | arrow function | Deflection interception hook for the current node. See [CatchDeflection](#thiscatchdeflection). |
 | `this.guard` | arrow function | Explicit state guard. See [Guard](#thisguard). |
-| `this.effects` | arrow function | Reactive observations and emitted host effects. See [Effects](#thiseffects). |
+| `this.effects` | arrow function | Finalization actions, including observations and host calls. See [Effects](#thiseffects). |
 | `this.hostParams` | object literal | Host-interpreted metadata carried on semantic work from this node. See [Host Params](#host-params). |
 
 Each config may be assigned at most once in a node. A duplicate assignment is a parse error.
@@ -442,7 +442,7 @@ Results and length:
 - With `results` bound, every element must set `span.result`; an element that finishes without one is a runtime error. Referencing `span.result` in a forEach `$map` is a parse error.
 - `$map` preserves length: one output per input, no filtering. `results` may be the receiver itself, replacing it in one write.
 
-The callback may block on an observation, an instruction, or an entered child that waits on the host. Elements run one at a time, and a blocked element resumes where it left off on the next report. A deflection escaping an element aborts the whole `$map`, discarding any outputs earlier elements produced, and reaches the node's `this.catchDeflection`, where `escaped(...)` matches the callback's authored target. Cell writes and host effects that earlier elements already applied stay applied.
+The callback may block on an observation, an instruction, or an entered child that waits on the host. Elements run one at a time, and a blocked element resumes where it left off on the next report. A deflection escaping an element aborts the whole `$map`, discarding any outputs earlier elements produced, and reaches the node's `this.catchDeflection`, where `escaped(...)` matches the callback's authored target. Cell writes and host-call actions that earlier elements already resolved stay resolved.
 
 #### Resolution Rules
 
@@ -459,7 +459,7 @@ Different actions and expressions resolve as follows:
 | `$instructLoop(...)` | Resolves when its `resolveWhen` evaluates true. While pending, the runtime checks reported `deflectWhen` evidence, `resolveWhen` evidence, and application reporting independently. |
 | `$enter(Target)` | Resolves when the target traversal reaches `State.COVERED` or `State.SKIPPED`. Covered targets commit staged `returns`; skipped targets resolve without committing staged `returns`. |
 | `$enterLoop(Target, { resolveWhen, ... })` | Resolves after a covered or skipped target iteration when the caller-side `resolveWhen` evaluates true. Otherwise the loop action remains pending or starts another target iteration. |
-| `judge(...)` and expression-position host calls | These are value dependencies, not standalone statement actions. A host report supplies the value. |
+| `judge(...)` and expression-position host calls | These are value dependencies, not actions. A host report supplies the value. |
 | `invoke(() => { ... })` | Does not carry resolved-once semantics. Each run treats the `$` actions in its body as unresolved; a blocked run resumes on the next report. |
 | `arr.$map(callback, results?)` | Resolves after the callback has run for every element. With `results`, commits the constructed array in one write. A blocked element resumes on the next report. |
 
@@ -519,17 +519,15 @@ if (lucky) {
 }
 ```
 
-**Statement position inside `this.effects`** — a host call that emits an external effect.
+**Action position** — a host call used for its host-side action. It is accepted anywhere an action statement is accepted, including direct node bodies, nested `if` and label blocks, `invoke(...)`, `$map(...)`, and `this.effects`.
 
 ```js
-this.effects = () => {
-  Memoir.facts.$apply(`${user} survived the tavern brawl`);
-};
+Memoir.facts.$apply(`${user} survived the tavern brawl`);
 ```
 
-Host effects must prefix the operation name with `$`, as in `Memoir.facts.$apply(...)`.
+A host call statement must prefix the operation name with `$`, as in `Memoir.facts.$apply(...)`. It resolves once per logical action instance: the runtime remembers a pending invocation across retries and advances only after the host reports it resolved.
 
-An operation with a declared result may be called in expression position or used as an effect; effect use discards the result. An operation without a result is valid only as an effect. The `$` belongs only to the authored effect use site. Arc lowers `Memoir.facts.$apply(...)` to the unsigiled operation path `memoir.facts.apply`, which is also the path carried in the host-effect brief.
+Whether a host-call result is required comes from its consumer. Expression consumers require a value compatible with their own expected spec. Action consumers require no value, so operations with or without a declared result are accepted and any reported value is discarded. The `$` marks the authored action use; it is not part of the host operation name, so `Memoir.facts.apply(...)` and `Memoir.facts.$apply(...)` both address the operation `memoir.facts.apply`.
 
 **Template interpolation** — a host variable mentioned inside semantic text. The host variable carries a reference for the host to render or route when it consumes the text.
 
@@ -545,7 +543,7 @@ Arguments to a host call must be renderable without further host work; a host ca
 
 Template-literal arguments use semantic text rendering. Structured semantic text is admitted only by semantic-text parameters; plain-string and enum parameters require plain string values.
 
-Host-call result types participate in ordinary spec resolution and compatibility checks. The runtime admits a reported payload against the result type before expression use or pin hydration. Artifact identity comes from the result type, not payload shape.
+Host-call result types participate in ordinary spec resolution and compatibility checks whenever a consumer demands a value. The runtime admits a reported payload against the result type before expression use or pin hydration. Artifact identity comes from the result type, not payload shape.
 
 ## Hooks
 
@@ -660,7 +658,7 @@ Guards make unconditional node-entry decisions. An `if` in the parent instead ro
 
 ### `this.effects`
 
-`this.effects` runs when the node's action graph cannot progress further — whether all actions resolved or traversal stopped early (e.g., a child was deflected). Effects handle post-traversal bookkeeping: extracting final cell values and emitting host effects.
+`this.effects` runs when the node's action graph cannot progress further — whether all actions resolved or traversal stopped early (e.g., a child was deflected). It is a finalization action graph for post-traversal bookkeeping, including final cell writes, observations, and host calls. Calls in this graph use the same protocol and action-state semantics as calls in the main action graph.
 
 While effects run, the node's terminal `state` remains unset. `this.pendingState` exposes the outcome being finalized: `State.COVERED` after normal graph completion or `State.DEFLECTED` after an uncaught deflection. During deflected effects, `this.deflection.escaped(Target)` reports whether the deflection came up through one of this node's own entries of `Target`. The runtime commits the pending state to the node's terminal state only after every effect finishes. `this.pendingState` is available only inside `this.effects`; `this.deflection` is unavailable during covered effects.
 
@@ -693,7 +691,7 @@ this.effects = () => {
 - `$observe()` calls use the cell's declared `.observing`.
 - `cell.$set(value)` performs a type-checked write.
 - `cell.$unset()` clears the inner value.
-- Host effects prefix the operation name with `$`, as in `Memoir.facts.$apply(...)`.
+- Host calls used as actions prefix the operation name with `$`, as in `Memoir.facts.$apply(...)`.
 
 Effects statements execute sequentially. `$observe()` is best-effort: if the host reports `unknown`, execution continues without writing a new value.
 

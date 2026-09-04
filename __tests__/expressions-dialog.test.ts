@@ -14,7 +14,7 @@ import type {
   ArcTraversalSet,
   Dialog,
   ElementId,
-  HostCallExpression,
+  HostCall,
   SourceRange,
 } from "../src/types/index.js";
 import { nodeSegKey } from "../src/types/index.js";
@@ -223,7 +223,7 @@ function Main() {
         start: { line: 50, column: 7 },
         end: { line: 50, column: 19 },
       };
-      const nested: HostCallExpression = {
+      const nested: HostCall = {
         id: statement.value.id.replace(/~0$/, "~1") as ElementId,
         kind: "host-call",
         module: "store",

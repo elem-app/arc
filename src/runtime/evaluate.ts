@@ -15,7 +15,6 @@ import {
 } from "../spec/resolution.js";
 import type {
   HostCallBrief,
-  HostEffectBrief,
   ObservationGroupField,
   ObservationValueMeta,
   ScalarObservationMeta,
@@ -30,9 +29,8 @@ import type {
   ComparisonOperator,
   ElementId,
   EnterTarget,
+  HostCall,
   HostCallArgument,
-  HostCallExpression,
-  HostEffectStatement,
   JudgeExpression,
   LocalExpression,
   Node,
@@ -113,7 +111,6 @@ import {
   cloneDialogCursor,
   cloneHostCallBrief,
   makeHostCallId,
-  makeHostEffectId,
   makeJudgeId,
   makeObservationGroupId,
   makeObservationId,
@@ -336,7 +333,7 @@ export function applyObserve(
         | undefined,
       hostParams: admitFinitePayload(
         effectiveHostParams(node, accum),
-        "brief/effect emission",
+        "host-bound emission",
       ),
       meta: observationMetaForTarget(observableSpec),
     });
@@ -432,7 +429,7 @@ export function applyObserveGroup(
       mode,
       hostParams: admitFinitePayload(
         effectiveHostParams(node, accum),
-        "brief/effect emission",
+        "host-bound emission",
       ),
       fields,
     });
@@ -620,28 +617,27 @@ export function applySetReturn(
   return { status: "resolved", value: { changed } };
 }
 
-export function renderHostEffect(
-  statement: HostEffectStatement,
+export function renderHostCallInvocation(
+  statement: HostCall,
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): HostEffectBrief {
+): Pick<HostCallBrief, "arguments" | "hostParams"> {
   const renderedArguments = renderTypedHostArguments(
     statement,
     traversal,
     node,
     accum,
   );
-  const rendered: HostEffectBrief = {
-    id: makeHostEffectId(accum.entry.arc, traversal, statement.id),
-    sourceRef: traversalToNodeRef(traversal),
-    module: statement.module,
-    target: [...statement.target],
-    operation: statement.operation,
+  const rendered = {
     arguments: renderedArguments,
+    hostParams: admitFinitePayload(
+      effectiveHostParams(node, accum),
+      "brief/host-call emission",
+    ),
   };
-  assertPayloadConsumer(rendered.arguments, "brief/effect emission");
-  assertFiniteConsumer(rendered.arguments, "brief/effect emission");
+  assertPayloadConsumer(rendered.arguments, "brief/host-call emission");
+  assertFiniteConsumer(rendered.arguments, "brief/host-call emission");
   return cloneWithCanonicalNumbers(rendered);
 }
 
@@ -658,7 +654,7 @@ export function renderHostCallArgument(
 }
 
 function renderTypedHostArguments(
-  action: HostCallExpression | HostEffectStatement,
+  action: HostCall,
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
@@ -741,7 +737,7 @@ function renderHostCallArgumentValue(
 // dial-back. Arguments render on every visit — before the pin settles — so the
 // visit's evaluation order stays prefix-stable for span replay.
 export function evaluateHostCall(
-  expression: HostCallExpression,
+  expression: HostCall,
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
@@ -751,18 +747,18 @@ export function evaluateHostCall(
     traversal,
     qualifiedBriefSite(briefSiteQualifiers(accum), expression.id),
   );
+  accum.hostCallValueDemands.add(id);
   const renderedArguments = renderTypedHostArguments(
     expression,
     traversal,
     node,
     accum,
   );
+  const report = accum.hostCallResults.get(id);
   const settled = settleHostCallPin(
     accum,
     id,
-    accum.hostCallResults.has(id)
-      ? { value: accum.hostCallResults.get(id) }
-      : undefined,
+    report ? { value: report.value } : undefined,
   );
   if (settled.status === "resolved") {
     return { status: "resolved", value: settled.value };
@@ -779,7 +775,7 @@ export function evaluateHostCall(
         arguments: renderedArguments,
         hostParams: admitFinitePayload(
           effectiveHostParams(node, accum),
-          "brief/effect emission",
+          "brief/host-call emission",
         ),
       } satisfies HostCallBrief),
     );
@@ -820,7 +816,7 @@ export function evaluateJudge(
       question: rendered,
       hostParams: admitFinitePayload(
         effectiveHostParams(node, accum),
-        "brief/effect emission",
+        "host-bound emission",
       ),
     });
   }
@@ -829,7 +825,7 @@ export function evaluateJudge(
 
 type CompoundValueExpression = Exclude<
   ValueExpression,
-  LocalExpression | HostCallExpression | JudgeExpression
+  LocalExpression | HostCall | JudgeExpression
 >;
 
 /** Internal expression domain; parsed `null` literals never enter payload consumers. */
