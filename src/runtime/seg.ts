@@ -16,6 +16,7 @@ import {
 export type SegOutcome<TResult> =
   | { status: "done"; value: TResult }
   | { status: "blocked" }
+  | { status: "interrupted" }
   | { status: "deflected"; deflection: DeflectionContext };
 
 /** A SEG walk result before the re-walk loop folds `rewalk` away. */

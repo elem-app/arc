@@ -183,7 +183,7 @@ this.catchDeflection = () => {
 };
 ```
 
-`this.deflection` exposes the deflection currently being finalized. Its `escaped(Target)` predicate tests whether the deflection came up through one of this node's own entries of `Target` — a canonical, `forgetful`, or `newcopy` entry all count. A node's own deflection entered nothing, so `escaped(Self)` is always false. It is available inside `this.catchDeflection` and remains available in deflected `this.effects`.
+The `this.deflection` channel exposes the deflection currently being finalized. Its `escaped(Target)` predicate tests whether the deflection came up through one of this node's own entries of `Target` — a canonical, `forgetful`, or `newcopy` entry all count. A node's own deflection entered nothing, so `escaped(Self)` is always false. It is available inside `this.catchDeflection` and remains available in deflected `this.effects`.
 
 Two constraints worth keeping in mind: `this.deflection.escaped(Target)` accepts only a bare node or import target (not `newcopy(...)` or `forgetful(...)`), and catching only spares _this_ node from becoming deflected — it does not undo the child or instruction that triggered the deflection.
 
@@ -237,7 +237,7 @@ Because a skipped or deflected callee does not commit its returns, do not depend
 
 Every `$enter(...)` / `$enterLoop(...)` names a target, and the target shape decides whether the call uses retained canonical entry state, forces a forgetful entry, or creates a blank anonymous copy. Choose by what re-entering the node should mean.
 
-**`ReferenceName` (canonical)** is the default: one logical occurrence of the node that resumes where it left off across turns, with an outcome addressable through `.state`. Reach for it whenever later logic routes on how the node went.
+**`ReferenceName` (canonical)** is the default: one logical occurrence of the node that resumes where it left off across turns, with an outcome addressable through `.state`. Reach for it whenever later logic routes on how the node went. Once covered, it stays covered on subsequent ordinary entries, including loop iterations; use an explicit `forgetful` or `newcopy` target to repeat completed work.
 
 ```js
 $enter(ShareRecipe);
@@ -301,8 +301,8 @@ A `$map` can run an element twice: a deflection escaping an element abandons the
 
 | Anti-pattern | Why it fails | Instead |
 | --- | --- | --- |
-| Re-firing a resolved-once action to repeat work (e.g. `$set` as a per-turn counter) | A resolved-once action is skipped for the rest of the entry, and a canonical re-entry skips it too | Use `$enterLoop` / `$instructLoop` with `resolveWhen`, or a `forgetful` / `newcopy` entry, for anything that recurs |
-| Arc vocabulary in semantic text (`deflection`, `node`, `route`, `state`) | The host worker sees only the conversation; these words name nothing it can observe | Phrase the text as a question or instruction about the dialog |
+| Re-firing a resolved-once action to repeat work (e.g. `$set` as a per-turn counter) | A resolved-once action is skipped for the rest of the entry, and a canonical re-entry skips it too | Use `$instructLoop` for repeated instructions, or `$enterLoop` with an explicit `forgetful` / `newcopy` target for repeated node work |
+| Arc vocabulary in semantic text (`this.deflection`, `node`, `route`, `state`) | The host worker sees only the conversation; these words name nothing it can observe | Phrase the text as a question or instruction about the dialog |
 | `$observeOrAsk(...)` for an incidental value | Forces the user to answer something the walk does not actually need | Use `$observe(...)` and continue on `unknown` |
 | `$set(...)` then expecting `$observe(...)` to resolve | A prior write supplies the current value but does not satisfy the observe | Branch on the known value directly |
 | Sentinel wedged into the middle of an enum | Breaks ordinal `>=` / `<=` comparisons | Put `"unknown"` at one end of the value list |

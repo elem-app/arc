@@ -8,6 +8,34 @@ import { describe, expect, it } from "vitest";
 
 import { parse, validate } from "../src/parser/index.js";
 
+const reservedImportAliases = [
+  "$enter",
+  "$enterLoop",
+  "$instruct",
+  "$instructLoop",
+  "$observe",
+  "$observeOrAsk",
+  "Array",
+  "Artifact",
+  "Bool",
+  "Dialog",
+  "Enum",
+  "Index",
+  "Num",
+  "RangedInt",
+  "State",
+  "Str",
+  "args",
+  "forgetful",
+  "invoke",
+  "judge",
+  "newcopy",
+  "returns",
+  "self",
+  "span",
+  "user",
+];
+
 describe("documents", () => {
   describe("doc.directive", () => {
     it("requires the Arc directive", () => {
@@ -73,6 +101,32 @@ function Main() {}
   });
 
   describe("doc.arc-imports", () => {
+    it("rejects reserved Arc import aliases in source and public IR", () => {
+      for (const alias of reservedImportAliases) {
+        for (const binding of [
+          `{ ${alias} }`,
+          `{ Other as ${alias} }`,
+          `* as ${alias}`,
+          alias,
+        ]) {
+          expect(() =>
+            parse(`"arc"; import ${binding} from "other"; function Main() {}`),
+          ).toThrow(`Import alias "${alias}" is reserved by Arc`);
+        }
+
+        const document = parse(
+          '"arc"; import { Other } from "other"; function Main() {}',
+        );
+        document.imports[0]!.localName = alias;
+        expect(validate(document)).toEqual([
+          expect.objectContaining({
+            code: "RESERVED_IMPORT_ALIAS",
+            message: `Import alias "${alias}" is reserved by Arc`,
+          }),
+        ]);
+      }
+    });
+
     it("parses aliased named imports and set() from cell references", () => {
       const document = parse(`
 "arc";
@@ -137,45 +191,14 @@ function Helper() {
 
   describe("doc.host-imports", () => {
     it("rejects host import aliases that collide with Arc built-in roots and namespaces", () => {
-      const reserved = [
-        "$enter",
-        "$enterLoop",
-        "$instruct",
-        "$instructLoop",
-        "$observe",
-        "$observeOrAsk",
-        "Array",
-        "Artifact",
-        "Bool",
-        "Dialog",
-        "Enum",
-        "Index",
-        "Num",
-        "RangedInt",
-        "State",
-        "Str",
-        "args",
-        "forgetful",
-        "invoke",
-        "judge",
-        "newcopy",
-        "returns",
-        "self",
-        "span",
-        "user",
-      ];
-      for (const alias of reserved) {
+      for (const alias of reservedImportAliases) {
         expect(() =>
           parse(`
 "arc";
 import ${alias} from "host:test";
 function Main() {}
 `),
-        ).toThrow(
-          new RegExp(
-            `Host module alias .*${alias.replace("$", "\\$")}.*reserved`,
-          ),
-        );
+        ).toThrow(`Import alias "${alias}" is reserved by Arc`);
       }
 
       expect(() =>
@@ -198,13 +221,18 @@ function Main() {
   path.$set(Files.path());
 }
 `);
-      publicDocument.hostModules[0]!.localName = "Artifact";
       const set = publicDocument.roots[0]!.statements[0]!;
       if (set.kind !== "set") throw new Error("expected set statement");
       set.value = { kind: "template-string", parts: {} } as never;
-      expect(validate(publicDocument)).toEqual([
-        expect.objectContaining({ code: "RESERVED_HOST_MODULE_ALIAS" }),
-      ]);
+      for (const alias of reservedImportAliases) {
+        publicDocument.hostModules[0]!.localName = alias;
+        expect(validate(publicDocument)).toEqual([
+          expect.objectContaining({
+            code: "RESERVED_IMPORT_ALIAS",
+            message: `Import alias "${alias}" is reserved by Arc`,
+          }),
+        ]);
+      }
     });
 
     it("requires host module imports to be default imports", () => {

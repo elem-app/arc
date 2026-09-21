@@ -360,7 +360,9 @@ export class Runtime {
   ): ActionBrief | TerminalBrief {
     this.#assertInitialized();
     assertPersistedTraversalValues(this.#entries, traversals);
+    traversals = cloneTraversalSet(traversals);
     const rootTraversal = selectActionRootTraversal(traversals);
+    if (rootTraversal.state === "interrupted") rootTraversal.state = undefined;
     if (rootTraversal.phase !== "entered") {
       throw new Error(
         `Root traversal phase must be "entered", got "${rootTraversal.phase}"`,
@@ -1031,7 +1033,8 @@ function assertPersistedSnapshot(
       state !== undefined &&
       state !== "covered" &&
       state !== "deflected" &&
-      state !== "skipped"
+      state !== "skipped" &&
+      state !== "interrupted"
     ) {
       throw invalidPersistedState(
         `pre-snapshot contains invalid node state ${JSON.stringify(state)}`,

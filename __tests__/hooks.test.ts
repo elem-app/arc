@@ -1603,7 +1603,7 @@ function Main() {
       expect(rootTraversal(caught).cells.caught).toBe(true);
       expect(rootTraversal(caught).state).toBe("covered");
       expect(
-        ownedChild(rootTraversal(caught), "Main.Branch")?.finalizing,
+        ownedChild(rootTraversal(caught), "Main.Branch")?.control,
       ).toBeUndefined();
       expect(
         ownedChild(
@@ -1733,7 +1733,7 @@ function Main() {
         ownedChild(rootTraversal(childEffects), "Main.Intro"),
       ).toMatchObject({
         state: undefined,
-        finalizing: { reason: "deflected", phase: "effects" },
+        control: { reason: "deflected", phase: "effects" },
       });
 
       const parentEffects = progressBrief(runtime, childEffects, {
@@ -1746,7 +1746,7 @@ function Main() {
       ]);
       expect(rootTraversal(parentEffects)).toMatchObject({
         state: undefined,
-        finalizing: { reason: "deflected", phase: "effects" },
+        control: { reason: "deflected", phase: "effects" },
       });
 
       const deflected = progressTerminal(runtime, parentEffects, {
@@ -1806,7 +1806,7 @@ function Main() {
       });
       expect(rootTraversal(catching)).toMatchObject({
         state: undefined,
-        finalizing: { reason: "deflected", phase: "catch" },
+        control: { reason: "deflected", phase: "catch" },
       });
 
       const routed = progressBrief(runtime, catching, {
@@ -1880,7 +1880,7 @@ function Main() {
       });
       expect(rootTraversal(catching)).toMatchObject({
         state: undefined,
-        finalizing: { reason: "deflected", phase: "catch" },
+        control: { reason: "deflected", phase: "catch" },
       });
 
       const judging = progressBrief(runtime, catching, {
@@ -1900,7 +1900,7 @@ function Main() {
       ).toEqual(["user still wants pricing"]);
       expect(rootTraversal(judging)).toMatchObject({
         state: undefined,
-        finalizing: { reason: "deflected", phase: "catch" },
+        control: { reason: "deflected", phase: "catch" },
       });
 
       const flagged = progressBrief(runtime, judging, {
@@ -2331,7 +2331,7 @@ function Main() {
       expect(rootTraversal(effects)).toMatchObject({
         phase: "entered",
         state: undefined,
-        finalizing: { reason: "covered", phase: "effects" },
+        control: { reason: "covered", phase: "effects" },
       });
       expect(
         renderSemanticTextForTest(effects.hostCalls[0]!.arguments[0]!),
@@ -2345,7 +2345,7 @@ function Main() {
       expect(rootTraversal(completed)).toMatchObject({
         phase: "completed",
         state: "covered",
-        finalizing: undefined,
+        control: undefined,
       });
     });
 
@@ -2380,7 +2380,7 @@ function Main() {
       expect(rootTraversal(effects)).toMatchObject({
         phase: "entered",
         state: undefined,
-        finalizing: {
+        control: {
           reason: "deflected",
           phase: "effects",
           // Own-frontier deflection entered nothing, so `from` is unset.
@@ -2389,10 +2389,10 @@ function Main() {
           },
         },
       });
-      const deflectedFinalizing = rootTraversal(effects).finalizing;
+      const deflectedControl = rootTraversal(effects).control;
       expect(
-        deflectedFinalizing?.reason === "deflected"
-          ? deflectedFinalizing.deflection.from
+        deflectedControl?.reason === "deflected"
+          ? deflectedControl.deflection.from
           : "unreachable",
       ).toBeUndefined();
       expect(
@@ -2407,7 +2407,7 @@ function Main() {
       expect(rootTraversal(suspended)).toMatchObject({
         phase: "suspended",
         state: "deflected",
-        finalizing: undefined,
+        control: undefined,
       });
     });
 
@@ -2518,7 +2518,7 @@ function Main() {
       ).toBe("user deflected intro");
       expect(ownedChild(rootTraversal(nextBrief), "Main.Intro")).toMatchObject({
         state: undefined,
-        finalizing: { reason: "deflected", phase: "effects" },
+        control: { reason: "deflected", phase: "effects" },
       });
       expect(rootTraversal(nextBrief).phase).toBe("entered");
 
@@ -2573,7 +2573,7 @@ function Main() {
       ]);
       expect(rootTraversal(effects)).toMatchObject({
         state: undefined,
-        finalizing: {
+        control: {
           reason: "deflected",
           phase: "effects",
           deflection: {
@@ -2733,7 +2733,7 @@ function Main() {
         ownedChild(rootTraversal(afterDeflect), "Main.Intro"),
       ).toMatchObject({
         state: undefined,
-        finalizing: { reason: "deflected", phase: "effects" },
+        control: { reason: "deflected", phase: "effects" },
       });
 
       const nextBrief = progressBrief(runtime, afterDeflect, {

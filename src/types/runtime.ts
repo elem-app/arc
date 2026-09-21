@@ -27,14 +27,15 @@ export type ArcRef = `arc:${string}`;
 export type NodeRef = `node:${string}`;
 
 /**
- * Terminal runtime state of a node, corresponding directly to `State.*` inside
- * expressions. Each value is an authored node outcome:
+ * Observable runtime state of a node, corresponding directly to `State.*` inside
+ * expressions. Each value describes a node outcome or pending-work marker:
  *
  * - `covered`: the node completed successfully
  * - `deflected`: the host reported an intentional decline or redirection
- * - `skipped`: the node was bypassed by an explicit guard outcome
+ * - `skipped`: the entry attempt was bypassed by an explicit guard outcome
+ * - `interrupted`: pending work marked by propagation; re-entry clears it
  */
-export type NodeState = "covered" | "deflected" | "skipped";
+export type NodeState = "covered" | "deflected" | "skipped" | "interrupted";
 
 /**
  * Opaque id for one semantic work item in a brief.
@@ -67,8 +68,8 @@ export type DeflectionContext = {
  * so a later report resumes that SEG at its suspended position instead of
  * re-deriving the arc from its root.
  *
- * `body` vs `guard` routes node-body resume: a `body` resume skips the guard (the
- * node already passed it on the way in), a `guard` resume re-runs the guard SEG.
+ * Guard progress is stored on the traversal independently of this suspension
+ * identity. Ordinary execution completes an unfinished guard before the body.
  *
  * The hook kinds (`resolveWhen` / `deflectWhen` / `enterLoop`) record an attached
  * hook body as the deepest blocked SEG, carrying the `owner` action whose hook
@@ -78,9 +79,8 @@ export type DeflectionContext = {
  * earlier blocking branch cannot divert control and drop the owner's
  * resolution.
  *
- * `effects` and `catch` are recorded for completeness, but resume routes them
- * through `TraversalFinalizing`, which is their resume authority, so their
- * `SegId` is informational.
+ * For `effects`, `catch`, and `catchInterruption`, the recorded SEG identifies
+ * the suspension point; `TraversalControl` determines which phase resumes.
  *
  * There is no `trigger` variant. A trigger consultation blocks by reporting no
  * match, and its pin tape is call state supplied per candidate by the trigger
@@ -92,6 +92,7 @@ export type SegId =
   | { kind: "body" }
   | { kind: "effects" }
   | { kind: "catch" }
+  | { kind: "catchInterruption" }
   | { kind: "resolveWhen"; owner: ElementId }
   | { kind: "deflectWhen"; owner: ElementId }
   | { kind: "enterLoop"; owner: ElementId }
@@ -100,7 +101,7 @@ export type SegId =
 
 /** SegKey of a node-lifecycle SEG. */
 export function nodeSegKey(
-  kind: "body" | "guard" | "effects" | "trigger",
+  kind: "body" | "guard" | "effects" | "trigger" | "catchInterruption",
 ): SegKey {
   return kind as string as SegKey;
 }
@@ -424,15 +425,10 @@ export type EnterChannelState = {
 };
 
 /**
- * Terminal work a traversal must finish before its `state` becomes visible, and
- * the authority resume routes through while it is set — `SegId` records the
- * finalizing SEGs only informationally.
- *
- * `phase` differs by reason because only a deflection can reach the catch hook:
- * a covered traversal goes straight to `effects`, while a deflected one runs
- * `catch` first and then `effects`.
+ * Persisted control flow for coverage, deflection, or interruption. Pending
+ * phases resume before ordinary node work.
  */
-export type TraversalFinalizing =
+export type TraversalControl =
   | {
       reason: "covered";
       phase: "effects";
@@ -441,6 +437,10 @@ export type TraversalFinalizing =
       reason: "deflected";
       deflection: DeflectionContext;
       phase: "catch" | "effects";
+    }
+  | {
+      reason: "interrupted";
+      phase: "catch" | "complete";
     };
 
 /**
@@ -484,10 +484,12 @@ export type TraversalBase<TRef extends ArcRef | NodeRef> = {
   /** Canonical identity of the arc or node this traversal belongs to. */
   ref: TRef;
   enterCount: number;
+  /** Whether the current entry completed its guard consultation. */
+  guardCompleted: boolean;
   /** Coarse authored node outcome visible as `State.*` in expressions. */
   state?: NodeState;
-  /** Internal terminal work that must finish before `state` is exposed. */
-  finalizing?: TraversalFinalizing;
+  /** Pending or completed control handling for this entry. */
+  control?: TraversalControl;
   /** Cell values declared by this node only. */
   cells: Record<string, CellValue | undefined>;
   /** Per-action resolution state for this node only. */
@@ -654,12 +656,12 @@ export type RuntimeRegistrationIssue =
   | RuntimeRegistryIssue;
 
 /**
- * Allowed high-level moves for one action brief.
+ * High-level moves offered by the current action brief through `allowedMoves`.
  *
  * - `proceed`: report semantic results and continue traversal
- * - `deflect`: mark the active node as intentionally deflected. This move is
- *   only available when `allowedMoves` includes it for the current frontier.
+ * - `deflect`: mark the active node as intentionally deflected.
+ * - `interrupt`: interrupt pending work without acknowledging it.
  * - `poison`: mark the active arc as unusable because the host cannot execute
  *   the current frontier contract.
  */
-export type ActionMove = "proceed" | "deflect" | "poison";
+export type ActionMove = "proceed" | "deflect" | "interrupt" | "poison";

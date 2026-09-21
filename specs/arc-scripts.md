@@ -85,10 +85,11 @@ Arc uses arrow functions for hooks and authored resolution logic. An arrow may u
 | `this.displayName` | string literal | Optional human-facing label. Presentation metadata only. |
 | `this.description` | string literal | Brief summary. |
 | `this.guidance` | string literal or template literal | Guidance for content delivery. |
-| `this.forgetfulEntry` | boolean literal | Default `false`. When `true`, each new entry is forgetful: it clears the prior outcome and action frame, so resolved-once actions run again. During the entry, resolved-once actions remain remembered normally. Cell values, child traversals, and canonical identity are preserved. |
+| `this.forgetfulEntry` | boolean literal | Default `false`. When `true`, each new entry is forgetful: it clears the prior outcome and action frame, so resolved-once actions run again. During the entry, resolved-once actions remain remembered normally. Cell values, child traversals, and canonical identity are preserved. This setting does not start a new entry when an ordinary canonical entry reaches an already-covered target. |
 | `this.trigger` | arrow function | Trigger condition for dormant arcs. See [Trigger](#thistrigger). |
 | `this.deflectWhen` | string literal, template literal, or arrow function | Default deflection policy inherited by instruction actions in this node subtree. See [DeflectWhen](#thisdeflectwhen). |
 | `this.catchDeflection` | arrow function | Deflection interception hook for the current node. See [CatchDeflection](#thiscatchdeflection). |
+| `this.catchInterruption` | arrow function | Interruption interception hook for pending node work. See [CatchInterruption](#thiscatchinterruption). |
 | `this.guard` | arrow function | Explicit state guard. See [Guard](#thisguard). |
 | `this.effects` | arrow function | Finalization actions, including observations and host calls. See [Effects](#thiseffects). |
 | `this.hostParams` | object literal | Host-interpreted metadata carried on semantic work from this node. See [Host Params](#host-params). |
@@ -291,7 +292,7 @@ Expression-capable forms:
 - ``judge(`semantic question`)`` — semantic boolean check against conversation context. Returns `boolean`.
 - Host calls through imported `host:*` modules — yields a host-provided value. See [Host Modules](#host-modules).
 
-`$observe()`, `target.$set(...)`, and `cell.$unset()` can also appear in hooks. Hooks can use expression-capable forms in their expressions. `this.catchDeflection` hook also allows `$observeOrAsk(...)`.
+`$observe()`, `target.$set(...)`, and `cell.$unset()` can also appear in hooks. Hooks can use expression-capable forms in their expressions. `this.catchDeflection` and `this.catchInterruption` hooks also allow `$observeOrAsk(...)`.
 
 ##### Grouped Observation
 
@@ -485,7 +486,7 @@ Comparison and logical composition evaluate by the rules in [Operators](#operato
 
 A template literal in a value position renders each interpolation to ordinary string text. Primitive values and primitive arrays use their existing string rendering, while an Artifact contributes its logical path. A whole Artifact array is rejected; indexing it first contributes the selected Artifact's path. The rendered result is an ordinary string regardless of which supported values contributed to it.
 
-A **boolean position** — an `if` test, the operands of `&&`, `||`, and `!`, a ternary test, and a `this.trigger`, `this.catchDeflection`, `resolveWhen`, or `deflectWhen` return — accepts only a boolean value, without coercion. A comparison, `Num.isFinite(...)`, `&&` / `||` / `!`, `judge(...)`, a regex `.test(...)`, `.isUnset()`, `this.deflection.escaped(...)`, and a set `Bool` cell are booleans; a `Str`, `Num`, `Enum`, `Dialog.Cursor`, Artifact, or array value is not, and must be compared explicitly — `count > 0`, never `count`.
+A **boolean position** — an `if` test, the operands of `&&`, `||`, and `!`, a ternary test, and a `this.trigger`, `this.catchDeflection`, `this.catchInterruption`, `resolveWhen`, or `deflectWhen` return — accepts only a boolean value, without coercion. A comparison, `Num.isFinite(...)`, `&&` / `||` / `!`, `judge(...)`, a regex `.test(...)`, `.isUnset()`, `this.deflection.escaped(...)`, and a set `Bool` cell are booleans; a `Str`, `Num`, `Enum`, `Dialog.Cursor`, Artifact, or array value is not, and must be compared explicitly — `count > 0`, never `count`.
 
 A non-boolean value in a boolean position is rejected at parse time when its type is statically known, and poisons the traversal at runtime otherwise. An unset `Bool` used bare poisons the traversal too — its type passes the parse check, but there is no boolean to read — so either compare it (`== true` / `== false`, which are `false` on an unset cell) or ensure it is set before the bare read.
 
@@ -500,7 +501,7 @@ import Dice from "host:rng";
 import Memoir from "host:memoir";
 ```
 
-The local import alias cannot be a reserved Arc identifier. Reserved aliases are `$enter`, `$enterLoop`, `$instruct`, `$instructLoop`, `$observe`, `$observeOrAsk`, `Array`, `Artifact`, `Bool`, `Dialog`, `Enum`, `Index`, `Num`, `RangedInt`, `State`, `Str`, `args`, `forgetful`, `invoke`, `judge`, `newcopy`, `returns`, `self`, `span`, and `user`. This keeps the same Arc form unambiguous everywhere it is recognized.
+The local import alias cannot be a reserved Arc identifier. Reserved aliases are `$enter`, `$enterLoop`, `$instruct`, `$instructLoop`, `$observe`, `$observeOrAsk`, `Array`, `Artifact`, `Bool`, `Dialog`, `Enum`, `Index`, `Num`, `RangedInt`, `State`, `Str`, `args`, `forgetful`, `invoke`, `judge`, `newcopy`, `returns`, `self`, `user`, and `span`. This keeps the same Arc form unambiguous everywhere it is recognized.
 
 The runtime associates every imported module with a typed operation surface. Each operation defines its ordered parameters and whether it returns a value. Arc authors consume that contract through host calls; how the host supplies it is outside the Arc script language.
 
@@ -525,7 +526,7 @@ if (lucky) {
 Memoir.facts.$apply(`${user} survived the tavern brawl`);
 ```
 
-A host call statement must prefix the operation name with `$`, as in `Memoir.facts.$apply(...)`. It resolves once per logical action instance: the runtime remembers a pending invocation across retries and advances only after the host reports it resolved.
+An action-position host call statement must prefix the operation name with `$`, as in `Memoir.facts.$apply(...)`. It resolves once per logical action instance: the runtime remembers a pending invocation across retries and advances only after the host reports it resolved.
 
 Whether a host-call result is required comes from its consumer. Expression consumers require a value compatible with their own expected spec. Action consumers require no value, so operations with or without a declared result are accepted and any reported value is discarded. The `$` marks the authored action use; it is not part of the host operation name, so `Memoir.facts.apply(...)` and `Memoir.facts.$apply(...)` both address the operation `memoir.facts.apply`.
 
@@ -547,7 +548,7 @@ Host-call result types participate in ordinary spec resolution and compatibility
 
 ## Hooks
 
-Hooks are node config entries that control behavior beyond the action graph: when the arc activates, how pending instructions deflect, how deflections are caught, whether a node should be entered, and what happens after actions resolve. `this.trigger`, `this.catchDeflection`, `this.guard`, and `this.effects` are written as arrow functions; `this.deflectWhen` accepts either an arrow function or a template-literal shorthand.
+Hooks are node config entries that control behavior beyond the action graph: when the arc activates, how pending instructions deflect, how deflections and interruptions are caught, whether a node should be entered, and what happens after actions resolve. `this.trigger`, `this.catchDeflection`, `this.catchInterruption`, `this.guard`, and `this.effects` are written as arrow functions; `this.deflectWhen` accepts either an arrow function or a template-literal shorthand.
 
 ### `this.trigger`
 
@@ -611,7 +612,7 @@ Inheritance rules:
 
 ### `this.catchDeflection`
 
-`this.catchDeflection` runs when a deflection reaches the current node. It can inspect the transient deflection context through the `this.deflection` accessor, perform hook-local work such as `$observe(...)`, `$observeOrAsk(...)`, `judge(...)`, and `cell.$set(...)`, and return `true` to catch the deflection for this node.
+`this.catchDeflection` runs when a deflection reaches the current node. It can inspect the transient deflection context through the `this.deflection` channel, perform hook-local work such as `$observe(...)`, `$observeOrAsk(...)`, `judge(...)`, and `cell.$set(...)`, and return `true` to catch the deflection for this node.
 
 ```js
 function Main() {
@@ -640,13 +641,43 @@ function Main() {
 Processing rules:
 
 - `this.deflection.escaped(Target)` reports whether the pending deflection came up into the current node through one of its own `$enter(Target)`/`$enterLoop(Target)` sites. This form accepts only a bare node/import target. It does not accept `newcopy(Target)` or `forgetful(Target)` as the argument.
-- If the hook returns `true`, the current node catches the deflection and runs its own action graph again while respecting existing `$`-action resolutions: actions that have already resolved are bypassed.
-- If the hook returns false or is absent, the current node begins deflected finalization. Its state remains unset while uncaught-deflection effects run; after they finish, the node becomes `State.DEFLECTED` and propagates the deflection to its parent.
-- A node's catch hook only prevents that node from becoming deflected. It does not undo the triggering child or instruction deflection.
+- Catch results follow the [deflection and interruption](#deflection-and-interruption) rules. In the example, catching sets `wantsPricing` so the node's next body pass reaches `Pricing`.
+
+### `this.catchInterruption`
+
+`this.catchInterruption` runs when a host interruption reaches the current node. It can perform hook-local work and return `true` to catch the interruption for this node.
+
+```js
+import Network from "host:network"; // Provides network tracking utility
+
+function Main() {
+  let workLocally = Bool();
+  workLocally.$set(false); // Work with the network by default.
+
+  this.catchInterruption = () => {
+    // Switch to local work after the host reports a network interruption.
+    workLocally.$set(true);
+    return true;
+  };
+
+  if (workLocally) {
+    $enter(LocalWork);
+  } else {
+    Network.$trackHealth();
+    $enter(NetworkDependentWork);
+  }
+}
+```
+
+Processing rules:
+
+- The hook accepts the same statement forms as `this.catchDeflection`.
+- Every reachable completed path must explicitly return a boolean. A bare return, fallthrough, `undefined`, or a nonboolean value is invalid.
+- Catch results follow the [deflection and interruption](#deflection-and-interruption) rules. In the example, catching sets `workLocally` so the body takes the `LocalWork` branch; the already-resolved initialization does not reset the cell. `NetworkDependentWork` stays interrupted while `LocalWork` runs. If the graph later enters `NetworkDependentWork` again, it resumes from where it stopped.
 
 ### `this.guard`
 
-`this.guard` is evaluated when traversal reaches a node — after the parent's `if` condition passes but before the node's action graph runs. It may return a `State.*` value to resolve the node without entering it. If it returns no node-state value, traversal continues normally.
+`this.guard` chooses whether an entered node proceeds into its action graph or produces a node-state outcome.
 
 ```js
 this.guard = () => {
@@ -654,13 +685,13 @@ this.guard = () => {
 };
 ```
 
+The hook may return `State.SKIPPED`, `State.COVERED`, or `State.DEFLECTED`, or complete without a state. Its result is handled by the [execution flow](#execution-flow).
+
 Guards make unconditional node-entry decisions. An `if` in the parent instead routes control within the parent's action graph.
 
 ### `this.effects`
 
-`this.effects` runs when the node's action graph cannot progress further — whether all actions resolved or traversal stopped early (e.g., a child was deflected). It is a finalization action graph for post-traversal bookkeeping, including final cell writes, observations, and host calls. Calls in this graph use the same protocol and action-state semantics as calls in the main action graph.
-
-While effects run, the node's terminal `state` remains unset. `this.pendingState` exposes the outcome being finalized: `State.COVERED` after normal graph completion or `State.DEFLECTED` after an uncaught deflection. During deflected effects, `this.deflection.escaped(Target)` reports whether the deflection came up through one of this node's own entries of `Target`. The runtime commits the pending state to the node's terminal state only after every effect finishes. `this.pendingState` is available only inside `this.effects`; `this.deflection` is unavailable during covered effects.
+`this.effects` defines the node's closing work: final cell writes, observations, and host calls. The [execution flow](#execution-flow) determines when it runs.
 
 ```js
 import Memoir from "host:memoir";
@@ -688,10 +719,14 @@ this.effects = () => {
 };
 ```
 
+Processing rules:
+
+- `this.pendingState` exposes the outcome being finalized: `State.COVERED` or `State.DEFLECTED`. It is available only inside `this.effects`.
+- During deflected effects, `this.deflection.escaped(Target)` reports whether the deflection came through one of the node's own entries of `Target`. The `this.deflection` channel is unavailable during covered effects.
 - `$observe()` calls use the cell's declared `.observing`.
 - `cell.$set(value)` performs a type-checked write.
 - `cell.$unset()` clears the inner value.
-- Host calls used as actions prefix the operation name with `$`, as in `Memoir.facts.$apply(...)`.
+- Host calls used as actions prefix the operation name with `$`, as in `Memoir.facts.$apply(...)`, and use the same protocol and action-state semantics as calls in the main action graph.
 
 Effects statements execute sequentially. `$observe()` is best-effort: if the host reports `unknown`, execution continues without writing a new value.
 
@@ -729,7 +764,7 @@ function CookingTogether() {
 }
 ```
 
-`ReferenceName.state` works the same for both — it reports the node's outcome (`COVERED`, `DEFLECTED`, `SKIPPED`).
+`ReferenceName.state` works the same for both — it reports the node's outcome (`COVERED`, `DEFLECTED`, `SKIPPED`, `INTERRUPTED`).
 
 Import resolution is two-stage:
 
@@ -772,8 +807,6 @@ The forgetting happens once when the new entry begins. If that entry blocks, its
 
 ### Control Transfer
 
-#### Enter
-
 Enter primitives transfer control into another node or arc traversal. The target selects the canonical traversal or a blank anonymous copy, suspends caller progress until that target iteration reaches a terminal outcome or remains unresolved, and optionally wires caller cells through explicit `args` / `returns` channels.
 
 Arc supports three enter forms:
@@ -792,26 +825,61 @@ Form rules:
   - an arrow function using the constrained statement subset allowed in `this.trigger`
 - `$enter(...)` does not expose authored `resolveWhen`. Its resolution depends on the target node state.
 
-Target semantics:
+Target selection:
 
-1. `Target` may be `ReferenceName`, `newcopy(ReferenceName)`, or `forgetful(ReferenceName)`.
-2. A target iteration transfers control into the referenced callee traversal.
-3. If `Target` is `ReferenceName`, the callee outcome is reflected through `ReferenceName.state` (`COVERED`, `DEFLECTED`, `SKIPPED`).
-4. If `Target` is `newcopy(ReferenceName)`, the callee outcome is not reflected through `ReferenceName.state`.
-5. If `Target` is `forgetful(ReferenceName)`, the runtime starts a forgetful entry on the canonical traversal before control transfers: prior terminal node state and action-frame progress are forgotten, cell values and child traversals are preserved, and the entry's eventual outcome becomes the new meaning of `ReferenceName.state`.
+- `Target` may be `ReferenceName`, `newcopy(ReferenceName)`, or `forgetful(ReferenceName)`.
+- If `Target` is `ReferenceName`, the canonical target form, the callee outcome is reflected through `ReferenceName.state` (`COVERED`, `DEFLECTED`, `SKIPPED`, `INTERRUPTED`).
+- If `Target` is `newcopy(ReferenceName)`, the callee outcome is not reflected through `ReferenceName.state`.
+- If `Target` is `forgetful(ReferenceName)`, the runtime starts a forgetful entry on the canonical traversal before control transfers: prior terminal node state and action-frame progress are forgotten, cell values and child traversals are preserved, and the entry's eventual outcome becomes the new meaning of `ReferenceName.state`.
 
-Execution semantics:
+#### Execution flow
 
-1. The runtime runs one target iteration using the target semantics.
-2. During that iteration, `args` reads from caller-backed cells and `returns.<name>.$set(...)` stages output candidates on the callee traversal.
-3. Each iteration reaches a definite callee node state.
-   - For `$enter(...)`, the action resolves when the callee reaches `COVERED` or `SKIPPED`. If the callee reaches `COVERED`, staged `returns` commit to caller cells. If the callee reaches `SKIPPED`, becomes `DEFLECTED`, or remains unresolved, staged `returns` do not commit.
-   - For `$enterLoop(...)`, the runtime evaluates `resolveWhen` in the caller context after a covered or skipped iteration. Covered iterations may stage `returns` candidates to the enclosing loop action, but caller cells are updated only if the whole `$enterLoop(...)` action later resolves normally. If the callee becomes `DEFLECTED` or remains unresolved, the action remains unresolved.
-4. If `$enterLoop(...)` is not resolved after an iteration, the runtime begins a new iteration by entering the same target shape again while respecting the target semantics described above.
+When entering a node target, the runtime follows this sequence:
+
+1. The runtime prepares the target using the target semantics:
+   - `newcopy(...)` creates a blank copy of the target without a node state, while `forgetful(...)` clears the canonical target's prior state and action progress.
+   - A target without a defined state begins its first entry or continues its pending entry.
+   - A canonical target in `COVERED` returns that outcome without running its guard, body, or effects again.
+   - A canonical target in `DEFLECTED` or `SKIPPED` begins a new entry: the runtime clears its state, increments its entry count, and reruns the guard. Action progress is retained unless the entry is forgetful.
+   - A canonical target in `INTERRUPTED` has its state cleared and continues its existing entry: its decisions, actions, guard progress, descendants, and entry count are retained.
+2. The runtime evaluates `this.guard`, if present and required by the target state. With no guard, proceed directly to the body. When the guard completes, its return value determines the next step:
+   - No state returned: proceed to the body.
+   - `State.SKIPPED`: mark the target skipped and return to the caller without running the body or effects.
+   - `State.COVERED`: bypass the body and proceed to coverage effects.
+   - `State.DEFLECTED`: bypass the body and consult the target's `this.catchDeflection`.
+3. The target runs its action graph while respecting existing action resolutions. Once all reachable actions resolve, the target proceeds to coverage effects.
+4. Coverage and uncaught deflection run `this.effects`, if present. The target's terminal state remains unset while effects run, and `this.pendingState` exposes `State.COVERED` or `State.DEFLECTED`. After effects finish, the target takes that state. Skipping and interruption do not run effects.
+
+During that entry, `args` reads from caller-backed cells and `returns.<name>.$set(...)` stages output candidates on the callee traversal.
+
+Guard, body, catch, effects, and loop-condition work can suspend for host input. An accepted report continues the suspended work rather than starting another entry.
+
+#### Deflection and interruption
+
+A deflection or interruption pauses ordinary work and consults the target's `this.catchDeflection` or `this.catchInterruption`, respectively. Deflection can arise from the guard, an instruction's `deflectWhen`, a host request, or an entered child. Interruption can arise from a host request or an entered child.
+
+- If the hook returns `true`, the target catches the event and reconsiders its body decisions while respecting existing action resolutions. An unfinished guard completes before the body resumes. Descendant outcomes remain unchanged; catching does not undo the triggering child's or instruction's deflection.
+- If `this.catchDeflection` returns `false` or is absent, the target proceeds to deflected effects. After those effects finish, it becomes `DEFLECTED` and gives its caller its own deflection catch opportunity.
+- If `this.catchInterruption` returns `false` or is absent, the target becomes `INTERRUPTED` and gives its caller its own interruption catch opportunity. Catching at an ancestor leaves interrupted descendants marked until reached again.
+
+A new host deflection or interruption during either catch replaces the current event; the abandoned catch's local work is released, while completed external work, cell writes, and descendant states remain.
+
+`State.INTERRUPTED` is an inspectable marker with the same in-node execution behavior as an unset state.
+
+#### Caller continuation
+
+An entry may remain unresolved or reach a callee node state.
+
+- For `$enter(...)`, the action resolves when the callee reaches `COVERED` or `SKIPPED`. If the callee reaches `COVERED`, staged `returns` commit to caller cells. If the callee reaches `SKIPPED` or `DEFLECTED`, is `INTERRUPTED`, or remains unresolved, staged `returns` do not commit.
+- For `$enterLoop(...)`, the runtime evaluates `resolveWhen` in the caller context after a covered or skipped iteration. Covered iterations may stage `returns` candidates to the enclosing loop action, but caller cells are updated only if the whole `$enterLoop(...)` action later resolves normally. If the callee becomes `DEFLECTED`, is `INTERRUPTED`, or remains unresolved, the action remains unresolved.
+- If `$enterLoop(...)`'s `resolveWhen` returns `false`, the runtime repeats the same target-entry operation. Every iteration follows the ordinary `$enter(...)` target rules: a covered canonical target stays covered, `forgetful(Target)` starts another entry after completion, and `newcopy(Target)` replaces a completed copy. Loop repetition alone resets neither the target's state nor its execution progress or entry count.
+- A covered canonical target with a `resolveWhen` that keeps returning `false` loops indefinitely. Repetition does not create a host suspension or force the target to run again.
+
+If an event propagates through every caller and escapes the root, an uncaught deflection leaves the root deflected and suspended; an uncaught interruption returns control to the host with pending work retained for later continuation.
 
 #### Args and Returns
 
-A node's `args` and `returns` are its input and output channels: `args` let it read cells owned by other nodes and `returns` let it write them, in a managed way rather than by the direct lexical access a node has to its own cells.
+A node's `args` and `returns` are its declared input and output [channels](#channels): `args` let it read cells owned by other nodes and `returns` let it write them, in a managed way rather than by the direct lexical access a node has to its own cells.
 
 A node declares each channel as an `args`/`returns` parameter defaulted to an object literal of keys and their types:
 
@@ -862,7 +930,7 @@ Binding rules:
 
 - An `args` binding gives the node a value to read: a caller cell, or the caller's own `args.<key>` (`args: { key: args.other }`).
 - A `returns` binding is a caller cell the node writes.
-- Each entry binds the node's key to a caller cell, shorthand (`{ ready }`) or renamed (`{ input: ready }`).
+- Each executed entry site resolves its bindings in the current caller context, using shorthand (`{ ready }`) or renamed (`{ input: ready }`) keys.
 - The value provider must be assignable to the receiving channel, including scalar type, enum members, and array element types recursively. `Index()` is assignable to `Num()`, while `Num()` is not assignable to `Index()` because an arbitrary number may be fractional, negative, or outside the safe-integer range. For `args`, the caller binding provides the value; for `returns`, the declared return channel provides the value to the caller cell.
 - Binding a key the target does not declare is an error. Within one `returns` map, each caller cell may back at most one key.
 - `args` and `returns` must be object literals (no spread, no computed keys).
@@ -874,19 +942,24 @@ Channel behavior:
 3. A caller cell updates when the `$enter`/`$enterLoop` resolves normally; a key the node never sets leaves its caller cell unchanged.
 4. A declared key the caller leaves unbound is legal: an unbound `args` key reads as unset, and a write to an unbound `returns` key is discarded at resolution. Reading or writing a key the node does not declare poisons the traversal.
 
-## Primitive Accessors
+## Channels
 
-Arc provides built-in accessors for semantic participants, node outcomes, dialog context, and the current deflection. These forms are supplied by the language; they are not node-declared cells.
+Channels expose values and operations supplied by an execution context. A node declares its `args` and `returns` channels; Arc supplies built-in channels for dialog, map iterations, and finalization. Each channel defines its members or value, supported operations, and availability. Cells own persistent state; channels expose information or accept output through the rules of their providing context.
 
-**`State`** — node outcome values used in `ReferenceName.state` comparisons.
+| Channel | Provider and availability | Contract |
+| --- | --- | --- |
+| `args` | Caller bindings for the entered node. | Reads the node's declared inputs. See [Args and Returns](#args-and-returns). |
+| `returns` | The entered node. | Stages declared outputs in `this.effects` for commit on normal entry resolution. See [Args and Returns](#args-and-returns). |
+| `span` | The current `$map` callback. | Reads `item` and `index`; writes `result` when results are bound. See [Map](#map). |
+| `Dialog` | Host-provided conversation context. | Supplies participant references, messages, and cursors. |
+| `this.deflection` | `this.catchDeflection` and deflected `this.effects`. | Queries the deflection being finalized. |
+| `this.pendingState` | `this.effects`. | Reads the outcome being finalized. |
 
-| Property | Description |
-| --- | --- |
-| `State.COVERED` | All reachable actions and effects completed. |
-| `State.DEFLECTED` | Deflection finalization, including effects, completed. Eligible for re-entry. |
-| `State.SKIPPED` | Permanently resolved via explicit guard logic. Not produced automatically by the runtime. |
+`span`, `this.deflection`, and `this.pendingState` are supplied by their enclosing execution context. Their availability follows that context through its supported expressions and nested bodies. References outside the permitted context are rejected during validation; using `this.deflection` during covered effects is a runtime error. Hook declarations remain node configuration assignments such as `this.effects = () => { ... }`.
 
-**`Dialog`** — conversation context accessors and cursor helpers.
+### Dialog
+
+`Dialog` supplies conversation context and cursor operations.
 
 | Form | Type | Description |
 | --- | --- | --- |
@@ -928,17 +1001,32 @@ $instructLoop(`Keep going.`, {
 
 Cursor values cannot be observed with `$observe()` or `$observeOrAsk()`.
 
-**`this.deflection`** — current-deflection accessors available inside `this.catchDeflection` and deflected `this.effects`.
+### Deflection
+
+`this.deflection` supplies the current deflection inside `this.catchDeflection` and deflected `this.effects`.
 
 | Form | Type | Description |
 | --- | --- | --- |
 | `this.deflection.escaped(Target)` | `boolean` | Whether the pending deflection came up through one of this node's own entries of `Target` (canonical, `forgetful`, or `newcopy`). `Target` is a bare node/import. Available in `this.catchDeflection` and deflected `this.effects`. |
 
-**`this.pendingState`** — the outcome being finalized, available only inside `this.effects`.
+### Pending State
+
+`this.pendingState` supplies the outcome being finalized, available only inside `this.effects`.
 
 | Form | Type | Description |
 | --- | --- | --- |
 | `this.pendingState` | `State.COVERED \| State.DEFLECTED` | The outcome that will become the current node's terminal state after effects finish. |
+
+## Node Outcome Constants
+
+`State` is a constants namespace for node outcomes, used in `ReferenceName.state` and `this.pendingState` comparisons.
+
+| Property | Description |
+| --- | --- |
+| `State.COVERED` | All reachable actions and effects completed. |
+| `State.DEFLECTED` | Deflection finalization, including effects, completed. Eligible for re-entry. |
+| `State.SKIPPED` | The current entry attempt was bypassed by its guard. A later entry may reconsider the guard. |
+| `State.INTERRUPTED` | Execution was interrupted. Re-entry resumes the same entry with its progress retained. |
 
 ## Execution Model
 
@@ -962,10 +1050,6 @@ A node's action graph is the unit the runtime interprets. The runtime works the 
 Delegated work produces inputs back to the runtime, such as a host report or an entered node's resulting state. The runtime interprets those inputs and decides whether the current action resolves normally.
 
 When the delegated action resolves, the runtime continues executing the action graph.
-
-Deflection is separate from normal resolution. It arises two ways: a pending instruction whose `deflectWhen` becomes true deflects instead of resolving, and the host may deflect any other frontier at its own discretion. A deflection therefore reaches `this.catchDeflection` in nodes that author no `deflectWhen` and run no instructions.
-
-The runtime pauses normal work and propagates the deflection to the nearest enclosing handler. If no handler catches it, deflection escapes the current work and the root traversal becomes deflected and suspended.
 
 ## Authoring Rules of Thumb
 

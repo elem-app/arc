@@ -121,8 +121,8 @@ import { type EnclosingNode, parseTarget } from "./targets.js";
 
 const HOST_MODULE_SOURCE_PREFIX = "host:";
 
-/** Identifiers whose Arc meaning takes precedence over host-module lookup. */
-const ARC_RESERVED_HOST_ALIAS_NAMES: ReadonlySet<string> = new Set([
+/** Identifiers whose Arc meaning takes precedence over imported bindings. */
+const ARC_RESERVED_IMPORT_ALIAS_NAMES: ReadonlySet<string> = new Set([
   "$enter",
   "$enterLoop",
   "$instruct",
@@ -177,9 +177,9 @@ export function parse(source: string): Document {
     const source = String(statement.source.value);
     const isHostModuleImport = source.startsWith(HOST_MODULE_SOURCE_PREFIX);
     for (const specifier of statement.specifiers) {
+      assertImportAliasAvailable(specifier.local.name);
       if (specifier.type === "ImportDefaultSpecifier") {
         if (isHostModuleImport) {
-          assertHostModuleAliasAvailable(specifier.local.name);
           hostModules.push({
             module: parseHostModuleName(source),
             importedName: "default",
@@ -357,7 +357,7 @@ export function analyzeDocument(
   if (issues.length > 0) {
     return { issues, lintIssues, rewalkPlan: { bySeg } };
   }
-  validatePublicHostModuleBindings(document, issues);
+  validatePublicImportBindings(document, issues);
   if (issues.length > 0) {
     return { issues, lintIssues, rewalkPlan: { bySeg } };
   }
@@ -1183,23 +1183,23 @@ function parseHostModuleName(source: string): string {
   return module;
 }
 
-function assertHostModuleAliasAvailable(localName: string): void {
-  if (ARC_RESERVED_HOST_ALIAS_NAMES.has(localName)) {
+function assertImportAliasAvailable(localName: string): void {
+  if (ARC_RESERVED_IMPORT_ALIAS_NAMES.has(localName)) {
     throw new Error(
-      `Host module alias ${JSON.stringify(localName)} is reserved by Arc`,
+      `Import alias ${JSON.stringify(localName)} is reserved by Arc`,
     );
   }
 }
 
-function validatePublicHostModuleBindings(
+function validatePublicImportBindings(
   document: Document,
   issues: ValidationIssue[],
 ): void {
-  for (const binding of document.hostModules) {
-    if (!ARC_RESERVED_HOST_ALIAS_NAMES.has(binding.localName)) continue;
+  for (const binding of [...document.hostModules, ...document.imports]) {
+    if (!ARC_RESERVED_IMPORT_ALIAS_NAMES.has(binding.localName)) continue;
     issues.push({
-      code: "RESERVED_HOST_MODULE_ALIAS",
-      message: `Host module alias ${JSON.stringify(binding.localName)} is reserved by Arc`,
+      code: "RESERVED_IMPORT_ALIAS",
+      message: `Import alias ${JSON.stringify(binding.localName)} is reserved by Arc`,
       loc: binding.loc,
     });
   }
@@ -1249,6 +1249,8 @@ function parseNode(
   let deflectWhen: ResolutionStatement[] | undefined;
   let catchDeflection: CatchDeflectionStatement[] | undefined;
   let catchDeflectionBody: acorn.Statement[] | undefined;
+  let catchInterruption: CatchDeflectionStatement[] | undefined;
+  let catchInterruptionBody: acorn.Statement[] | undefined;
   let guard: GuardStatement[] | undefined;
   let effects: EffectStatement[] | undefined;
   let effectsBody: acorn.Statement[] | undefined;
@@ -1301,6 +1303,7 @@ function parseNode(
       thisProperty === "trigger" ||
       thisProperty === "deflectWhen" ||
       thisProperty === "catchDeflection" ||
+      thisProperty === "catchInterruption" ||
       thisProperty === "guard" ||
       thisProperty === "effects"
     ) {
@@ -1369,6 +1372,20 @@ function parseNode(
         "this.deflectWhen",
         availableHostModules,
       );
+      handledStatements.add(statement);
+      continue;
+    }
+    if (thisProperty === "catchInterruption") {
+      if (expression.right.type !== "ArrowFunctionExpression") {
+        throw new Error("this.catchInterruption must be an arrow function");
+      }
+      if (expression.right.async || expression.right.params.length > 0) {
+        throw new Error(
+          "this.catchInterruption must be a synchronous arrow function without parameters",
+        );
+      }
+      catchInterruptionBody =
+        getHookBodyStatements(expression.right, "return") ?? undefined;
       handledStatements.add(statement);
       continue;
     }
@@ -1442,8 +1459,18 @@ function parseNode(
     identifier: fn.id.name,
     childNames: new Set(childFunctions.keys()),
   };
+  if (catchInterruptionBody) {
+    catchInterruption = parseCatchStatements(
+      catchInterruptionBody,
+      availableHostModules,
+      availableImports,
+      nextVisibleNodeNames,
+      enclosing,
+      "catchInterruption",
+    );
+  }
   if (catchDeflectionBody) {
-    catchDeflection = parseCatchDeflectionStatements(
+    catchDeflection = parseCatchStatements(
       catchDeflectionBody,
       availableHostModules,
       availableImports,
@@ -1504,6 +1531,7 @@ function parseNode(
     trigger,
     deflectWhen,
     catchDeflection,
+    catchInterruption,
     guard,
     effects,
     loc: locOf(fn),
@@ -1815,6 +1843,7 @@ function applyElementIds(
     [node.deflectWhen, "deflectWhen/"],
     [node.guard, "guard/"],
     [node.catchDeflection, "catch/"],
+    [node.catchInterruption, "catchInterruption/"],
     [node.effects, "effects/"],
     [node.statements, "body/"],
   ];
@@ -2642,6 +2671,7 @@ function unsupportedArcStatement(
     | "this.trigger"
     | "this.guard"
     | "this.catchDeflection"
+    | "this.catchInterruption"
     | "this.effects",
   statement: acorn.Statement,
 ): Error {
@@ -3974,16 +4004,19 @@ function parseGuardStatements(
   });
 }
 
-function parseCatchDeflectionStatements(
+function parseCatchStatements(
   statements: acorn.Statement[],
 
   availableHostModules: Map<string, string>,
   availableImports: Set<string>,
   visibleNodeNames: Set<string>,
   enclosing: EnclosingNode,
+  hook: "catchDeflection" | "catchInterruption" = "catchDeflection",
 ): CatchDeflectionStatement[] {
   const expressionContext: ExpressionParseContext = {
-    deflectionTargets: { availableImports, visibleNodeNames, enclosing },
+    ...(hook === "catchDeflection"
+      ? { deflectionTargets: { availableImports, visibleNodeNames, enclosing } }
+      : {}),
   };
   const parseHookExpression = (expression: acorn.Expression): ValueExpression =>
     parseExpression(expression, availableHostModules, true, expressionContext);
@@ -3991,26 +4024,23 @@ function parseCatchDeflectionStatements(
   return statements.flatMap<CatchDeflectionStatement>((statement) => {
     if (statement.type === "LabeledStatement") {
       if (statement.label.type !== "Identifier") {
-        throw new Error(
-          "this.catchDeflection labels must use identifier names",
-        );
+        throw new Error(`this.${hook} labels must use identifier names`);
       }
       if (statement.body.type !== "BlockStatement") {
-        throw new Error(
-          "this.catchDeflection labels must target a block statement",
-        );
+        throw new Error(`this.${hook} labels must target a block statement`);
       }
       return [
         {
           id: UNSTAMPED_ID,
           kind: "label",
           label: statement.label.name,
-          body: parseCatchDeflectionStatements(
+          body: parseCatchStatements(
             statement.body.body,
             availableHostModules,
             availableImports,
             visibleNodeNames,
             enclosing,
+            hook,
           ),
           loc: locOf(statement),
         },
@@ -4019,9 +4049,7 @@ function parseCatchDeflectionStatements(
 
     if (statement.type === "BreakStatement") {
       if (!statement.label || statement.label.type !== "Identifier") {
-        throw new Error(
-          "this.catchDeflection break statements must specify a label",
-        );
+        throw new Error(`this.${hook} break statements must specify a label`);
       }
       return [
         {
@@ -4039,20 +4067,22 @@ function parseCatchDeflectionStatements(
           id: UNSTAMPED_ID,
           kind: "if",
           test: parseHookExpression(statement.test),
-          consequent: parseCatchDeflectionStatements(
+          consequent: parseCatchStatements(
             getBlockStatements(statement.consequent),
             availableHostModules,
             availableImports,
             visibleNodeNames,
             enclosing,
+            hook,
           ),
           alternate: statement.alternate
-            ? parseCatchDeflectionStatements(
+            ? parseCatchStatements(
                 getBlockStatements(statement.alternate),
                 availableHostModules,
                 availableImports,
                 visibleNodeNames,
                 enclosing,
+                hook,
               )
             : undefined,
           loc: locOf(statement),
@@ -4074,12 +4104,12 @@ function parseCatchDeflectionStatements(
     }
 
     if (statement.type !== "ExpressionStatement") {
-      throw unsupportedArcStatement("this.catchDeflection", statement);
+      throw unsupportedArcStatement(`this.${hook}`, statement);
     }
     const expression = statement.expression;
     if (expression.type !== "CallExpression") {
       throw new Error(
-        `Unsupported this.catchDeflection expression statement: ${expression.type}`,
+        `Unsupported this.${hook} expression statement: ${expression.type}`,
       );
     }
 
@@ -4126,7 +4156,7 @@ function parseCatchDeflectionStatements(
       return [mutation];
     }
 
-    throw new Error("Unsupported this.catchDeflection call");
+    throw new Error(`Unsupported this.${hook} call`);
   });
 }
 
@@ -5130,6 +5160,19 @@ function validateNode(
         effectsOptions,
       );
     }
+    if (node.catchInterruption !== undefined) {
+      validateInterruptionCompletion(node.catchInterruption, context.issues);
+      for (const statement of node.catchInterruption) {
+        validateCatchDeflectionStatement(
+          statement,
+          cells,
+          nodeNames,
+          context.issues,
+          [],
+          baseOptions,
+        );
+      }
+    }
     for (const statement of node.catchDeflection ?? []) {
       validateCatchDeflectionStatement(
         statement,
@@ -5860,6 +5903,19 @@ function validateGuardStatement(
   if (statement.kind === "return") {
     if (statement.value) {
       validateExpression(statement.value, cells, nodes, issues, options);
+      if (
+        statement.value.kind !== "literal" ||
+        ![undefined, null, "covered", "skipped", "deflected"].includes(
+          statement.value.value as string | null | undefined,
+        )
+      ) {
+        issues.push({
+          code: "INVALID_GUARD_RETURN",
+          message:
+            "this.guard must return State.SKIPPED, State.DEFLECTED, State.COVERED, or undefined",
+          loc: statement.loc,
+        });
+      }
     }
     return;
   }
@@ -5888,6 +5944,57 @@ function validateGuardStatement(
   if (statement.kind === "unset") {
     validateUnsetTarget(statement, cells, nodes, issues, options);
     return;
+  }
+}
+
+function validateInterruptionCompletion(
+  statements: readonly CatchDeflectionStatement[],
+  issues: ValidationIssue[],
+): void {
+  type Exit = "next" | "return" | `break:${string}`;
+  function exits(list: readonly CatchDeflectionStatement[]): Set<Exit> {
+    const result = new Set<Exit>(["next"]);
+    for (const statement of list) {
+      if (!result.delete("next")) break;
+      if (statement.kind === "return") {
+        if (
+          !statement.value ||
+          (statement.value.kind === "literal" &&
+            typeof statement.value.value !== "boolean")
+        ) {
+          issues.push({
+            code: "INVALID_INTERRUPTION_RETURN",
+            message: "this.catchInterruption must explicitly return a boolean",
+            loc: statement.loc,
+          });
+        }
+        result.add("return");
+      } else if (statement.kind === "break") {
+        result.add(`break:${statement.label}`);
+      } else if (statement.kind === "if") {
+        const literal =
+          statement.test.kind === "literal" ? statement.test.value : undefined;
+        const branches =
+          literal === true
+            ? [statement.consequent]
+            : literal === false
+              ? [statement.alternate ?? []]
+              : [statement.consequent, statement.alternate ?? []];
+        for (const branch of branches)
+          for (const exit of exits(branch)) result.add(exit);
+      } else if (statement.kind === "label") {
+        for (const exit of exits(statement.body))
+          result.add(exit === `break:${statement.label}` ? "next" : exit);
+      } else result.add("next");
+    }
+    return result;
+  }
+  if (exits(statements).has("next")) {
+    issues.push({
+      code: "INVALID_INTERRUPTION_RETURN",
+      message:
+        "this.catchInterruption must explicitly return a boolean on every completed path",
+    });
   }
 }
 

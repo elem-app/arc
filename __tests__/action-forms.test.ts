@@ -646,7 +646,7 @@ function Main() {
           postcheck: undefined,
         },
       ]);
-      expect(brief.allowedMoves).toEqual(["poison", "proceed"]);
+      expect(brief.allowedMoves).toEqual(["poison", "proceed", "interrupt"]);
 
       const afterProceed = progressTerminal(runtime, brief, {
         move: "proceed",

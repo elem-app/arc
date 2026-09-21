@@ -133,7 +133,6 @@ import {
   cloneInstructionPostcheck,
   createEmptyArcTraversal,
   createEmptyEnterChannelState,
-  createEmptyNodeTraversal,
   dedupeBriefIds,
   ensureEphemeralTraversal,
   ensureOwnedTraversal,
@@ -155,8 +154,8 @@ import {
   markPendingHostCall,
   markResolvedActionState,
   noteBriefYield,
+  recordActiveFrame,
   recordPendingTransition,
-  replaceEphemeralTraversal,
   selectActionRootTraversal,
   setActiveTraversal,
   stampEnteredBy,
@@ -167,6 +166,7 @@ type TerminalTraversalState = Extract<NodeState, "covered" | "skipped">;
 type TraversalOutcome =
   | { status: "done"; finalState: TerminalTraversalState }
   | { status: "blocked" }
+  | { status: "interrupted" }
   | { status: "deflected"; deflection: DeflectionContext };
 
 type HookOutcome<TResult> = SegOutcome<TResult>;
@@ -178,6 +178,7 @@ type EnterActionOutcome =
       finalState: TerminalTraversalState;
     }
   | { status: "blocked"; traversal: Traversal }
+  | { status: "interrupted"; traversal: Traversal }
   | {
       status: "deflected";
       traversal: Traversal;
@@ -459,7 +460,7 @@ export function runTrigger(
     },
   );
   if (outcome.status === "blocked") return false;
-  if (outcome.status === "deflected") {
+  if (outcome.status === "deflected" || outcome.status === "interrupted") {
     throw new Error("Triggers cannot deflect");
   }
   clearEvaluatorActionStates(traversal, nodeSegKey("trigger"));
@@ -493,9 +494,13 @@ function runGuardStatements(
         if (result.status === "blocked") {
           return blockSeg(accum, traversal);
         }
-        return isResultNodeState(result)
-          ? { status: "done", value: result.value }
-          : { status: "done", value: undefined };
+        if (isResultNodeState(result))
+          return { status: "done", value: result.value };
+        if (result.value === undefined || result.value === null)
+          return { status: "done", value: undefined };
+        throw new Error(
+          "this.guard must return State.SKIPPED, State.DEFLECTED, State.COVERED, or undefined",
+        );
       },
       isResolvedLeaf: (statement) => isResolvedNarrowLeaf(statement, scope),
       stepLeaf: (statement) => {
@@ -514,7 +519,7 @@ function runGuardStatements(
   if (outcome.status === "blocked") {
     return { status: "blocked" };
   }
-  if (outcome.status === "deflected") {
+  if (outcome.status === "deflected" || outcome.status === "interrupted") {
     throw new Error("Guards cannot deflect");
   }
   // Guard completion ends the consultation: the next guard run is fresh.
@@ -643,7 +648,11 @@ export function resumeActiveFrame(accum: Accumulator): void {
       );
     }
 
-    if (outcome.status === "deflected") {
+    if (outcome.status === "interrupted") {
+      clearEvaluatorActionStates(caller, nodeSegKey("catchInterruption"));
+      caller.control = { reason: "interrupted", phase: "catch" };
+      outcome = resumeTraversal(caller, accum, { kind: "catchInterruption" });
+    } else if (outcome.status === "deflected") {
       // The active SEG deflected: its owning enter deflects too, and the
       // deflection propagates to the caller's catch. An enter inside an invoke
       // body abandons the open invocation as the deflection crosses it, so the
@@ -654,7 +663,7 @@ export function resumeActiveFrame(accum: Accumulator): void {
         nodeForTraversal(accum, caller),
         enteredBy.actionId,
       );
-      caller.finalizing = {
+      caller.control = {
         reason: "deflected",
         deflection: {
           origin: outcome.deflection.origin,
@@ -773,10 +782,10 @@ function runTraversal(
   bodyResumeStack?: SegFrame<Statement>[],
 ): TraversalOutcome {
   // `resumeSeg` and `bodyResumeStack` apply only to the first restart iteration:
-  // a resume that begins at the action body skips the guard, so a body block does
-  // not rerun the guard under changed state, and an unchanged-read bubble-up
-  // resumes the body just past the resolved enter. Finalizing (effects/catch)
-  // always wins; a re-walk after a deflection-catch restarts the whole body.
+  // guard completion is independent of the resume SEG, and an unchanged-read
+  // bubble-up resumes the body just past the resolved enter. A pending control phase
+  // takes precedence; a caught event restarts the body after any
+  // unfinished guard completes.
   let entrySeg = resumeSeg;
   let resumeStack = bodyResumeStack;
   while (true) {
@@ -786,10 +795,10 @@ function runTraversal(
     let bodyStack = resumeStack;
     resumeStack = undefined;
 
-    if (traversal.finalizing) {
-      const finalized = continueFinalizingTraversal(traversal, node, accum);
-      if (finalized.status === "caught") continue;
-      return finalized;
+    if (traversal.control && traversal.control.phase !== "complete") {
+      const controlled = continueTraversalControl(traversal, node, accum);
+      if (controlled.status === "caught") continue;
+      return controlled;
     }
 
     const ownerFirstResume =
@@ -820,9 +829,9 @@ function runTraversal(
       bodyStack = ownerStack;
     }
 
-    if (!isRoot && seg?.kind !== "body" && !ownerFirstResume) {
+    if (!isRoot) {
       const guardPhase = runGuardPhase(traversal, node, accum);
-      if (guardPhase.status === "finalizing") continue;
+      if (guardPhase.status === "control") continue;
       if (guardPhase.status !== "proceed") return guardPhase;
     }
 
@@ -832,8 +841,13 @@ function runTraversal(
     if (outcome.status === "blocked") {
       return { status: "blocked" };
     }
+    if (outcome.status === "interrupted") {
+      clearEvaluatorActionStates(traversal, nodeSegKey("catchInterruption"));
+      traversal.control = { reason: "interrupted", phase: "catch" };
+      continue;
+    }
     if (outcome.status === "deflected") {
-      traversal.finalizing = {
+      traversal.control = {
         reason: "deflected",
         deflection: outcome.deflection,
         phase: "catch",
@@ -845,7 +859,7 @@ function runTraversal(
       return blockTraversal(accum, traversal);
     }
 
-    traversal.finalizing = {
+    traversal.control = {
       reason: "covered",
       phase: "effects",
     };
@@ -859,7 +873,8 @@ function shouldInitializeRootArtifactCells(
   return (
     traversal.enterCount <= 1 &&
     traversal.state === undefined &&
-    traversal.finalizing === undefined &&
+    (traversal.control === undefined ||
+      traversal.control.phase === "complete") &&
     (!("activeFrame" in traversal) || traversal.activeFrame === undefined) &&
     node.cells.some(
       (cell) => cell.type === "artifact" && cell.initializer !== undefined,
@@ -877,13 +892,17 @@ function runGuardPhase(
   accum: Accumulator,
 ):
   | { status: "proceed" }
-  | { status: "finalizing" }
+  | { status: "control" }
   | { status: "done"; finalState: TerminalTraversalState }
   | { status: "blocked" } {
   if (traversal.state === "covered" || traversal.state === "skipped") {
     return { status: "done", finalState: traversal.state };
   }
-  if (!node.guard) return { status: "proceed" };
+  if (traversal.guardCompleted) return { status: "proceed" };
+  if (!node.guard) {
+    traversal.guardCompleted = true;
+    return { status: "proceed" };
+  }
 
   accum.activeSeg = { kind: "guard" };
   if (maybeBlockForTransition(accum, traversal)) {
@@ -893,22 +912,25 @@ function runGuardPhase(
   if (guardResult.status === "blocked") {
     return { status: "blocked" };
   }
-  if (guardResult.value === "covered" || guardResult.value === "skipped") {
-    traversal.state = guardResult.value;
-    // A guard-covered/skipped node exits without a body or finalizing pass, so
-    // its exit latches here.
+  traversal.guardCompleted = true;
+  if (guardResult.value === "covered") {
+    traversal.control = { reason: "covered", phase: "effects" };
+    return { status: "control" };
+  }
+  if (guardResult.value === "skipped") {
+    traversal.state = "skipped";
     latchExitedTransition(accum, traversalToNodeRef(traversal));
-    return { status: "done", finalState: guardResult.value };
+    return { status: "done", finalState: "skipped" };
   }
   if (guardResult.value === "deflected") {
-    traversal.finalizing = {
+    traversal.control = {
       reason: "deflected",
       // Guard deflection is this node's own; it entered nothing, so `from` stays
       // unset until it propagates up through a parent's enter boundary.
       deflection: { origin: traversalToNodeRef(traversal) },
       phase: "catch",
     };
-    return { status: "finalizing" };
+    return { status: "control" };
   }
   traversal.state = undefined;
   return { status: "proceed" };
@@ -959,17 +981,54 @@ function runBodySeg(
   );
 }
 
-function continueFinalizingTraversal(
+function continueInterruption(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
 ): TraversalOutcome | { status: "caught" } {
-  const finalizing = traversal.finalizing;
-  if (!finalizing) {
-    throw new Error("Traversal is not finalizing");
+  accum.activeSeg = { kind: "catchInterruption" };
+  const scope = nodeSegKey("catchInterruption");
+  if (node.catchInterruption !== undefined) {
+    const gated = maybeBlockForTransition(accum, traversal);
+    if (gated) return gated;
+    const caught = evaluateBooleanHook(
+      node.catchInterruption,
+      traversal,
+      node,
+      accum,
+      scope,
+      true,
+    );
+    if (caught.status === "blocked") return { status: "blocked" };
+    // Completion is recorded before propagation; a retained entry cannot replay it.
+    traversal.control = { reason: "interrupted", phase: "complete" };
+    if (caught.value) {
+      clearEvaluatorActionStates(traversal, scope);
+      traversal.control = undefined;
+      dropPinTape(traversal, nodeSegKey("body"));
+      return { status: "caught" };
+    }
+  } else traversal.control = { reason: "interrupted", phase: "complete" };
+  traversal.state = "interrupted";
+  latchExitedTransition(accum, traversalToNodeRef(traversal));
+  recordActiveFrame(accum);
+  return { status: "interrupted" };
+}
+
+function continueTraversalControl(
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): TraversalOutcome | { status: "caught" } {
+  const control = traversal.control;
+  if (!control || control.phase === "complete") {
+    throw new Error("Traversal has no pending control phase");
+  }
+  if (control.reason === "interrupted") {
+    return continueInterruption(traversal, node, accum);
   }
 
-  if (finalizing.reason === "deflected" && finalizing.phase === "catch") {
+  if (control.reason === "deflected" && control.phase === "catch") {
     accum.activeSeg = { kind: "catch" };
     // A declared catch hook is an authored evaluation at this node; gate a
     // latched transition before it. A hookless node passes through and its
@@ -982,17 +1041,17 @@ function continueFinalizingTraversal(
       traversal,
       node,
       accum,
-      finalizing.deflection,
+      control.deflection,
     );
     if (caught.status === "blocked") return { status: "blocked" };
     if (caught.value) {
-      traversal.finalizing = undefined;
+      traversal.control = undefined;
       // The caught-deflection restart is a dial-back of this node's body SEG:
       // the abandoned walk's sigil-less pins release, resolved `$` slots stay.
       dropPinTape(traversal, nodeSegKey("body"));
       return { status: "caught" };
     }
-    traversal.finalizing = { ...finalizing, phase: "effects" };
+    traversal.control = { ...control, phase: "effects" };
   }
 
   accum.activeSeg = { kind: "effects" };
@@ -1005,20 +1064,19 @@ function continueFinalizingTraversal(
   const effects = runEffects(traversal, node, accum);
   if (effects.status !== "done") return effects;
 
-  traversal.finalizing = undefined;
+  traversal.control = undefined;
   // The traversal is terminal: every walk it owned is over, so all of its
   // sigil-less pins release. Resolved `$` slots persist in the frame.
   dropAllPinTapes(traversal);
-  traversal.state = finalizing.reason;
+  traversal.state = control.reason;
   if (isArcTraversal(traversal)) {
-    traversal.phase =
-      finalizing.reason === "covered" ? "completed" : "suspended";
+    traversal.phase = control.reason === "covered" ? "completed" : "suspended";
   }
   latchExitedTransition(accum, traversalToNodeRef(traversal));
-  if (finalizing.reason === "deflected") {
+  if (control.reason === "deflected") {
     return {
       status: "deflected",
-      deflection: finalizing.deflection,
+      deflection: control.deflection,
     };
   }
   return { status: "done", finalState: "covered" };
@@ -1209,9 +1267,10 @@ function restoreBodySegAfterWideAction(accum: Accumulator): void {
  * phases per iteration:
  *
  * - `target`: enter the target child — applying a `forgetful`/`newcopy` decorator
- *   when present. A covered target is never routed here on resume: bubble-up
- *   resolves a covered `enter` and routes a covered loop iteration to
- *   `resolveWhen` directly, so this phase always genuinely (re-)enters.
+ *   when present. Every iteration applies the same entry rules: a covered
+ *   canonical target retains its outcome; explicit forgetting or copying starts
+ *   another entry after completion. Bubble-up routes a completed iteration
+ *   directly to resolution without entering its target again.
  * - `resolveWhen` (`enterLoop` only): evaluate the hook — loop again on false,
  *   resolve and commit the staged returns transaction on true. `enter` never
  *   reaches this phase; its action resolves the moment its target covers.
@@ -1281,12 +1340,6 @@ function runEnterAction(
         hookSegKey(statement.id, "resolveWhen"),
       );
       if (!truthy(resolution.value)) {
-        prepareNextEnterLoopIteration(
-          traversal,
-          target,
-          accum,
-          statement.target.mode === "forgetful",
-        );
         phase = "target";
         continue restart;
       }
@@ -1306,7 +1359,7 @@ function runEnterAction(
       return readSetRewalkStep(preSnapshot, traversal, node, accum);
     }
 
-    // `target` phase: genuinely enter the target (decorator applied).
+    // `target` phase: apply the target's ordinary entry rules.
     const result = runEnterIteration(traversal, node, statement, target, accum);
     if (result.status === "blocked") {
       persistPendingEnterState(
@@ -1317,6 +1370,16 @@ function runEnterAction(
         preSnapshot,
       );
       return { status: "blocked" };
+    }
+    if (result.status === "interrupted") {
+      persistPendingEnterState(
+        traversal,
+        statement,
+        "target",
+        stagedReturns,
+        preSnapshot,
+      );
+      return { status: "interrupted" };
     }
     if (result.status === "deflected") {
       clearActionState(traversal, statement.id);
@@ -1699,7 +1762,8 @@ function stepInvoke(
     accum.invokeContext.pop();
   }
 
-  if (outcome.status === "blocked") return { status: "blocked" };
+  if (outcome.status === "blocked" || outcome.status === "interrupted")
+    return outcome;
   if (outcome.status === "deflected") {
     // The deflection abandons the invocation on its way out; the containing
     // node's catch rewalk re-reaches a fresh one.
@@ -1777,7 +1841,8 @@ function stepMap(
 
   while (arena.nextIndex < arena.pinnedInput.length) {
     const outcome = runMapMember(traversal, node, statement, accum, arena);
-    if (outcome.status === "blocked") return { status: "blocked" };
+    if (outcome.status === "blocked" || outcome.status === "interrupted")
+      return outcome;
     if (outcome.status === "deflected") {
       // The deflection abandons the member on its way out; as it crosses the
       // `$map` the whole arena clears, and the node's catch rewalk re-reaches a
@@ -2475,7 +2540,9 @@ export function evaluateBooleanHook(
   node: Node,
   accum: Accumulator,
   segKey: SegKey,
+  interruption = false,
 ): ActionOutcome<boolean> {
+  let returned = false;
   const scope = evaluatorNarrowScope(traversal, segKey);
   // One consultation is one walk: the hook's tape persists across blocked
   // round-trips (a report that resolves a later leaf replays earlier judge
@@ -2486,8 +2553,27 @@ export function evaluateBooleanHook(
     doneValue: false,
     evaluateIf: (statement) =>
       evaluateIfBranch(statement, traversal, node, accum),
-    evaluateReturn: (statement) =>
-      evaluateBooleanReturn(statement, traversal, node, accum),
+    evaluateReturn: (statement) => {
+      if (!interruption)
+        return evaluateBooleanReturn(statement, traversal, node, accum);
+      if (!statement.value)
+        throw new Error(
+          "this.catchInterruption must explicitly return a boolean",
+        );
+      const result = evaluateValueExpression(
+        statement.value,
+        traversal,
+        node,
+        accum,
+      );
+      if (result.status === "blocked") return blockSeg(accum, traversal);
+      if (typeof result.value !== "boolean")
+        throw new Error(
+          "this.catchInterruption must explicitly return a boolean",
+        );
+      returned = true;
+      return { status: "done", value: result.value };
+    },
     isResolvedLeaf: (statement) => isResolvedNarrowLeaf(statement, scope),
     stepLeaf: (statement) => {
       const step = stepNarrowLeaf<boolean>(
@@ -2506,10 +2592,14 @@ export function evaluateBooleanHook(
   if (outcome.status === "blocked") {
     return { status: "blocked" };
   }
-  if (outcome.status === "deflected") {
+  if (outcome.status === "deflected" || outcome.status === "interrupted") {
     throw new Error("Hooks cannot deflect");
   }
-  clearEvaluatorActionStates(traversal, segKey);
+  if (interruption && !returned)
+    throw new Error(
+      "this.catchInterruption must explicitly return a boolean on every completed path",
+    );
+  if (!interruption) clearEvaluatorActionStates(traversal, segKey);
   return { status: "resolved", value: outcome.value };
 }
 
@@ -2518,7 +2608,12 @@ function prepareTraversalForEntry(
   node: Node,
   target: { mode: "canonical" | "forgetful" | "newcopy" },
 ): boolean {
-  if (traversal.finalizing) {
+  if (traversal.control && traversal.control.phase !== "complete") {
+    return false;
+  }
+
+  if (traversal.state === "interrupted") {
+    traversal.state = undefined;
     return false;
   }
 
@@ -2531,23 +2626,14 @@ function prepareTraversalForEntry(
     return true;
   }
 
-  if (traversal.state === "deflected" || isSuspendedArcTraversal(traversal)) {
+  if (
+    traversal.state === "skipped" ||
+    traversal.state === "deflected" ||
+    isSuspendedArcTraversal(traversal)
+  ) {
     resetTraversalForEntry(traversal, node, traversal.enterCount + 1);
   }
   return false;
-}
-
-function restartTraversalForEntry(
-  traversal: Traversal,
-  node: Node,
-  forceForgetfulEntry = false,
-): void {
-  resetTraversalForEntry(
-    traversal,
-    node,
-    traversal.enterCount + 1,
-    forceForgetfulEntry,
-  );
 }
 
 function prepareForgetfulTraversalEntry(
@@ -2611,14 +2697,6 @@ function applyEnterChannels(
   calleeTraversal: Traversal,
   accum: Accumulator,
 ): void {
-  const hasArgs = !!statement.args && Object.keys(statement.args).length > 0;
-  const hasReturns =
-    !!statement.returns && Object.keys(statement.returns).length > 0;
-  if (!hasArgs && !hasReturns) {
-    calleeTraversal.enterChannels = createEmptyEnterChannelState();
-    return;
-  }
-
   const nextArgs = resolveEnterChannelLinks(
     statement.args ?? {},
     callerTraversal,
@@ -2850,37 +2928,6 @@ function persistPendingEnterState(
   });
 }
 
-function prepareNextEnterLoopIteration(
-  traversal: Traversal,
-  target: EnterTarget,
-  accum: Accumulator,
-  forgetful: boolean,
-): void {
-  if (target.kind === "anonymous-copy") {
-    replaceEphemeralTraversal(
-      traversal,
-      target.ref,
-      createEmptyNodeTraversal(target.ref, target.node),
-    );
-    return;
-  }
-
-  // A forgetful iteration clears the node frame per forgetful-target semantics;
-  // a bare canonical target follows the node's forgetfulEntry policy.
-  if (target.kind === "referenced") {
-    const nextTraversal = ensureReferencedTraversal(
-      accum,
-      target.ref,
-      target.entry.root,
-    );
-    restartTraversalForEntry(nextTraversal, target.entry.root, forgetful);
-    return;
-  }
-
-  const nextTraversal = ensureOwnedTraversal(accum, target.ref, target.node);
-  restartTraversalForEntry(nextTraversal, target.node, forgetful);
-}
-
 function ensureReferencedTraversal(
   accum: Accumulator,
   ref: ArcRef,
@@ -2990,8 +3037,8 @@ function toEnterActionOutcome(
       finalState: outcome.finalState,
     };
   }
-  if (outcome.status === "blocked") {
-    return { status: "blocked", traversal };
+  if (outcome.status === "blocked" || outcome.status === "interrupted") {
+    return { status: outcome.status, traversal };
   }
   if (outcome.status === "deflected") {
     return {
@@ -3010,8 +3057,9 @@ function resetTraversalForEntry(
   forceForgetfulEntry = false,
 ): void {
   traversal.enterCount = nextEnterCount;
+  traversal.guardCompleted = false;
   traversal.state = undefined;
-  traversal.finalizing = undefined;
+  traversal.control = undefined;
   traversal.enterChannels = createEmptyEnterChannelState();
   if (isArcTraversal(traversal)) {
     traversal.phase = "entered";

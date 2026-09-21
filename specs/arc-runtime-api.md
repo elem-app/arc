@@ -111,7 +111,7 @@ Invalid judgment or observation results supplied in a report do not poison the t
 
 Two pieces of traversal state that serve distinct purposes:
 
-**Node state** is the outcome — what happened to the node as a whole. It is one of `COVERED`, `DEFLECTED`, `SKIPPED`, or not yet resolved. The parent's action graph reads it through `ReferenceName.state` to decide whether to re-enter or move on. Node state is set by the runtime (`COVERED` when all reachable actions and effects complete, `DEFLECTED` on host-initiated deflection) or by explicit guard logic (`SKIPPED`). `forgetful(ReferenceName)` explicitly clears the prior canonical node state and starts a new entry whose eventual outcome becomes the new `ReferenceName.state`.
+**Node state** is the outcome — what happened to the node as a whole. It is `COVERED` after actions and effects complete, `DEFLECTED` after deflection finalization, `SKIPPED` when a guard bypasses the entry, `INTERRUPTED` when an interruption leaves work pending, or unset before an outcome is recorded. The parent's action graph reads it through `ReferenceName.state` to decide whether to re-enter or move on. `forgetful(ReferenceName)` explicitly clears the prior canonical node state and starts a new entry whose eventual outcome becomes the new `ReferenceName.state`.
 
 Canonical node state is addressable from Arc source through `ReferenceName.state`. Blank anonymous copies created through `newcopy(ReferenceName)` are not addressable from Arc source and do not change the meaning of `ReferenceName.state`. Forgetful entries created through `forgetful(ReferenceName)` remain addressable and replace the prior canonical outcome with the new entry's outcome.
 
@@ -214,7 +214,7 @@ type TriggerReport = {
 
 ### `ActionBrief`
 
-`ActionBrief` is the reportable frontier the runtime yields during the action stage. Action-stage entrypoints return `ActionBrief | TerminalBrief`, without naming that union, and hosts narrow the output through `canProgress`.
+`ActionBrief` is the reportable frontier the runtime yields during the action stage. Action-stage entrypoints return `ActionBrief | TerminalBrief`, without naming that union, and hosts narrow the output through `canProgress`. Its `allowedMoves` determines which control moves the host may submit at the current frontier.
 
 ```typescript
 type ActionBrief = {
@@ -247,26 +247,30 @@ type ActionBrief = {
 
 ### `TerminalBrief`
 
-`TerminalBrief` is the non-reportable output returned when the action root stops.
+`TerminalBrief` ends the current action progression and cannot be submitted to `Runtime.progress`.
 
 ```typescript
 type TerminalBrief = {
-  /** Updated traversal state after terminal settlement. */
+  /** Updated traversal state at handback. */
   traversals: ArcTraversalSet;
-  /** This output cannot be submitted to Runtime.progress. */
   canProgress: false;
-  /** Registered root whose action stage stopped. */
+  /** Registered root whose action stage produced this result. */
   root: ArcRef;
-  /** Terminal outcome of that root. */
-  outcome: "covered" | "deflected" | "poisoned";
-  /** Committed root returns, when a covered root declares return channels. */
-  returns?: Record<string, CellValue>;
-  /** Structured issues carried by terminal settlement. */
   issues: RuntimeIssue[];
-};
+} & (
+  | {
+      outcome: "covered";
+      /** Committed root returns, when the root declares return channels. */
+      returns?: Record<string, CellValue>;
+    }
+  | {
+      outcome: "deflected" | "poisoned" | "interrupted";
+      returns?: never;
+    }
+);
 ```
 
-`TerminalBrief` has no `active`, work arrays, `transition`, or `allowedMoves`. A covered root with declared returns exposes cloned values for the keys it actually staged, including `{}` when it staged none. `returns` is absent when the root declares no return channels and for deflected or poisoned outcomes. `root` identifies the action root when `traversals` also contains other roots.
+`TerminalBrief` has no `active`, work arrays, `transition`, or `allowedMoves`. A covered root with declared returns exposes cloned values for the keys it actually staged, including `{}` when it staged none. `returns` is absent when the root declares no return channels and for every other outcome. `root` identifies the action root when `traversals` also contains other roots.
 
 ### `ActionReport`
 
@@ -279,10 +283,12 @@ type ActionReport = {
    *   This is host-driven and does not imply exactly one new user/assistant
    *   message since the prior brief. It does not imply that any instruction was
    *   applied; application is reported per instruction id below.
-   * "deflect" — user changed topic; the active node becomes deflected and is
-   *   eligible for re-entry. Pending finalization actions still run. Only
+   * "deflect" — requests deflection at the active node, subject to its catch
+   *   hook and the ordinary propagation rules. Only
    *   available when `allowedMoves` includes it: a brief carrying no
    *   instruction, unresolved host-call action, or transition.
+   * "interrupt" — requests interruption without acknowledging pending work.
+   *   Submitted as the bare report { move: "interrupt" }.
    * "poison" — host cannot execute the current frontier contract. The active
    *   arc becomes terminally poisoned. Available while the action traversal can
    *   progress, including frontiers blocked on an unresolved host call.
@@ -310,7 +316,7 @@ type ActionReport = {
 
 Nodes that complete all reachable actions and effects become covered automatically. Nodes bypassed by explicit guard logic become skipped. Poison is a host-initiated contract failure for a malformed or unusable frontier.
 
-A node reaches the deflected outcome two ways. `move: "deflect"` is host-initiated: the host decides, at its own discretion, on a frontier where `allowedMoves` offers the move. An authored `deflectWhen` deflects on the arc's own policy, evaluated by the runtime from probes the host answers — there the host supplies a judgment, not a decision. The two never compete for one frontier: `deflectWhen` is consulted only while a reachable instruction is pending, which is exactly when the host-initiated move is withheld.
+Host-requested deflection and instruction policy use different host inputs. With `move: "deflect"`, the host requests deflection on a frontier where `allowedMoves` offers the move. An authored `deflectWhen` evaluates the arc's own policy from probes the host answers. The two never compete for one frontier: `deflectWhen` is consulted only while a reachable instruction is pending, when the host-initiated move is withheld.
 
 ### Transitions
 
@@ -738,7 +744,7 @@ After all candidate consultations settle, when multiple arcs are matchable and n
 
 **`start(traversals, dialog)`** → `ActionBrief | TerminalBrief`
 
-Begins or reconstructs runtime work for an existing action traversal. There must be exactly one root traversal in the `"entered"` phase. In a trigger-driven run, use the traversal set in the latest `TriggerBrief` once `matched` is set. An in-progress direct Arc entry is resumed on a fresh runtime by adding compatible documents, calling `init()`, and then calling `start(savedTraversals, dialog)`; `enterArc` is not called again.
+Begins or reconstructs runtime work for an existing action traversal. There must be exactly one root traversal in the `"entered"` phase. Pending work continues within its existing entry; an interrupted root has its node state cleared before continuation. In a trigger-driven run, use the traversal set in the latest `TriggerBrief` once `matched` is set. An in-progress direct Arc entry is resumed on a fresh runtime by adding compatible documents, calling `init()`, and then calling `start(savedTraversals, dialog)`; `enterArc` is not called again.
 
 **`enterArc(arc, dialog, options?)`** → `ActionBrief | TerminalBrief`
 
@@ -746,7 +752,7 @@ Freshly enters one registered Arc without evaluating its trigger or creating tra
 
 **`progress(brief, report, dialog)`** → `ActionBrief | TerminalBrief`
 
-Accepts an `ActionBrief` and action report, then returns the next action frontier or terminal output. A `TerminalBrief` is never accepted by `progress`.
+Accepts the exact current `ActionBrief` object returned by this runtime and an action report, then returns the next `ActionBrief` frontier or a `TerminalBrief`. Only an `ActionBrief` is accepted by `progress`.
 
 `dialog` is the current conversation snapshot at the time the host hands control back to Arc. It may be newer than the dialog that produced `brief`, and it must be projected for the current position — a transition brief announces when that position changes.
 
@@ -754,9 +760,9 @@ Accepts an `ActionBrief` and action report, then returns the next action frontie
 
 When the report is accepted and execution continues normally, `progress(...)` returns the next action frontier for the active root.
 
-When the action root stops, the action-stage call returns `TerminalBrief` with its explicit `root` and `outcome`. Covered roots expose cloned committed root returns according to the rules above. Deflection and poison expose no returns. When `report.move` is `"poison"`, or when authored execution fails during advancement, the terminal outcome is `"poisoned"` and `issues` carries the structured failure.
+When the current action progression ends, the action-stage call returns `TerminalBrief` with its explicit `root` and `outcome`. Covered roots expose cloned committed root returns according to the rules above. Deflection, poison, and interruption expose no returns. When `report.move` is `"poison"`, or when authored execution fails during advancement, the terminal outcome is `"poisoned"` and `issues` carries the structured failure.
 
-When report validation fails, `progress(...)` returns an `ActionBrief` with `issues`. For issues with `kind: "invalid-report"`, the runtime rejects the report as a whole, applies no changes, and re-yields the same frontier. For issues with `kind: "invalid-item"`, the runtime applies the valid subset of reported results and re-yields only the rejected work items.
+When report validation fails, `progress(...)` returns an `ActionBrief` with `issues`. For issues with `kind: "invalid-report"`, the runtime rejects the report as a whole, applies no changes, and re-yields the same frontier. This includes unlisted moves and fields disallowed by the selected move or frontier. For issues with `kind: "invalid-item"`, the runtime applies the valid subset of reported results and re-yields only the rejected work items.
 
 ### References
 

@@ -983,7 +983,7 @@ function Main() {
       expect(issues).toEqual([]);
     });
 
-    it("lints canonical enterLoop targets whose nodes retain their frames", () => {
+    it("lints canonical enterLoop targets including nodes with forgetfulEntry", () => {
       const document = parse(`
 "arc";
 
@@ -1005,6 +1005,10 @@ function Main() {
       );
 
       expect(lintIssues).toEqual([
+        expect.objectContaining({
+          code: "canonical-enter-loop-retained-frame",
+          severity: "warning",
+        }),
         expect.objectContaining({
           code: "canonical-enter-loop-retained-frame",
           severity: "warning",

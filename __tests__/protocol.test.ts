@@ -471,7 +471,7 @@ function Main() {
         cursor: { user: 0, self: 0 },
         lastTurns: [],
       });
-      expect(brief.allowedMoves).toEqual(["poison", "proceed"]);
+      expect(brief.allowedMoves).toEqual(["poison", "proceed", "interrupt"]);
       const nextBrief = progressBrief(runtime, brief, { move: "deflect" });
       expect(nextBrief.issues).toEqual([
         expect.objectContaining({
@@ -1558,7 +1558,11 @@ function Main() {
       expect(afterReady.observations).toEqual([]);
       // The instruction is still on the brief in postcheck phase, so it keeps
       // suppressing deflect even though the pending work is a judgment.
-      expect(afterReady.allowedMoves).toEqual(["poison", "proceed"]);
+      expect(afterReady.allowedMoves).toEqual([
+        "poison",
+        "proceed",
+        "interrupt",
+      ]);
       expect(
         afterReady.judgments.map((item) =>
           renderSemanticTextForTest(item.question),
@@ -1687,7 +1691,7 @@ function Main() {
         observationIds: [],
         hostCallIds: [],
       });
-      expect(brief.allowedMoves).toEqual(["poison", "proceed"]);
+      expect(brief.allowedMoves).toEqual(["poison", "proceed", "interrupt"]);
 
       const afterHandback = progressBrief(runtime, brief, {
         move: "proceed",
@@ -1710,7 +1714,11 @@ function Main() {
         judgments: { [afterHandback.judgments[0]!.id]: false },
       });
       expect(afterFalse.issues).toEqual([]);
-      expect(afterFalse.allowedMoves).toEqual(["poison", "proceed"]);
+      expect(afterFalse.allowedMoves).toEqual([
+        "poison",
+        "proceed",
+        "interrupt",
+      ]);
       expect(afterFalse.instructions).toMatchObject([
         {
           text: "Carry the topic.",
@@ -2389,7 +2397,7 @@ function Main() {
         expect(rootTraversal(effects)).toMatchObject({
           phase: "entered",
           state: undefined,
-          finalizing: { reason: pendingState, phase: "effects" },
+          control: { reason: pendingState, phase: "effects" },
         });
         expect(effects.hostCalls).toHaveLength(1);
 
@@ -2403,7 +2411,7 @@ function Main() {
         expect(rootTraversal(resumed)).toMatchObject({
           phase: "entered",
           state: undefined,
-          finalizing: { reason: pendingState, phase: "effects" },
+          control: { reason: pendingState, phase: "effects" },
         });
 
         const finished = progressTerminal(second, resumed, {
@@ -2414,7 +2422,7 @@ function Main() {
         expect(rootTraversal(finished)).toMatchObject({
           phase: finalPhase,
           state: pendingState,
-          finalizing: undefined,
+          control: undefined,
         });
       },
     );
@@ -2454,7 +2462,7 @@ function Main() {
       const work = startRun(first, [seeded], EMPTY_DIALOG);
       const effects = progressBrief(first, work, { move: "deflect" });
 
-      expect(rootTraversal(effects).finalizing).toEqual({
+      expect(rootTraversal(effects).control).toEqual({
         reason: "deflected",
         phase: "effects",
         deflection: {
@@ -2473,8 +2481,8 @@ function Main() {
       const resumed = startRun(second, restored, EMPTY_DIALOG);
 
       expect(resumed.hostCalls).toEqual(effects.hostCalls);
-      expect(rootTraversal(resumed).finalizing).toEqual(
-        rootTraversal(effects).finalizing,
+      expect(rootTraversal(resumed).control).toEqual(
+        rootTraversal(effects).control,
       );
 
       const finished = progressTerminal(second, resumed, {
@@ -2484,7 +2492,7 @@ function Main() {
       expect(rootTraversal(finished)).toMatchObject({
         phase: "suspended",
         state: "deflected",
-        finalizing: undefined,
+        control: undefined,
       });
     });
 

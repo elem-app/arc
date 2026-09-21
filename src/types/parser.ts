@@ -570,6 +570,9 @@ export type CatchDeflectionStatement = HookStatement<
   HookReturnStatement | ObserveOrAskAction | ObserveOrAskGroupAction
 >;
 
+/** Statement allowed inside `this.catchInterruption`, using the catch hook forms above. */
+export type CatchInterruptionStatement = CatchDeflectionStatement;
+
 /**
  * Statement subset allowed in `this.effects`: the shared hook skeleton plus
  * staged returns and standalone host calls.
@@ -769,7 +772,7 @@ export type WriteDiffMode = "rewalk" | "advance";
  * - Collection fields (`cells`, `statements`, `children`, `newcopyAliases`,
  *   `imports`) are always present and empty when the node declares none, so a
  *   walk can iterate them unguarded.
- * - Hook fields (`trigger`, `deflectWhen`, `catchDeflection`, `guard`,
+ * - Hook fields (`trigger`, `deflectWhen`, `catchDeflection`, `catchInterruption`, `guard`,
  *   `effects`) are absent when undeclared, because "no hook" and "an empty
  *   hook" differ — an empty hook body would consult and return nothing.
  *   `hostParams` is optional here for the same reason, and required on
@@ -799,6 +802,7 @@ export type Node = {
   trigger?: TriggerStatement[];
   deflectWhen?: ResolutionStatement[];
   catchDeflection?: CatchDeflectionStatement[];
+  catchInterruption?: CatchInterruptionStatement[];
   guard?: GuardStatement[];
   effects?: EffectStatement[];
   loc?: SourceRange;

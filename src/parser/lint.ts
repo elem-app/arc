@@ -30,7 +30,7 @@ const LINT_RULES = {
   "canonical-enter-loop-retained-frame": {
     severity: "warning",
     message:
-      "$enterLoop() uses a canonical target whose frame is retained on entry; use newcopy(...) for anonymous-copy iterations or forgetful(...) for an intentional forgetful entry.",
+      "$enterLoop() preserves a covered canonical target; use newcopy(...) or forgetful(...) to repeat completed work.",
   },
   "unguarded-invoke": {
     severity: "warning",
@@ -115,6 +115,7 @@ export function lintNodeBareCellBooleans(
     node.guard,
     node.deflectWhen,
     node.catchDeflection,
+    node.catchInterruption,
     node.effects,
   ]) {
     lintBareCellBooleansInStatements(statements ?? [], lintIssues);
@@ -242,7 +243,7 @@ function lintStatement(
       statement.target.imported || statement.target.mode !== "canonical"
         ? undefined
         : context.nodeLookup.get(statement.target.identifier);
-    if (targetNode?.forgetfulEntry === false) {
+    if (targetNode) {
       emitLintIssue(
         context.lintIssues,
         "canonical-enter-loop-retained-frame",
@@ -465,7 +466,7 @@ function collectBooleanLiteralSets(
     writes,
   );
   collectBooleanLiteralSetsFromStatements(
-    node.catchDeflection ?? [],
+    [...(node.catchDeflection ?? []), ...(node.catchInterruption ?? [])],
     declarations,
     writes,
   );
@@ -948,6 +949,7 @@ function collectArcCellUsage(
     node.guard,
     node.deflectWhen,
     node.catchDeflection,
+    node.catchInterruption,
     node.effects,
   ]) {
     collectReadsAndWrites(list ?? [], onRead, onWrite);

@@ -253,21 +253,29 @@ export type ActionBrief = {
   allowedMoves: ActionMove[];
 };
 
-/** Terminal action-stage output. It cannot be submitted to `Runtime.progress`. */
+/**
+ * Ends the current action progression and cannot be submitted to Runtime.progress.
+ */
 export type TerminalBrief = {
-  /** Full persisted traversal state after terminal settlement. */
+  /** Full persisted traversal state at handback. */
   traversals: ArcTraversalSet;
   /** Discriminator for terminal action output. */
   canProgress: false;
   /** Registered root whose action stage produced this result. */
   root: ArcRef;
-  /** Terminal outcome of the action root. */
-  outcome: "covered" | "deflected" | "poisoned";
-  /** Committed root returns, present only for a covered root that declares them. */
-  returns?: Record<string, CellValue>;
-  /** Structured issues carried by terminal settlement. */
+  /** Structured issues carried by the output. */
   issues: RuntimeIssue[];
-};
+} & (
+  | {
+      outcome: "covered";
+      /** Committed root returns, present only when the root declares them. */
+      returns?: Record<string, CellValue>;
+    }
+  | {
+      outcome: "deflected" | "poisoned" | "interrupted";
+      returns?: never;
+    }
+);
 
 /**
  * Outcome for one observation reported back by the host.

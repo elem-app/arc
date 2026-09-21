@@ -674,6 +674,191 @@ function Main() {
   });
 
   describe("compose.enter-loop", () => {
+    it.each([
+      ["local", "forgetful"],
+      ["local", "newcopy"],
+      ["imported", "forgetful"],
+      ["imported", "newcopy"],
+    ] as const)(
+      "compose.enter-loop starts another guarded %s entry with %s",
+      (kind, mode) => {
+        const childSource = `function Child() {
+          this.guard = () => { if (judge(\`allow iteration\`)) return; return State.SKIPPED; };
+          $instruct(\`iteration work\`);
+        }`;
+        const document = parse(`"arc";
+          ${kind === "imported" ? 'import { Child } from "guarded-child";' : ""}
+          function Main() {
+            $enterLoop(${mode}(Child), { resolveWhen: () => judge(\`done\`) });
+            $instruct(\`loop tail\`);
+            ${kind === "local" ? childSource : ""}
+          }`);
+        const runtime = new Runtime();
+        if (kind === "imported")
+          runtime.add("guarded-child", parse(`"arc"; ${childSource}`));
+        runtime.add("guarded-loop", document).init();
+        const root = runtime.newTraversal(arc("guarded-loop", "Main"));
+        root.phase = "entered";
+        let brief = startRun(runtime, [root], EMPTY_DIALOG);
+        for (let iteration = 0; iteration < 2; iteration++) {
+          expect(brief.judgments).toHaveLength(1);
+          expect(brief.instructions).toEqual([]);
+          brief = progressBrief(runtime, brief, {
+            move: "proceed",
+            judgments: { [brief.judgments[0]!.id]: true },
+          });
+          expect(
+            brief.instructions.map((instruction) => instruction.text),
+          ).toEqual(["iteration work"]);
+          const child =
+            mode === "newcopy"
+              ? rootTraversal(brief).ephemeralChildren[0]!
+              : kind === "local"
+                ? ownedChild(rootTraversal(brief), "Main.Child")!
+                : brief.traversals.find(
+                    (traversal) =>
+                      traversal.ref === arc("guarded-child", "Child"),
+                  )!;
+          expect(child).toMatchObject({
+            guardCompleted: true,
+            enterCount: mode === "newcopy" ? 1 : iteration + 1,
+          });
+          brief = progressBrief(runtime, brief, {
+            move: "proceed",
+            instructions: appliedInstructions(brief),
+          });
+          expect(brief.judgments).toHaveLength(1);
+          brief = progressBrief(runtime, brief, {
+            move: "proceed",
+            judgments: { [brief.judgments[0]!.id]: iteration === 1 },
+          });
+        }
+        expect(
+          brief.instructions.map((instruction) => instruction.text),
+        ).toEqual(["loop tail"]);
+      },
+    );
+
+    it.each([
+      ["local", false, false],
+      ["local", false, true],
+      ["local", true, false],
+      ["local", true, true],
+      ["imported", false, false],
+      ["imported", false, true],
+      ["imported", true, false],
+      ["imported", true, true],
+    ] as const)(
+      "compose.enter-loop preserves covered %s targets with forgetfulEntry=%s and precovered=%s",
+      (kind, forgetfulEntry, precovered) => {
+        const childSource = `function Child(returns = { verdict: Str() }) {
+          this.forgetfulEntry = ${forgetfulEntry};
+          this.guard = () => { if (judge(\`allow entry\`)) return; return State.SKIPPED; };
+          $instruct(\`child work\`);
+          this.effects = () => returns.verdict.$set("done");
+        }`;
+        const document = parse(`"arc";
+          ${kind === "imported" ? 'import { Child } from "loop-child";' : ""}
+          function Main() {
+            let verdict = Str(); let repeat = Bool();
+            ${precovered ? "$enter(Child, { returns: { verdict } });" : ""}
+            $enterLoop(Child, {
+              returns: { verdict },
+              resolveWhen: () => {
+                if (repeat.isUnset()) {
+                  repeat.$set(false);
+                  return judge(\`first decision\`);
+                }
+                if (repeat == false) { repeat.$set(true); return false; }
+                return judge(\`final decision\`);
+              },
+            });
+            $instruct(\`loop tail\`);
+            ${kind === "local" ? childSource : ""}
+          }`);
+        const create = () => {
+          const runtime = new Runtime();
+          if (kind === "imported")
+            runtime.add("loop-child", parse(`"arc"; ${childSource}`));
+          return runtime.add("uniform-loop", document).init();
+        };
+        const runtime = create();
+        const root = runtime.newTraversal(arc("uniform-loop", "Main"));
+        root.phase = "entered";
+        let brief = startRun(runtime, [root], EMPTY_DIALOG);
+        expect(brief.judgments).toHaveLength(1);
+        brief = progressBrief(runtime, brief, {
+          move: "proceed",
+          judgments: { [brief.judgments[0]!.id]: true },
+        });
+        expect(
+          brief.instructions.map((instruction) => instruction.text),
+        ).toEqual(["child work"]);
+        brief = progressBrief(runtime, brief, {
+          move: "proceed",
+          instructions: appliedInstructions(brief),
+        });
+        expect(brief.judgments).toHaveLength(1);
+        const findChild = (traversals: ArcTraversalSet) =>
+          kind === "local"
+            ? ownedChild(traversals[0]!, "Main.Child")!
+            : traversals.find(
+                (traversal) => traversal.ref === arc("loop-child", "Child"),
+              )!;
+        const covered = findChild(brief.traversals);
+        expect(covered).toMatchObject({
+          state: "covered",
+          enterCount: 1,
+          guardCompleted: true,
+        });
+        expect(rootTraversal(brief).cells.verdict).toBe(
+          precovered ? "done" : undefined,
+        );
+
+        // Two false consultations revisit the covered target without entering it.
+        const repeated = actionProgress(
+          runtime.progress(
+            brief,
+            {
+              move: "proceed",
+              judgments: { [brief.judgments[0]!.id]: false },
+            },
+            EMPTY_DIALOG,
+          ),
+        );
+        expect(repeated.transition).toBeUndefined();
+        expect(repeated.instructions).toEqual([]);
+        expect(repeated.judgments).toHaveLength(1);
+        expect(findChild(repeated.traversals)).toEqual(covered);
+        expect(rootTraversal(repeated).cells.repeat).toBe(true);
+        expect(rootTraversal(repeated).cells.verdict).toBe(
+          precovered ? "done" : undefined,
+        );
+
+        const restored = create();
+        const finalCheck = startRun(
+          restored,
+          JSON.parse(JSON.stringify(repeated.traversals)),
+          EMPTY_DIALOG,
+        );
+        expect(findChild(finalCheck.traversals)).toEqual(covered);
+        const tail = progressBrief(restored, finalCheck, {
+          move: "proceed",
+          judgments: { [finalCheck.judgments[0]!.id]: true },
+        });
+        expect(
+          tail.instructions.map((instruction) => instruction.text),
+        ).toEqual(["loop tail"]);
+        expect(rootTraversal(tail).cells.verdict).toBe("done");
+        expect(findChild(tail.traversals)).toMatchObject({
+          state: "covered",
+          enterCount: 1,
+          guardCompleted: true,
+          frame: covered.frame,
+        });
+      },
+    );
+
     it("requires resolveWhen for $enterLoop()", () => {
       expect(() =>
         parse(`

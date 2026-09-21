@@ -256,7 +256,7 @@ export function actionProgress(
 export function actionTerminal(
   brief: ActionBrief | TerminalBrief,
 ): TerminalBrief {
-  if (brief.canProgress) {
+  if (brief.canProgress || brief.outcome === "interrupted") {
     throw new Error("Expected a terminal action result brief");
   }
   return brief;

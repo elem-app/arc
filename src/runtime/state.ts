@@ -310,7 +310,11 @@ function createCellSlots(node: Node): Record<string, CellValue | undefined> {
 }
 
 function createTraversalFrame(): NodeFrame {
-  return { actionStates: {}, evaluatorActionStates: {}, pinTapes: {} };
+  return {
+    actionStates: {},
+    evaluatorActionStates: {},
+    pinTapes: {},
+  };
 }
 
 export function createEmptyArcTraversal(
@@ -321,6 +325,7 @@ export function createEmptyArcTraversal(
     ref: arcRef,
     phase: "dormant",
     enterCount: 0,
+    guardCompleted: false,
     state: undefined,
     cells: createCellSlots(node),
     frame: createTraversalFrame(),
@@ -338,6 +343,7 @@ export function createEmptyNodeTraversal(
   return {
     ref: nodeRef,
     enterCount: 0,
+    guardCompleted: false,
     state: undefined,
     cells: createCellSlots(node),
     frame: createTraversalFrame(),
@@ -362,7 +368,8 @@ export function restartTraversal(
   next.enterCount += 1;
   next.phase = "entered";
   next.state = undefined;
-  next.finalizing = undefined;
+  next.control = undefined;
+  next.guardCompleted = false;
   next.enteredBy = undefined;
   next.activeFrame = undefined;
   next.pendingTransition = undefined;
@@ -408,16 +415,17 @@ function cloneTraversalBase<T extends Traversal>(traversal: T) {
   }
   return {
     enterCount: traversal.enterCount,
+    guardCompleted: traversal.guardCompleted,
     state: traversal.state,
-    finalizing: traversal.finalizing
-      ? traversal.finalizing.reason === "deflected"
+    control: traversal.control
+      ? traversal.control.reason === "deflected"
         ? {
-            ...traversal.finalizing,
+            ...traversal.control,
             deflection: {
-              ...traversal.finalizing.deflection,
+              ...traversal.control.deflection,
             },
           }
-        : { ...traversal.finalizing }
+        : { ...traversal.control }
       : undefined,
     cells,
     frame: {
@@ -435,7 +443,7 @@ function cloneTraversalBase<T extends Traversal>(traversal: T) {
               ? Object.fromEntries(
                   Object.entries(scopedStates).map(([id, state]) => [
                     id,
-                    state ? { ...state } : undefined,
+                    state ? cloneActionState(state) : undefined,
                   ]),
                 )
               : undefined,
@@ -590,8 +598,9 @@ export function isStopped(traversal: ArcTraversal): boolean {
 
 export function isEnteredTraversal(traversal: Traversal): boolean {
   return isArcTraversal(traversal)
-    ? traversal.phase === "entered" && traversal.state === undefined
-    : traversal.state === undefined;
+    ? traversal.phase === "entered" &&
+        (traversal.state === undefined || traversal.state === "interrupted")
+    : traversal.state === undefined || traversal.state === "interrupted";
 }
 
 export function isSuspendedArcTraversal(traversal: Traversal): boolean {
@@ -1147,6 +1156,7 @@ export function ensureEphemeralTraversal(
   );
 }
 
+/** Whether a prior copy ended its attempt and may be replaced by a fresh copy. */
 export function isTerminalNodeTraversal(traversal: NodeTraversal): boolean {
   return (
     traversal.state === "covered" ||

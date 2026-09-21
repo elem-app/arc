@@ -1321,13 +1321,13 @@ function computeLocalExpression(
     case "enterCount":
       return { status: "resolved", value: traversal.enterCount };
     case "pendingState": {
-      const finalizing = traversal.finalizing;
-      if (!finalizing || finalizing.phase !== "effects") {
+      const control = traversal.control;
+      if (!control || control.phase !== "effects") {
         throw new Error(
           "this.pendingState is only available while this.effects is running",
         );
       }
-      return { status: "resolved", value: finalizing.reason };
+      return { status: "resolved", value: control.reason };
     }
     case "nodeState": {
       const ref = resolveRefInTraversal(
@@ -1464,8 +1464,8 @@ function deflectionEscaped(
   node: Node,
   accum: Accumulator,
 ): boolean {
-  const finalizing = traversal.finalizing;
-  if (finalizing?.reason !== "deflected") {
+  const control = traversal.control;
+  if (control?.reason !== "deflected") {
     throw new Error(
       "this.deflection.escaped(...) is only available while a deflection is pending",
     );
@@ -1474,7 +1474,7 @@ function deflectionEscaped(
   // `from` is the canonical target of the entry the deflection propagated up
   // through. A node's own frontier deflection entered nothing, so `from` is
   // unset and `escaped` matches no target — self included.
-  const from = finalizing.deflection.from;
+  const from = control.deflection.from;
   if (!from) return false;
 
   const ref = resolveRefInTraversal(

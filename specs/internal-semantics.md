@@ -39,7 +39,7 @@ Shared authored forms should have one coherent interpretation. Equivalent syntax
 
 Target expressions are one example. `$enter(Target)`, `$enterLoop(Target)`, and `this.deflection.escaped(Target)` may allow different target shapes, but a bare target should mean the same structural reference in each place: a local child node or local import binding resolved by Arc reference-name rules.
 
-Scoped reserved names are acceptable when they are local to a coherent authored construct. `args` and `returns` are local channel namespaces inside node bodies. `span` is a local namespace inside a `$map` callback, carrying that member's `item`, `index`, and `result`. Global namespaces such as `State` and `Dialog` are document-wide.
+Channels have contextual availability: `args` and `returns` belong to the declaring node, `span` belongs to a `$map` callback, `this.deflection` belongs to catch and deflected-effects finalization, and `this.pendingState` belongs to effects finalization. `Dialog` supplies the host-provided conversation context. `State` is a document-wide constants namespace. Channel roots `args`, `returns`, `Dialog`, and `span` are reserved as import aliases throughout the document; both source parsing and public-IR validation enforce that reservation before expression validation.
 
 Scoped language forms should be available only in their intended authored scope. Outside that scope they should fail clearly rather than silently becoming ordinary cells or unrelated expressions.
 
@@ -233,7 +233,7 @@ A completed `ValueString` is always an ordinary string. A completed `SemanticStr
 
 ## Element Ids
 
-Every statement and every briefable expression carries one identity, the element id, and it is structural: the element's position within its SEG scope, prefixed by the scope's owner chain. No allocator exists — ids are derivable from document shape alone. A scope is a SEG: the node-lifecycle scopes (`body`, `guard`, `effects`, `trigger`, `catch`, and the node-level `deflectWhen` declaration), an owned hook scope (`<ownerId>/resolveWhen`, `<ownerId>/deflectWhen`), or an invoke body or `$map` callback (the invoke's or the `$map` statement's own id is the scope). Within a scope, a step is a sibling index with a branch tag (`c` consequent, `a` alternate, `l` label body) on every non-terminal step, and briefable expressions inside one statement take the statement's id plus `~n` in evaluation order. Examples: `body/0c/1`, `guard/0`, `body/2/0` (first statement of the invoke at `body/2`), `body/3/resolveWhen/0`, `body/0~0`.
+Every statement and every briefable expression carries one identity, the element id, and it is structural: the element's position within its SEG scope, prefixed by the scope's owner chain. No allocator exists — ids are derivable from document shape alone. A scope is a SEG: the node-lifecycle scopes (`body`, `guard`, `effects`, `trigger`, `catch`, `catchInterruption`, and the node-level `deflectWhen` declaration), an owned hook scope (`<ownerId>/resolveWhen`, `<ownerId>/deflectWhen`), or an invoke body or `$map` callback (the invoke's or the `$map` statement's own id is the scope). Within a scope, a step is a sibling index with a branch tag (`c` consequent, `a` alternate, `l` label body) on every non-terminal step, and briefable expressions inside one statement take the statement's id plus `~n` in evaluation order. Examples: `body/0c/1`, `guard/0`, `body/2/0` (first statement of the invoke at `body/2`), `body/3/resolveWhen/0`, `body/0~0`.
 
 The branch-tag invariant makes ids injective: an untagged step always ends its scope's local path, so whatever follows unambiguously opens a nested scope. Ids are node-relative — every node has a `body/0` — and anything crossing nodes pairs the id with a node ref (brief ids, enter continuations, anonymous-copy refs). The alphabet excludes `.` `:` `[` `]` `#`, so an id embeds safely in refs and brief ids. Consumers never parse ids; the single sanctioned manipulation is the inherited-hook brief-site prefix substitution described under Runtime State Invariants.
 
@@ -281,7 +281,7 @@ Values bind when their evaluation is first reached. A later brief may therefore 
 
 ### Boundaries
 
-A fresh SEG instance starts with empty resolved-once state and an empty tape. Fresh instances include a `forgetful` / `newcopy` entry, a new hook consultation, a new invoke, and a new map member. A host-call action reached in a fresh instance executes again, while a retry of a pending instance preserves its captured inputs and brief id. Explicit restart boundaries are separate from ordinary write continuation: a caught deflection restarts the catching node body and drops that body tape.
+A fresh SEG instance starts with empty resolved-once state and an empty tape. Fresh instances include a `forgetful` / `newcopy` entry, a new hook consultation, a new invoke, and a new map member. A host-call action reached in a fresh instance executes again, while a retry of a pending instance preserves its captured inputs and brief id. Explicit restart boundaries are separate from ordinary write continuation: a caught deflection or interruption restarts the catching node body and drops that body tape.
 
 Trigger evaluation uses the same pin-and-seek model per candidate consultation. Retries on one trigger brief chain retain answered pins and re-emit only blocked work. A fresh `startTrigger(...)` starts fresh consultations, while terminal candidate outcomes remain stable within a retry chain. A terminal match can therefore coexist with work from open candidates. Without an effective `preferredMatch`, implicit sole-match selection waits until no consultation work remains. An explicit preference for a terminal match selects immediately and discards the other candidates' pending work from the matched brief; a preference for an open candidate remains pending until it either matches or settles unmatched. An unmatched request is rejected rather than falling back to another match or reporting ambiguity. Trigger consultation state lives in the in-memory brief chain rather than persisted traversal state, so process reconstruction begins fresh consultations.
 
@@ -327,29 +327,29 @@ Lifetimes follow the frontier model, as an invoke's do:
 
 Deflection boundaries: a deflection raised in a member — including a host `move: "deflect"` on a frontier blocked inside it — abandons the member and, crossing the `$map`, clears the whole arena (arena, terminal rows, pinned input), then routes to the enclosing node's own catch, reusing the wide-body crossing precedent. A caught restart reaches a virgin `$map`; an uncaught deflection deflects the node with no `results` commit. Cell mutations and host-call actions earlier members already resolved stay resolved — the atomic construction is of the output array, not of member execution.
 
-## Traversal Finalizing
+## Guard Progress
 
-Traversal finalizing is runtime state for completing a node outcome after the node action graph can no longer make ordinary progress.
+`TraversalBase.guardCompleted` records completion of the current entry's guard before interpreting its result. Ordinary execution consults this flag independently of `activeFrame`, whose identity remains the suspended node and SEG. Catch handling uses its own SEG and does not reset guard progress. Entry preparation resets completion for a later skipped or deflected attempt. Explicit forgetting separately clears the action frame before the guard. Continuing a pending forgetful entry or copy does neither operation again.
 
-Finalizing must be persisted in traversal state whenever it blocks on a briefable action. A later runtime call must resume the same finalizing phase, not restart the node body.
+## Traversal Control
 
-Covered finalizing sequence: enter finalizing with `reason: "covered"` while node state remains unset; expose that reason as `this.pendingState` inside effects; run effects; clear finalizing; set node state to `State.COVERED`; let the parent `$enter(...)` action resolve. The target is not fully covered for caller progression until effects finish.
+`TraversalBase.control` is the single persisted carrier for coverage, deflection, and interruption handling. Its `TraversalControl` union distinguishes the reason and the phases that reason permits. A pending catch or effects phase takes precedence over ordinary execution; when it blocks, the next runtime call resumes that phase. The recorded `effects`, `catch`, or `catchInterruption` SEG identifies the suspension point, while the control state determines resumption.
 
-Deflected finalizing sequence: enter finalizing with `reason: "deflected"` and `phase: "catch"` while node state remains unset; run `this.catchDeflection`; if it returns true, clear finalizing and restart this node's SEG; otherwise switch to effects, expose the reason as `this.pendingState`, run effects, clear finalizing, set node state to `State.DEFLECTED`, and propagate deflection to the parent.
+- Coverage, including a guard returning coverage, enters `reason: "covered", phase: "effects"` while node state remains unset. Effects finish before control is cleared and before the node becomes `State.COVERED`. A covered root's phase becomes `"completed"`.
+- Deflection enters `reason: "deflected", phase: "catch"` with its deflection context. A true catch clears control and restarts the node body with retained action resolutions. Otherwise control advances to effects; after effects finish, control is cleared, the node becomes `State.DEFLECTED`, and deflection propagates to the parent. A deflected root enters phase `"suspended"`.
+- Interruption enters `reason: "interrupted", phase: "catch"`. A true catch clears control and drops only the catching node's body tape. A false or absent hook sets `phase: "complete"` and marks the node interrupted while retaining its pending work. An interrupted root stays in phase `"entered"`. Continuing the entry clears its state marker without rerunning the completed catch.
 
-`this.catchDeflection` uses hook-local evaluator state and a hook-local pin tape, both keyed by the persisted `origin` and `from` references in `TraversalFinalizing.deflection`. Hook-local `$observe(...)`, `$observeOrAsk(...)`, and `cell.$set(...)` leaves advance after they resolve; expression-position `judge(...)` blocks through the same catch phase, and its answer pins for the rest of the consultation. The consultation's evaluator state and tape are released together when the hook completes.
+The catch hooks use their own element IDs, evaluator state, and pin tapes. Deflection scopes are keyed by the `origin` and `from` references in the control state's deflection context; interruption uses the `catchInterruption` scope. Hook-local observations, asks, and cell writes advance after resolution; expression judgments pin their answers for the consultation. Deflection consultations release their evaluator state and tape on completion. A successful interruption catch also releases its consultation; an uncaught interruption retains the completed consultation data without replaying it.
 
-Effects are part of finalization. They may block and resume through normal brief/report progression. `this.pendingState` is derived from the persisted finalizing reason rather than stored independently, so it remains stable across effects suspension and runtime reconstruction.
+An admitted new interruption or deflection replaces the current catch control. The abandoned consultation's evaluator state and tape are released, and each newly reached catch starts with fresh consultation state. Completed writes, external work, and descendant outcomes remain. Moving to a parent's catch latches the child exit and uses the existing transition gate before authored evaluation; hookless ancestors may coalesce.
 
-## Deflection Propagation
+Effects may block through normal brief/report progression. `this.pendingState` is derived from the control reason only during the effects phase, exposing coverage or deflection consistently across suspension and runtime reconstruction.
 
-Deflection originates at the active node or instruction frontier. Its `origin` remains unchanged while propagation rewrites `from` at each parent boundary to the canonical target of that parent's entry the deflection came up through. At the origin node itself, `from` is unset — nothing was entered.
+## Deflection and Interruption Propagation
 
-A node's `this.catchDeflection` catches only that node's own deflection. It does not erase the triggering child's deflected state.
+Deflection and interruption propagate from the active frontier through its owning entries. Each enclosing node gets its own catch opportunity. Catching changes the current node's path while preserving descendant outcomes; those remain visible until subsequent execution updates them.
 
-If a child deflects and the parent does not catch, the parent becomes deflected after its own catch opportunity fails. This propagation repeats upward until some ancestor catches or the root becomes deflected.
-
-If an ancestor catches, that ancestor becomes the active traversal and restarts its own SEG. Already persisted child outcomes remain visible unless the action graph explicitly changes state through normal Arc operations.
+Crossing an invoke or map with a deflection abandons its pending owner state. Interruption retains owner state, including captured inputs, pending actions, member progress, and staged returns, so a later entry continues that work. Closing a parent does not clear a retained child's frame.
 
 The persisted pending-deflection context stores `origin` and an optional `from` as node references. `origin` identifies where deflection began and remains unchanged while it bubbles. `from` is the canonical target of the entry the deflection propagated up through, rewritten at each parent boundary and unset at the origin node. A `newcopy` entry canonicalizes back to the node/arc the author named, so `from` reflects the authored `$enter` target rather than the anonymous copy's own ref. `this.deflection.escaped(Target)` compares `from` against a bare node/import target while the node is running `this.catchDeflection` or deflected `this.effects`. It does not accept `newcopy(Target)` or `forgetful(Target)` as the argument.
 
@@ -375,11 +375,11 @@ An unacknowledged transition persists on the action root as `pendingTransition`,
 
 Canonical node traversals are addressable through `ReferenceName.state`. Blank anonymous copies created by `newcopy(...)` are not addressable from Arc source. Forgetful entries replace the canonical traversal outcome for the referenced node or arc.
 
-Node state records the terminal outcome visible to parents. Node frame state records the absent, pending, or resolved slots occupied by resolved-once action occurrences inside the node. These are separate concepts and must not be collapsed.
+Node state records coverage, deflection, a skipped attempt, or an interruption marker visible to parents. Node frame state records the absent, pending, or resolved slots occupied by resolved-once action occurrences inside the node. These are separate concepts and must not be collapsed.
 
 `Node.cells` contains declaration/schema IR; `Traversal.cells` contains runtime values. An optional Artifact constructor initializer therefore remains on its `ArtifactCell` declaration, runs once in source order after argument installation, and stores only the resulting concrete `ArtifactValue` in the traversal. The initializer is a snapshot: later changes to cells it read do not update the stored value.
 
-`this.forgetfulEntry = true` makes each new entry forget the prior outcome and action-frame progress without forgetting cell values, child traversal outcomes, or canonical identity. During the entry, resolved-once actions remain remembered normally.
+`this.forgetfulEntry = true` makes each new entry forget the prior outcome and action-frame progress without forgetting cell values, child traversal outcomes, or canonical identity. During the entry, resolved-once actions remain remembered normally. It does not make an ordinary canonical entry restart an already-covered target; `forgetful(Target)` explicitly requests that entry.
 
 The active traversal is derived from runtime progression. It should identify the traversal currently owning the frontier represented by the brief. It is not an independent host-persisted control pointer.
 

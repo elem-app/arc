@@ -548,7 +548,7 @@ function Main() {
 
     expect(frontier).toMatchObject({
       canProgress: true,
-      allowedMoves: ["poison", "proceed"],
+      allowedMoves: ["poison", "proceed", "interrupt"],
     });
     expect("outcome" in frontier).toBe(false);
     expect("returns" in frontier).toBe(false);

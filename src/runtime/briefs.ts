@@ -17,7 +17,7 @@ import type {
   NodeTransition,
   RuntimeIssue,
 } from "../types/runtime.js";
-import { nodeSegKey } from "../types/runtime.js";
+import { catchSegKey, nodeSegKey } from "../types/runtime.js";
 import type { Dialog } from "../types/value.js";
 import { clonePayloadValue } from "../value-utils.js";
 import {
@@ -400,7 +400,7 @@ export function buildTriggerBrief(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       base.phase = "poisoned";
-      base.finalizing = undefined;
+      base.control = undefined;
       if (!existing) upsertTraversal(nextTraversals, base);
       issues.push(
         buildPoisonedTraversalIssue(
@@ -473,7 +473,11 @@ export function buildTriggerBrief(
 function allowedMovesForActionBrief(
   accum: Pick<
     Accumulator,
-    "judgments" | "observations" | "hostCalls" | "hostCallValueDemands"
+    | "judgments"
+    | "observations"
+    | "hostCalls"
+    | "hostCallValueDemands"
+    | "activeSeg"
   >,
   traversal: ArcTraversal,
   instructions: readonly InstructionBrief[],
@@ -496,10 +500,14 @@ function allowedMovesForActionBrief(
     accum.hostCalls.length > 0
   ) {
     allowedMoves.add("proceed");
+    if (accum.activeSeg.kind !== "effects") allowedMoves.add("interrupt");
     const hasStandaloneHostCall = accum.hostCalls.some(
       (call) => !accum.hostCallValueDemands.has(call.id),
     );
-    if (instructions.length === 0 && !hasStandaloneHostCall) {
+    if (
+      accum.activeSeg.kind === "catchInterruption" ||
+      (instructions.length === 0 && !hasStandaloneHostCall)
+    ) {
       allowedMoves.add("deflect");
     }
   }
@@ -534,7 +542,7 @@ export function buildActionBrief(
       entered: [...workingRoot.pendingTransition.entered],
     };
   }
-  if (workingRoot.phase === "entered") {
+  if (workingRoot.phase === "entered" && workingRoot.state !== "interrupted") {
     if (workingRoot.activeFrame) {
       // Resume the recorded frontier in plan mode (symmetric with apply), so the
       // brief is rebuilt by replaying the suspended SEG from its recorded
@@ -570,6 +578,18 @@ export function buildActionBrief(
     ...leadingIssues.map(cloneRuntimeIssue),
     ...accum.issues.map(cloneRuntimeIssue),
   ];
+  if (actionRoot.phase === "entered" && actionRoot.state === "interrupted") {
+    return {
+      brief: {
+        traversals: cloneTraversalSet(workingTraversals),
+        canProgress: false,
+        root: actionRoot.ref,
+        outcome: "interrupted",
+        issues,
+      },
+      traversals: workingTraversals,
+    };
+  }
   if (actionRoot.phase !== "entered") {
     if (
       instructions.length > 0 ||
@@ -625,8 +645,9 @@ export function buildActionBrief(
         traversals: cloneTraversalSet(workingTraversals),
         canProgress: false,
         root: actionRoot.ref,
-        outcome,
-        ...(returns === undefined ? {} : { returns }),
+        ...(outcome === "covered"
+          ? { outcome, ...(returns === undefined ? {} : { returns }) }
+          : { outcome }),
         issues,
       },
       traversals: workingTraversals,
@@ -712,7 +733,7 @@ export function buildPoisonedActionBrief(
   const working = cloneTraversalSet(traversals);
   const rootTraversal = selectActionRootTraversal(working, entry.arc);
   rootTraversal.phase = "poisoned";
-  rootTraversal.finalizing = undefined;
+  rootTraversal.control = undefined;
   rootTraversal.pendingTransition = undefined;
   const message = error instanceof Error ? error.message : String(error);
   const built = buildActionBrief(entries, entry, working, dialog, [
@@ -724,10 +745,10 @@ export function buildPoisonedActionBrief(
       reasonCode ?? runtimeErrorReasonCode(error),
     ),
   ]);
-  if ("snapshot" in built) {
-    throw new Error("Poisoned action root produced a progress brief");
+  if (built.brief.canProgress || built.brief.outcome !== "poisoned") {
+    throw new Error("Poisoned action root produced a non-poisoned result");
   }
-  return built;
+  return { brief: built.brief, traversals: built.traversals };
 }
 
 function cloneActionBriefSnapshot(
@@ -772,6 +793,17 @@ export function validateActionReport(
 
   const accepted = buildAcceptedActionReport(report);
   const issues: RuntimeIssue[] = [];
+  if (report.move === "interrupt") {
+    const bundled = Object.keys(report).some((key) => key !== "move");
+    if (bundled)
+      issues.push(
+        buildInvalidReportIssue(
+          "interrupt-results",
+          "An interruption report must contain only the interruption move, without work results",
+        ),
+      );
+    return { accepted, issues, rejected: bundled };
+  }
   if (report.move === "poison") {
     return { accepted, issues, rejected: false };
   }
@@ -930,15 +962,45 @@ export function acceptActionReport(
     true,
   );
 
-  if (report.move === "deflect") {
-    // Deflect the recorded frontier, then resume it: its finalizing routes to
+  if (report.move === "interrupt" || report.move === "deflect") {
+    const activeRef =
+      rootTraversal.activeFrame?.activeRef ?? state.snapshot.active;
+    const activeTraversal = resolveTraversalForBrief(working, activeRef);
+    // A new event abandons only the previous catch consultation. Mutations and
+    // completed external work survive; the new consultation starts at this node.
+    if (
+      activeTraversal.control?.reason === "interrupted" ||
+      report.move === "interrupt"
+    ) {
+      clearEvaluatorActionStates(
+        activeTraversal,
+        nodeSegKey("catchInterruption"),
+      );
+    }
+    if (
+      activeTraversal.control?.reason === "deflected" &&
+      activeTraversal.control.phase === "catch"
+    ) {
+      clearEvaluatorActionStates(
+        activeTraversal,
+        catchSegKey(activeTraversal.control.deflection),
+      );
+      activeTraversal.control = undefined;
+    }
+    if (report.move === "interrupt") {
+      activeTraversal.control = { reason: "interrupted", phase: "catch" };
+      rootTraversal.activeFrame = {
+        activeRef,
+        activeSeg: { kind: "catchInterruption" },
+      };
+      resumeActiveFrame(accum);
+      return { traversals: working };
+    }
+    // Deflect the recorded frontier, then resume it: its control state routes to
     // `this.catchDeflection`, and an uncaught deflection bubbles up through the
     // same enter continuations as a normal completion. A frontier blocked in an
     // invoke body (or in a hook owned inside one) abandons the open invocation
     // as the deflection crosses it.
-    const activeRef =
-      rootTraversal.activeFrame?.activeRef ?? state.snapshot.active;
-    const activeTraversal = resolveTraversalForBrief(working, activeRef);
     const recordedSeg = rootTraversal.activeFrame?.activeSeg;
     if (recordedSeg && "owner" in recordedSeg) {
       const entry = state.entries.get(rootRefOf(activeTraversal.ref));
@@ -953,7 +1015,7 @@ export function acceptActionReport(
         );
       }
     }
-    activeTraversal.finalizing = {
+    activeTraversal.control = {
       reason: "deflected",
       // Deflection originates at this node's own frontier; it entered nothing,
       // so `from` stays unset until it propagates up through a parent's enter.

@@ -1090,7 +1090,7 @@ function Main() {
 
 function Main() {
   if (true) {
-    $enterLoop(Child, {
+    $enterLoop(forgetful(Child), {
       resolveWhen: () => {
         return judge(\`is the loop done\`);
       },
@@ -1098,11 +1098,7 @@ function Main() {
     $instruct(\`loop tail\`);
   }
 
-  // Forgetful on entry so each loop iteration re-asks (and re-blocks) rather than
-  // re-covering an already-resolved observation, which would never re-reach the
-  // hook.
   function Child() {
-    this.forgetfulEntry = true;
     let topic = Enum(["a", "b"]);
     topic.observing = \`pick a topic\`;
     $observeOrAsk(topic);
@@ -2046,7 +2042,7 @@ function Main() {
       expect(ownedChild(rootTraversal(childBrief), "Main.Intro")).toMatchObject(
         {
           state: undefined,
-          finalizing: { reason: "deflected", phase: "effects" },
+          control: { reason: "deflected", phase: "effects" },
         },
       );
 
@@ -2071,7 +2067,7 @@ function Main() {
       expect(rootTraversal(parentBrief)).toMatchObject({
         phase: "entered",
         state: undefined,
-        finalizing: { reason: "deflected", phase: "effects" },
+        control: { reason: "deflected", phase: "effects" },
       });
 
       const suspended = progressTerminal(runtime, parentBrief, {
