@@ -48,15 +48,21 @@ export type ChannelSpec =
   | { type: "index" }
   | { type: "array"; element: ArrayElementSpec };
 
-/** Value guarantee accepted by one host-operation parameter. */
-export type HostParameterSpec =
+/** Value guarantee accepted by a supplied host-operation argument. */
+export type HostParameterValueSpec =
   | ScalarValueSpec
   | ArtifactSpec
   | DialogCursorSpec
   | { type: "index" }
-  | { type: "array"; element: HostParameterSpec }
-  | { type: "tuple"; elements: HostParameterSpec[] }
+  | { type: "array"; element: HostParameterValueSpec }
+  | { type: "tuple"; elements: HostParameterValueSpec[] }
+  | { type: "struct"; fields: Record<string, HostParameterSpec> }
   | { type: "semanticText" };
+
+/** Required or omittable host parameter or named Struct field. */
+export type HostParameterSpec =
+  | HostParameterValueSpec
+  | { type: "omittable"; spec: HostParameterValueSpec };
 
 /** Callable member selected by an authored host action. */
 export type HostOperationSpec = {

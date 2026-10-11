@@ -39,11 +39,13 @@ import { HipHop } from "music";
 
 See [Composition](#composition) for details about how arcs and nodes compose.
 
-[Host modules](#host-modules) are imported with a default import whose source starts with `host:`:
+[Host modules](#host-modules) are imported from sources beginning with `host:` and bound to locally chosen names:
 
 ```js
-import Dice from "host:rng";
+import Random from "host:rng";
 ```
+
+`Random` is a local name chosen by the script.
 
 ## Nodes
 
@@ -60,7 +62,7 @@ Config, cells, and child declarations are **declarative** — they define fixed 
 
 Arc gives literal string syntax its meaning from the use site.
 
-At semantic-text use sites — `$instruct(...)`, `$instructLoop(...)`, `judge(...)`, `$observe(...)`, `$observeOrAsk(...)`, `this.guidance`, `this.deflectWhen`, an instruction or `$enterLoop` `resolveWhen` / `deflectWhen`, cell `observing`, and inside host calls — authors may use either a string literal or a template literal. Template interpolation can mention `Dialog.user`/`Dialog.self` (and their shorthand forms `user`/`self`), artifacts, host variables, and ordinary value expressions. When this text is handed to the host, Arc renders ordinary value expressions to text and preserves semantic references for the host to render or route.
+At semantic-text use sites — `$instruct(...)`, `$instructLoop(...)`, `judge(...)`, `$observe(...)`, `$observeOrAsk(...)`, `this.guidance`, `this.deflectWhen`, an instruction or `$enterLoop` `resolveWhen` / `deflectWhen`, cell `observing`, and host-call arguments declared as semantic text — authors may use either a string literal or a template literal. Template interpolation can mention `Dialog.user`/`Dialog.self` (and their shorthand forms `user`/`self`), artifacts, host variables, and ordinary value expressions. When this text is handed to the host, Arc renders ordinary value expressions to text and preserves semantic references for the host to render or route.
 
 Semantic templates render lazily. A template is stored unevaluated where it is authored and renders each time its text is emitted to the host, using inner values current at that emission. A declaration-site template such as a cell's `observing` may therefore mention cells that are unset at declaration; an interpolation is a runtime error only when a render reaches it while its value is unset.
 
@@ -494,10 +496,10 @@ A non-boolean value in a boolean position is rejected at parse time when its typ
 
 Host modules let arcs interact with host-owned systems — rolling dice, reading feature flags, writing to memoir. Each module has a declared namespace and operation surface; the host supplies the implementations.
 
-Host modules are imported with a default import whose source starts with `host:`:
+Host modules are imported from sources beginning with `host:` and bound to locally chosen names:
 
 ```js
-import Dice from "host:rng";
+import Random from "host:rng";
 import Memoir from "host:memoir";
 ```
 
@@ -505,7 +507,7 @@ The local import alias cannot be a reserved Arc identifier. Reserved aliases are
 
 The runtime associates every imported module with a typed operation surface. Each operation defines its ordered parameters and whether it returns a value. Arc authors consume that contract through host calls; how the host supplies it is outside the Arc script language.
 
-A host module exposes a namespace under the imported binding. Arc reaches into that namespace through member access at any depth. A callable path such as `Dice.roll(...)` or `Dice["tables"].roll(...)` asks the host to perform an operation. A bare member path such as `Audience.supervisor`, `Audience.group.supervisor`, or `Audience["supervisor"]` mentions a host-owned symbolic variable. Paths may use dot segments or static string-literal bracket segments.
+A host module exposes a namespace under the imported binding. Arc reaches into that namespace through member access at any depth. A callable path such as `Random.next(...)` or `Random["dice-d6"].roll(...)` asks the host to perform an operation. A bare member path such as `Audience.supervisor`, `Audience.group.supervisor`, or `Audience["supervisor"]` mentions a host-owned symbolic variable. Paths may use dot segments or static string-literal bracket segments.
 
 A host import can be used in three ways:
 
@@ -528,7 +530,7 @@ Memoir.facts.$apply(`${user} survived the tavern brawl`);
 
 An action-position host call statement must prefix the operation name with `$`, as in `Memoir.facts.$apply(...)`. It resolves once per logical action instance: the runtime remembers a pending invocation across retries and advances only after the host reports it resolved.
 
-Whether a host-call result is required comes from its consumer. Expression consumers require a value compatible with their own expected spec. Action consumers require no value, so operations with or without a declared result are accepted and any reported value is discarded. The `$` marks the authored action use; it is not part of the host operation name, so `Memoir.facts.apply(...)` and `Memoir.facts.$apply(...)` both address the operation `memoir.facts.apply`.
+An expression-position host call requires a declared result compatible with the surrounding expression. Arc checks the returned value against that declaration before the script uses it. Action calls accept operations with or without a declared result and discard any returned value. The `$` marks the authored action use; it is not part of the host operation name, so `Memoir.facts.apply(...)` and `Memoir.facts.$apply(...)` both address the operation `memoir.facts.apply`.
 
 **Template interpolation** — a host variable mentioned inside semantic text. The host variable carries a reference for the host to render or route when it consumes the text.
 
@@ -540,11 +542,33 @@ $instruct(`Ask ${Audience["supervisor"]} whether the plan is acceptable.`);
 
 Host variables are valid only inside template literals. `Audience.supervisor`, `Audience.group.supervisor`, and `Audience["group"]["supervisor"]` are host variables. Bracket segments must be static string literals, so `Audience[role]` is not a host variable. `Audience.supervisor()` is a host call, not a host variable, and follows the same static segment rule.
 
-Arguments to a host call must be renderable without further host work; a host call may not appear inside another host call's arguments. Arc enforces exact arity and the operation's parameter types before emitting host work.
+#### Call Arguments
 
-Template-literal arguments use semantic text rendering. Structured semantic text is admitted only by semantic-text parameters; plain-string and enum parameters require plain string values.
+Host-call arguments must follow the host module's declared contract, including argument count, required object fields, and accepted value types. Arc rejects statically detectable violations during registration. Violations discovered during execution cause a runtime error before the host call is emitted.
 
-Host-call result types participate in ordinary spec resolution and compatibility checks whenever a consumer demands a value. The runtime admits a reported payload against the result type before expression use or pin hydration. Artifact identity comes from the result type, not payload shape.
+Cells supplied as arguments must be set when the call executes, including inside object fields and array elements. An omittable argument or field may be omitted; supplying an unset cell is an error.
+
+Arguments must be renderable without further host work; a host call may not appear inside another host call's arguments, including inside nested objects or arrays.
+
+Object and array arguments can nest according to the operation's contract:
+
+```js
+import Records from "host:records";
+
+let title = Str();
+title.$set("Review");
+
+Records.$record({
+  title,
+  context: {
+    instruction: `Ask ${user} to review this`,
+  },
+});
+```
+
+Object arguments use static named data properties. Field names must be nonempty and cannot be `__proto__`, `prototype`, or `constructor`. Duplicate keys, accessors, methods, computed keys, and spread are invalid.
+
+For template literals, the host module's declaration determines whether the use site is a value use site or a semantic-text use site. The template literal must conform to that use.
 
 ## Hooks
 
@@ -655,9 +679,11 @@ function Main() {
   workLocally.$set(false); // Work with the network by default.
 
   this.catchInterruption = () => {
-    // Switch to local work after the host reports a network interruption.
-    workLocally.$set(true);
-    return true;
+    if (this.interruption.id == "network-unavailable") {
+      workLocally.$set(true);
+      return true;
+    }
+    return false;
   };
 
   if (workLocally) {
@@ -672,6 +698,7 @@ function Main() {
 Processing rules:
 
 - The hook accepts the same statement forms as `this.catchDeflection`.
+- `this.interruption.id` is the host-provided interruption identifier. `this.interruption.reason` is its explanation, or `""` when the host omits it. Both are read-only strings available only in this hook.
 - Every reachable completed path must explicitly return a boolean. A bare return, fallthrough, `undefined`, or a nonboolean value is invalid.
 - Catch results follow the [deflection and interruption](#deflection-and-interruption) rules. In the example, catching sets `workLocally` so the body takes the `LocalWork` branch; the already-resolved initialization does not reset the cell. `NetworkDependentWork` stays interrupted while `LocalWork` runs. If the graph later enters `NetworkDependentWork` again, it resumes from where it stopped.
 
@@ -944,7 +971,7 @@ Channel behavior:
 
 ## Channels
 
-Channels expose values and operations supplied by an execution context. A node declares its `args` and `returns` channels; Arc supplies built-in channels for dialog, map iterations, and finalization. Each channel defines its members or value, supported operations, and availability. Cells own persistent state; channels expose information or accept output through the rules of their providing context.
+Channels expose values and operations supplied by an execution context. A node declares its `args` and `returns` channels; Arc supplies built-in channels for dialog, map iterations, and node control handling. Each channel defines its members or value, supported operations, and availability. Cells own persistent state; channels expose information or accept output through the rules of their providing context.
 
 | Channel | Provider and availability | Contract |
 | --- | --- | --- |
@@ -953,9 +980,10 @@ Channels expose values and operations supplied by an execution context. A node d
 | `span` | The current `$map` callback. | Reads `item` and `index`; writes `result` when results are bound. See [Map](#map). |
 | `Dialog` | Host-provided conversation context. | Supplies participant references, messages, and cursors. |
 | `this.deflection` | `this.catchDeflection` and deflected `this.effects`. | Queries the deflection being finalized. |
+| `this.interruption` | `this.catchInterruption`. | Reads the current interruption's `id` and `reason`. |
 | `this.pendingState` | `this.effects`. | Reads the outcome being finalized. |
 
-`span`, `this.deflection`, and `this.pendingState` are supplied by their enclosing execution context. Their availability follows that context through its supported expressions and nested bodies. References outside the permitted context are rejected during validation; using `this.deflection` during covered effects is a runtime error. Hook declarations remain node configuration assignments such as `this.effects = () => { ... }`.
+`span`, `this.deflection`, `this.interruption`, and `this.pendingState` are supplied by their enclosing execution context. Their availability follows that context through its supported expressions and nested bodies. References outside the permitted context are rejected during validation; using `this.deflection` during covered effects is a runtime error. Hook declarations remain node configuration assignments such as `this.effects = () => { ... }`.
 
 ### Dialog
 
@@ -1008,6 +1036,15 @@ Cursor values cannot be observed with `$observe()` or `$observeOrAsk()`.
 | Form | Type | Description |
 | --- | --- | --- |
 | `this.deflection.escaped(Target)` | `boolean` | Whether the pending deflection came up through one of this node's own entries of `Target` (canonical, `forgetful`, or `newcopy`). `Target` is a bare node/import. Available in `this.catchDeflection` and deflected `this.effects`. |
+
+### Interruption
+
+`this.interruption` supplies the host-provided interruption inside `this.catchInterruption`.
+
+| Form | Type | Description |
+| --- | --- | --- |
+| `this.interruption.id` | `string` | Host-defined identifier of the interruption being caught. |
+| `this.interruption.reason` | `string` | Host-provided explanation, or `""` when omitted. |
 
 ### Pending State
 

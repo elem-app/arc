@@ -2,6 +2,11 @@ import type * as acorn from "acorn";
 import { parse as acornParse } from "acorn";
 
 import {
+  acceptsHostArgumentCount,
+  hostOperationArity,
+  hostParameterValueSpec,
+} from "../spec/host-parameters.js";
+import {
   arithmeticRule,
   artifactPathRule,
   booleanRule,
@@ -17,7 +22,6 @@ import {
   reusableSpecCompatible,
   stringOperandRule,
 } from "../spec/resolution.js";
-import { validateSpec } from "../spec/validation.js";
 import type {
   ArrayReference,
   BreakStatement,
@@ -63,7 +67,6 @@ import type {
   UnsetAction,
   ValidationIssue,
   ValueExpression,
-  ValueString,
   WriteDiffMode,
 } from "../types/parser.js";
 import {
@@ -85,15 +88,7 @@ import {
   isObservableCellSpec,
   isSettableCellSpec,
 } from "../types/spec.js";
-import {
-  classifyArtifactPath,
-  type PayloadValue,
-  type StructValue,
-} from "../types/value.js";
-import {
-  describeArtifactPathIssue,
-  firstInvalidPayloadValue,
-} from "../value-utils.js";
+import type { PayloadValue, StructValue } from "../types/value.js";
 import {
   containsBriefableExpression,
   type ExpressionParseContext,
@@ -110,6 +105,11 @@ import {
   parseHostCallTarget,
   parseSemanticString,
 } from "./ast.js";
+import {
+  instructionResolutionIssue,
+  isReservedChannelKey,
+  validateDocumentStructure,
+} from "./document-grammar.js";
 import {
   lintArcCellReads,
   lintNodeBareCellBooleans,
@@ -271,13 +271,19 @@ export function parse(source: string): Document {
     ),
   );
 
-  for (const root of roots) stampElementIds(root);
-
   const document: Document = {
     imports,
     hostModules,
     roots,
   };
+
+  const structuralIssues: ValidationIssue[] = [];
+  validateDocumentStructure(document, structuralIssues);
+  if (structuralIssues.length > 0) {
+    const first = structuralIssues[0]!;
+    throw new Error(`${first.code}: ${first.message}`);
+  }
+  for (const root of roots) stampElementIds(root);
 
   const issues = validate(document);
   if (issues.length > 0) {
@@ -353,7 +359,7 @@ export function analyzeDocument(
   activeInvokeBuilders = [];
   mapContextStack = [];
   activeSegReadSets = undefined;
-  validatePublicDocumentGraph(document, issues);
+  validateDocumentStructure(document, issues);
   if (issues.length > 0) {
     return { issues, lintIssues, rewalkPlan: { bySeg } };
   }
@@ -366,14 +372,6 @@ export function analyzeDocument(
     if (issues.length > 0) {
       return { issues, lintIssues, rewalkPlan: { bySeg } };
     }
-  }
-  validatePublicNumericIr(document, issues);
-  if (issues.length > 0) {
-    return { issues, lintIssues, rewalkPlan: { bySeg } };
-  }
-  validateDocumentSpecs(document, issues);
-  if (issues.length > 0) {
-    return { issues, lintIssues, rewalkPlan: { bySeg } };
   }
   validateDocumentShape(document, issues);
   const documentImportNames = new Set(
@@ -398,705 +396,6 @@ export function analyzeDocument(
     });
   }
   return { issues, lintIssues, rewalkPlan: { bySeg } };
-}
-
-/**
- * Validates the caller-owned IR graph before any clone can erase accessors,
- * symbols, non-enumerable fields, sparse arrays, custom prototypes, or cycles.
- * Optional properties may be present with an `undefined` data value.
- */
-function validatePublicDocumentGraph(
-  document: Document,
-  issues: ValidationIssue[],
-): void {
-  const seen = new WeakSet<object>();
-  const active = new WeakSet<object>();
-
-  const reject = (path: string, detail: string): void => {
-    issues.push({
-      code: "INVALID_PUBLIC_IR",
-      message: `Invalid public IR at ${path}: ${detail}`,
-    });
-  };
-
-  const visit = (value: unknown, path: string): void => {
-    if (
-      value === undefined ||
-      value === null ||
-      typeof value === "string" ||
-      typeof value === "number" ||
-      typeof value === "boolean"
-    ) {
-      return;
-    }
-    if (typeof value !== "object") {
-      reject(path, `unsupported ${typeof value} value`);
-      return;
-    }
-    if (active.has(value)) {
-      reject(path, "cyclic references are not allowed");
-      return;
-    }
-    if (seen.has(value)) return;
-    seen.add(value);
-    active.add(value);
-
-    let prototype: object | null;
-    let keys: (string | symbol)[];
-    try {
-      prototype = Object.getPrototypeOf(value);
-      keys = Reflect.ownKeys(value);
-    } catch {
-      active.delete(value);
-      reject(path, "object shape could not be inspected");
-      return;
-    }
-
-    if (Array.isArray(value)) {
-      if (prototype !== Array.prototype) {
-        reject(path, "arrays must use the ordinary Array prototype");
-      } else {
-        for (let index = 0; index < value.length; index += 1) {
-          const descriptor = Object.getOwnPropertyDescriptor(
-            value,
-            String(index),
-          );
-          if (
-            !descriptor ||
-            !("value" in descriptor) ||
-            !descriptor.enumerable
-          ) {
-            reject(
-              `${path}[${index}]`,
-              "arrays must contain dense enumerable data elements",
-            );
-            continue;
-          }
-          visit(descriptor.value, `${path}[${index}]`);
-        }
-        for (const key of keys) {
-          if (key === "length") continue;
-          if (
-            typeof key !== "string" ||
-            !Number.isSafeInteger(Number(key)) ||
-            Number(key) < 0 ||
-            String(Number(key)) !== key ||
-            Number(key) >= value.length
-          ) {
-            reject(
-              typeof key === "string"
-                ? `${path}[${JSON.stringify(key)}]`
-                : path,
-              "arrays cannot contain non-element properties",
-            );
-          }
-        }
-      }
-      active.delete(value);
-      return;
-    }
-
-    if (prototype !== Object.prototype && prototype !== null) {
-      reject(path, "objects must use a plain or null prototype");
-      active.delete(value);
-      return;
-    }
-    for (const key of keys) {
-      if (typeof key !== "string") {
-        reject(path, "objects cannot contain symbol keys");
-        continue;
-      }
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      const fieldPath = `${path}[${JSON.stringify(key)}]`;
-      if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
-        reject(fieldPath, "fields must be enumerable data properties");
-        continue;
-      }
-      if (key === "hostParams") {
-        const payloadIssue = firstInvalidPayloadValue(descriptor.value);
-        if (payloadIssue) {
-          issues.push({
-            code: "INVALID_PAYLOAD_VALUE",
-            message: `Invalid hostParams payload at ${fieldPath}${
-              payloadIssue.path === "$" ? "" : payloadIssue.path.slice(1)
-            }: ${payloadIssue.detail}`,
-          });
-        }
-        continue;
-      }
-      visit(descriptor.value, fieldPath);
-    }
-    active.delete(value);
-  };
-
-  visit(document, "$");
-}
-
-function validateDocumentSpecs(
-  document: Document,
-  issues: ValidationIssue[],
-): void {
-  const visit = (node: Node): void => {
-    for (const cell of node.cells) {
-      const violation = validateSpec(cell);
-      if (violation) {
-        issues.push({
-          code: "INVALID_SPEC",
-          message: `Invalid spec for cell ${cell.name}: ${violation.detail}`,
-          loc: cell.loc,
-        });
-      }
-      validateArtifactArrayElementShape(
-        cell,
-        `cell ${cell.name}`,
-        cell.loc,
-        issues,
-      );
-    }
-    for (const namespace of ["args", "returns"] as const) {
-      for (const [key, spec] of Object.entries(
-        node.signature?.[namespace] ?? {},
-      )) {
-        const violation = validateSpec(spec);
-        if (violation) {
-          issues.push({
-            code: "INVALID_SPEC",
-            message: `Invalid spec for ${namespace}.${key}: ${violation.detail}`,
-          });
-        }
-        validateArtifactArrayElementShape(
-          spec,
-          `${namespace}.${key}`,
-          undefined,
-          issues,
-        );
-      }
-    }
-    node.children.forEach(visit);
-  };
-  document.roots.forEach(visit);
-}
-
-function validateArtifactArrayElementShape(
-  spec: unknown,
-  owner: string,
-  loc: SourceRange | undefined,
-  issues: ValidationIssue[],
-): void {
-  if (!spec || typeof spec !== "object" || Array.isArray(spec)) return;
-  const object = spec as Record<string, unknown>;
-  if (object.type !== "array") return;
-  const element = object.element;
-  if (!element || typeof element !== "object" || Array.isArray(element)) return;
-  const elementObject = element as Record<string, unknown>;
-  if (elementObject.type !== "artifact") return;
-  const unsupported = Object.keys(elementObject).find((key) => key !== "type");
-  if (unsupported === undefined) return;
-  issues.push({
-    code: "INVALID_SPEC",
-    message: `Invalid spec for ${owner}: Artifact array element does not support ${JSON.stringify(unsupported)}`,
-    loc,
-  });
-}
-
-function validatePublicNumericIr(
-  document: Document,
-  issues: ValidationIssue[],
-): void {
-  const numericSeen = new WeakSet<object>();
-  const scanNumbers = (value: unknown, path: string): void => {
-    if (typeof value === "number") {
-      if (!Number.isFinite(value)) {
-        issues.push({
-          code: "NON_FINITE_NUMBER",
-          message: `Document contains a non-finite number at ${path}`,
-        });
-      }
-      return;
-    }
-    if (value === null || typeof value !== "object") return;
-    if (numericSeen.has(value)) return;
-    numericSeen.add(value);
-    if (Array.isArray(value)) {
-      value.forEach((item, index) => scanNumbers(item, `${path}[${index}]`));
-      return;
-    }
-    for (const key of Object.keys(value)) {
-      scanNumbers(
-        (value as Record<string, unknown>)[key],
-        `${path}[${JSON.stringify(key)}]`,
-      );
-    }
-  };
-  scanNumbers(document, "$");
-  if (issues.length > 0) return;
-
-  const seen = new WeakSet<object>();
-  const visit = (value: unknown, path: string): void => {
-    if (typeof value === "number") {
-      return;
-    }
-    if (value === null || typeof value !== "object") return;
-    if (seen.has(value)) return;
-    seen.add(value);
-    if (Array.isArray(value)) {
-      value.forEach((item, index) => visit(item, `${path}[${index}]`));
-      return;
-    }
-    const object = value as Record<string, unknown>;
-    if (object.type === "rangedInt") {
-      issues.push({
-        code: "NON_CANONICAL_NUMERIC_SPEC",
-        message: `Source / IR numeric spec at ${path} must use type "number"; found "rangedInt"`,
-      });
-    }
-    if (object.type === "number" && "observeAs" in object) {
-      validatePublicObserveAs(object.observeAs, `${path}["observeAs"]`, issues);
-    } else if ("observeAs" in object) {
-      issues.push({
-        code: "INVALID_NUMERIC_OBSERVE_AS",
-        message: `Invalid numeric observeAs at ${path}: unsupported field "observeAs"`,
-      });
-    }
-    validatePublicArtifactCellSpec(object, path, issues);
-    validatePublicExpressionObject(object, path, issues);
-    validateLocalConsumerShapes(object, path, issues);
-    for (const key of Object.keys(object)) {
-      // `hostParams` is an opaque PayloadValue boundary. The number-admission
-      // walk above still descends through it, but Source / IR schema and
-      // expression rules must not interpret payload keys such as `type`,
-      // `observeAs`, `kind`, or `op`.
-      if (key === "hostParams") {
-        const payloadIssue = firstInvalidPayloadValue(object[key]);
-        if (payloadIssue) {
-          issues.push({
-            code: "INVALID_PAYLOAD_VALUE",
-            message: `Invalid hostParams payload at ${path}[${JSON.stringify(key)}]${payloadIssue.path === "$" ? "" : payloadIssue.path.slice(1)}: ${payloadIssue.detail}`,
-          });
-        }
-        continue;
-      }
-      visit(object[key], `${path}[${JSON.stringify(key)}]`);
-    }
-  };
-  visit(document, "$");
-  document.roots.forEach((root, index) =>
-    validateNodeChannelObserveAs(root, `$["roots"][${index}]`, issues),
-  );
-}
-
-function validateNodeChannelObserveAs(
-  node: Node,
-  path: string,
-  issues: ValidationIssue[],
-): void {
-  for (const namespace of ["args", "returns"] as const) {
-    for (const [key, spec] of Object.entries(
-      node.signature?.[namespace] ?? {},
-    )) {
-      validateChannelObserveAs(
-        spec,
-        `${path}["signature"][${JSON.stringify(namespace)}][${JSON.stringify(key)}]`,
-        issues,
-      );
-    }
-  }
-  node.children.forEach((child, index) =>
-    validateNodeChannelObserveAs(
-      child,
-      `${path}["children"][${index}]`,
-      issues,
-    ),
-  );
-}
-
-function validateChannelObserveAs(
-  spec: ChannelSpec,
-  path: string,
-  issues: ValidationIssue[],
-): void {
-  if ("observeAs" in (spec as unknown as Record<string, unknown>)) {
-    issues.push({
-      code: "INVALID_NUMERIC_OBSERVE_AS",
-      message: `Invalid numeric observeAs at ${path}: unsupported field "observeAs"`,
-    });
-  }
-  if (spec.type === "array") {
-    validateChannelObserveAs(spec.element, `${path}["element"]`, issues);
-  }
-}
-
-function validatePublicObserveAs(
-  value: unknown,
-  path: string,
-  issues: ValidationIssue[],
-): void {
-  const fail = (detail: string): void => {
-    issues.push({
-      code: "INVALID_NUMERIC_OBSERVE_AS",
-      message: `Invalid numeric observeAs at ${path}: ${detail}`,
-    });
-  };
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    fail("expected an object");
-    return;
-  }
-  const object = value as Record<string, unknown>;
-  for (const key of Object.keys(object)) {
-    if (key !== "kind" && key !== "min" && key !== "max") {
-      fail(`unsupported field ${JSON.stringify(key)}`);
-    }
-  }
-  if (object.kind !== "number" && object.kind !== "integer") {
-    fail('kind must be "number" or "integer"');
-    return;
-  }
-  for (const bound of ["min", "max"] as const) {
-    if (object[bound] !== undefined && typeof object[bound] !== "number") {
-      fail(`${bound} must be a number`);
-    }
-  }
-  const min = typeof object.min === "number" ? object.min : undefined;
-  const max = typeof object.max === "number" ? object.max : undefined;
-  if (min !== undefined && max !== undefined && min > max) {
-    fail("bounds must satisfy min <= max");
-  }
-  if (object.kind === "integer") {
-    if (min !== undefined && !Number.isSafeInteger(min)) {
-      fail("integer min must be a safe integer");
-    }
-    if (max !== undefined && !Number.isSafeInteger(max)) {
-      fail("integer max must be a safe integer");
-    }
-  }
-}
-
-function validatePublicArtifactCellSpec(
-  object: Record<string, unknown>,
-  path: string,
-  issues: ValidationIssue[],
-): void {
-  if (object.type !== "artifact" || typeof object.name !== "string") return;
-  if ("path" in object) {
-    issues.push({
-      code: "INVALID_ARTIFACT_CELL_SPEC",
-      message: `Invalid Artifact cell at ${path}: declaration path expressions belong under "initializer"`,
-    });
-  }
-  if (
-    object.initializer !== undefined &&
-    (!isPublicValueExpression(object.initializer) ||
-      (object.initializer as Record<string, unknown>).kind !== "artifact")
-  ) {
-    issues.push({
-      code: "INVALID_ARTIFACT_CELL_SPEC",
-      message: `Invalid Artifact cell at ${path}: initializer must be omitted or an Artifact constructor expression`,
-    });
-  }
-}
-
-function validatePublicExpressionObject(
-  object: Record<string, unknown>,
-  path: string,
-  issues: ValidationIssue[],
-): void {
-  const requireValue = (field: string): void => {
-    if (!isPublicValueExpression(object[field])) {
-      issues.push({
-        code: "INVALID_EXPRESSION_STRATUM",
-        message: `Expression at ${path}[${JSON.stringify(field)}] is not valid in the value expression stratum`,
-      });
-    }
-  };
-  const requireLocal = (field: string): void => {
-    if (!isPublicLocalExpression(object[field])) {
-      issues.push({
-        code: "INVALID_EXPRESSION_STRATUM",
-        message: `Expression at ${path}[${JSON.stringify(field)}] is not valid in the local expression stratum`,
-      });
-    }
-  };
-  const invalidOperator = (code: string, label: string): void => {
-    issues.push({
-      code,
-      message: `Invalid ${label} operator ${JSON.stringify(object.op)} at ${path}`,
-    });
-  };
-  if (object.kind === "artifact") {
-    if (!isPublicValueExpression(object.path)) {
-      issues.push({
-        code: "INVALID_ARTIFACT_CONSTRUCT_EXPRESSION",
-        message: `Invalid Artifact constructor at ${path}: path must be a value expression`,
-      });
-    } else if (
-      object.path !== null &&
-      typeof object.path === "object" &&
-      !Array.isArray(object.path) &&
-      (object.path as Record<string, unknown>).kind === "literal" &&
-      typeof (object.path as Record<string, unknown>).value === "string"
-    ) {
-      const issue = classifyArtifactPath(
-        (object.path as Record<string, unknown>).value as string,
-      );
-      if (issue !== undefined) {
-        issues.push({
-          code: "INVALID_ARTIFACT_PATH",
-          message: `Invalid Artifact constructor at ${path}["path"]: ${describeArtifactPathIssue(issue)}`,
-        });
-      }
-    }
-  }
-  if (
-    object.kind === "comparison" &&
-    object.op !== "==" &&
-    object.op !== "!=" &&
-    object.op !== ">" &&
-    object.op !== ">=" &&
-    object.op !== "<" &&
-    object.op !== "<="
-  ) {
-    invalidOperator("INVALID_COMPARISON_OPERATOR", "comparison");
-  }
-  if (
-    object.kind === "arithmetic" &&
-    object.op !== "+" &&
-    object.op !== "-" &&
-    object.op !== "*" &&
-    object.op !== "/" &&
-    object.op !== "%"
-  ) {
-    invalidOperator("INVALID_ARITHMETIC_OPERATOR", "arithmetic");
-  }
-  if (object.kind === "arithmetic") {
-    for (const side of ["left", "right"] as const) {
-      requireValue(side);
-    }
-  }
-  if (
-    object.kind === "numericUnary" &&
-    !isPublicValueExpression(object.argument)
-  ) {
-    issues.push({
-      code: "INVALID_EXPRESSION_STRATUM",
-      message: `Expression at ${path}["argument"] is not valid in the value expression stratum`,
-    });
-  }
-  if (object.kind === "logical" && object.op !== "&&" && object.op !== "||") {
-    invalidOperator("INVALID_LOGICAL_OPERATOR", "logical");
-  }
-  if (object.kind === "numericUnary" && object.op !== "-") {
-    invalidOperator("INVALID_NUMERIC_UNARY_OPERATOR", "numeric unary");
-  }
-  if (object.kind === "unary" && object.op !== "!") {
-    invalidOperator("INVALID_LOGICAL_UNARY_OPERATOR", "logical unary");
-  }
-  if (object.kind === "comparison" || object.kind === "logical") {
-    requireValue("left");
-    requireValue("right");
-  }
-  if (object.kind === "conditional") {
-    requireValue("test");
-    requireValue("consequent");
-    requireValue("alternate");
-  }
-  if (object.kind === "if") requireValue("test");
-  if (object.kind === "set" || object.kind === "set-return") {
-    requireValue("value");
-  }
-  if (
-    object.kind === "return" &&
-    object.value !== undefined &&
-    object.value !== null
-  ) {
-    requireValue("value");
-  }
-  if (object.kind === "value") requireValue("value");
-  if (object.kind === "unary") requireValue("argument");
-  if (object.kind === "regexTest") requireLocal("target");
-  if (object.kind === "dialogTurnsSince") {
-    requireLocal("receiver");
-    requireLocal("baseline");
-  }
-  if (object.kind === "arrayLiteral") {
-    if (!Array.isArray(object.elements)) {
-      issues.push({
-        code: "INVALID_EXPRESSION_STRATUM",
-        message: `Expression at ${path}["elements"] is not valid in the value expression stratum`,
-      });
-    } else {
-      object.elements.forEach((element, index) => {
-        if (!isPublicValueExpression(element)) {
-          issues.push({
-            code: "INVALID_EXPRESSION_STRATUM",
-            message: `Expression at ${path}["elements"][${index}] is not valid in the value expression stratum`,
-          });
-        }
-      });
-    }
-  }
-  if (object.kind === "numIsFinite") {
-    if (!("argument" in object)) {
-      issues.push({
-        code: "INVALID_NUM_IS_FINITE_EXPRESSION",
-        message: `Invalid Num.isFinite expression at ${path}: expected one value-expression argument`,
-      });
-    } else if (!isPublicValueExpression(object.argument)) {
-      issues.push({
-        code: "INVALID_EXPRESSION_STRATUM",
-        message: `Expression at ${path}["argument"] is not valid in the value expression stratum`,
-      });
-    }
-  }
-  if (
-    object.kind === "scope" &&
-    object.name === "lastTurns" &&
-    object.count !== undefined &&
-    (typeof object.count !== "number" ||
-      !Number.isSafeInteger(object.count) ||
-      object.count < 0)
-  ) {
-    issues.push({
-      code: "INVALID_DIALOG_LAST_TURNS_COUNT",
-      message: `Dialog.lastTurns count at ${path}["count"] must be a non-negative safe integer`,
-    });
-  }
-}
-
-function validateLocalConsumerShapes(
-  object: Record<string, unknown>,
-  path: string,
-  issues: ValidationIssue[],
-): void {
-  const check = (value: unknown, valuePath: string): void => {
-    if (!isPublicLocalExpression(value)) {
-      issues.push({
-        code: "INVALID_EXPRESSION_STRATUM",
-        message: `Expression at ${valuePath} is not valid in the local expression stratum`,
-      });
-    }
-  };
-  if (object.kind === "arrayElementRead") {
-    check(object.index, `${path}["index"]`);
-  }
-  if (
-    (object.kind === "set" ||
-      object.kind === "unset" ||
-      object.kind === "observe" ||
-      object.kind === "observeOrAsk") &&
-    Array.isArray(object.target)
-  ) {
-    object.target
-      .slice(1)
-      .forEach((item, index) => check(item, `${path}["target"][${index + 1}]`));
-  }
-  if (
-    (object.kind === "observeGroup" || object.kind === "observeOrAskGroup") &&
-    Array.isArray(object.targets)
-  ) {
-    object.targets.forEach((target, targetIndex) => {
-      if (!Array.isArray(target)) return;
-      target
-        .slice(1)
-        .forEach((item, index) =>
-          check(item, `${path}["targets"][${targetIndex}][${index + 1}]`),
-        );
-    });
-  }
-}
-
-function isPublicLocalExpression(value: unknown): boolean {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const expression = value as Record<string, unknown>;
-  if (expression.kind === "arithmetic") {
-    return (
-      isPublicLocalExpression(expression.left) &&
-      isPublicLocalExpression(expression.right)
-    );
-  }
-  if (expression.kind === "numericUnary") {
-    return isPublicLocalExpression(expression.argument);
-  }
-  return (
-    expression.kind === "literal" ||
-    expression.kind === "cell" ||
-    expression.kind === "isUnset" ||
-    expression.kind === "channel" ||
-    expression.kind === "channelIsUnset" ||
-    expression.kind === "arrayElementRead" ||
-    expression.kind === "arrayLength" ||
-    expression.kind === "span" ||
-    expression.kind === "deflectionEscaped" ||
-    expression.kind === "dialogCursor" ||
-    expression.kind === "dialogTurnsSince" ||
-    expression.kind === "scope" ||
-    expression.kind === "enterCount" ||
-    expression.kind === "pendingState" ||
-    expression.kind === "nodeState"
-  );
-}
-
-function isPublicValueExpression(value: unknown): boolean {
-  if (isPublicLocalExpression(value)) return true;
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const expression = value as Record<string, unknown>;
-  if (expression.kind === "arithmetic") {
-    return (
-      isPublicValueExpression(expression.left) &&
-      isPublicValueExpression(expression.right)
-    );
-  }
-  if (expression.kind === "numericUnary") {
-    return isPublicValueExpression(expression.argument);
-  }
-  if (expression.kind === "template-string") {
-    return isPublicValueString(expression);
-  }
-  if (expression.kind === "artifact") {
-    return isPublicValueExpression(expression.path);
-  }
-  return (
-    expression.kind === "judge" ||
-    expression.kind === "host-call" ||
-    expression.kind === "arrayLiteral" ||
-    expression.kind === "regexTest" ||
-    expression.kind === "comparison" ||
-    expression.kind === "logical" ||
-    expression.kind === "conditional" ||
-    expression.kind === "unary" ||
-    expression.kind === "numIsFinite"
-  );
-}
-
-/** Validates an untrusted public value-template shape before typed walkers use it. */
-function isPublicValueString(value: unknown): value is ValueString {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const expression = value as Record<string, unknown>;
-  if (
-    expression.kind !== "template-string" ||
-    !Array.isArray(expression.parts)
-  ) {
-    return false;
-  }
-  return expression.parts.every((valuePart) => {
-    if (
-      valuePart === null ||
-      typeof valuePart !== "object" ||
-      Array.isArray(valuePart)
-    ) {
-      return false;
-    }
-    const part = valuePart as Record<string, unknown>;
-    if (part.kind === "text") return typeof part.value === "string";
-    return (
-      part.kind === "expression" && isPublicValueExpression(part.expression)
-    );
-  });
 }
 
 /**
@@ -1601,7 +900,7 @@ function parseChannelSchema(
     // reserves (`args.state` is a node-state read, `args.length` an array-length
     // read, `args.isUnset()` the channel-unset check), so a channel key cannot
     // use them.
-    if (key === "state" || key === "length" || key === "isUnset") {
+    if (isReservedChannelKey(key)) {
       throw new Error(
         `${namespace} schema key "${key}" is reserved and cannot name a channel`,
       );
@@ -1803,35 +1102,6 @@ export function stampElementIds(node: Node): void {
 /** Verifies canonical ids without mutating; mismatches become issues. */
 function verifyElementIds(node: Node, issues: ValidationIssue[]): void {
   applyElementIds(node, issues);
-  scanUnstampedIds(node, issues);
-}
-
-/**
- * Independent unstamped-id sweep by structural reflection: any `kind`-bearing
- * object whose `id` is the unstamped placeholder is reported. Deliberately
- * NOT the stamper walk — the walk dispatches on statement kind, so a kind it
- * forgot to descend into is invisible to it, and this sweep is what turns
- * that gap into a validation issue instead of runtime garbage ids.
- */
-function scanUnstampedIds(value: unknown, issues: ValidationIssue[]): void {
-  if (Array.isArray(value)) {
-    for (const entry of value) scanUnstampedIds(entry, issues);
-    return;
-  }
-  if (value === null || typeof value !== "object") return;
-  const record = value as Record<string, unknown>;
-  if (
-    typeof record.kind === "string" &&
-    "id" in record &&
-    record.id === UNSTAMPED_ID
-  ) {
-    issues.push({
-      code: "ELEMENT_ID",
-      message: `Unstamped element id on a "${record.kind}" element; normalize the document with stampElementIds`,
-      loc: record.loc as SourceRange | undefined,
-    });
-  }
-  for (const entry of Object.values(record)) scanUnstampedIds(entry, issues);
 }
 
 function applyElementIds(
@@ -3244,12 +2514,8 @@ function parseInstructionCall(
 
   const mode: InstructionAction["mode"] =
     callee === "$instruct" ? "once" : "persistent";
-  if (mode === "persistent" && !resolveWhen) {
-    throw new Error("$instructLoop() requires resolveWhen");
-  }
-  if (mode === "once" && resolveWhen) {
-    throw new Error("$instruct() does not support resolveWhen");
-  }
+  const resolutionIssue = instructionResolutionIssue({ mode, resolveWhen });
+  if (resolutionIssue) throw new Error(resolutionIssue);
 
   const action = createInstructionAction(
     template,
@@ -4016,7 +3282,7 @@ function parseCatchStatements(
   const expressionContext: ExpressionParseContext = {
     ...(hook === "catchDeflection"
       ? { deflectionTargets: { availableImports, visibleNodeNames, enclosing } }
-      : {}),
+      : { allowInterruption: true }),
   };
   const parseHookExpression = (expression: acorn.Expression): ValueExpression =>
     parseExpression(expression, availableHostModules, true, expressionContext);
@@ -4469,7 +3735,8 @@ function validateEnterChannelBindings(
       if (source.key === "index") return { type: "index" };
       return source.key === "item" ? context.receiverSpec : context.resultsSpec;
     }
-    return undefined;
+    const unreachable: never = source;
+    throw new Error(`Unexpected enter binding: ${JSON.stringify(unreachable)}`);
   };
 
   for (const [key, source] of Object.entries(statement.args ?? {})) {
@@ -4524,7 +3791,11 @@ function validateEnterChannelBindings(
   }
 }
 
-type ExpressionScope = "ordinary" | "catchDeflection" | "effects";
+type ExpressionScope =
+  | "ordinary"
+  | "catchDeflection"
+  | "catchInterruption"
+  | "effects";
 
 type TargetBinding = "local" | "imported" | "self";
 
@@ -4556,7 +3827,7 @@ function validateDocumentShape(
   issues: ValidationIssue[],
 ): void {
   const importNames = new Set<string>();
-  for (const binding of document.imports) {
+  for (const binding of [...document.imports, ...document.hostModules]) {
     if (importNames.has(binding.localName)) {
       issues.push({
         code: "DUPLICATE_IMPORT",
@@ -4566,6 +3837,23 @@ function validateDocumentShape(
       continue;
     }
     importNames.add(binding.localName);
+  }
+
+  for (const binding of document.imports) {
+    if (binding.source.startsWith(HOST_MODULE_SOURCE_PREFIX))
+      issues.push({
+        code: "INVALID_IMPORT_BINDING",
+        message: "Host imports belong in Document.hostModules",
+        loc: binding.loc,
+      });
+  }
+  for (const binding of document.hostModules) {
+    if (binding.source !== `${HOST_MODULE_SOURCE_PREFIX}${binding.module}`)
+      issues.push({
+        code: "INVALID_IMPORT_BINDING",
+        message: "Host import source must name its declared module",
+        loc: binding.loc,
+      });
   }
 
   const rootNames = new Set<string>();
@@ -4591,15 +3879,6 @@ function validateNodeShape(
     issues.push({
       code: "RESERVED_NAME",
       message: "invoke is a reserved name and cannot name a node",
-      loc: node.loc,
-    });
-  }
-  // `parseNode` always sets this, so only hand-built or deserialized IR can
-  // reach the trust boundary with it missing or misspelled.
-  if (node.writeDiffMode !== "advance" && node.writeDiffMode !== "rewalk") {
-    issues.push({
-      code: "INVALID_WRITE_DIFF_MODE",
-      message: `Invalid writeDiffMode: ${JSON.stringify(node.writeDiffMode)}. Expected "advance" or "rewalk"`,
       loc: node.loc,
     });
   }
@@ -4685,33 +3964,12 @@ function resolveNodeStateBinding(
   return undefined;
 }
 
-function validateTargetMode(
-  target: EnterTarget,
-  issues: ValidationIssue[],
-  loc: SourceRange | undefined,
-): boolean {
-  if (
-    target.mode === "canonical" ||
-    target.mode === "forgetful" ||
-    target.mode === "newcopy"
-  ) {
-    return true;
-  }
-  issues.push({
-    code: "INVALID_TARGET_MODE",
-    message: `Invalid target mode: ${String(target.mode)}`,
-    loc,
-  });
-  return false;
-}
-
 function validateEnterTarget(
   target: EnterTarget,
   issues: ValidationIssue[],
   loc: SourceRange | undefined,
   references: ReferenceValidationContext | undefined,
 ): void {
-  validateTargetMode(target, issues, loc);
   if (!references) return;
 
   const binding = resolveTargetBinding(target.identifier, references);
@@ -5068,6 +4326,14 @@ function validateNode(
   activeReadSet = builder;
   activeSegReadSets = segReadSets;
   try {
+    if (node.guidance !== undefined)
+      validateSemanticString(
+        node.guidance,
+        cells,
+        nodeNames,
+        context.issues,
+        baseOptions,
+      );
     for (const cell of node.cells) {
       if (isScalarObservableCell(cell) && cell.observing !== undefined) {
         validateSemanticString(
@@ -5092,6 +4358,13 @@ function validateNode(
         );
       }
       if (cell.type === "artifact" && cell.initializer !== undefined) {
+        if (containsBriefableExpression(cell.initializer)) {
+          context.issues.push({
+            code: "INVALID_ARTIFACT_CELL_SPEC",
+            message: `Artifact ${cell.name} path cannot contain judge() or host call expressions`,
+            loc: cell.loc,
+          });
+        }
         validateExpression(
           cell.initializer,
           cells,
@@ -5169,7 +4442,7 @@ function validateNode(
           nodeNames,
           context.issues,
           [],
-          baseOptions,
+          { ...baseOptions, expressionScope: "catchInterruption" },
         );
       }
     }
@@ -5388,6 +4661,12 @@ function validateStatement(
     return;
   }
 
+  if (statement.kind !== "instruction") {
+    const unreachable: never = statement;
+    throw new Error(
+      `Unexpected action statement: ${JSON.stringify(unreachable)}`,
+    );
+  }
   validateSemanticString(statement.template, cells, nodes, issues, options);
   for (const entry of statement.resolveWhen ?? []) {
     validateTriggerStatement(entry, cells, nodes, issues, [], options);
@@ -5823,6 +5102,11 @@ function validateTriggerStatement(
     return;
   }
 
+  if (statement.kind === "observeGroup") {
+    validateObserveGroupTarget(statement, cells, nodes, issues, options);
+    return;
+  }
+
   if (statement.kind === "set") {
     validateSetTarget(statement, cells, nodes, issues, options);
     validateExpression(statement.value, cells, nodes, issues, options);
@@ -5840,6 +5124,8 @@ function validateTriggerStatement(
     validateUnsetTarget(statement, cells, nodes, issues, options);
     return;
   }
+  const unreachable: never = statement;
+  throw new Error(`Unexpected hook statement: ${JSON.stringify(unreachable)}`);
 }
 
 function validateGuardStatement(
@@ -5928,6 +5214,11 @@ function validateGuardStatement(
     return;
   }
 
+  if (statement.kind === "observeGroup") {
+    validateObserveGroupTarget(statement, cells, nodes, issues, options);
+    return;
+  }
+
   if (statement.kind === "set") {
     validateSetTarget(statement, cells, nodes, issues, options);
     validateExpression(statement.value, cells, nodes, issues, options);
@@ -5945,6 +5236,8 @@ function validateGuardStatement(
     validateUnsetTarget(statement, cells, nodes, issues, options);
     return;
   }
+  const unreachable: never = statement;
+  throw new Error(`Unexpected hook statement: ${JSON.stringify(unreachable)}`);
 }
 
 function validateInterruptionCompletion(
@@ -6117,6 +5410,8 @@ function validateCatchDeflectionStatement(
     validateUnsetTarget(statement, cells, nodes, issues, options);
     return;
   }
+  const unreachable: never = statement;
+  throw new Error(`Unexpected hook statement: ${JSON.stringify(unreachable)}`);
 }
 
 function validateEffectStatement(
@@ -6225,6 +5520,12 @@ function validateEffectStatement(
     return;
   }
 
+  if (statement.kind !== "host-call") {
+    const unreachable: never = statement;
+    throw new Error(
+      `Unexpected effect statement: ${JSON.stringify(unreachable)}`,
+    );
+  }
   for (const arg of statement.arguments) {
     validateHostCallArgument(arg, cells, nodes, issues, options);
   }
@@ -6259,6 +5560,10 @@ function validateHostCallArgument(
       validateHostCallArgument(item, cells, nodes, issues, options),
     );
     return;
+  }
+  if (arg.kind !== "object") {
+    const unreachable: never = arg;
+    throw new Error(`Unexpected host argument: ${JSON.stringify(unreachable)}`);
   }
   for (const item of Object.values(arg.value)) {
     validateHostCallArgument(item, cells, nodes, issues, options);
@@ -6299,10 +5604,11 @@ function validateHostCall(
   }
 
   const operation = resolution.operation;
-  if (action.arguments.length !== operation.parameters.length) {
+  if (!acceptsHostArgumentCount(operation, action.arguments.length)) {
+    const { min, max } = hostOperationArity(operation);
     issues.push({
       code: "HOST_ARGUMENT_ARITY",
-      message: `Host action ${path} requires ${operation.parameters.length} arguments but received ${action.arguments.length}`,
+      message: `Host action ${path} requires ${min === max ? max : `${min} to ${max}`} arguments but received ${action.arguments.length}`,
       loc: action.loc,
     });
     return;
@@ -6314,7 +5620,7 @@ function validateHostCall(
     options,
   );
   action.arguments.forEach((argument, index) => {
-    const parameter = operation.parameters[index]!;
+    const parameter = hostParameterValueSpec(operation.parameters[index]!);
     if (
       judgeHostArgument(argument, parameter, context).kind === "incompatible"
     ) {
@@ -6348,6 +5654,7 @@ function validateSemanticString(
         });
         continue;
       }
+      validateExpression(part.expression, cells, nodes, issues, options);
       if (
         expressionIsArtifact(
           part.expression,
@@ -6365,7 +5672,6 @@ function validateSemanticString(
         }
         continue;
       }
-      validateExpression(part.expression, cells, nodes, issues, options);
       const judgment = interpolationRule.checkProducer(
         part.expression,
         producerContext(
@@ -6724,6 +6030,16 @@ function validateExpression(
       return;
     case "scope":
       return;
+    case "interruptionId":
+    case "interruptionReason":
+      if (options.expressionScope !== "catchInterruption") {
+        issues.push({
+          code: "INTERRUPTION_OUTSIDE_CATCH",
+          message:
+            "this.interruption is only available inside this.catchInterruption",
+        });
+      }
+      return;
     case "pendingState":
       if (options.expressionScope !== "effects") {
         issues.push({
@@ -6870,8 +6186,14 @@ function validateExpression(
         }
       }
       return;
-    default:
+    case "literal":
       return;
+    default: {
+      const unreachable: never = expression;
+      throw new Error(
+        `Unexpected value expression: ${JSON.stringify(unreachable)}`,
+      );
+    }
   }
 }
 

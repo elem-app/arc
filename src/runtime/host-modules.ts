@@ -1,9 +1,9 @@
+import { cloneParameterSpec } from "../spec/host-parameters.js";
 import { validateHostModuleSpec } from "../spec/validation.js";
 import type {
   ChannelSpec,
   HostModuleSpec,
   HostOperationSpec,
-  HostParameterSpec,
 } from "../types/spec.js";
 
 /** Validates and privately clones a runtime's complete injected registry. */
@@ -56,22 +56,6 @@ function cloneOperation(operation: HostOperationSpec): HostOperationSpec {
       ? { returns: cloneChannelSpec(operation.returns) }
       : {}),
   };
-}
-
-function cloneParameterSpec(spec: HostParameterSpec): HostParameterSpec {
-  switch (spec.type) {
-    case "enum":
-      return { type: "enum", values: [...spec.values] };
-    case "array":
-      return { type: "array", element: cloneParameterSpec(spec.element) };
-    case "tuple":
-      return {
-        type: "tuple",
-        elements: spec.elements.map(cloneParameterSpec),
-      };
-    default:
-      return { type: spec.type };
-  }
 }
 
 function cloneChannelSpec(spec: ChannelSpec): ChannelSpec {

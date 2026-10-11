@@ -298,8 +298,10 @@ describe("host module declarations", () => {
       "Index",
       "Artifact",
       "Dialog",
+      "Omittable",
       "Array",
       "Tuple",
+      "Struct",
       "SemanticText",
     ]);
   });

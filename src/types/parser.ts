@@ -196,6 +196,8 @@ export type LocalExpression =
     }
   | { kind: "scope"; name: "lastUserMessage" | "lastTurns"; count?: number }
   | { kind: "enterCount" }
+  | { kind: "interruptionId" }
+  | { kind: "interruptionReason" }
   | { kind: "pendingState" }
   | { kind: "nodeState"; identifier: string }
   | ArithmeticExpression<LocalExpression>
@@ -631,7 +633,9 @@ export type InstructionAction = {
   kind: "instruction";
   mode: "once" | "persistent";
   template: SemanticString;
-  hostParams: PayloadValue;
+  // Strictly speaking a hostParams defined in-arc cannot be `undefined` so
+  // although PayloadValue covers `undefined`, it is not really expressible
+  hostParams?: PayloadValue;
   resolveWhen?: ResolutionStatement[];
   deflectWhen?: ResolutionStatement[];
   /**
@@ -766,19 +770,15 @@ export type WriteDiffMode = "rewalk" | "advance";
  * function declaration name. It is used for references like `$enter(X)` and
  * `X.state`. `displayName` is optional human-facing metadata, used for display
  * only.
- *
- * Two conventions express absence, by kind:
- *
- * - Collection fields (`cells`, `statements`, `children`, `newcopyAliases`,
- *   `imports`) are always present and empty when the node declares none, so a
- *   walk can iterate them unguarded.
- * - Hook fields (`trigger`, `deflectWhen`, `catchDeflection`, `catchInterruption`, `guard`,
- *   `effects`) are absent when undeclared, because "no hook" and "an empty
- *   hook" differ — an empty hook body would consult and return nothing.
- *   `hostParams` is optional here for the same reason, and required on
- *   `InstructionAction`, where the merged node/instruction params always reach
- *   the brief.
  */
+// Absence conventions, by kind:
+// - Collection fields (`cells`, `statements`, `children`, `newcopyAliases`,
+//   `imports`) are always present and empty when the node declares none, so a
+//   walk can iterate them unguarded.
+// - Hook fields (`trigger`, `deflectWhen`, `catchDeflection`, `catchInterruption`,
+//   `guard`, `effects`) are absent when undeclared, because "no hook" and "an
+//   empty hook" differ — an empty hook body would consult and return nothing.
+// - `hostParams` is optional for the same reason.
 export type Node = {
   identifier: string;
   displayName?: string;

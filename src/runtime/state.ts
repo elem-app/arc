@@ -425,7 +425,12 @@ function cloneTraversalBase<T extends Traversal>(traversal: T) {
               ...traversal.control.deflection,
             },
           }
-        : { ...traversal.control }
+        : traversal.control.reason === "interrupted"
+          ? {
+              ...traversal.control,
+              interruption: { ...traversal.control.interruption },
+            }
+          : { ...traversal.control }
       : undefined,
     cells,
     frame: {
@@ -923,6 +928,9 @@ export function cloneValueExpression(
       };
     case "enterCount":
       return { kind: "enterCount" };
+    case "interruptionId":
+    case "interruptionReason":
+      return { kind: expression.kind };
     case "pendingState":
       return { kind: "pendingState" };
     case "nodeState":
@@ -1673,6 +1681,9 @@ export function normalizeValueExpression(expression: ValueExpression): unknown {
       };
     case "enterCount":
       return { kind: "enterCount" };
+    case "interruptionId":
+    case "interruptionReason":
+      return { kind: expression.kind };
     case "pendingState":
       return { kind: "pendingState" };
     case "nodeState":

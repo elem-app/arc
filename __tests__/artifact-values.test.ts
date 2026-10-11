@@ -200,7 +200,7 @@ function Main() {
       document.roots[0]!.hostParams = value as unknown as PayloadValue;
       expect(() =>
         new Runtime().add(`malformed-${index}`, document).init(),
-      ).toThrow(/INVALID_PAYLOAD_VALUE/);
+      ).toThrow(/INVALID_PUBLIC_IR/);
     }
   });
 

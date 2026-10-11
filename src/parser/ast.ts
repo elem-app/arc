@@ -1,5 +1,6 @@
 import type * as acorn from "acorn";
 
+import { isHostStructFieldName } from "../spec/host-parameters.js";
 import {
   UNSTAMPED_ID,
   type ArithmeticOperator,
@@ -23,6 +24,7 @@ import { parseTarget, type TargetParseContext } from "./targets.js";
 export type ExpressionParseContext = {
   deflectionTargets?: TargetParseContext;
   allowPendingState?: boolean;
+  allowInterruption?: boolean;
 };
 
 export function getName(
@@ -296,6 +298,24 @@ export function expressionToLocalExpression(
   }
 
   if (node.type === "MemberExpression") {
+    if (
+      !node.computed &&
+      node.object.type === "MemberExpression" &&
+      !node.object.computed &&
+      getThisProperty(node.object) === "interruption" &&
+      node.property.type === "Identifier" &&
+      (node.property.name === "id" || node.property.name === "reason")
+    ) {
+      if (!context?.allowInterruption) {
+        throw new Error(
+          "this.interruption is only available inside this.catchInterruption",
+        );
+      }
+      return {
+        kind:
+          node.property.name === "id" ? "interruptionId" : "interruptionReason",
+      };
+    }
     const prop = getThisProperty(node);
     if (prop === "enterCount") {
       return { kind: "enterCount" };
@@ -1002,6 +1022,9 @@ export function parseHostCallArgument(
       if (property.computed) {
         throw new Error("Host call objects do not support computed keys");
       }
+      if (property.kind !== "init" || property.method) {
+        throw new Error("Host call objects require data properties");
+      }
       const key =
         property.key.type === "Identifier"
           ? property.key.name
@@ -1011,6 +1034,16 @@ export function parseHostCallArgument(
             : undefined;
       if (!key) {
         throw new Error("Host call objects require identifier or string keys");
+      }
+      if (!isHostStructFieldName(key)) {
+        throw new Error(
+          "Host call object keys cannot be __proto__, prototype, or constructor",
+        );
+      }
+      if (Object.hasOwn(value, key)) {
+        throw new Error(
+          `Duplicate host call object key ${JSON.stringify(key)}`,
+        );
       }
       value[key] = parseHostCallArgument(
         property.value,

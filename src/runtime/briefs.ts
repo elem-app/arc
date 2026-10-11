@@ -794,15 +794,63 @@ export function validateActionReport(
   const accepted = buildAcceptedActionReport(report);
   const issues: RuntimeIssue[] = [];
   if (report.move === "interrupt") {
-    const bundled = Object.keys(report).some((key) => key !== "move");
+    const bundled = Reflect.ownKeys(report).some(
+      (key) => key !== "move" && key !== "interruption",
+    );
     if (bundled)
       issues.push(
         buildInvalidReportIssue(
           "interrupt-results",
-          "An interruption report must contain only the interruption move, without work results",
+          "An interrupt report may contain only move and interruption, without work results",
         ),
       );
-    return { accepted, issues, rejected: bundled };
+    const field = Object.getOwnPropertyDescriptor(report, "interruption");
+    const interruption: unknown =
+      field && "value" in field ? field.value : undefined;
+    const id =
+      interruption && typeof interruption === "object"
+        ? Object.getOwnPropertyDescriptor(interruption, "id")
+        : undefined;
+    const reason =
+      interruption && typeof interruption === "object"
+        ? Object.getOwnPropertyDescriptor(interruption, "reason")
+        : undefined;
+    if (
+      !interruption ||
+      typeof interruption !== "object" ||
+      Array.isArray(interruption) ||
+      Reflect.ownKeys(interruption).some(
+        (key) => key !== "id" && key !== "reason",
+      ) ||
+      !id ||
+      !("value" in id) ||
+      typeof id.value !== "string" ||
+      (reason &&
+        (!("value" in reason) ||
+          (reason.value !== undefined && typeof reason.value !== "string")))
+    ) {
+      issues.push(
+        buildInvalidReportIssue(
+          "invalid-interruption",
+          "Interruption requires a string id and an optional string reason",
+        ),
+      );
+    } else {
+      accepted.interruption = { id: id.value, reason: reason?.value ?? "" };
+    }
+    return { accepted, issues, rejected: issues.length > 0 };
+  }
+  if (Object.hasOwn(report, "interruption")) {
+    return {
+      accepted,
+      issues: [
+        buildInvalidReportIssue(
+          "unexpected-interruption",
+          "Interruption data is only allowed with the interrupt move",
+        ),
+      ],
+      rejected: true,
+    };
   }
   if (report.move === "poison") {
     return { accepted, issues, rejected: false };
@@ -988,7 +1036,16 @@ export function acceptActionReport(
       activeTraversal.control = undefined;
     }
     if (report.move === "interrupt") {
-      activeTraversal.control = { reason: "interrupted", phase: "catch" };
+      if (!report.interruption)
+        throw new Error("Accepted interrupt has no interruption data");
+      activeTraversal.control = {
+        reason: "interrupted",
+        phase: "catch",
+        interruption: {
+          id: report.interruption.id,
+          reason: report.interruption.reason ?? "",
+        },
+      };
       rootTraversal.activeFrame = {
         activeRef,
         activeSeg: { kind: "catchInterruption" },

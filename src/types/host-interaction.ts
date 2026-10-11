@@ -345,6 +345,12 @@ export type TriggerReport = {
   hostCalls?: Record<BriefId, HostCallReport>;
 };
 
+/** Host-defined interruption identity and optional explanation. */
+export type ActionInterruption = {
+  id: string;
+  reason?: string;
+};
+
 /**
  * Structured report returned by the host or presenter.
  *
@@ -354,6 +360,8 @@ export type TriggerReport = {
  */
 export type ActionReport = {
   move: ActionMove;
+  /** Required for interrupt; unavailable on other moves. */
+  interruption?: ActionInterruption;
   poisonReason?: ActionPoisonReason;
   instructions?: Record<BriefId, InstructionReport>;
   judgments?: Record<BriefId, boolean>;

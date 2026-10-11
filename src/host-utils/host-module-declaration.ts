@@ -1,3 +1,7 @@
+import {
+  cloneParameterSpec,
+  isHostStructFieldName,
+} from "../spec/host-parameters.js";
 import { validateHostModuleSpec, validateSpec } from "../spec/validation.js";
 import type {
   ChannelSpec,
@@ -5,6 +9,7 @@ import type {
   HostNamespaceSpec,
   HostOperationSpec,
   HostParameterSpec,
+  HostParameterValueSpec,
 } from "../types/spec.js";
 
 declare const tokenType: unique symbol;
@@ -250,24 +255,24 @@ function enumToken(values: readonly string[]): DeclarationToken<{
   return createToken(spec);
 }
 
-function arrayToken<Spec extends HostParameterSpec>(
+function arrayToken<Spec extends HostParameterValueSpec>(
   element: DeclarationToken<Spec>,
 ): DeclarationToken<{ type: "array"; element: Spec }> {
-  const record = tokenRecord(element, activeCapture?.path ?? "$", "Array");
+  const spec = valueTokenSpec(element, activeCapture?.path ?? "$", "Array");
   return createToken(
     {
       type: "array",
-      element: cloneParameterSpec(record.spec) as Spec,
+      element: spec as Spec,
     },
     [element],
   );
 }
 
-function tupleToken<const Tokens extends readonly DeclarationToken[]>(
-  elements: Tokens,
+function tupleToken(
+  elements: readonly DeclarationToken<HostParameterValueSpec>[],
 ): DeclarationToken<{
   type: "tuple";
-  elements: HostParameterSpec[];
+  elements: HostParameterValueSpec[];
 }> {
   const copied = inspectTokenArray(
     elements,
@@ -278,22 +283,74 @@ function tupleToken<const Tokens extends readonly DeclarationToken[]>(
     {
       type: "tuple",
       elements: copied.map((element) =>
-        cloneParameterSpec(
-          tokenRecord(element, activeCapture?.path ?? "$", "Tuple").spec,
-        ),
+        valueTokenSpec(element, activeCapture?.path ?? "$", "Tuple"),
       ),
     },
     copied,
   );
 }
 
-function tokenRecord(value: unknown, path: string, owner: string): TokenRecord {
-  const token = asToken(value, path, `${owner} child`);
-  const record = tokenRecords.get(token as object);
-  if (!record) {
-    declarationError(path, `${owner} requires declaration marker children`);
+function omittableToken(
+  value: DeclarationToken<HostParameterValueSpec>,
+): DeclarationToken<{ type: "omittable"; spec: HostParameterValueSpec }> {
+  const spec = valueTokenSpec(value, activeCapture?.path ?? "$", "Omittable");
+  return createToken({ type: "omittable", spec }, [value]);
+}
+
+function structToken(
+  fields: Readonly<Record<string, DeclarationToken>>,
+): DeclarationToken<{
+  type: "struct";
+  fields: Record<string, HostParameterSpec>;
+}> {
+  const path = activeCapture?.path ?? "$";
+  const object = inspectNamespace(fields, path);
+  const children: DeclarationToken[] = [];
+  const entries: [string, HostParameterSpec][] = [];
+  for (const name of Reflect.ownKeys(object)) {
+    if (typeof name !== "string" || !isHostStructFieldName(name)) {
+      declarationError(
+        path,
+        "Struct field names must be nonempty strings and cannot be __proto__, prototype, or constructor",
+      );
+    }
+    const fieldPath = propertyPath(path, name);
+    const descriptor = Object.getOwnPropertyDescriptor(object, name);
+    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
+      declarationError(
+        fieldPath,
+        "Struct fields must be enumerable data properties",
+      );
+    }
+    const token = asToken(descriptor.value, fieldPath, "Struct field");
+    children.push(token);
+    entries.push([name, tokenRecords.get(token as object)!.spec]);
   }
-  return record;
+  // Integer-like object keys enumerate in numeric order, independent of capture order.
+  const captured = activeCapture?.tokens ?? [];
+  children.sort(
+    (left, right) => captured.indexOf(left) - captured.indexOf(right),
+  );
+  return createToken(
+    { type: "struct", fields: Object.fromEntries(entries) },
+    children,
+  );
+}
+
+function valueTokenSpec(
+  value: unknown,
+  path: string,
+  owner: string,
+): HostParameterValueSpec {
+  const token = asToken(value, path, `${owner} child`);
+  const { spec } = tokenRecords.get(token as object)!;
+  if (spec.type === "omittable") {
+    declarationError(
+      path,
+      `${owner} requires a value marker; Omittable is only valid around a whole parameter or Struct field`,
+    );
+  }
+  return spec;
 }
 
 function asToken(
@@ -400,25 +457,11 @@ function isChannelSpec(spec: HostParameterSpec): spec is ChannelSpec {
         spec.element.type === "number" ||
         spec.element.type === "artifact"
       );
+    case "omittable":
     case "tuple":
+    case "struct":
     case "semanticText":
       return false;
-  }
-}
-
-function cloneParameterSpec(spec: HostParameterSpec): HostParameterSpec {
-  switch (spec.type) {
-    case "enum":
-      return { type: "enum", values: [...spec.values] };
-    case "array":
-      return { type: "array", element: cloneParameterSpec(spec.element) };
-    case "tuple":
-      return {
-        type: "tuple",
-        elements: spec.elements.map(cloneParameterSpec),
-      };
-    default:
-      return { type: spec.type };
   }
 }
 
@@ -458,7 +501,9 @@ export const hmd = Object.freeze({
   Dialog: Object.freeze({
     Cursor: () => scalarToken({ type: "dialogCursor" }),
   }),
+  Omittable: omittableToken,
   Array: arrayToken,
   Tuple: tupleToken,
+  Struct: structToken,
   SemanticText: () => scalarToken({ type: "semanticText" }),
 });

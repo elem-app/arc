@@ -1,5 +1,9 @@
 import { analyzeDocument, stampElementIds } from "../parser/index.js";
 import {
+  acceptsHostArgumentCount,
+  hostParameterValueSpec,
+} from "../spec/host-parameters.js";
+import {
   admitHostArgument,
   admitValue,
   resolveHostOperation,
@@ -857,7 +861,7 @@ function assertPersistedHostCallState(
   }
   if (
     state.call.arguments.length !== action.arguments.length ||
-    state.call.arguments.length !== resolution.operation.parameters.length
+    !acceptsHostArgumentCount(resolution.operation, state.call.arguments.length)
   ) {
     throw invalidPersistedState(
       "pending host-call arguments do not match the operation arity",
@@ -871,7 +875,7 @@ function assertPersistedHostCallState(
     const admission = admitHostArgument(
       action.arguments[index]!,
       argument,
-      resolution.operation.parameters[index]!,
+      hostParameterValueSpec(resolution.operation.parameters[index]!),
       `$[${index}]`,
     );
     if (!admission.admitted) {

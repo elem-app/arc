@@ -16,7 +16,7 @@ import {
   type HostModuleSpec,
   type HostNamespaceSpec,
   type HostOperationSpec,
-  type HostParameterSpec,
+  type HostParameterValueSpec,
 } from "../types/spec.js";
 import {
   classifyArtifactPath,
@@ -33,8 +33,10 @@ import {
 import {
   describeArtifactPathIssue,
   describeArtifactValueIssue,
+  firstInvalidPayloadValue,
   firstNonFiniteNumberPath,
 } from "../value-utils.js";
+import { hostParameterValueSpec } from "./host-parameters.js";
 
 type HostActionPath = {
   module: string;
@@ -375,6 +377,8 @@ export function resolveProducer(
     case "template-string":
       return resolvedFact(interpolationRule.result);
     case "scope":
+    case "interruptionId":
+    case "interruptionReason":
     case "pendingState":
     case "nodeState":
       return resolvedFact(stringOperandRule.result);
@@ -447,10 +451,31 @@ export function resolveHostCallArgument(
 /** Applies one-time coherence to one authored host argument. */
 export function judgeHostArgument(
   argument: HostCallArgument,
-  destination: HostParameterSpec,
+  destination: HostParameterValueSpec,
   context: ProducerContext,
 ): CoherenceJudgment {
-  if (argument.kind === "object") return { kind: "incompatible" };
+  if (argument.kind === "object") {
+    if (destination.type !== "struct") return INCOMPATIBLE;
+    if (
+      Object.keys(argument.value).some(
+        (name) => !Object.hasOwn(destination.fields, name),
+      ) ||
+      Object.entries(destination.fields).some(
+        ([name, field]) =>
+          field.type !== "omittable" && !Object.hasOwn(argument.value, name),
+      )
+    )
+      return INCOMPATIBLE;
+    return reduceAlternativeJudgments(
+      Object.entries(argument.value).map(([name, value]) =>
+        judgeHostArgument(
+          value,
+          hostParameterValueSpec(destination.fields[name]!),
+          context,
+        ),
+      ),
+    );
+  }
   if (argument.kind === "array") {
     if (destination.type === "tuple") {
       if (argument.elements.length !== destination.elements.length) {
@@ -503,17 +528,67 @@ export type HostArgumentAdmission =
 export function admitHostArgument(
   argument: HostCallArgument,
   rendered: PayloadValue,
-  destination: HostParameterSpec,
+  destination: HostParameterValueSpec,
   path = "$",
 ): HostArgumentAdmission {
   if (rendered === undefined) {
     return hostArgumentViolation("An unset host argument is not allowed", path);
   }
   if (argument.kind === "object") {
-    return hostArgumentViolation(
-      "Object host arguments have no supported parameter spec",
-      path,
-    );
+    if (destination.type !== "struct") {
+      return hostArgumentViolation(
+        "An authored object requires a Struct parameter",
+        path,
+      );
+    }
+    const shapeIssue = firstInvalidPayloadValue(rendered, path);
+    if (shapeIssue)
+      return hostArgumentViolation(shapeIssue.detail, shapeIssue.path);
+    if (!rendered || typeof rendered !== "object" || Array.isArray(rendered)) {
+      return hostArgumentViolation(
+        "A Struct host argument must be a plain object",
+        path,
+      );
+    }
+    for (const [name, field] of Object.entries(destination.fields)) {
+      if (field.type !== "omittable" && !Object.hasOwn(argument.value, name)) {
+        return hostArgumentViolation(
+          "Required Struct field is missing",
+          `${path}[${JSON.stringify(name)}]`,
+        );
+      }
+    }
+    for (const name of Object.keys(rendered)) {
+      if (
+        !Object.hasOwn(argument.value, name) ||
+        !Object.hasOwn(destination.fields, name)
+      ) {
+        return hostArgumentViolation(
+          "Unexpected Struct field",
+          `${path}[${JSON.stringify(name)}]`,
+        );
+      }
+    }
+    for (const [name, child] of Object.entries(argument.value)) {
+      const fieldPath = `${path}[${JSON.stringify(name)}]`;
+      if (!Object.hasOwn(destination.fields, name)) {
+        return hostArgumentViolation("Undeclared Struct field", fieldPath);
+      }
+      if (!Object.hasOwn(rendered, name)) {
+        return hostArgumentViolation(
+          "Supplied Struct field is missing",
+          fieldPath,
+        );
+      }
+      const admission = admitHostArgument(
+        child,
+        rendered[name],
+        hostParameterValueSpec(destination.fields[name]!),
+        fieldPath,
+      );
+      if (!admission.admitted) return admission;
+    }
+    return { admitted: true };
   }
   if (argument.kind === "array") {
     if (!Array.isArray(rendered)) {
@@ -540,7 +615,10 @@ export function admitHostArgument(
       }
       return { admitted: true };
     }
-    if (destination.type !== "array") {
+    if (
+      destination.type !== "array" ||
+      rendered.length !== argument.elements.length
+    ) {
       return hostArgumentViolation("Host argument type is incompatible", path);
     }
     for (let index = 0; index < argument.elements.length; index += 1) {
@@ -1565,7 +1643,7 @@ function resolvedFact(fact: SourceFact): ProducerEvidence {
 }
 
 function hostParameterChannelSpec(
-  spec: HostParameterSpec,
+  spec: HostParameterValueSpec,
 ): ChannelSpec | undefined {
   switch (spec.type) {
     case "boolean":
@@ -1597,6 +1675,7 @@ function hostParameterChannelSpec(
       };
     }
     case "tuple":
+    case "struct":
     case "semanticText":
       return undefined;
   }

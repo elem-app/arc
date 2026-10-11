@@ -221,9 +221,6 @@ function Main() {
   path.$set(Files.path());
 }
 `);
-      const set = publicDocument.roots[0]!.statements[0]!;
-      if (set.kind !== "set") throw new Error("expected set statement");
-      set.value = { kind: "template-string", parts: {} } as never;
       for (const alias of reservedImportAliases) {
         publicDocument.hostModules[0]!.localName = alias;
         expect(validate(publicDocument)).toEqual([

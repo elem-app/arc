@@ -1,6 +1,11 @@
-import type { HostModuleSpecIssue, SpecViolation } from "../types/spec.js";
+import type {
+  HostModuleSpecIssue,
+  HostParameterSpec,
+  SpecViolation,
+} from "../types/spec.js";
+import { isHostStructFieldName } from "./host-parameters.js";
 
-type HostSpecValidationContext = "argument" | "result";
+type HostSpecValidationContext = "parameter" | "field" | "argument" | "result";
 
 type HostSpecValidationState = {
   visiting: WeakSet<object>;
@@ -93,16 +98,31 @@ function validateHostOperation(
       issues,
     );
     if (!parameters) return;
+    const parameterIssueCount = issues.length;
     parameters.forEach((parameter, index) => {
       const parameterPath = `${path}.parameters[${index}]`;
       validateHostParameterSpec(
         parameter,
         parameterPath,
-        "argument",
+        "parameter",
         issues,
         state,
       );
     });
+    if (issues.length === parameterIssueCount) {
+      let omittable = false;
+      (parameters as HostParameterSpec[]).forEach((parameter, index) => {
+        if (parameter.type === "omittable") {
+          omittable = true;
+        } else if (omittable) {
+          hostSpecIssue(
+            issues,
+            `${path}.parameters[${index}]`,
+            "required parameters cannot follow omittable parameters",
+          );
+        }
+      });
+    }
     if (Object.hasOwn(object, "returns")) {
       validateHostParameterSpec(
         object.returns,
@@ -131,6 +151,25 @@ function validateHostParameterSpec(
     const type = object.type;
     if (typeof type !== "string") {
       hostSpecIssue(issues, `${path}.type`, "spec type must be a string");
+      return;
+    }
+    if (type === "omittable") {
+      if (context !== "parameter" && context !== "field") {
+        hostSpecIssue(
+          issues,
+          path,
+          "omittable specs are only valid around a whole parameter or Struct field",
+        );
+        return;
+      }
+      if (!exactHostSpecKeys(object, ["type", "spec"], path, issues)) return;
+      validateHostParameterSpec(
+        object.spec,
+        `${path}.spec`,
+        "argument",
+        issues,
+        state,
+      );
       return;
     }
     if (type === "array") {
@@ -170,7 +209,7 @@ function validateHostParameterSpec(
       validateHostParameterSpec(
         object.element,
         `${path}.element`,
-        context,
+        "argument",
         issues,
         state,
       );
@@ -193,11 +232,37 @@ function validateHostParameterSpec(
         validateHostParameterSpec(
           element,
           `${path}.elements[${index}]`,
-          context,
+          "argument",
           issues,
           state,
         ),
       );
+      return;
+    }
+    if (type === "struct") {
+      if (context === "result") {
+        hostSpecIssue(issues, path, "struct specs are parameter-only");
+        return;
+      }
+      if (!exactHostSpecKeys(object, ["type", "fields"], path, issues)) return;
+      const fields = inspectHostSpecObject(
+        object.fields,
+        `${path}.fields`,
+        issues,
+      );
+      if (!fields) return;
+      for (const [name, field] of Object.entries(fields)) {
+        const fieldPath = `${path}.fields[${JSON.stringify(name)}]`;
+        if (!isHostStructFieldName(name)) {
+          hostSpecIssue(
+            issues,
+            fieldPath,
+            "Struct field names must be nonempty and cannot be __proto__, prototype, or constructor",
+          );
+          continue;
+        }
+        validateHostParameterSpec(field, fieldPath, "field", issues, state);
+      }
       return;
     }
     if (type === "semanticText") {
@@ -354,7 +419,7 @@ function exactHostSpecKeys(
 ): boolean {
   const keys = Object.keys(object);
   const unknown = keys.find((key) => !allowed.includes(key));
-  if (unknown) {
+  if (unknown !== undefined) {
     hostSpecIssue(
       issues,
       `${path}[${JSON.stringify(unknown)}]`,

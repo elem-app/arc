@@ -20,6 +20,7 @@ export type {
   HostNamespaceSpec,
   HostOperationSpec,
   HostParameterSpec,
+  HostParameterValueSpec,
   LocalCellSpec,
   ObservableArraySpec,
   ObservableCellSpec,

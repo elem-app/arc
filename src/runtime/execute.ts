@@ -28,6 +28,7 @@ import type {
   BriefId,
   DeflectionContext,
   EnterChannelLink,
+  InterruptionContext,
   MapActionState,
   NodeRef,
   NodeState,
@@ -166,7 +167,7 @@ type TerminalTraversalState = Extract<NodeState, "covered" | "skipped">;
 type TraversalOutcome =
   | { status: "done"; finalState: TerminalTraversalState }
   | { status: "blocked" }
-  | { status: "interrupted" }
+  | { status: "interrupted"; interruption: InterruptionContext }
   | { status: "deflected"; deflection: DeflectionContext };
 
 type HookOutcome<TResult> = SegOutcome<TResult>;
@@ -178,7 +179,11 @@ type EnterActionOutcome =
       finalState: TerminalTraversalState;
     }
   | { status: "blocked"; traversal: Traversal }
-  | { status: "interrupted"; traversal: Traversal }
+  | {
+      status: "interrupted";
+      traversal: Traversal;
+      interruption: InterruptionContext;
+    }
   | {
       status: "deflected";
       traversal: Traversal;
@@ -650,7 +655,11 @@ export function resumeActiveFrame(accum: Accumulator): void {
 
     if (outcome.status === "interrupted") {
       clearEvaluatorActionStates(caller, nodeSegKey("catchInterruption"));
-      caller.control = { reason: "interrupted", phase: "catch" };
+      caller.control = {
+        reason: "interrupted",
+        phase: "catch",
+        interruption: outcome.interruption,
+      };
       outcome = resumeTraversal(caller, accum, { kind: "catchInterruption" });
     } else if (outcome.status === "deflected") {
       // The active SEG deflected: its owning enter deflects too, and the
@@ -843,7 +852,11 @@ function runTraversal(
     }
     if (outcome.status === "interrupted") {
       clearEvaluatorActionStates(traversal, nodeSegKey("catchInterruption"));
-      traversal.control = { reason: "interrupted", phase: "catch" };
+      traversal.control = {
+        reason: "interrupted",
+        phase: "catch",
+        interruption: outcome.interruption,
+      };
       continue;
     }
     if (outcome.status === "deflected") {
@@ -986,6 +999,10 @@ function continueInterruption(
   node: Node,
   accum: Accumulator,
 ): TraversalOutcome | { status: "caught" } {
+  const control = traversal.control;
+  if (control?.reason !== "interrupted")
+    throw new Error("Traversal has no interruption context");
+  const interruption = control.interruption;
   accum.activeSeg = { kind: "catchInterruption" };
   const scope = nodeSegKey("catchInterruption");
   if (node.catchInterruption !== undefined) {
@@ -1001,18 +1018,27 @@ function continueInterruption(
     );
     if (caught.status === "blocked") return { status: "blocked" };
     // Completion is recorded before propagation; a retained entry cannot replay it.
-    traversal.control = { reason: "interrupted", phase: "complete" };
+    traversal.control = {
+      reason: "interrupted",
+      phase: "complete",
+      interruption,
+    };
     if (caught.value) {
       clearEvaluatorActionStates(traversal, scope);
       traversal.control = undefined;
       dropPinTape(traversal, nodeSegKey("body"));
       return { status: "caught" };
     }
-  } else traversal.control = { reason: "interrupted", phase: "complete" };
+  } else
+    traversal.control = {
+      reason: "interrupted",
+      phase: "complete",
+      interruption,
+    };
   traversal.state = "interrupted";
   latchExitedTransition(accum, traversalToNodeRef(traversal));
   recordActiveFrame(accum);
-  return { status: "interrupted" };
+  return { status: "interrupted", interruption };
 }
 
 function continueTraversalControl(
@@ -1379,7 +1405,7 @@ function runEnterAction(
         stagedReturns,
         preSnapshot,
       );
-      return { status: "interrupted" };
+      return { status: "interrupted", interruption: result.interruption };
     }
     if (result.status === "deflected") {
       clearActionState(traversal, statement.id);
@@ -3038,7 +3064,7 @@ function toEnterActionOutcome(
     };
   }
   if (outcome.status === "blocked" || outcome.status === "interrupted") {
-    return { status: outcome.status, traversal };
+    return { ...outcome, traversal };
   }
   if (outcome.status === "deflected") {
     return {

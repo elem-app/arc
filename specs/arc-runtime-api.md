@@ -288,12 +288,14 @@ type ActionReport = {
    *   available when `allowedMoves` includes it: a brief carrying no
    *   instruction, unresolved host-call action, or transition.
    * "interrupt" — requests interruption without acknowledging pending work.
-   *   Submitted as the bare report { move: "interrupt" }.
+   *   Requires interruption: { id: string; reason?: string }, without work results.
    * "poison" — host cannot execute the current frontier contract. The active
    *   arc becomes terminally poisoned. Available while the action traversal can
    *   progress, including frontiers blocked on an unresolved host call.
    */
   move: ActionMove;
+  /** Required for interrupt; unavailable on other moves. Omitted reason reads as "". */
+  interruption?: { id: string; reason?: string };
   /** Optional diagnostic used when `move` is "poison". */
   poisonReason?: {
     reasonCode?: string;
@@ -507,14 +509,16 @@ type HostCallBrief = {
   target: string[];
   /** Final called member name, e.g. `"roll"` or `"apply"`. */
   operation: string;
-  /** Rendered call arguments. Semantic arguments may preserve semantic text parts. */
+  /** Supplied arguments. Semantic arguments may preserve semantic text parts. */
   arguments: PayloadValue[];
   /** Semantic metadata for this work item. */
   hostParams: PayloadValue;
 };
 ```
 
-The runtime resolves the call's `module + target + operation` path through its injected host-module registry and admits every rendered argument against the declared parameter specs before emitting the brief. Static document analysis rejects provably incompatible operands; concrete admission checks every emitted value, including Enum membership, finite numbers, Artifact paths, recursive arrays, tuples, and `SemanticText`. If argument admission fails, the traversal poisons with `invalid-host-argument` and emits no invalid call. Nested host calls remain unavailable as arguments because arguments must be renderable without additional host work.
+The runtime resolves the call's `module + target + operation` path through its injected host-module registry and checks every argument, including nested fields and elements, against the operation's declaration before emitting the brief. If argument admission fails, the traversal poisons with `invalid-host-argument` and emits no invalid call. Nested host calls remain unavailable as arguments because arguments must be renderable without additional host work.
+
+`HostCallBrief.arguments` contains exactly the arguments supplied by the authored call, preserving their positions and count, including the supplied fields of nested Structs. Omittable arguments and fields left out of the call remain absent; the runtime inserts no values or defaults. Every supplied value must be set and satisfy the payload rules.
 
 The consumer decides whether a result is required. An expression consumer requires the operation to declare a result compatible with the demanded spec. An action consumer imposes no result requirement; it accepts an operation with or without a declared result and discards any value the host reports. There is no consumer marker in the brief. The `$` sigil is consumed by parsing, and `operation` is always unsigiled.
 
@@ -536,7 +540,7 @@ Report values first pass transport sanitation. Every nested value must satisfy t
 
 A host call used as an action follows resolved-once action-state lifetime. On first reach, the runtime captures its admitted arguments and `hostParams` and suspends at that action. It re-emits the captured invocation under the same brief id without reevaluating its inputs until it receives `{ status: "resolved" }` or the host poisons the frontier. Once resolved, the action slot stays resolved through ordinary retries and re-entry. A new `invoke(...)` run, a different `$map(...)` member, or a forgetful entry clears the applicable action state, so the call executes again when reached.
 
-Persisted action state includes pending captured invocations. Restoration validates pending and resolved state shapes, call identity, captured argument admission, and captured `hostParams` before traversal resumes.
+Persisted action state includes pending captured invocations. Restoration validates pending and resolved state shapes, call identity, captured argument admission, and captured `hostParams` before traversal resumes. Captured arguments must preserve the authored argument count, supplied Struct fields, and authored array lengths at every nesting depth.
 
 #### Instructions
 
@@ -694,13 +698,13 @@ Expected document and registry incoherence is reported through `RuntimeRegistrat
 
 Document intake uses this exact order:
 
-1. Analyze the raw caller graph before cloning. Only `ELEMENT_ID` issues are provisionally ignored; every other issue rejects the add. Raw graph validation rejects accessors, symbol or non-enumerable fields, sparse or decorated arrays, custom prototypes, cycles, and unsupported values before cloning could erase them.
+1. Analyze the raw caller graph before cloning: establish graph safety, then the complete Document grammar, then semantic validity. Malformed records and misplaced variants produce structured issues before typed traversal. Graph-safety failures uniformly use `INVALID_PUBLIC_IR`; payload diagnostics apply to safe carriers at actual payload positions. Only `ELEMENT_ID` issues are provisionally ignored; every other issue rejects the add.
 2. Clone the accepted graph while preserving numeric values exactly, including the sign of zero.
 3. Stamp canonical element IDs on the private clone, so valid hand-built IR may omit them without mutating the caller's graph.
 4. Analyze the stamped private clone again under the runtime's definitive host-module registry and reject every issue. The runtime retains this analysis's rewalk plan.
 5. Canonicalize negative zero in the private clone only after the second analysis succeeds, then collect every root atomically.
 
-If raw analysis finds issues, `add()` reports all non-`ELEMENT_ID` issues together and does not clone. Environment-free analysis treats a host call without declaration evidence as dynamic; this preserves raw public-IR validation without guessing a host environment. If the stamped private analysis finds issues, it reports all of them together and does not collect. The definitive pass requires every imported host module and action path, exact operation arity, compatible parameter operands, and satisfaction of each consumer's result demand. An action consumer creates no result demand. The second pass runs only after raw validation succeeds because malformed descriptors, cycles, and other invalid graph shapes cannot safely cross the clone boundary. Duplicate sources, duplicate Arc refs, and validation failures collect nothing from that call. `add()` performs every document-local and host-environment check, but it does not require imported Arc documents to have been added yet.
+If raw analysis finds issues, `add()` reports all non-`ELEMENT_ID` issues discovered by that stage together and does not clone. Environment-free analysis treats a host call without declaration evidence as dynamic; this preserves raw public-IR validation without guessing a host environment. If the stamped private analysis finds issues, it reports all of them together and does not collect. The definitive pass requires every imported host module and action path, exact operation arity, compatible parameter operands, and satisfaction of each consumer's result demand. An action consumer creates no result demand. The second pass runs only after raw validation succeeds because malformed descriptors, cycles, and other invalid graph shapes cannot safely cross the clone boundary. Duplicate sources, duplicate Arc refs, and validation failures collect nothing from that call. `add()` performs every document-local and host-environment check, but it does not require imported Arc documents to have been added yet.
 
 **`init()`** — resolve and validate the complete prospective registry. Initialization resolves every import and imported node-entry endpoint, then walks imported bindings with the caller's lexical cells, current node signature, and enclosing `$map` receiver/result element specs. Args bindings are checked provider-to-receiver; returns bindings are checked declared-return-to-local-receiver. It collects unresolved imports and every independently checkable undeclared, unresolved, or incompatible binding. A binding dependent on an unresolved import is skipped rather than reported as a cascade. Issues are returned in canonical source/position/binding order, independent of document-add order, and one `RuntimeRegistrationError` reports the complete result.
 

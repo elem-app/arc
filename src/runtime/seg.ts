@@ -1,5 +1,9 @@
 import type { ElementId, Node, ValueExpression } from "../types/parser.js";
-import type { DeflectionContext, Traversal } from "../types/runtime.js";
+import type {
+  DeflectionContext,
+  InterruptionContext,
+  Traversal,
+} from "../types/runtime.js";
 import { traversalToNodeRef } from "./refs.js";
 import { runtimeError } from "./report-validation.js";
 import {
@@ -16,7 +20,7 @@ import {
 export type SegOutcome<TResult> =
   | { status: "done"; value: TResult }
   | { status: "blocked" }
-  | { status: "interrupted" }
+  | { status: "interrupted"; interruption: InterruptionContext }
   | { status: "deflected"; deflection: DeflectionContext };
 
 /** A SEG walk result before the re-walk loop folds `rewalk` away. */

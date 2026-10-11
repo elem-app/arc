@@ -57,7 +57,10 @@ function restore(document: Document, traversals: ArcTraversalSet) {
   };
 }
 function interrupt(runtime: Runtime, brief: ActionBrief): Output {
-  return next(runtime, brief, { move: "interrupt" });
+  return next(runtime, brief, {
+    move: "interrupt",
+    interruption: { id: "test" },
+  });
 }
 
 it.each([
@@ -260,7 +263,7 @@ describe("interruption", () => {
         {
           id: "catchInterruption/0",
           kind: "return",
-          value: { kind: "literal", value: undefined },
+          value: { kind: "literal", value: null },
         },
       ],
     ]) {
@@ -393,7 +396,7 @@ describe("interruption", () => {
     const transition = actionProgress(
       runtime.progress(
         brief,
-        { move: "interrupt" },
+        { move: "interrupt", interruption: { id: "test" } },
         {
           cursor: { user: 1, self: 0 },
           lastTurns: [{ role: "user", message: "child" }],
@@ -555,7 +558,11 @@ describe("interruption", () => {
       "hostCalls",
     ]) {
       const rejected = actionProgress(
-        next(runtime, brief, { move: "interrupt", [field]: {} }),
+        next(runtime, brief, {
+          move: "interrupt",
+          interruption: { id: "test" },
+          [field]: {},
+        }),
       );
       expect(rejected.issues[0]?.kind).toBe("invalid-report");
       expect(rootTraversal(rejected)).toEqual(rootTraversal(brief));
@@ -568,7 +575,11 @@ describe("interruption", () => {
     expect(gate.transition).toBeDefined();
     expect(gate.allowedMoves).not.toContain("interrupt");
     const rejected = actionProgress(
-      other.progress(gate, { move: "interrupt" }, EMPTY_DIALOG),
+      other.progress(
+        gate,
+        { move: "interrupt", interruption: { id: "test" } },
+        EMPTY_DIALOG,
+      ),
     );
     expect(rejected.transition).toEqual(gate.transition);
     expect(rejected.traversals).toEqual(gate.traversals);
@@ -584,11 +595,18 @@ describe("interruption", () => {
     (first, replacement) => {
       const { runtime, brief, document } = boot(`function Main() {
       let seen = Bool();
-      this.catchInterruption = () => { seen.$set(true); return judge(\`interrupt catch\`); };
+      this.catchInterruption = () => { seen.$set(true); return judge(\`interrupt \${this.interruption.id}: \${this.interruption.reason}\`); };
       this.catchDeflection = () => { seen.$set(true); return judge(\`deflect catch\`); };
       if (judge(\`main\`)) $instruct(\`work\`);
     }`);
-      const caught = actionProgress(next(runtime, brief, { move: first }));
+      const caught = actionProgress(
+        next(runtime, brief, {
+          move: first,
+          ...(first === "interrupt"
+            ? { interruption: { id: "first", reason: "original" } }
+            : {}),
+        }),
+      );
       expect(rootTraversal(caught).cells.seen).toBe(true);
       expect(rootTraversal(caught).control).toMatchObject({
         reason: first === "interrupt" ? "interrupted" : "deflected",
@@ -598,9 +616,17 @@ describe("interruption", () => {
       const replaced = actionProgress(
         next(reconstructed.runtime, actionProgress(reconstructed.output), {
           move: replacement,
+          ...(replacement === "interrupt"
+            ? { interruption: { id: "replacement" } }
+            : {}),
         }),
       );
       expect(replaced.judgments).toHaveLength(1);
+      expect(replaced.judgments[0]?.question).toBe(
+        replacement === "interrupt"
+          ? "interrupt replacement: "
+          : "deflect catch",
+      );
       expect(rootTraversal(replaced).control).toMatchObject({
         reason: replacement === "interrupt" ? "interrupted" : "deflected",
         phase: "catch",
@@ -667,12 +693,12 @@ describe("interruption composition", () => {
     expect(rootTraversal(done).cells.out).toEqual(["a", "b"]);
   });
 
-  it("interruption.map child escalation retains pending copies bindings and return destinations", () => {
+  it("interruption.invoke-map routes by identity after ancestor transition restoration and retains progress", () => {
     const { runtime, brief, document } = boot(
       `function Main() {
       let items = Array(Str()); let out = Array(Str()); items.$set(["a", "b"]);
-      this.catchInterruption = () => true;
-      items.$map(() => { $enter(newcopy(Work), { args: { input: span.item }, returns: { output: span.result } }); }, out);
+      this.catchInterruption = () => this.interruption.id == "network" && this.interruption.reason == "lost";
+      invoke(() => { items.$map(() => { $enter(newcopy(Work), { args: { input: span.item }, returns: { output: span.result } }); }, out); });
       function Work(args = { input: Str() }, returns = { output: Str() }) {
         $instruct(\`work \${args.input}\`);
         this.effects = () => returns.output.$set(args.input);
@@ -687,7 +713,24 @@ describe("interruption composition", () => {
     );
     expect(second.instructions[0]?.text).toBe("work b");
     const before = rootTraversal(second);
-    const caught = actionProgress(interrupt(runtime, second));
+    const transition = actionProgress(
+      runtime.progress(
+        second,
+        { move: "interrupt", interruption: { id: "network", reason: "lost" } },
+        EMPTY_DIALOG,
+      ),
+    );
+    expect(transition.transition?.position).toBe(node(id, "Main"));
+    expect(rootTraversal(transition).frame).toEqual(before.frame);
+    const fresh = new Runtime().add(id, document).init();
+    const gate = actionProgress(
+      fresh.start(
+        JSON.parse(JSON.stringify(transition.traversals)),
+        EMPTY_DIALOG,
+      ),
+    );
+    expect(gate.transition).toEqual(transition.transition);
+    const caught = actionProgress(next(fresh, gate, { move: "proceed" }));
     expect(caught.instructions).toEqual(second.instructions);
     const copy = rootTraversal(caught).ephemeralChildren[0]!;
     expect(copy.ref).toBe(before.ephemeralChildren[0]!.ref);
@@ -1014,7 +1057,11 @@ it("interruption.false catch preserves completed consultation data without repla
   const retained = rootTraversal(stopped);
   expect(retained).toMatchObject({
     state: "interrupted",
-    control: { reason: "interrupted", phase: "complete" },
+    control: {
+      reason: "interrupted",
+      phase: "complete",
+      interruption: { id: "test", reason: "" },
+    },
     cells: { seen: true },
   });
   expect(Object.keys(retained.frame.evaluatorActionStates)).toContain(
@@ -1055,9 +1102,246 @@ it("interruption.replacement starts a fresh catch after completed interruption a
   });
   const interrupted = actionProgress(interrupt(restored.runtime, deflecting));
   expect(rootTraversal(interrupted).control).toEqual({
+    interruption: { id: "test", reason: "" },
     reason: "interrupted",
     phase: "catch",
   });
   expect(interrupted.judgments).toHaveLength(1);
   expect(interrupted.judgments[0]!.id).toBe(catching.judgments[0]!.id);
 });
+
+it.each([undefined, "", "connection lost"])(
+  "interruption.channel normalizes reason %s and exposes strings throughout catch expressions",
+  (reason) => {
+    const { runtime, brief, document } = boot(`import Store from "host:store";
+      function Main() {
+        let savedId = Str(); let savedReason = Str();
+        this.catchInterruption = () => {
+          choose: {
+            if (this.interruption.id != "network") break choose;
+            savedId.$set(this.interruption.id);
+            savedReason.$set(this.interruption.reason);
+            if (judge(\`Handle \${this.interruption.id}: \${this.interruption.reason}\`)) {
+              return Store.accepts(\`\${this.interruption.id}:\${this.interruption.reason}\`);
+            }
+          }
+          return false;
+        };
+        $instruct(\`pending\`);
+      }`);
+    const data = { id: "network", ...(reason === undefined ? {} : { reason }) };
+    const caught = actionProgress(
+      next(runtime, brief, { move: "interrupt", interruption: data }),
+    );
+    const expected = { id: "network", reason: reason ?? "" };
+    expect(caught.judgments[0]?.question).toBe(
+      `Handle network: ${reason ?? ""}`,
+    );
+    expect(rootTraversal(caught).cells).toMatchObject({
+      savedId: expected.id,
+      savedReason: expected.reason,
+    });
+    data.id = "changed";
+    data.reason = "changed";
+    expect(rootTraversal(caught).control).toMatchObject({
+      interruption: expected,
+    });
+    const restored = restore(document, caught.traversals);
+    const question = actionProgress(restored.output);
+    const host = actionProgress(
+      next(restored.runtime, question, {
+        move: "proceed",
+        judgments: { [question.judgments[0]!.id]: true },
+      }),
+    );
+    expect(host.hostCalls[0]?.arguments).toEqual([
+      `${expected.id}:${expected.reason}`,
+    ]);
+    const resumed = actionProgress(
+      next(restored.runtime, host, {
+        move: "proceed",
+        hostCalls: {
+          [host.hostCalls[0]!.id]: { status: "resolved", value: true },
+        },
+      }),
+    );
+    expect(resumed.instructions).toEqual(brief.instructions);
+  },
+);
+
+it("interruption.channel validates source and public IR scope and string uses", () => {
+  const contexts = [
+    "saved.$set(VALUE);",
+    'this.trigger = () => VALUE == "x";',
+    "this.guard = () => { saved.$set(VALUE); };",
+    "this.effects = () => { saved.$set(VALUE); };",
+    'this.catchDeflection = () => VALUE == "x";',
+    '$instructLoop(`work`, { resolveWhen: () => VALUE == "x" });',
+  ];
+  for (const member of ["id", "reason"] as const) {
+    for (const context of contexts) {
+      expect(() =>
+        parse(
+          `"arc"; function Main() { let saved = Str(); ${context.replaceAll("VALUE", `this.interruption.${member}`)} }`,
+        ),
+      ).toThrow(/interruption/);
+      const doc = parse(
+        `"arc"; function Main() { let saved = Str(); ${context.replaceAll("VALUE", '"sentinel"')} }`,
+      );
+      const injected = JSON.parse(
+        JSON.stringify(doc).replaceAll(
+          '{"kind":"literal","value":"sentinel"}',
+          JSON.stringify({
+            kind: member === "id" ? "interruptionId" : "interruptionReason",
+          }),
+        ),
+      );
+      expect(
+        validate(injected).some(
+          (issue) => issue.code === "INTERRUPTION_OUTSIDE_CATCH",
+        ),
+      ).toBe(true);
+    }
+    expect(() =>
+      parse(
+        `"arc"; function Main() { let n = Num(); this.catchInterruption = () => { n.$set(this.interruption.${member}); return true; }; }`,
+      ),
+    ).toThrow();
+    expect(() =>
+      parse(
+        `"arc"; function Main() { this.catchInterruption = () => this.interruption.${member}; }`,
+      ),
+    ).toThrow();
+  }
+  for (const value of ["this.interruption", "this.interruption.other"]) {
+    expect(() =>
+      parse(
+        `"arc"; function Main() { this.catchInterruption = () => ${value} == "x"; }`,
+      ),
+    ).toThrow();
+  }
+});
+
+it("interruption.admission validates the fixed envelope without changing the frontier", () => {
+  const { runtime, brief } = boot(
+    'function Main() { this.catchInterruption = () => this.interruption.id == "accepted"; $instruct(`pending`); }',
+  );
+  const invalid: unknown[] = [
+    { move: "interrupt" },
+    ...[
+      null,
+      [],
+      {},
+      { reason: "missing id" },
+      { id: 42 },
+      { id: "x", reason: null },
+      { id: "x", reason: 2 },
+      { id: "x", extra: true },
+    ].map((interruption) => ({ move: "interrupt", interruption })),
+    ...["proceed", "poison"].map((move) => ({
+      move,
+      interruption: { id: "x" },
+    })),
+    {
+      move: "interrupt",
+      interruption: { id: "x" },
+      instructions: appliedInstructions(brief),
+    },
+  ];
+  let getterReads = 0;
+  invalid.push({
+    move: "interrupt",
+    interruption: {
+      get id() {
+        getterReads++;
+        return "x";
+      },
+    },
+  });
+  invalid.push({
+    move: "interrupt",
+    interruption: {
+      id: "x",
+      get reason() {
+        getterReads++;
+        return "x";
+      },
+    },
+  });
+  invalid.push({
+    move: "interrupt",
+    get interruption() {
+      getterReads++;
+      return { id: "x" };
+    },
+  });
+  let frontier = brief;
+  for (const report of invalid) {
+    const rejected = actionProgress(
+      next(runtime, frontier, report as ActionReport),
+    );
+    expect(rejected.issues[0]?.kind).toBe("invalid-report");
+    expect(rejected.traversals).toEqual(frontier.traversals);
+    expect(rejected.instructions).toEqual(frontier.instructions);
+    frontier = rejected;
+  }
+  expect(getterReads).toBe(0);
+  const resumed = actionProgress(
+    next(runtime, frontier, {
+      move: "interrupt",
+      interruption: { id: "accepted" },
+    }),
+  );
+  expect(resumed.issues).toEqual([]);
+  expect(resumed.instructions).toEqual(brief.instructions);
+});
+
+it.each(["owned", "imported"] as const)(
+  "interruption.channel preserves identity through a hookless ancestor from an %s child",
+  (kind) => {
+    const leaf = "function Work() { $instruct(`work`); }";
+    const doc =
+      parse(`"arc"; ${kind === "imported" ? 'import { Work } from "worker";' : ""}
+      function Main() {
+        this.catchInterruption = () => this.interruption.id == "network" && this.interruption.reason == "lost";
+        $enter(Middle);
+        function Middle() { $enter(Work); ${kind === "owned" ? leaf : ""} }
+      }`);
+    const create = () =>
+      new Runtime()
+        .add(id, doc)
+        .add("worker", parse(`"arc"; ${leaf}`))
+        .init();
+    const runtime = create();
+    const brief = actionProgress(
+      settleTransitions(
+        runtime,
+        runtime.enterArc(arc(id, "Main"), EMPTY_DIALOG),
+        EMPTY_DIALOG,
+      ),
+    );
+    const transition = actionProgress(
+      runtime.progress(
+        brief,
+        { move: "interrupt", interruption: { id: "network", reason: "lost" } },
+        EMPTY_DIALOG,
+      ),
+    );
+    expect(transition.transition?.position).toBe(node(id, "Main"));
+    expect(rootTraversal(transition).control).toMatchObject({
+      phase: "catch",
+      interruption: { id: "network", reason: "lost" },
+    });
+    const fresh = create();
+    const gate = actionProgress(
+      fresh.start(
+        JSON.parse(JSON.stringify(transition.traversals)),
+        EMPTY_DIALOG,
+      ),
+    );
+    expect(gate.transition).toEqual(transition.transition);
+    const resumed = actionProgress(next(fresh, gate, { move: "proceed" }));
+    expect(resumed.instructions).toEqual(brief.instructions);
+    expect(rootTraversal(resumed).control).toBeUndefined();
+  },
+);

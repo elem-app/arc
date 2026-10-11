@@ -7,6 +7,7 @@ import {
   type TerminalBrief,
 } from "../src/runtime/index.js";
 import type {
+  ActionInterruption,
   ActionMove,
   ActionStatement,
   CatchInterruptionStatement,
@@ -15,6 +16,7 @@ import type {
   Dialog,
   EffectStatement,
   HostCall,
+  InterruptionContext,
   NodeState,
   RuntimeIssue,
   TraversalControl,
@@ -67,12 +69,20 @@ it("interruption.types exports hook state move and retained-root output contract
   const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
   const brief = runtime.enterArc("arc:interrupt:Main", dialog);
   if (!brief.canProgress) throw new Error("Expected work");
-  const output = runtime.progress(brief, { move }, dialog);
+  const interruption: ActionInterruption = { id: "network" };
+  const output = runtime.progress(brief, { move, interruption }, dialog);
   if (output.canProgress || output.outcome !== "interrupted")
     throw new Error("Expected interruption");
   expectTypeOf<
     Extract<TraversalControl, { reason: "interrupted" }>["phase"]
   >().toEqualTypeOf<"catch" | "complete">();
+  expectTypeOf<
+    Extract<TraversalControl, { reason: "interrupted" }>["interruption"]
+  >().toEqualTypeOf<InterruptionContext>();
+  expectTypeOf<InterruptionContext["reason"]>().toEqualTypeOf<string>();
+  expectTypeOf<ActionInterruption["reason"]>().toEqualTypeOf<
+    string | undefined
+  >();
   const retained: TerminalBrief = output;
   expectTypeOf(output).toMatchTypeOf<TerminalBrief>();
   expectTypeOf(output.returns).toEqualTypeOf<undefined>();

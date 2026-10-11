@@ -1,4 +1,8 @@
 import {
+  acceptsHostArgumentCount,
+  hostParameterValueSpec,
+} from "../spec/host-parameters.js";
+import {
   admitHostArgument,
   admitValue,
   arithmeticRule,
@@ -666,7 +670,7 @@ function renderTypedHostArguments(
     );
   }
   const operation = resolution.operation;
-  if (action.arguments.length !== operation.parameters.length) {
+  if (!acceptsHostArgumentCount(operation, action.arguments.length)) {
     throw new Error(
       "Registered host action no longer matches its declared arity",
     );
@@ -681,7 +685,7 @@ function renderTypedHostArguments(
     const admission = admitHostArgument(
       argument,
       rendered,
-      operation.parameters[index]!,
+      hostParameterValueSpec(operation.parameters[index]!),
       `$[${index}]`,
     );
     if (!admission.admitted) {
@@ -1320,6 +1324,22 @@ function computeLocalExpression(
       };
     case "enterCount":
       return { status: "resolved", value: traversal.enterCount };
+    case "interruptionId":
+    case "interruptionReason": {
+      const control = traversal.control;
+      if (control?.reason !== "interrupted" || control.phase !== "catch") {
+        throw new Error(
+          "this.interruption is only available while this.catchInterruption is running",
+        );
+      }
+      return {
+        status: "resolved",
+        value:
+          expression.kind === "interruptionId"
+            ? control.interruption.id
+            : control.interruption.reason,
+      };
+    }
     case "pendingState": {
       const control = traversal.control;
       if (!control || control.phase !== "effects") {

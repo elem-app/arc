@@ -50,6 +50,12 @@ export type NodeState = "covered" | "deflected" | "skipped" | "interrupted";
  */
 export type BriefId = string;
 
+/** Host interruption data retained through catch handling and propagation. */
+export type InterruptionContext = {
+  id: string;
+  reason: string;
+};
+
 /** Persisted information about the deflection currently being finalized. */
 export type DeflectionContext = {
   /** The traversal where the deflection originated. Preserved while bubbling. */
@@ -440,6 +446,7 @@ export type TraversalControl =
     }
   | {
       reason: "interrupted";
+      interruption: InterruptionContext;
       phase: "catch" | "complete";
     };
 
