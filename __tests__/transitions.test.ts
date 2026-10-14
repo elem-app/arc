@@ -216,12 +216,17 @@ function Main() {
 
       // Deflection unwinds K and C without their own hooks; the coalesced exits
       // pause at Main, the first ancestor with a catch.
-      const exit = actionProgress(
+      const pendingDeflection = actionProgress(
         runtime.progress(
           work,
           { move: "proceed", judgments: { [work.judgments[0]!.id]: true } },
           EMPTY_DIALOG,
         ),
+      );
+      expect(pendingDeflection.allowedMoves).toEqual(["deflect"]);
+      expect(pendingDeflection.transition).toBeUndefined();
+      const exit = actionProgress(
+        runtime.progress(pendingDeflection, { move: "deflect" }, EMPTY_DIALOG),
       );
       expect(exit.transition?.exited).toEqual([
         node("transition-deflect-arc", "Main.C.K"),

@@ -946,11 +946,15 @@ function Main() {
       });
       expect(secondResolution.judgments).toHaveLength(1);
 
-      const afterDeflect = progressTerminal(runtime, secondResolution, {
+      const pendingDeflection = progressBrief(runtime, secondResolution, {
         move: "proceed",
         judgments: {
           [secondResolution.judgments[0]!.id]: true,
         },
+      });
+      expect(pendingDeflection.allowedMoves).toEqual(["deflect"]);
+      const afterDeflect = progressTerminal(runtime, pendingDeflection, {
+        move: "deflect",
       });
       expect(rootTraversal(afterDeflect).cells.verdict).toBeUndefined();
       expect(rootTraversal(afterDeflect).phase).toBe("suspended");

@@ -8,6 +8,7 @@ import type {
   ArcRef,
   ArcTraversalSet,
   BriefId,
+  DeflectionContext,
   NodeRef,
   NodeTransition,
   RuntimeIssue,
@@ -250,6 +251,11 @@ export type ActionBrief = {
    * `proceed` with a dialog freshly projected for `position`.
    */
   transition?: NodeTransition;
+  /**
+   * Required deflection awaiting a bare `{ move: "deflect" }` acknowledgement.
+   * Carries its origin with `from` unset. Exclusive of transition and work.
+   */
+  deflection?: DeflectionContext;
   allowedMoves: ActionMove[];
 };
 

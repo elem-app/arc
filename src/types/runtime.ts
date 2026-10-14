@@ -56,7 +56,7 @@ export type InterruptionContext = {
   reason: string;
 };
 
-/** Persisted information about the deflection currently being finalized. */
+/** Information about a deflection awaiting acknowledgement or being handled. */
 export type DeflectionContext = {
   /** The traversal where the deflection originated. Preserved while bubbling. */
   origin: NodeRef;
@@ -442,7 +442,8 @@ export type TraversalControl =
   | {
       reason: "deflected";
       deflection: DeflectionContext;
-      phase: "catch" | "effects";
+      /** Requested deflection awaits a host acknowledgement before handling. */
+      phase: "requested" | "catch" | "effects";
     }
   | {
       reason: "interrupted";
@@ -666,7 +667,7 @@ export type RuntimeRegistrationIssue =
  * High-level moves offered by the current action brief through `allowedMoves`.
  *
  * - `proceed`: report semantic results and continue traversal
- * - `deflect`: mark the active node as intentionally deflected.
+ * - `deflect`: initiate or acknowledge deflection at the active node.
  * - `interrupt`: interrupt pending work without acknowledging it.
  * - `poison`: mark the active arc as unusable because the host cannot execute
  *   the current frontier contract.

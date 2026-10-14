@@ -114,7 +114,7 @@ import {
   type SegOutcome,
   blockSeg,
   blockTraversal,
-  deflectSeg,
+  requestDeflection,
   runSeg,
 } from "./seg.js";
 import {
@@ -804,6 +804,19 @@ function runTraversal(
     let bodyStack = resumeStack;
     resumeStack = undefined;
 
+    if (
+      traversal.control?.reason === "deflected" &&
+      traversal.control.phase === "requested"
+    ) {
+      // Retain the original instruction owner (or guard SEG) for acknowledgement
+      // cleanup. Reconstruction never re-evaluates the deciding policy.
+      if (seg) accum.activeSeg = seg;
+      return (
+        maybeBlockForTransition(accum, traversal) ??
+        blockTraversal(accum, traversal)
+      );
+    }
+
     if (traversal.control && traversal.control.phase !== "complete") {
       const controlled = continueTraversalControl(traversal, node, accum);
       if (controlled.status === "caught") continue;
@@ -936,14 +949,7 @@ function runGuardPhase(
     return { status: "done", finalState: "skipped" };
   }
   if (guardResult.value === "deflected") {
-    traversal.control = {
-      reason: "deflected",
-      // Guard deflection is this node's own; it entered nothing, so `from` stays
-      // unset until it propagates up through a parent's enter boundary.
-      deflection: { origin: traversalToNodeRef(traversal) },
-      phase: "catch",
-    };
-    return { status: "control" };
+    return requestDeflection(accum, traversal);
   }
   traversal.state = undefined;
   return { status: "proceed" };
@@ -2284,17 +2290,24 @@ function stepReportedInstruction(
     }),
   );
   if (deflectResult.status !== "blocked" && truthy(deflectResult.value)) {
-    accum.activeSeg = { kind: "body" };
-    // The lap short-circuits on deflection, honoring the finished evidence
-    // collected up to this handback: a finished lap stays resolved through the
-    // deflection, an unfinished one re-presents fresh after a catch or
-    // re-entry.
+    // Bank accepted evidence before yielding the required acknowledgement.
+    // Retain the owner SEG even for a finished lap: acknowledgement still needs
+    // to abandon any enclosing invoke or map. Unfinished cleanup waits for it.
     if (resolveResult.status !== "blocked" && truthy(resolveResult.value)) {
       markActionResolved(traversal, statement);
     } else {
-      clearActionState(traversal, statement.id);
+      markPendingActionState(traversal, statement.id, statement.kind, {
+        preSnapshot,
+        instructionPhase: applicationConfirmed ? "postcheck" : instructionPhase,
+        deflectWhenOutcome: true,
+        resolveWhenOutcome:
+          bankedResolve ??
+          (resolveResult.status !== "blocked" && statement.resolveWhen
+            ? truthy(resolveResult.value)
+            : undefined),
+      });
     }
-    return deflectSeg(traversal);
+    return requestDeflection(accum, traversal);
   }
   if (
     deflectResult.status === "blocked" ||

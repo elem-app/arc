@@ -1533,7 +1533,13 @@ function Main() {
         "will deflect",
       ]);
 
-      const resumed = progressBrief(runtime, brief, { move: "proceed" });
+      const pendingDeflection = progressBrief(runtime, brief, {
+        move: "proceed",
+      });
+      expect(pendingDeflection.allowedMoves).toEqual(["deflect"]);
+      const resumed = progressBrief(runtime, pendingDeflection, {
+        move: "deflect",
+      });
 
       // On handback the inherited deflectWhen evaluates true, so the instruct
       // deflects the node from inside the body; Main's catch sets `caught`.

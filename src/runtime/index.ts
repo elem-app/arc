@@ -54,6 +54,7 @@ import {
 } from "../value-utils.js";
 import {
   acceptActionReport,
+  acceptDeflectionReport,
   buildActionBrief,
   buildPoisonedActionBrief,
   buildRetryTriggerBrief,
@@ -517,7 +518,21 @@ export class Runtime {
       }
     }
 
+    let rollback = state.traversals;
     try {
+      if (validation.accepted.move === "deflect") {
+        rollback = acceptDeflectionReport(state);
+        return this.#storeActionBrief(
+          state.entry,
+          buildActionBrief(
+            state.entries,
+            state.entry,
+            rollback,
+            dialog,
+            validation.issues,
+          ),
+        );
+      }
       const applied = acceptActionReport(state, dialog, validation.accepted);
 
       return this.#storeActionBrief(
@@ -536,7 +551,7 @@ export class Runtime {
         buildPoisonedActionBrief(
           state.entries,
           state.entry,
-          state.traversals,
+          rollback,
           dialog,
           state.snapshot.active,
           error,

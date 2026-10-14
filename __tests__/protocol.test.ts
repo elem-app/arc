@@ -1610,13 +1610,15 @@ function Main() {
       );
       secondSeeded.phase = "entered";
       const issuedAgain = startRun(runtime, [secondSeeded], EMPTY_DIALOG);
+      const pendingDeflection = progressBrief(runtime, issuedAgain, {
+        move: "proceed",
+        judgments: { [issuedAgain.judgments[0]!.id]: true },
+      });
+      expect(pendingDeflection.allowedMoves).toEqual(["deflect"]);
       const deflectedBeforeApplication = progressTerminal(
         runtime,
-        issuedAgain,
-        {
-          move: "proceed",
-          judgments: { [issuedAgain.judgments[0]!.id]: true },
-        },
+        pendingDeflection,
+        { move: "deflect" },
       );
       expect("instructions" in deflectedBeforeApplication).toBe(false);
       expect(rootTraversal(deflectedBeforeApplication).phase).toBe("suspended");

@@ -795,9 +795,13 @@ function Main() {
       ]);
 
       // The second owner's answer routes by its own id and deflects the node.
-      const deflected = progressTerminal(runtime, second, {
+      const pendingDeflection = progressBrief(runtime, second, {
         move: "proceed",
         judgments: { [secondId]: true },
+      });
+      expect(pendingDeflection.allowedMoves).toEqual(["deflect"]);
+      const deflected = progressTerminal(runtime, pendingDeflection, {
+        move: "deflect",
       });
       expect(rootTraversal(deflected).phase).toBe("suspended");
       expect(rootTraversal(deflected).state).toBe("deflected");

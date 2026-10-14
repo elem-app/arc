@@ -17,7 +17,7 @@ import type {
   NodeTransition,
   RuntimeIssue,
 } from "../types/runtime.js";
-import { catchSegKey, nodeSegKey } from "../types/runtime.js";
+import { catchSegKey, hookSegKey, nodeSegKey } from "../types/runtime.js";
 import type { Dialog } from "../types/value.js";
 import { clonePayloadValue } from "../value-utils.js";
 import {
@@ -50,6 +50,7 @@ import {
   type ReportValidation,
 } from "./report-validation.js";
 import {
+  clearActionState,
   clearEvaluatorActionStates,
   cloneCellValue,
   cloneHostCallBrief,
@@ -482,9 +483,11 @@ function allowedMovesForActionBrief(
   traversal: ArcTraversal,
   instructions: readonly InstructionBrief[],
   transition: NodeTransition | undefined,
+  requiredDeflection: boolean,
 ): ActionMove[] {
   const allowedMoves = new Set<ActionMove>();
   if (traversal.phase !== "entered") return [];
+  if (requiredDeflection && !transition) return ["deflect"];
 
   allowedMoves.add("poison");
   if (transition) {
@@ -558,6 +561,25 @@ export function buildActionBrief(
     }
   }
   const actionRoot = selectActionRootTraversal(workingTraversals, entry.arc);
+  const activeTraversal = resolveTraversalForBrief(
+    workingTraversals,
+    actionRoot.activeFrame?.activeRef ?? arcToNodeRef(actionRoot.ref),
+  );
+  const requestedDeflection =
+    activeTraversal.control?.reason === "deflected" &&
+    activeTraversal.control.phase === "requested"
+      ? activeTraversal.control.deflection
+      : undefined;
+  if (requestedDeflection) {
+    // A deciding policy may have collected unfinished sibling hook work. The
+    // required acknowledgement owns the frontier exclusively; its accepted
+    // state remains on the traversal until acknowledgement performs cleanup.
+    accum.instructions = [];
+    accum.judgments = [];
+    accum.observations = [];
+    accum.hostCalls = [];
+    accum.hostCallValueDemands.clear();
+  }
   const instructions = mergeInstructionBriefs(accum.instructions);
   const transition = buildTransitionPayload(entries, entry, accum);
   if (
@@ -663,11 +685,16 @@ export function buildActionBrief(
     hostCalls: accum.hostCalls,
     instructions,
     transition,
+    deflection:
+      requestedDeflection && !transition
+        ? { ...requestedDeflection }
+        : undefined,
     allowedMoves: allowedMovesForActionBrief(
       accum,
       actionRoot,
       instructions,
       transition,
+      requestedDeflection !== undefined,
     ),
   };
   return {
@@ -770,6 +797,7 @@ function cloneActionBriefSnapshot(
           hostParams: clonePayloadValue(plan.transition.hostParams),
         }
       : undefined,
+    deflection: plan.deflection ? { ...plan.deflection } : undefined,
     allowedMoves: [...plan.allowedMoves],
   };
 }
@@ -793,6 +821,17 @@ export function validateActionReport(
 
   const accepted = buildAcceptedActionReport(report);
   const issues: RuntimeIssue[] = [];
+  if (plan.deflection) {
+    if (Reflect.ownKeys(report).some((key) => key !== "move")) {
+      issues.push(
+        buildInvalidReportIssue(
+          "deflect-results",
+          "A required deflection acknowledgement may contain only move",
+        ),
+      );
+    }
+    return { accepted, issues, rejected: issues.length > 0 };
+  }
   if (report.move === "interrupt") {
     const bundled = Reflect.ownKeys(report).some(
       (key) => key !== "move" && key !== "interruption",
@@ -987,6 +1026,57 @@ export function validateActionReport(
   return { accepted, issues, rejected: false };
 }
 
+/**
+ * Admits a validated deflect report without running authored evaluation. The
+ * returned snapshot is the rollback base even if its catch succeeds and later
+ * body execution fails in the same progression.
+ */
+export function acceptDeflectionReport(
+  state: ActionBriefState,
+): ArcTraversalSet {
+  const working = cloneTraversalSet(state.traversals);
+  const root = selectActionRootTraversal(working, state.entry.arc);
+  const activeRef = root.activeFrame?.activeRef ?? state.snapshot.active;
+  const active = resolveTraversalForBrief(working, activeRef);
+  const control = active.control;
+  if (control?.reason === "interrupted") {
+    clearEvaluatorActionStates(active, nodeSegKey("catchInterruption"));
+  }
+  if (control?.reason === "deflected" && control.phase === "catch") {
+    clearEvaluatorActionStates(active, catchSegKey(control.deflection));
+  }
+  const recordedSeg = root.activeFrame?.activeSeg;
+  if (recordedSeg && "owner" in recordedSeg) {
+    if (control?.reason === "deflected" && control.phase === "requested") {
+      const action = active.frame.actionStates[recordedSeg.owner];
+      if (action?.kind === "instruction" && action.status === "pending") {
+        clearActionState(active, recordedSeg.owner);
+        clearEvaluatorActionStates(
+          active,
+          hookSegKey(recordedSeg.owner, "resolveWhen"),
+        );
+        clearEvaluatorActionStates(
+          active,
+          hookSegKey(recordedSeg.owner, "deflectWhen"),
+        );
+      }
+    }
+    const entry = state.entries.get(rootRefOf(active.ref));
+    const node = entry
+      ? getNodeForRef(state.entries, entry, active.ref)
+      : undefined;
+    if (node)
+      clearInvokeStateCrossedByDeflection(active, node, recordedSeg.owner);
+  }
+  active.control = {
+    reason: "deflected",
+    phase: "catch",
+    deflection: { origin: activeRef },
+  };
+  root.activeFrame = { activeRef, activeSeg: { kind: "catch" } };
+  return working;
+}
+
 export function acceptActionReport(
   state: ActionBriefState,
   dialog: Dialog,
@@ -1010,21 +1100,14 @@ export function acceptActionReport(
     true,
   );
 
-  if (report.move === "interrupt" || report.move === "deflect") {
+  if (report.move === "interrupt") {
     const activeRef =
       rootTraversal.activeFrame?.activeRef ?? state.snapshot.active;
     const activeTraversal = resolveTraversalForBrief(working, activeRef);
-    // A new event abandons only the previous catch consultation. Mutations and
-    // completed external work survive; the new consultation starts at this node.
-    if (
-      activeTraversal.control?.reason === "interrupted" ||
-      report.move === "interrupt"
-    ) {
-      clearEvaluatorActionStates(
-        activeTraversal,
-        nodeSegKey("catchInterruption"),
-      );
-    }
+    clearEvaluatorActionStates(
+      activeTraversal,
+      nodeSegKey("catchInterruption"),
+    );
     if (
       activeTraversal.control?.reason === "deflected" &&
       activeTraversal.control.phase === "catch"
@@ -1033,53 +1116,21 @@ export function acceptActionReport(
         activeTraversal,
         catchSegKey(activeTraversal.control.deflection),
       );
-      activeTraversal.control = undefined;
     }
-    if (report.move === "interrupt") {
-      if (!report.interruption)
-        throw new Error("Accepted interrupt has no interruption data");
-      activeTraversal.control = {
-        reason: "interrupted",
-        phase: "catch",
-        interruption: {
-          id: report.interruption.id,
-          reason: report.interruption.reason ?? "",
-        },
-      };
-      rootTraversal.activeFrame = {
-        activeRef,
-        activeSeg: { kind: "catchInterruption" },
-      };
-      resumeActiveFrame(accum);
-      return { traversals: working };
-    }
-    // Deflect the recorded frontier, then resume it: its control state routes to
-    // `this.catchDeflection`, and an uncaught deflection bubbles up through the
-    // same enter continuations as a normal completion. A frontier blocked in an
-    // invoke body (or in a hook owned inside one) abandons the open invocation
-    // as the deflection crosses it.
-    const recordedSeg = rootTraversal.activeFrame?.activeSeg;
-    if (recordedSeg && "owner" in recordedSeg) {
-      const entry = state.entries.get(rootRefOf(activeTraversal.ref));
-      const activeNode = entry
-        ? getNodeForRef(state.entries, entry, activeTraversal.ref)
-        : undefined;
-      if (activeNode) {
-        clearInvokeStateCrossedByDeflection(
-          activeTraversal,
-          activeNode,
-          recordedSeg.owner,
-        );
-      }
-    }
+    if (!report.interruption)
+      throw new Error("Accepted interrupt has no interruption data");
     activeTraversal.control = {
-      reason: "deflected",
-      // Deflection originates at this node's own frontier; it entered nothing,
-      // so `from` stays unset until it propagates up through a parent's enter.
-      deflection: { origin: activeRef },
+      reason: "interrupted",
       phase: "catch",
+      interruption: {
+        id: report.interruption.id,
+        reason: report.interruption.reason ?? "",
+      },
     };
-    rootTraversal.activeFrame = { activeRef, activeSeg: { kind: "catch" } };
+    rootTraversal.activeFrame = {
+      activeRef,
+      activeSeg: { kind: "catchInterruption" },
+    };
     resumeActiveFrame(accum);
     return { traversals: working };
   }

@@ -271,14 +271,19 @@ export function blockSeg<TResult>(
   return { status: "blocked" };
 }
 
-/** A SEG outcome that deflects at the current traversal. */
-export function deflectSeg<TResult>(traversal: Traversal): SegOutcome<TResult> {
-  // The deflection originates here and has entered nothing yet, so `from` is
-  // unset until it propagates up through a parent's `$enter` boundary.
-  return {
-    status: "deflected",
+/** Suspends at a new deflection origin until the host acknowledges it. */
+export function requestDeflection(
+  accum: Accumulator,
+  traversal: Traversal,
+): { status: "blocked" } {
+  traversal.control = {
+    reason: "deflected",
+    phase: "requested",
     deflection: { origin: traversalToNodeRef(traversal) },
   };
+  // A request is a block, so enclosing enters, invokes, and maps retain their
+  // ownership. Only an acknowledged deflection can unwind those boundaries.
+  return blockTraversal(accum, traversal);
 }
 
 /**

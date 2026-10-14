@@ -66,7 +66,7 @@ Each arc traversal tracks where it is in its lifecycle:
 
 A traversal becomes `"poisoned"` when progression cannot continue. The phase is terminal: a poisoned traversal counts as stopped and is never advanced again. Poison has two origins.
 
-**Host-initiated.** The host reports `move: "poison"` on an action frontier it cannot execute — a malformed or unusable frontier, such as an instruction missing required host params. The runtime discards any work-item results carried by a poison report; poison ends the frontier rather than resolving its semantic work. The host may attach a `poisonReason` (`reasonCode`, `reason`); when it is omitted, the runtime records `reasonCode: "host-poisoned"`.
+**Host-initiated.** The host reports `move: "poison"` where offered by `allowedMoves` on an action frontier it cannot execute — a malformed or unusable frontier, such as an instruction missing required host params. The runtime discards any work-item results carried by a poison report; poison ends the frontier rather than resolving its semantic work. The host may attach a `poisonReason` (`reasonCode`, `reason`); when it is omitted, the runtime records `reasonCode: "host-poisoned"`.
 
 **Runtime-initiated.** Authored Arc execution throws while the runtime advances a trigger or an action. Known failure sites attach a stable cause-specific `reasonCode`, which the runtime preserves at the advancement boundary. An uncategorized exception records `reasonCode: "other-runtime-error"`.
 
@@ -240,6 +240,8 @@ type ActionBrief = {
   instructions: InstructionBrief[];
   /** The walk's position moved; exclusive of all other work (see Transitions). */
   transition?: NodeTransition;
+  /** Required deflection awaiting host acknowledgement; exclusive of other work. */
+  deflection?: DeflectionContext;
   /** Valid moves for the report. */
   allowedMoves: ActionMove[];
 };
@@ -270,7 +272,7 @@ type TerminalBrief = {
 );
 ```
 
-`TerminalBrief` has no `active`, work arrays, `transition`, or `allowedMoves`. A covered root with declared returns exposes cloned values for the keys it actually staged, including `{}` when it staged none. `returns` is absent when the root declares no return channels and for every other outcome. `root` identifies the action root when `traversals` also contains other roots.
+`TerminalBrief` has no `active`, work arrays, `transition`, `deflection`, or `allowedMoves`. A covered root with declared returns exposes cloned values for the keys it actually staged, including `{}` when it staged none. `returns` is absent when the root declares no return channels and for every other outcome. `root` identifies the action root when `traversals` also contains other roots.
 
 ### `ActionReport`
 
@@ -286,12 +288,13 @@ type ActionReport = {
    * "deflect" — requests deflection at the active node, subject to its catch
    *   hook and the ordinary propagation rules. Only
    *   available when `allowedMoves` includes it: a brief carrying no
-   *   instruction, unresolved host-call action, or transition.
+   *   instruction, unresolved host-call action, or transition, or the exclusive
+   *   required-deflection frontier.
    * "interrupt" — requests interruption without acknowledging pending work.
    *   Requires interruption: { id: string; reason?: string }, without work results.
    * "poison" — host cannot execute the current frontier contract. The active
-   *   arc becomes terminally poisoned. Available while the action traversal can
-   *   progress, including frontiers blocked on an unresolved host call.
+   *   arc becomes terminally poisoned. Available on progressable frontiers
+   *   except the exclusive required-deflection frontier.
    */
   move: ActionMove;
   /** Required for interrupt; unavailable on other moves. Omitted reason reads as "". */
@@ -318,7 +321,15 @@ type ActionReport = {
 
 Nodes that complete all reachable actions and effects become covered automatically. Nodes bypassed by explicit guard logic become skipped. Poison is a host-initiated contract failure for a malformed or unusable frontier.
 
-Host-requested deflection and instruction policy use different host inputs. With `move: "deflect"`, the host requests deflection on a frontier where `allowedMoves` offers the move. An authored `deflectWhen` evaluates the arc's own policy from probes the host answers. The two never compete for one frontier: `deflectWhen` is consulted only while a reachable instruction is pending, when the host-initiated move is withheld.
+### Deflections
+
+Every new deflection starts with an accepted host `deflect` report. A host may choose deflection on an ordinary eligible frontier. When a guard or an instruction's `deflectWhen` requires deflection, the runtime instead yields an exclusive `ActionBrief` carrying `deflection: { origin }` whose `allowedMoves` is exactly `["deflect"]`. The host identifies this boundary by inspecting `brief.deflection`. The field is absent on ordinary work, transitions, and applied catch frontiers.
+
+The host persists the returned traversals and prepares the handoff before reporting `{ move: "deflect" }` with the dialog for the current position. Catch handling, effects, propagation, and deflection-driven abandonment begin after acknowledgement.
+
+Guard completion, accepted instruction application and settled lap evidence, and enclosing invoke/map ownership survive reconstruction. `start(savedTraversals, dialog)` re-yields the same request without reevaluating its cause. An outstanding transition is acknowledged first, with the deflection request still pending afterward. Propagation and resumed catches create no new request; a new policy deflection after a caught restart does.
+
+Accepted deflection is an execution boundary. A subsequent authored failure in catch, effects, or a restarted body returns a poisoned result based on the acknowledged state, preserving acceptance. Rejected reports leave the request pending. Repeating the same immutable brief and report remains deterministic; hosts suppress duplicate external records for repeated progression.
 
 ### Transitions
 
@@ -608,11 +619,11 @@ For instructions, the host should:
    - Typical progression is: first reach emits `phase: "apply"`; follow-up briefs while primarily checking conditions emit `phase: "postcheck"`; after a non-terminal check cycle the same instruction may return to `phase: "apply"`.
 3. For each `phase: "apply"` instruction actually performed, report `instructions[id]: { status: "applied" }`. Omitted ids remain unconfirmed and stay in `apply`; when a brief contains multiple instructions, it may therefore be acknowledged partially. A `postcheck` instruction has already been applied for its current cycle and must not be reported applied again.
 4. Independently report any available values for `postcheck` ids in the same brief (`judgments` / `observations` / `hostCalls`). Application and postcheck evidence may arrive separately or in the same report.
-5. Expect no explicit `move: "deflect"` on an instruction brief: a pending instruction suppresses that move in both phases. An authored `deflectWhen` is different: the runtime evaluates its reported semantic evidence and may deflect the traversal even when the host has not yet reported the instruction applied.
+5. A pending instruction suppresses `move: "deflect"` in both phases. The runtime evaluates reported `deflectWhen` evidence independently of application. True deflect evidence yields the exclusive required-deflection frontier even when the instruction has not been reported applied; acknowledge that subsequent frontier with `{ move: "deflect" }`.
 
 Runtime then derives instruction outcome from authored conditions. Each `$instruct`, and each `$instructLoop` iteration, is one lap collecting two evidences, each banked once settled: the deflect evidence (`deflectWhen`) and the finished evidence (application for a one-shot, `resolveWhen` for a loop).
 
-1. A deflect evidence that settles true decides the lap immediately, honoring the finished evidence collected up to the same handback: a finished lap stays resolved through the deflection, an unfinished one re-presents after the deflection is handled.
+1. A deflect evidence that settles true decides the lap and yields the required acknowledgement, honoring the finished evidence collected up to the same handback: a finished lap stays resolved through the deflection, an unfinished one retains its evidence until acknowledgement and re-presents after the deflection is handled.
 2. With both evidences in and no deflection, a finished lap resolves — for a loop, a true `resolveWhen` resolves the whole action and a false one starts a fresh lap with fresh evidence.
 3. Else the lap waits for its open evidence. An unapplied instruction stays in `apply`; an applied instruction with unresolved checks stays in `postcheck`.
 
@@ -795,5 +806,5 @@ A typical host turn:
 3. Action stage (if an arc is active):
    1. `start(traversals, dialog)` → `ActionBrief | TerminalBrief`.
    1. Persist `brief.traversals`.
-   1. While `brief.canProgress`, inspect its instructions, pending work, and `allowedMoves`; choose when to hand control back; resolve available items; and call `progress(brief, { move, instructions, judgments, observations, hostCalls }, latestDialog)`. Unresolved or unreported work re-surfaces on later `ActionBrief`s under the same ids. Report `move: "poison"` instead if the host cannot accept the frontier contract or fails a resolution fatally. Persist each returned `brief.traversals`.
+   1. While `brief.canProgress`, inspect its instructions, pending work, and `allowedMoves`; choose when to hand control back; resolve available items; and call `progress(brief, { move, instructions, judgments, observations, hostCalls }, latestDialog)`. Unresolved or unreported work re-surfaces on later `ActionBrief`s under the same ids. When `brief.deflection` is present, prepare the handoff and report only `{ move: "deflect" }`. On other frontiers, report `move: "poison"` if the host cannot accept the frontier contract or fails a resolution fatally. Persist each returned `brief.traversals`.
    1. When `canProgress` is false, settle from `brief.root`, `brief.outcome`, `brief.returns`, and `brief.issues`.

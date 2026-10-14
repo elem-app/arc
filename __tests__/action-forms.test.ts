@@ -719,10 +719,14 @@ function Main() {
       // The lap short-circuits on the deflection but honors the application
       // evidence from the same handback: the one-shot stays resolved, so the
       // catch rewalk completes the node instead of re-presenting it.
-      const caught = progressTerminal(runtime, issued, {
+      const pendingDeflection = progressBrief(runtime, issued, {
         move: "proceed",
         instructions: appliedInstructions(issued),
         judgments: { [check]: true },
+      });
+      expect(pendingDeflection.allowedMoves).toEqual(["deflect"]);
+      const caught = progressTerminal(runtime, pendingDeflection, {
+        move: "deflect",
       });
       expect("instructions" in caught).toBe(false);
       expect(rootTraversal(caught).phase).toBe("completed");
@@ -749,9 +753,13 @@ function Main() {
 
       // No finished evidence at the short-circuit: the lap ends unfinished and
       // the catch rewalk starts a fresh lap, re-presenting the instruction.
-      const caught = progressBrief(runtime, issued, {
+      const pendingDeflection = progressBrief(runtime, issued, {
         move: "proceed",
         judgments: { [check]: true },
+      });
+      expect(pendingDeflection.allowedMoves).toEqual(["deflect"]);
+      const caught = progressBrief(runtime, pendingDeflection, {
+        move: "deflect",
       });
       expect(caught.instructions).toMatchObject([
         { text: "Say it.", phase: "apply" },
@@ -859,12 +867,16 @@ function Main() {
       expect(deflect).toBeDefined();
       expect(resolve).toBeDefined();
 
-      const nextBrief = progressTerminal(runtime, brief, {
+      const pendingDeflection = progressBrief(runtime, brief, {
         move: "proceed",
         judgments: {
           [deflect!.id]: true,
           [resolve!.id]: true,
         },
+      });
+      expect(pendingDeflection.allowedMoves).toEqual(["deflect"]);
+      const nextBrief = progressTerminal(runtime, pendingDeflection, {
+        move: "deflect",
       });
 
       expect(nextBrief.canProgress).toBe(false);
@@ -1056,9 +1068,13 @@ function Main() {
       // The lap short-circuits on the deflection but honors the banked
       // finished evidence: the loop stays resolved, so the catch rewalk
       // completes the node instead of re-presenting it.
-      const caught = progressTerminal(runtime, waiting, {
+      const pendingDeflection = progressBrief(runtime, waiting, {
         move: "proceed",
         judgments: { [deflectId]: true },
+      });
+      expect(pendingDeflection.allowedMoves).toEqual(["deflect"]);
+      const caught = progressTerminal(runtime, pendingDeflection, {
+        move: "deflect",
       });
       expect("instructions" in caught).toBe(false);
       expect(rootTraversal(caught).phase).toBe("completed");

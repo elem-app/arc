@@ -363,7 +363,7 @@ Execution semantics:
 1. The runtime emits an instruction text along with its `deflectWhen` and `resolveWhen` frontier.
 2. The host reports the instruction's application and/or semantic results needed by the checks.
 3. The runtime evaluates `deflectWhen` if possible, followed by `resolveWhen`.
-4. If `deflectWhen` becomes true, the traversal deflects.
+4. If `deflectWhen` becomes true, the runtime requests host acknowledgement before beginning deflection handling.
 5. Prior to `deflectWhen` resolution, or after `deflectWhen` becomes false, `$instruct` resolves when application is reported, and `$instructLoop` resolves when `resolveWhen` becomes true.
 
 Only the currently reachable semantic checks from `deflectWhen` / `resolveWhen` surface in a given brief. See [arc-runtime-api.md](./arc-runtime-api.md) for the `InstructionBrief` and `postcheck` protocol.
@@ -883,7 +883,7 @@ Guard, body, catch, effects, and loop-condition work can suspend for host input.
 
 #### Deflection and interruption
 
-A deflection or interruption pauses ordinary work and consults the target's `this.catchDeflection` or `this.catchInterruption`, respectively. Deflection can arise from the guard, an instruction's `deflectWhen`, a host request, or an entered child. Interruption can arise from a host request or an entered child.
+A deflection or interruption pauses ordinary work and consults the target's `this.catchDeflection` or `this.catchInterruption`, respectively. Deflection can arise from the guard, an instruction's `deflectWhen`, a host request, or an entered child. A guard or instruction policy first yields a required host acknowledgement; deflection handling begins only after the host reports back. Propagation through entered children continues that acknowledged deflection. Interruption can arise from a host request or an entered child.
 
 - If the hook returns `true`, the target catches the event and reconsiders its body decisions while respecting existing action resolutions. An unfinished guard completes before the body resumes. Descendant outcomes remain unchanged; catching does not undo the triggering child's or instruction's deflection.
 - If `this.catchDeflection` returns `false` or is absent, the target proceeds to deflected effects. After those effects finish, it becomes `DEFLECTED` and gives its caller its own deflection catch opportunity.

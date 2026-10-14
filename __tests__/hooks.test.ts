@@ -1257,12 +1257,16 @@ function Main() {
         "self covered the topic enough",
       ]);
 
-      const deflected = progressTerminal(runtime, resolutionBrief, {
+      const pendingDeflection = progressBrief(runtime, resolutionBrief, {
         move: "proceed",
         judgments: {
           [resolutionBrief.judgments[0]!.id]: true,
           [resolutionBrief.judgments[1]!.id]: false,
         },
+      });
+      expect(pendingDeflection.allowedMoves).toEqual(["deflect"]);
+      const deflected = progressTerminal(runtime, pendingDeflection, {
+        move: "deflect",
       });
 
       expect(deflected.canProgress).toBe(false);
@@ -1549,9 +1553,13 @@ function Main() {
       );
       expect(deflect).toBeDefined();
 
-      const caught = progressBrief(runtime, handback, {
+      const pendingDeflection = progressBrief(runtime, handback, {
         move: "proceed",
         judgments: { [deflect!.id]: true },
+      });
+      expect(pendingDeflection.allowedMoves).toEqual(["deflect"]);
+      const caught = progressBrief(runtime, pendingDeflection, {
+        move: "deflect",
       });
 
       expect(rootTraversal(caught).state).toBeUndefined();
@@ -2168,7 +2176,11 @@ function Main() {
       const seeded = runtime.newTraversal(arc("guard-deflect-arc", "Main"));
       seeded.phase = "entered";
 
-      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
+      const pendingDeflection = startRun(runtime, [seeded], EMPTY_DIALOG);
+      expect(pendingDeflection.allowedMoves).toEqual(["deflect"]);
+      const brief = progressTerminal(runtime, pendingDeflection, {
+        move: "deflect",
+      });
 
       expect("instructions" in brief).toBe(false);
       expect(rootTraversal(brief).state).toBe("deflected");

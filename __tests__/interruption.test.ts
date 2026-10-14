@@ -477,11 +477,14 @@ describe("interruption", () => {
   });
 
   it("interruption.guard deflection catch retains the completed guard outcome", () => {
-    const { brief } = boot(`function Main() { $enter(Child); function Child() {
+    const { runtime, brief: pending } =
+      boot(`function Main() { $enter(Child); function Child() {
       this.guard = () => State.DEFLECTED;
       this.catchDeflection = () => true;
       $instruct(\`after caught guard\`);
     } }`);
+    expect(pending.allowedMoves).toEqual(["deflect"]);
+    const brief = actionProgress(next(runtime, pending, { move: "deflect" }));
     expect(brief.instructions[0]?.text).toBe("after caught guard");
     expect(ownedChild(rootTraversal(brief), "Main.Child")?.guardCompleted).toBe(
       true,
@@ -1090,11 +1093,15 @@ it("interruption.replacement starts a fresh catch after completed interruption a
   expect(stopped).toMatchObject({ outcome: "interrupted" });
   const restored = restore(document, stopped.traversals);
   const work = actionProgress(restored.output);
-  const deflecting = actionProgress(
+  const pendingDeflection = actionProgress(
     next(restored.runtime, work, {
       move: "proceed",
       judgments: { [work.judgments[0]!.id]: true },
     }),
+  );
+  expect(pendingDeflection.allowedMoves).toEqual(["deflect"]);
+  const deflecting = actionProgress(
+    next(restored.runtime, pendingDeflection, { move: "deflect" }),
   );
   expect(rootTraversal(deflecting).control).toMatchObject({
     reason: "deflected",
