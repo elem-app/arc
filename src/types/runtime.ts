@@ -14,6 +14,7 @@ import type {
   ArrayValue,
   CellValue,
   PayloadValue,
+  SemanticText,
 } from "./value.js";
 
 /**
@@ -310,6 +311,7 @@ export type ActionState =
       call: {
         arguments: PayloadValue[];
         hostParams?: PayloadValue;
+        guidance?: SemanticText;
       };
     }
   | { kind: "host-call"; status: "resolved" }

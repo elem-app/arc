@@ -65,6 +65,7 @@ import {
   findCellOwner,
   initializeArtifactCells,
   renderHostCallInvocation,
+  renderNodeGuidance,
   renderSemanticText,
   requireArrayValue,
   resolveRefInTraversal,
@@ -1229,6 +1230,7 @@ function stepStandaloneHostCall(
   const rendered = renderHostCallInvocation(statement, traversal, node, accum);
   const call = {
     arguments: rendered.arguments,
+    ...(rendered.guidance === undefined ? {} : { guidance: rendered.guidance }),
     ...(rendered.hostParams === undefined
       ? {}
       : { hostParams: rendered.hostParams }),
@@ -1269,6 +1271,7 @@ function emitStandaloneHostCall(
       target: [...statement.target],
       operation: statement.operation,
       arguments: call.arguments,
+      guidance: call.guidance,
       hostParams: call.hostParams,
     } satisfies HostCallBrief),
   );
@@ -3047,6 +3050,7 @@ function emitInstruction(
     mode: statement.mode,
     phase,
     text: renderSemanticText(statement.template, traversal, node, accum),
+    guidance: renderNodeGuidance(traversal, node, accum),
     hostParams: admitBriefPayload(
       mergeAndClonePayload(node.hostParams, statement.hostParams),
     ),

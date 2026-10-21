@@ -86,7 +86,7 @@ Arc uses arrow functions for hooks and authored resolution logic. An arrow may u
 | --- | --- | --- |
 | `this.displayName` | string literal | Optional human-facing label. Presentation metadata only. |
 | `this.description` | string literal | Brief summary. |
-| `this.guidance` | string literal or template literal | Guidance for content delivery. |
+| `this.guidance` | string literal or template literal | Standing guidance carried on action-stage semantic work emitted by this node. |
 | `this.forgetfulEntry` | boolean literal | Default `false`. When `true`, each new entry is forgetful: it clears the prior outcome and action frame, so resolved-once actions run again. During the entry, resolved-once actions remain remembered normally. Cell values, child traversals, and canonical identity are preserved. This setting does not start a new entry when an ordinary canonical entry reaches an already-covered target. |
 | `this.trigger` | arrow function | Trigger condition for dormant arcs. See [Trigger](#thistrigger). |
 | `this.deflectWhen` | string literal, template literal, or arrow function | Default deflection policy inherited by instruction actions in this node subtree. See [DeflectWhen](#thisdeflectwhen). |
@@ -97,6 +97,8 @@ Arc uses arrow functions for hooks and authored resolution logic. An arrow may u
 | `this.hostParams` | object literal | Host-interpreted metadata carried on semantic work from this node. See [Host Params](#host-params). |
 
 Each config may be assigned at most once in a node. A duplicate assignment is a parse error.
+
+`this.guidance` supplies standing context for action-stage semantic work emitted by the declaring node. Trigger semantic work neither evaluates nor carries this guidance. It follows the semantic-text rules in [String Conventions](#string-conventions); each node supplies its own guidance.
 
 Structural identity comes from the function declaration identifier, not metadata.
 

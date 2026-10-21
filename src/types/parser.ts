@@ -783,7 +783,6 @@ export type Node = {
   identifier: string;
   displayName?: string;
   description?: string;
-  // TODO: Surface parsed guidance to the host; the runtime does not read it yet.
   guidance?: SemanticString;
   hostParams?: PayloadValue;
   forgetfulEntry: boolean;

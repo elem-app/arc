@@ -654,7 +654,8 @@ export function admitHostArgument(
       );
 }
 
-function isRenderedSemanticText(value: unknown): value is SemanticText {
+/** Validates the carrier shape of rendered host-facing semantic text. */
+export function isRenderedSemanticText(value: unknown): value is SemanticText {
   if (typeof value === "string") return true;
   if (!Array.isArray(value)) return false;
   return value.every((part) => {

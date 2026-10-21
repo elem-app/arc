@@ -378,8 +378,7 @@ export function buildTriggerBrief(
       [base],
       dialog,
       "plan",
-      // Trigger probing never announces transitions.
-      false,
+      "trigger",
     );
     applyReportResults(accum, acceptedReport);
     try {
@@ -533,7 +532,7 @@ export function buildActionBrief(
     workingTraversals,
     dialog,
     "plan",
-    true,
+    "action",
   );
   if (workingRoot.pendingTransition) {
     // An unacknowledged transition seeds the plan walk's latch, so the walk
@@ -1097,7 +1096,7 @@ export function acceptActionReport(
     working,
     dialog,
     "apply",
-    true,
+    "action",
   );
 
   if (report.move === "interrupt") {

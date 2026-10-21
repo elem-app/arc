@@ -29,6 +29,7 @@ import type {
 export type JudgmentBrief = {
   id: BriefId;
   sourceRef: NodeRef;
+  guidance?: SemanticText;
   question: SemanticText;
   hostParams: PayloadValue;
 };
@@ -69,6 +70,7 @@ export type ObservationBrief = {
   kind: "observation";
   id: BriefId;
   sourceRef: NodeRef;
+  guidance?: SemanticText;
   cell: string;
   mode: "observe" | "observeOrAsk";
   question: SemanticText;
@@ -107,6 +109,7 @@ export type ObservationGroupBrief = {
   kind: "observation-group";
   id: BriefId;
   sourceRef: NodeRef;
+  guidance?: SemanticText;
   mode: "observe" | "observeOrAsk";
   hostParams: PayloadValue;
   fields: ObservationGroupField[];
@@ -143,6 +146,7 @@ export type InstructionPostcheck = {
 export type InstructionBrief = {
   id: BriefId;
   sourceRef: NodeRef;
+  guidance?: SemanticText;
   mode: InstructionAction["mode"];
   phase: "apply" | "postcheck";
   text: SemanticText;
@@ -154,6 +158,7 @@ export type InstructionBrief = {
 export type HostCallBrief = {
   id: BriefId;
   sourceRef: NodeRef;
+  guidance?: SemanticText;
   module: string;
   target: string[];
   operation: string;

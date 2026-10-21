@@ -6,6 +6,7 @@ import {
 import {
   admitHostArgument,
   admitValue,
+  isRenderedSemanticText,
   resolveHostOperation,
 } from "../spec/resolution.js";
 import type {
@@ -860,7 +861,7 @@ function assertPersistedHostCallState(
   }
   assertExactPersistedKeys(
     state.call,
-    ["arguments", "hostParams"],
+    ["arguments", "hostParams", "guidance"],
     "pending host-call capture",
     ["arguments"],
   );
@@ -903,6 +904,18 @@ function assertPersistedHostCallState(
     "pending host-call hostParams",
     state.call.hostParams,
   );
+  assertPersistedDurableCarrier(
+    "pending host-call guidance",
+    state.call.guidance,
+  );
+  if (
+    state.call.guidance !== undefined &&
+    !isRenderedSemanticText(state.call.guidance)
+  ) {
+    throw invalidPersistedState(
+      "pending host-call guidance is not rendered semantic text",
+    );
+  }
 }
 
 function assertExactPersistedKeys(

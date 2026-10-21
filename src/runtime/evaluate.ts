@@ -331,6 +331,7 @@ export function applyObserve(
         node,
         accum,
       ),
+      guidance: renderNodeGuidance(traversal, node, accum),
       currentValue: cloneCellValue(target.value) as
         | PrimitiveValue
         | PrimitiveArrayValue
@@ -431,6 +432,7 @@ export function applyObserveGroup(
       id: workId,
       sourceRef: traversalToNodeRef(traversal),
       mode,
+      guidance: renderNodeGuidance(traversal, node, accum),
       hostParams: admitFinitePayload(
         effectiveHostParams(node, accum),
         "host-bound emission",
@@ -626,7 +628,7 @@ export function renderHostCallInvocation(
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
-): Pick<HostCallBrief, "arguments" | "hostParams"> {
+): Pick<HostCallBrief, "arguments" | "hostParams" | "guidance"> {
   const renderedArguments = renderTypedHostArguments(
     statement,
     traversal,
@@ -635,6 +637,7 @@ export function renderHostCallInvocation(
   );
   const rendered = {
     arguments: renderedArguments,
+    guidance: renderNodeGuidance(traversal, node, accum),
     hostParams: admitFinitePayload(
       effectiveHostParams(node, accum),
       "brief/host-call emission",
@@ -758,6 +761,8 @@ export function evaluateHostCall(
     node,
     accum,
   );
+  // Render before settling the result so resume visits the same pin prefix.
+  const guidance = renderNodeGuidance(traversal, node, accum);
   const report = accum.hostCallResults.get(id);
   const settled = settleHostCallPin(
     accum,
@@ -777,6 +782,7 @@ export function evaluateHostCall(
         target: [...expression.target],
         operation: expression.operation,
         arguments: renderedArguments,
+        guidance,
         hostParams: admitFinitePayload(
           effectiveHostParams(node, accum),
           "brief/host-call emission",
@@ -803,6 +809,8 @@ export function evaluateJudge(
     node,
     accum,
   );
+  // Guidance is part of the judgment's inputs and shares their pin lifetime.
+  const guidance = renderNodeGuidance(traversal, node, accum);
   const id = makeJudgeId(
     accum.entry.arc,
     traversal,
@@ -818,6 +826,7 @@ export function evaluateJudge(
       id,
       sourceRef: traversalToNodeRef(traversal),
       question: rendered,
+      guidance,
       hostParams: admitFinitePayload(
         effectiveHostParams(node, accum),
         "host-bound emission",
@@ -1900,6 +1909,17 @@ function assertDialogCursor(
       `${label} must be a valid Dialog cursor`,
     );
   }
+}
+
+/** Renders the emitting node's standing guidance for action-stage work. */
+export function renderNodeGuidance(
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): SemanticText | undefined {
+  return accum.stage === "trigger" || node.guidance === undefined
+    ? undefined
+    : renderSemanticText(node.guidance, traversal, node, accum);
 }
 
 export function renderSemanticText(

@@ -217,7 +217,7 @@ function Main() {
         [traversal],
         EMPTY_DIALOG,
         "apply",
-        true,
+        "action",
       );
 
       expect(applyUnset(statement, traversal, root, accum)).toEqual({

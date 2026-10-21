@@ -122,6 +122,7 @@ export type Accumulator = {
   traversals: ArcTraversalSet;
   dialog: Dialog;
   phase: "plan" | "apply";
+  stage: "trigger" | "action";
   judgments: JudgmentBrief[];
   observations: (ObservationBrief | ObservationGroupBrief)[];
   hostCalls: HostCallBrief[];
@@ -135,11 +136,9 @@ export type Accumulator = {
    * Latched, not-yet-yielded position changes for this walk. Appended at
    * genuine traversal entry/exit and flushed by the first transition gate,
    * which stamps `position` and records the stretch onto the action root as
-   * `pendingTransition`. Inert when `transitionsEnabled` is false (trigger
-   * stage).
+   * `pendingTransition`. Inert during the trigger stage.
    */
   transition?: TransitionStretch & { position?: NodeRef };
-  transitionsEnabled: boolean;
   /** Runtime issues raised mid-walk, merged into the brief by the plan walk. */
   issues: RuntimeIssue[];
   active?: NodeRef;
@@ -264,7 +263,7 @@ export function createAccumulator(
   traversals: ArcTraversalSet,
   dialog: Dialog,
   phase: "plan" | "apply",
-  transitionsEnabled: boolean,
+  stage: Accumulator["stage"],
 ): Accumulator {
   return {
     entries,
@@ -273,6 +272,7 @@ export function createAccumulator(
     traversals,
     dialog,
     phase,
+    stage,
     judgments: [],
     observations: [],
     hostCalls: [],
@@ -281,7 +281,6 @@ export function createAccumulator(
     hostParamsActive: false,
     blocked: false,
     transition: undefined,
-    transitionsEnabled,
     issues: [],
     active: undefined,
     activeSeg: { kind: "body" },
@@ -662,6 +661,7 @@ export function cloneHostCallBrief(brief: HostCallBrief): HostCallBrief {
   return {
     id: brief.id,
     sourceRef: brief.sourceRef,
+    guidance: cloneOptionalSemanticText(brief.guidance),
     module: brief.module,
     target: [...brief.target],
     operation: brief.operation,
@@ -674,6 +674,7 @@ export function cloneJudgmentBrief(brief: JudgmentBrief): JudgmentBrief {
   return {
     id: brief.id,
     sourceRef: brief.sourceRef,
+    guidance: cloneOptionalSemanticText(brief.guidance),
     question: cloneSemanticText(brief.question),
     hostParams: clonePayloadValue(brief.hostParams),
   };
@@ -708,6 +709,9 @@ function cloneActionState(state: ActionState): ActionState {
               arguments: state.call.arguments.map((argument) =>
                 clonePayloadValue(argument),
               ),
+              ...(state.call.guidance === undefined
+                ? {}
+                : { guidance: cloneSemanticText(state.call.guidance) }),
               ...(state.call.hostParams === undefined
                 ? {}
                 : { hostParams: clonePayloadValue(state.call.hostParams) }),
@@ -761,6 +765,7 @@ export function cloneObservationBrief(
     kind: "observation",
     id: brief.id,
     sourceRef: brief.sourceRef,
+    guidance: cloneOptionalSemanticText(brief.guidance),
     cell: brief.cell,
     mode: brief.mode,
     question: cloneSemanticText(brief.question),
@@ -788,6 +793,7 @@ export function cloneObservationGroupBrief(
     kind: "observation-group",
     id: brief.id,
     sourceRef: brief.sourceRef,
+    guidance: cloneOptionalSemanticText(brief.guidance),
     mode: brief.mode,
     hostParams: clonePayloadValue(brief.hostParams),
     fields: brief.fields.map((field) => ({
@@ -828,6 +834,7 @@ export function cloneInstructionBrief(
   return {
     id: brief.id,
     sourceRef: brief.sourceRef,
+    guidance: cloneOptionalSemanticText(brief.guidance),
     mode: brief.mode,
     phase: brief.phase,
     text: cloneSemanticText(brief.text),
@@ -838,7 +845,15 @@ export function cloneInstructionBrief(
 
 export function cloneSemanticText(text: SemanticText): SemanticText {
   if (typeof text === "string") return text;
-  return text.map((part) => ({ ...part }));
+  return text.map((part) =>
+    part.kind === "hostVar" ? { ...part, path: [...part.path] } : { ...part },
+  );
+}
+
+function cloneOptionalSemanticText(
+  text: SemanticText | undefined,
+): SemanticText | undefined {
+  return text === undefined ? undefined : cloneSemanticText(text);
 }
 
 export function cloneInstructionPostcheck(
@@ -1328,6 +1343,9 @@ export function markPendingHostCall(
     status: "pending",
     call: {
       arguments: call.arguments.map((argument) => clonePayloadValue(argument)),
+      ...(call.guidance === undefined
+        ? {}
+        : { guidance: cloneSemanticText(call.guidance) }),
       ...(call.hostParams === undefined
         ? {}
         : { hostParams: clonePayloadValue(call.hostParams) }),
@@ -1368,20 +1386,20 @@ export function recordActiveFrame(accum: Accumulator): void {
 
 /** Appends a genuinely entered traversal to the walk's transition latch. */
 export function latchEnteredTransition(accum: Accumulator, ref: NodeRef): void {
-  if (!accum.transitionsEnabled) return;
+  if (accum.stage !== "action") return;
   (accum.transition ??= { exited: [], entered: [] }).entered.push(ref);
 }
 
 /** Appends a genuinely exited traversal to the walk's transition latch. */
 export function latchExitedTransition(accum: Accumulator, ref: NodeRef): void {
-  if (!accum.transitionsEnabled) return;
+  if (accum.stage !== "action") return;
   (accum.transition ??= { exited: [], entered: [] }).exited.push(ref);
 }
 
 /** Whether the walk has latched position changes awaiting a transition gate. */
 export function hasPendingTransitionLatch(accum: Accumulator): boolean {
   return (
-    accum.transitionsEnabled &&
+    accum.stage === "action" &&
     accum.transition !== undefined &&
     (accum.transition.exited.length > 0 || accum.transition.entered.length > 0)
   );

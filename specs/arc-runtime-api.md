@@ -358,6 +358,8 @@ Transitions surface only during the action stage; trigger probing evaluates agai
 
 ### Work Items
 
+Each work item identifies its request with `id` and its source node with `sourceRef`. Alongside work-specific inputs, it carries `hostParams`. Action-stage work also carries optional `guidance?: SemanticText` rendered from that node's `this.guidance`; trigger work neither evaluates nor carries guidance. The host applies guidance as standing context; observation groups share it across their fields. Undeclared guidance is absent, and an explicitly empty string is preserved.
+
 #### Semantic Text
 
 Semantic text is the host-facing representation of authored template literals intended for LLMs/agents to consume. The runtime resolves ordinary value expressions to text, but it preserves semantic mentions that only the host can render correctly for the current agent, workspace, and prompt format.
@@ -388,6 +390,8 @@ type JudgmentBrief = {
   id: BriefId;
   /** Source node that produced this brief item. */
   sourceRef: NodeRef;
+  /** Rendered action-stage standing guidance from the source node, when declared. */
+  guidance?: SemanticText;
   /** Rendered semantic question. */
   question: SemanticText;
   /** Semantic metadata for this work item. */
@@ -407,6 +411,8 @@ type ObservationBrief = {
   id: BriefId;
   /** Source node that produced this brief item. */
   sourceRef: NodeRef;
+  /** Rendered action-stage standing guidance from the source node, when declared. */
+  guidance?: SemanticText;
   /** Canonical concrete target label, for example "items[2]". */
   cell: string;
   /** Whether the host may ask the user. */
@@ -471,6 +477,8 @@ type ObservationGroupBrief = {
   id: BriefId;
   /** Source node that produced this brief item. */
   sourceRef: NodeRef;
+  /** Rendered action-stage standing guidance shared by this group's fields. */
+  guidance?: SemanticText;
   /** Whether the host may ask the user. */
   mode: "observe" | "observeOrAsk";
   /** Semantic metadata for this work item. */
@@ -514,6 +522,8 @@ type HostCallBrief = {
   id: BriefId;
   /** Source node that produced this brief item. */
   sourceRef: NodeRef;
+  /** Rendered action-stage standing guidance from the source node, when declared. */
+  guidance?: SemanticText;
   /** Host module name from `host:*`. */
   module: string;
   /** Member path before the operation, e.g. `["facts"]`. */
@@ -549,9 +559,9 @@ This envelope represents a void resolution without using `undefined` as the ackn
 
 Report values first pass transport sanitation. Every nested value must satisfy the durable payload-shape rules and every number must be finite. A non-finite number is rejected with `reasonCode: "host-call-non-finite-number"`; a malformed recursive shape uses `invalid-struct-value`. Each invalid item is removed from the accepted report subset, valid siblings remain accepted, and the rejected call reappears under the same id. Negative zero is accepted and represented as zero.
 
-A host call used as an action follows resolved-once action-state lifetime. On first reach, the runtime captures its admitted arguments and `hostParams` and suspends at that action. It re-emits the captured invocation under the same brief id without reevaluating its inputs until it receives `{ status: "resolved" }` or the host poisons the frontier. Once resolved, the action slot stays resolved through ordinary retries and re-entry. A new `invoke(...)` run, a different `$map(...)` member, or a forgetful entry clears the applicable action state, so the call executes again when reached.
+A host call used as an action follows resolved-once action-state lifetime. On first reach, the runtime captures its admitted arguments, `hostParams`, and rendered `guidance` and suspends at that action. It re-emits the captured invocation under the same brief id without reevaluating its inputs until it receives `{ status: "resolved" }` or the host poisons the frontier. Once resolved, the action slot stays resolved through ordinary retries and re-entry. A new `invoke(...)` run, a different `$map(...)` member, or a forgetful entry clears the applicable action state, so the call executes again when reached.
 
-Persisted action state includes pending captured invocations. Restoration validates pending and resolved state shapes, call identity, captured argument admission, and captured `hostParams` before traversal resumes. Captured arguments must preserve the authored argument count, supplied Struct fields, and authored array lengths at every nesting depth.
+Persisted action state includes pending captured invocations. Restoration validates pending and resolved state shapes, call identity, captured argument admission, captured `hostParams`, and the semantic-text shape of captured `guidance` before traversal resumes. Captured arguments must preserve the authored argument count, supplied Struct fields, and authored array lengths at every nesting depth.
 
 #### Instructions
 
@@ -563,6 +573,8 @@ type InstructionBrief = {
   id: BriefId;
   /** Source node that produced this instruction. */
   sourceRef: NodeRef;
+  /** Rendered action-stage standing guidance from the source node, when declared. */
+  guidance?: SemanticText;
   /** Instruction mode from arc source. */
   mode: "once" | "persistent";
   /**
