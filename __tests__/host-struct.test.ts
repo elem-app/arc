@@ -178,14 +178,8 @@ describe("Struct host parameters", () => {
     ).toThrow(/composite/);
     expect(() =>
       hmd.define({
-        // @ts-expect-error Struct is parameter-only.
-        call: () => hmd.Struct({}),
-      }),
-    ).toThrow(/result must be an Arc channel spec/);
-    expect(() =>
-      hmd.define({
-        // @ts-expect-error Struct arrays are parameter-only results.
-        call: () => hmd.Array(hmd.Struct({})),
+        // @ts-expect-error Struct results cannot carry omittable fields.
+        call: () => hmd.Array(hmd.Struct({ name: hmd.Omittable(hmd.Str()) })),
       }),
     ).toThrow(/result must be an Arc channel spec/);
     expect(() =>
@@ -264,8 +258,15 @@ describe("Struct host parameters", () => {
       ).toThrow(/INVALID_HOST_MODULE_SPEC/);
     }
     for (const result of [
-      { type: "struct", fields: {} },
-      { type: "array", element: { type: "struct", fields: {} } },
+      {
+        type: "array",
+        element: { type: "struct", fields: { file: { type: "artifact" } } },
+      },
+      { type: "struct", fields: { file: { type: "artifact" } } },
+      {
+        type: "struct",
+        fields: { name: { type: "omittable", spec: { type: "string" } } },
+      },
     ])
       expect(
         validateHostModuleSpec(normalized({ type: "string" }, result)).length,

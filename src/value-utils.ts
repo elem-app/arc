@@ -7,6 +7,17 @@ import {
   type StructValue,
 } from "./types/value.js";
 
+/** Whether a value is a plain or null-prototype object record. */
+export function isPlainRecord(
+  value: unknown,
+): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
 /** First structural violation found while inspecting a host payload carrier. */
 export type PayloadValueIssue = {
   path: string;

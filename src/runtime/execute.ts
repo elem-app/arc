@@ -14,6 +14,7 @@ import type {
   InstructionAction,
   InvokeAction,
   MapAction,
+  MapResultsTarget,
   Node,
   ResolutionStatement,
   SegKey,
@@ -21,6 +22,7 @@ import type {
   Statement,
   TriggerStatement,
 } from "../types/parser.js";
+import { mapResultsCell, mapResultsLabel } from "../types/parser.js";
 import type {
   ActionState,
   ArcRef,
@@ -69,8 +71,9 @@ import {
   renderSemanticText,
   requireArrayValue,
   resolveRefInTraversal,
+  runtimeArrayElementSpec,
   truthy,
-  writeOwnedCell,
+  writeOwnedCellPath,
   writeOwnedCellValue,
 } from "./evaluate.js";
 import {
@@ -1859,11 +1862,15 @@ function stepMap(
         requireArrayValue(
           statement.receiver,
           traversal,
+          node,
           accum,
           "$map receiver",
         ),
       ) as ArrayValue,
-      results: statement.results,
+      results:
+        statement.results === undefined
+          ? undefined
+          : mapResultsLabel(statement.results),
       nextIndex: 0,
       terminals: [],
       staged: undefined,
@@ -1899,17 +1906,19 @@ function stepMap(
       }
       return value;
     });
-    const owner = findCellOwner(statement.results, traversal, accum);
+    const root = mapResultsCell(statement.results)!;
+    const owner = findCellOwner(root, traversal, accum);
     if (!owner) {
-      throw runtimeError(
-        "unknown-cell",
-        `Unknown $map results cell: ${statement.results}`,
-      );
+      throw runtimeError("unknown-cell", `Unknown $map results cell: ${root}`);
     }
-    // Validate the whole constructed list against the output cell's element
+    // Validate the whole constructed list against the output array's element
     // shape before it lands, exactly as an array `$set` does.
-    assertAssignableValue(statement.results, owner.cell, output);
-    writeOwnedCell(owner.traversal, statement.results, output);
+    writeOwnedCellPath(
+      owner.traversal,
+      owner.cell,
+      typeof statement.results === "string" ? [] : statement.results.path,
+      output,
+    );
   }
   clearMapSubtreeState(traversal, statement);
   recordValuePin(accum, true);
@@ -1948,7 +1957,12 @@ function runMapMember(
     resultSpec:
       statement.results === undefined
         ? undefined
-        : runtimeArrayCellElementSpec(statement.results, traversal, accum),
+        : runtimeMapResultsElementSpec(
+            statement.results,
+            traversal,
+            node,
+            accum,
+          ),
   };
   accum.activeSeg = { kind: "mapMember", owner: statement.id, index };
   const tape = pinTapeFor(traversal, mapMemberSegKey(statement.id, index));
@@ -1986,26 +2000,18 @@ function runMapMember(
   return outcome;
 }
 
-function runtimeArrayElementSpec(
-  reference: MapAction["receiver"],
+function runtimeMapResultsElementSpec(
+  results: MapResultsTarget,
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
 ): ArrayElementSpec | undefined {
-  if (reference.kind === "channel") {
-    const spec = node.signature?.[reference.namespace][reference.key];
-    return spec?.type === "array" ? spec.element : undefined;
-  }
-  return runtimeArrayCellElementSpec(reference.name, traversal, accum);
-}
-
-function runtimeArrayCellElementSpec(
-  name: string,
-  traversal: Traversal,
-  accum: Accumulator,
-): ArrayElementSpec | undefined {
-  const cell = findCellOwner(name, traversal, accum)?.cell;
-  return cell?.type === "array" ? cell.element : undefined;
+  return runtimeArrayElementSpec(
+    typeof results === "string" ? { kind: "cell", name: results } : results,
+    traversal,
+    node,
+    accum,
+  );
 }
 
 /**
@@ -2905,11 +2911,16 @@ function commitSpanResult(
       `span.result sink map not found: ${link.mapId}`,
     );
   }
-  const resultSpec = runtimeArrayCellElementSpec(map.results, owner, accum);
+  const resultSpec = runtimeMapResultsElementSpec(
+    map.results,
+    owner,
+    node,
+    accum,
+  );
   if (!resultSpec) {
     throw runtimeError(
       "invalid-span-result",
-      `span.result sink ${map.results} has no array element spec`,
+      `span.result sink ${mapResultsLabel(map.results)} has no array element spec`,
     );
   }
   assertAssignableValue("span.result", resultSpec, value);

@@ -1,22 +1,35 @@
 import type * as acorn from "acorn";
 
 import { isHostStructFieldName } from "../spec/host-parameters.js";
+import { isStructFieldName } from "../spec/struct.js";
 import {
   UNSTAMPED_ID,
   type ArithmeticOperator,
   type ArrayReference,
   type ArtifactConstructExpression,
+  type Cell,
   type CellTarget,
   type ComparisonOperator,
+  type FieldReceiver,
+  type FieldReference,
   type HostCallArgument,
   type LocalExpression,
+  type NodeSignature,
   type SemanticString,
+  type SlotReference,
   type SourceRange,
   type TemplateString,
   type TemplateStringPart,
   type ValueExpression,
   type ValueStringPart,
 } from "../types/parser.js";
+import {
+  fieldSpecAt,
+  type ArrayElementSpec,
+  type CellSpec,
+  type ChannelSpec,
+  type ObservableFieldSpec,
+} from "../types/spec.js";
 import { classifyArtifactPath } from "../types/value.js";
 import { describeArtifactPathIssue } from "../value-utils.js";
 import { parseTarget, type TargetParseContext } from "./targets.js";
@@ -26,6 +39,237 @@ export type ExpressionParseContext = {
   allowPendingState?: boolean;
   allowInterruption?: boolean;
 };
+
+/**
+ * Declarations of one node visible while its expressions are parsed. Member
+ * access is interpreted by the receiver's declared role, so a Struct field
+ * named `state` or `length` reads that field rather than node state or an
+ * array length.
+ */
+type DeclarationScopeFrame = {
+  cells: ReadonlyMap<string, Cell>;
+  signature?: NodeSignature;
+};
+
+let declarationScope: DeclarationScopeFrame[] = [];
+
+/**
+ * Element declarations of the `$map` receivers whose callbacks are being
+ * parsed, innermost last, so `span.item.field` reads resolve their fields.
+ */
+let mapItemScope: (ArrayElementSpec | undefined)[] = [];
+
+/** Spec a parse-time reference resolves to through the declaration scope. */
+type ScopedSpec =
+  | CellSpec
+  | ChannelSpec
+  | ObservableFieldSpec
+  | ArrayElementSpec;
+
+/** Parses `body` with one node's cell and channel declarations in scope. */
+export function withDeclarationScope<T>(
+  frame: DeclarationScopeFrame,
+  body: () => T,
+): T {
+  declarationScope = [...declarationScope, frame];
+  try {
+    return body();
+  } finally {
+    declarationScope = declarationScope.slice(0, -1);
+  }
+}
+
+/**
+ * Parses a `$map` callback with the receiver's element declaration in scope
+ * for `span.item`.
+ */
+export function withMapItemScope<T>(
+  element: ArrayElementSpec | undefined,
+  body: () => T,
+): T {
+  mapItemScope = [...mapItemScope, element];
+  try {
+    return body();
+  } finally {
+    mapItemScope = mapItemScope.slice(0, -1);
+  }
+}
+
+/** Resets the declaration scope before parsing a new document. */
+export function resetDeclarationScope(): void {
+  declarationScope = [];
+  mapItemScope = [];
+}
+
+function scopedSlotSpec(reference: SlotReference): ScopedSpec | undefined {
+  if (reference.kind === "channel") {
+    return declarationScope.at(-1)?.signature?.[reference.namespace][
+      reference.key
+    ];
+  }
+  for (let index = declarationScope.length - 1; index >= 0; index -= 1) {
+    const cell = declarationScope[index]!.cells.get(reference.name);
+    if (cell) return cell;
+  }
+  return undefined;
+}
+
+function scopedReceiverSpec(receiver: FieldReceiver): ScopedSpec | undefined {
+  switch (receiver.kind) {
+    case "cell":
+    case "channel":
+      return scopedSlotSpec(receiver);
+    case "arrayElementRead": {
+      const array = scopedReferenceSpec(receiver.array);
+      return array?.type === "array" ? array.element : undefined;
+    }
+    case "span":
+      return mapItemScope.at(-1);
+  }
+}
+
+/** The declaration an array or field reference resolves to, when in scope. */
+export function scopedReferenceSpec(
+  reference: ArrayReference,
+): ScopedSpec | undefined {
+  if (reference.kind !== "field") return scopedSlotSpec(reference);
+  const receiver = scopedReceiverSpec(reference.receiver);
+  return receiver?.type === "struct"
+    ? fieldSpecAt(receiver, reference.path)
+    : undefined;
+}
+
+/**
+ * Recognizes a declared cell or channel receiver: a bare cell identifier or a
+ * typed channel projection (`args.x` / `returns.x`).
+ */
+function parseSlotReference(
+  node: acorn.Expression | acorn.Super,
+  availableHostModules: ReadonlyMap<string, string>,
+): SlotReference | undefined {
+  if (node.type === "Identifier") {
+    if (availableHostModules.has(node.name)) return undefined;
+    return { kind: "cell", name: node.name };
+  }
+  if (
+    node.type === "MemberExpression" &&
+    !node.computed &&
+    node.object.type === "Identifier" &&
+    (node.object.name === "args" || node.object.name === "returns") &&
+    node.property.type === "Identifier"
+  ) {
+    return {
+      kind: "channel",
+      namespace: node.object.name,
+      key: node.property.name,
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Parses a member chain whose receiver is a Struct-declared cell, channel,
+ * Struct array element, or `span.item` into a field reference. Dot access and
+ * a literal-string bracket select the same field. Returns `undefined` when the
+ * receiver is not a declared Struct; an undeclared field of a Struct receiver
+ * is a parse error.
+ */
+export function parseFieldReference(
+  node: acorn.Expression,
+  availableHostModules: ReadonlyMap<string, string>,
+  context?: ExpressionParseContext,
+): FieldReference | undefined {
+  if (node.type !== "MemberExpression" || node.object.type === "Super") {
+    return undefined;
+  }
+  const name = staticFieldName(node);
+  if (name === undefined) return undefined;
+  const object = node.object;
+  const parent =
+    parseFieldReference(object, availableHostModules, context) ??
+    parseSlotReference(object, availableHostModules) ??
+    parseElementReceiver(object, availableHostModules, context);
+  if (!parent) return undefined;
+  const receiverSpec =
+    parent.kind === "field"
+      ? scopedReferenceSpec(parent)
+      : scopedReceiverSpec(parent);
+  if (receiverSpec?.type !== "struct") return undefined;
+  if (!Object.hasOwn(receiverSpec.fields, name)) {
+    throw new Error(
+      `Struct ${formatReference(parent)} has no declared field ${JSON.stringify(name)}`,
+    );
+  }
+  return parent.kind === "field"
+    ? { kind: "field", receiver: parent.receiver, path: [...parent.path, name] }
+    : { kind: "field", receiver: parent, path: [name] };
+}
+
+/**
+ * Recognizes an element receiver of a field read: an element read
+ * `items[index]` of an array reference, or `span.item`.
+ */
+function parseElementReceiver(
+  node: acorn.Expression,
+  availableHostModules: ReadonlyMap<string, string>,
+  context?: ExpressionParseContext,
+): FieldReceiver | undefined {
+  if (node.type !== "MemberExpression" || node.object.type === "Super") {
+    return undefined;
+  }
+  if (
+    !node.computed &&
+    node.object.type === "Identifier" &&
+    node.object.name === "span" &&
+    node.property.type === "Identifier" &&
+    node.property.name === "item"
+  ) {
+    return { kind: "span", owner: "map", key: "item" };
+  }
+  if (!node.computed || node.property.type === "PrivateIdentifier") {
+    return undefined;
+  }
+  const array = parseArrayReference(node.object, availableHostModules, context);
+  if (!array) return undefined;
+  return {
+    kind: "arrayElementRead",
+    array,
+    index: expressionToLocalExpression(
+      node.property,
+      availableHostModules,
+      undefined,
+      context,
+    ),
+  };
+}
+
+function staticFieldName(node: acorn.MemberExpression): string | undefined {
+  if (!node.computed) {
+    return node.property.type === "Identifier" ? node.property.name : undefined;
+  }
+  return node.property.type === "Literal" &&
+    typeof node.property.value === "string"
+    ? node.property.value
+    : undefined;
+}
+
+/** Renders a field receiver or field reference for diagnostics. */
+export function formatReference(
+  reference: FieldReceiver | FieldReference,
+): string {
+  switch (reference.kind) {
+    case "field":
+      return [formatReference(reference.receiver), ...reference.path].join(".");
+    case "cell":
+      return reference.name;
+    case "channel":
+      return `${reference.namespace}.${reference.key}`;
+    case "arrayElementRead":
+      return `${formatReference(reference.array)}[...]`;
+    case "span":
+      return "span.item";
+  }
+}
 
 export function getName(
   node: acorn.Node | null | undefined,
@@ -180,6 +424,8 @@ export function expressionToLocalExpression(
   }
 
   if (node.type === "MemberExpression") {
+    const field = parseFieldReference(node, availableHostModules, context);
+    if (field) return field;
     if (node.computed) {
       // Bracket indexing `items[index]` / `args.items[index]` is an element
       // read on a cell or typed array channel. Any other computed access stays
@@ -381,34 +627,22 @@ export function parseCellTarget(
 
 /**
  * Recognizes the receiver of a bracket index or `.length` read: a bare cell
- * identifier or a typed array channel projection (`args.items` / `returns.items`).
- * Returns `undefined` for any other expression, so element and length reads are
- * admitted only on direct cell or channel references.
+ * identifier, a typed array channel projection (`args.items` /
+ * `returns.items`), or a declared Struct field. Returns `undefined` for any
+ * other expression, so element and length reads are admitted only on declared
+ * references.
  */
-function parseArrayReference(
+export function parseArrayReference(
   node: acorn.Expression,
   availableHostModules: ReadonlyMap<string, string>,
+  context?: ExpressionParseContext,
 ): ArrayReference | undefined {
-  if (node.type === "Identifier") {
-    // A host-module identifier is not a cell; a computed access on it stays a
-    // rejected dynamic host-member reference, not an element read.
-    if (availableHostModules.has(node.name)) return undefined;
-    return { kind: "cell", name: node.name };
-  }
-  if (
-    node.type === "MemberExpression" &&
-    !node.computed &&
-    node.object.type === "Identifier" &&
-    (node.object.name === "args" || node.object.name === "returns") &&
-    node.property.type === "Identifier"
-  ) {
-    return {
-      kind: "channel",
-      namespace: node.object.name,
-      key: node.property.name,
-    };
-  }
-  return undefined;
+  // A host-module identifier is not a cell; a computed access on it stays a
+  // rejected dynamic host-member reference, not an element read.
+  return (
+    parseFieldReference(node, availableHostModules, context) ??
+    parseSlotReference(node, availableHostModules)
+  );
 }
 
 export function parseExpression(
@@ -453,6 +687,10 @@ export function parseExpression(
         );
       }),
     };
+  }
+
+  if (node.type === "ObjectExpression") {
+    return parseStructLiteral(node, availableHostModules, briefable, context);
   }
 
   if (node.type === "LogicalExpression") {
@@ -610,6 +848,23 @@ export function parseExpression(
         cell: node.callee.object.name,
       };
     }
+    if (
+      node.callee.type === "MemberExpression" &&
+      !node.callee.computed &&
+      node.callee.property.type === "Identifier" &&
+      node.callee.property.name === "isUnset" &&
+      node.callee.object.type === "MemberExpression"
+    ) {
+      const field = parseFieldReference(
+        node.callee.object,
+        availableHostModules,
+      );
+      if (field) {
+        throw new Error(
+          "isUnset() applies to a whole cell; a Struct field is set exactly when its Struct is set",
+        );
+      }
+    }
     // `args.x.isUnset()` / `returns.x.isUnset()` on a typed channel.
     if (
       node.callee.type === "MemberExpression" &&
@@ -739,6 +994,53 @@ export function parseExpression(
     briefable,
     context,
   );
+}
+
+/**
+ * Parses an object literal in a value position into a Struct construction.
+ * Keys are identifiers or strings; shorthand `{ a }` reads the cell `a`.
+ */
+function parseStructLiteral(
+  node: acorn.ObjectExpression,
+  availableHostModules: ReadonlyMap<string, string>,
+  briefable: boolean | undefined,
+  context: ExpressionParseContext | undefined,
+): ValueExpression {
+  const fields: Record<string, ValueExpression> = {};
+  for (const property of node.properties) {
+    if (property.type === "SpreadElement") {
+      throw new Error("Struct values do not support spread");
+    }
+    if (property.computed) {
+      throw new Error("Struct values do not support computed keys");
+    }
+    if (property.kind !== "init" || property.method) {
+      throw new Error("Struct values require data properties");
+    }
+    const key =
+      property.key.type === "Identifier"
+        ? property.key.name
+        : property.key.type === "Literal" &&
+            typeof property.key.value === "string"
+          ? property.key.value
+          : undefined;
+    if (key === undefined) {
+      throw new Error("Struct values require identifier or string keys");
+    }
+    if (!isStructFieldName(key)) {
+      throw new Error(`Invalid Struct field name ${JSON.stringify(key)}`);
+    }
+    if (Object.hasOwn(fields, key)) {
+      throw new Error(`Duplicate Struct field ${JSON.stringify(key)}`);
+    }
+    fields[key] = parseExpression(
+      property.value,
+      availableHostModules,
+      briefable,
+      context,
+    );
+  }
+  return { kind: "structLiteral", fields };
 }
 
 /** Parses the shared declaration- and value-site Artifact constructor. */
@@ -1108,6 +1410,10 @@ export function containsBriefableExpression(
     case "arrayLiteral":
       return expression.elements.some((element) =>
         containsBriefableExpression(element),
+      );
+    case "structLiteral":
+      return Object.values(expression.fields).some((field) =>
+        containsBriefableExpression(field),
       );
     default:
       return false;

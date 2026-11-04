@@ -4,12 +4,19 @@ import { parse, type DocumentAnalysis } from "../src/parser/index.js";
 import {
   Runtime,
   type ActionBrief,
+  type ArrayObservationMeta as RuntimeArrayObservationMeta,
+  type ObservedStructValue as RuntimeObservedStructValue,
+  type ObservedValue as RuntimeObservedValue,
+  type StructObservationField as RuntimeStructObservationField,
+  type StructObservationMeta as RuntimeStructObservationMeta,
+  type StructValue as RuntimeStructValue,
   type TerminalBrief,
 } from "../src/runtime/index.js";
 import type {
   ActionInterruption,
   ActionMove,
   ActionStatement,
+  ArrayObservationMeta,
   CatchInterruptionStatement,
   CellSpec,
   CellValue,
@@ -18,7 +25,12 @@ import type {
   HostCall,
   InterruptionContext,
   NodeState,
+  ObservedStructValue,
+  ObservedValue,
   RuntimeIssue,
+  StructObservationField,
+  StructObservationMeta,
+  StructValue,
   TraversalControl,
   ValueExpression,
 } from "../src/types/index.js";
@@ -54,6 +66,25 @@ describe("public type surface", () => {
     expect(brief).toBeUndefined();
     expect(issue).toBeUndefined();
     expect(new Runtime()).toBeInstanceOf(Runtime);
+  });
+
+  it("struct.type-ownership exports Struct value and observation contracts from arc/types and arc/runtime", () => {
+    expectTypeOf<RuntimeArrayObservationMeta>().toEqualTypeOf<ArrayObservationMeta>();
+    expectTypeOf<RuntimeStructObservationMeta>().toEqualTypeOf<StructObservationMeta>();
+    expectTypeOf<RuntimeStructObservationField>().toEqualTypeOf<StructObservationField>();
+    expectTypeOf<RuntimeObservedValue>().toEqualTypeOf<ObservedValue>();
+    expectTypeOf<RuntimeObservedStructValue>().toEqualTypeOf<ObservedStructValue>();
+    expectTypeOf<RuntimeStructValue>().toEqualTypeOf<StructValue>();
+    const record: RuntimeObservedStructValue = { name: "Ada", tags: ["a"] };
+    const meta: RuntimeArrayObservationMeta = {
+      type: "array",
+      element: {
+        type: "struct",
+        fields: { name: { question: "the name", meta: { type: "string" } } },
+      },
+    };
+    expect(record).toEqual({ name: "Ada", tags: ["a"] });
+    expect(meta.element.type).toBe("struct");
   });
 });
 

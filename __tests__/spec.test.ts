@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { parse } from "../src/parser/index.js";
 import {
   admitValue,
   judgeOneTimeLanding,
@@ -8,6 +9,8 @@ import {
   type CoherenceJudgment,
 } from "../src/spec/resolution.js";
 import { validateSpec } from "../src/spec/validation.js";
+import { fieldDeclarationAt } from "../src/types/parser.js";
+import { fieldSpecAt, type StructSpec } from "../src/types/spec.js";
 import { createArtifactValue } from "../src/value-utils.js";
 
 const kind = (judgment: CoherenceJudgment) => judgment.kind;
@@ -476,5 +479,33 @@ describe("spec judgments", () => {
         { type: "array", element: { type: "artifact" } },
       ),
     ).toBe(false);
+  });
+
+  it("struct.field-path resolves a nested field with the receiver's field family", () => {
+    const spec: StructSpec = {
+      type: "struct",
+      fields: {
+        inner: { type: "struct", fields: { x: { type: "string" } } },
+      },
+    };
+    const leaf = fieldSpecAt(spec, ["inner", "x"]);
+    expect(leaf).toEqual({ type: "string" });
+    // The result is any field guarantee, so Struct members need narrowing.
+    // @ts-expect-error -- `fields` exists only on the Struct member.
+    expect(leaf?.fields).toBeUndefined();
+    expect(fieldSpecAt(spec, ["inner", "missing"])).toBeUndefined();
+    expect(fieldSpecAt(spec, ["inner", "x", "deeper"])).toBeUndefined();
+
+    const cell = parse(`
+"arc";
+function Main() {
+  let s = Struct({ inner: Struct({ x: Str({ observing: \`the x\` }) }) });
+}
+`).roots[0]!.cells[0]!;
+    if (cell.type !== "struct") throw new Error("expected a Struct cell");
+    expect(fieldDeclarationAt(cell, ["inner", "x"])).toMatchObject({
+      type: "string",
+      observing: expect.anything(),
+    });
   });
 });

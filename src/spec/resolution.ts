@@ -2,6 +2,7 @@ import type {
   ArrayReference,
   Cell,
   ComparisonOperator,
+  FieldReceiver,
   HostCall,
   HostCallArgument,
   NodeSignature,
@@ -10,6 +11,8 @@ import type {
 } from "../types/parser.js";
 import {
   cellSpecToChannelSpec,
+  fieldSpecAt,
+  fieldSpecOf,
   type ArrayElementSpec,
   type CellSpec,
   type ChannelSpec,
@@ -17,6 +20,7 @@ import {
   type HostNamespaceSpec,
   type HostOperationSpec,
   type HostParameterValueSpec,
+  type StructSpec,
 } from "../types/spec.js";
 import {
   classifyArtifactPath,
@@ -35,6 +39,7 @@ import {
   describeArtifactValueIssue,
   firstInvalidPayloadValue,
   firstNonFiniteNumberPath,
+  isPlainRecord,
 } from "../value-utils.js";
 import { hostParameterValueSpec } from "./host-parameters.js";
 
@@ -87,7 +92,8 @@ export type AdmissionViolation = {
     | "invalid-index"
     | "invalid-array"
     | "invalid-artifact"
-    | "invalid-dialog-cursor";
+    | "invalid-dialog-cursor"
+    | "invalid-struct";
   detail: string;
   path: string;
 };
@@ -167,7 +173,51 @@ export function admitValue(
             "A valid Dialog cursor is required",
             path,
           );
+    case "struct":
+      return admitStructValue(spec, value, path);
   }
+}
+
+/**
+ * Admits one complete concrete Struct value: a plain data record carrying
+ * exactly the declared fields, each with an admitted concrete value.
+ */
+function admitStructValue(
+  spec: StructSpec,
+  value: unknown,
+  path: string,
+): Admission {
+  const carrierIssue = firstInvalidPayloadValue(value, path);
+  if (carrierIssue) {
+    return violation("invalid-struct", carrierIssue.detail, carrierIssue.path);
+  }
+  if (!isPlainRecord(value)) {
+    return violation("invalid-struct", "A Struct record is required", path);
+  }
+  for (const key of Object.keys(value)) {
+    if (!Object.hasOwn(spec.fields, key)) {
+      return violation(
+        "invalid-struct",
+        "Struct value contains an undeclared field",
+        `${path}[${JSON.stringify(key)}]`,
+      );
+    }
+  }
+  const fields: Record<string, PayloadValue> = {};
+  for (const [name, field] of Object.entries(spec.fields)) {
+    const fieldPath = `${path}[${JSON.stringify(name)}]`;
+    if (!Object.hasOwn(value, name)) {
+      return violation(
+        "invalid-struct",
+        "Struct value is missing a declared field",
+        fieldPath,
+      );
+    }
+    const result = admitValue(field, value[name], fieldPath);
+    if (!result.admitted) return result;
+    fields[name] = result.value;
+  }
+  return admitted(fields);
 }
 
 function admitted(value: CellValue): Admission {
@@ -276,7 +326,26 @@ export function reusableSpecCompatible(
   if (provider.type === "array" && receiver.type === "array") {
     return reusableSpecCompatible(provider.element, receiver.element);
   }
+  if (provider.type === "struct" && receiver.type === "struct") {
+    return (
+      sameFieldNames(provider.fields, receiver.fields) &&
+      Object.entries(provider.fields).every(([name, field]) =>
+        reusableSpecCompatible(field, receiver.fields[name]!),
+      )
+    );
+  }
   return true;
+}
+
+function sameFieldNames(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+): boolean {
+  const leftNames = Object.keys(left);
+  return (
+    leftNames.length === Object.keys(right).length &&
+    leftNames.every((name) => Object.hasOwn(right, name))
+  );
 }
 
 function judgeSpecLanding(
@@ -294,6 +363,14 @@ function judgeSpecLanding(
   if (source.type === "array" && destination.type === "array") {
     return judgeSpecLanding(source.element, destination.element);
   }
+  if (source.type === "struct" && destination.type === "struct") {
+    if (!sameFieldNames(source.fields, destination.fields)) return INCOMPATIBLE;
+    return reduceAlternativeJudgments(
+      Object.entries(source.fields).map(([name, field]) =>
+        judgeSpecLanding(field, destination.fields[name]!),
+      ),
+    );
+  }
   return INCOMPATIBLE;
 }
 
@@ -309,12 +386,16 @@ export type ProducerContext = {
   resolveHostOperation?: (call: HostCall) => HostOperationSpec | undefined;
 };
 
-/** Facts derived from an expression producer without accompanying its value. */
+/**
+ * Facts derived from an expression producer without accompanying its value.
+ * `struct` describes an authored object; `fields` is present when each named
+ * field has its own producer evidence.
+ */
 export type ProducerEvidence =
   | { kind: "fact"; fact: SourceFact }
   | { kind: "alternatives"; alternatives: ProducerEvidence[] }
   | { kind: "array"; elements: ProducerEvidence[] }
-  | { kind: "struct" }
+  | { kind: "struct"; fields?: Record<string, ProducerEvidence> }
   | { kind: "dynamic" }
   | { kind: "unusable" };
 
@@ -343,12 +424,28 @@ export function resolveProducer(
         ? { kind: "fact", fact: { kind: "site", spec } }
         : { kind: "dynamic" };
     }
+    case "field": {
+      const spec = resolveReferenceSpec(expression, context);
+      return spec
+        ? { kind: "fact", fact: { kind: "site", spec } }
+        : { kind: "dynamic" };
+    }
     case "arrayElementRead": {
       const spec = resolveArrayElementSpec(expression.array, context);
       return spec
         ? { kind: "fact", fact: { kind: "site", spec } }
         : { kind: "dynamic" };
     }
+    case "structLiteral":
+      return {
+        kind: "struct",
+        fields: Object.fromEntries(
+          Object.entries(expression.fields).map(([name, field]) => [
+            name,
+            resolveProducer(field, context),
+          ]),
+        ),
+      };
     case "span":
       if (expression.key === "index") {
         return {
@@ -504,6 +601,12 @@ export function judgeHostArgument(
   if (destination.type === "semanticText") {
     return stringOperandRule.checkProducer(argument.value, context);
   }
+  if (destination.type === "struct") {
+    return judgeHostStructValue(
+      resolveProducer(argument.value, context),
+      destination,
+    );
+  }
   const channelSpec = hostParameterChannelSpec(destination);
   return channelSpec
     ? judgeProducerLanding(
@@ -511,6 +614,123 @@ export function judgeHostArgument(
         channelSpec,
       )
     : { kind: "incompatible" };
+}
+
+/**
+ * Judges a value producer landing on a host Struct parameter. A complete Arc
+ * Struct supplies every field it declares, so each of its fields must be
+ * declared by the parameter and every required parameter field must be
+ * supplied.
+ */
+function judgeHostStructValue(
+  evidence: ProducerEvidence,
+  destination: Extract<HostParameterValueSpec, { type: "struct" }>,
+): CoherenceJudgment {
+  if (evidence.kind === "dynamic") return { kind: "unknown" };
+  if (evidence.kind === "alternatives") {
+    return reduceAlternativeJudgments(
+      evidence.alternatives.map((alternative) =>
+        judgeHostStructValue(alternative, destination),
+      ),
+    );
+  }
+  const fields: Record<string, ProducerEvidence> | undefined =
+    evidence.kind === "struct"
+      ? evidence.fields
+      : evidence.kind === "fact" &&
+          evidence.fact.kind === "site" &&
+          evidence.fact.spec.type === "struct"
+        ? Object.fromEntries(
+            Object.entries(evidence.fact.spec.fields).map(([name, spec]) => [
+              name,
+              { kind: "fact", fact: { kind: "site", spec } },
+            ]),
+          )
+        : undefined;
+  if (!fields) return { kind: "incompatible" };
+  if (
+    Object.keys(fields).some(
+      (name) => !Object.hasOwn(destination.fields, name),
+    ) ||
+    Object.entries(destination.fields).some(
+      ([name, field]) =>
+        field.type !== "omittable" && !Object.hasOwn(fields, name),
+    )
+  ) {
+    return { kind: "incompatible" };
+  }
+  return reduceAlternativeJudgments(
+    Object.entries(fields).map(([name, field]) => {
+      const fieldSpec = hostParameterValueSpec(destination.fields[name]!);
+      if (fieldSpec.type === "struct") {
+        return judgeHostStructValue(field, fieldSpec);
+      }
+      const channelSpec = hostParameterChannelSpec(fieldSpec);
+      return channelSpec
+        ? judgeProducerLanding(field, channelSpec)
+        : { kind: "incompatible" };
+    }),
+  );
+}
+
+/**
+ * Admits a rendered complete Struct value under a host Struct parameter: a
+ * plain record whose fields are declared, which supplies every required field,
+ * and whose field values satisfy their parameter specs.
+ */
+function admitHostStructValue(
+  rendered: unknown,
+  destination: Extract<HostParameterValueSpec, { type: "struct" }>,
+  path: string,
+): HostArgumentAdmission {
+  const shapeIssue = firstInvalidPayloadValue(rendered, path);
+  if (shapeIssue)
+    return hostArgumentViolation(shapeIssue.detail, shapeIssue.path);
+  if (!isPlainRecord(rendered)) {
+    return hostArgumentViolation(
+      "A Struct host argument must be a plain object",
+      path,
+    );
+  }
+  for (const name of Object.keys(rendered)) {
+    if (!Object.hasOwn(destination.fields, name)) {
+      return hostArgumentViolation(
+        "Unexpected Struct field",
+        `${path}[${JSON.stringify(name)}]`,
+      );
+    }
+  }
+  for (const [name, field] of Object.entries(destination.fields)) {
+    const fieldPath = `${path}[${JSON.stringify(name)}]`;
+    if (!Object.hasOwn(rendered, name)) {
+      if (field.type === "omittable") continue;
+      return hostArgumentViolation(
+        "Required Struct field is missing",
+        fieldPath,
+      );
+    }
+    const fieldSpec = hostParameterValueSpec(field);
+    if (fieldSpec.type === "struct") {
+      const nested = admitHostStructValue(rendered[name], fieldSpec, fieldPath);
+      if (!nested.admitted) return nested;
+      continue;
+    }
+    const channelSpec = hostParameterChannelSpec(fieldSpec);
+    if (!channelSpec) {
+      return hostArgumentViolation(
+        "Host argument type is incompatible",
+        fieldPath,
+      );
+    }
+    const admission = admitValue(channelSpec, rendered[name], fieldPath);
+    if (!admission.admitted) {
+      return hostArgumentViolation(
+        admission.violation.detail,
+        admission.violation.path,
+      );
+    }
+  }
+  return { admitted: true };
 }
 
 export type HostArgumentAdmission =
@@ -641,6 +861,17 @@ export function admitHostArgument(
           path,
         );
   }
+  if (destination.type === "struct") {
+    // An Artifact constructor carries `{ path }` under Artifact authority, so
+    // its carrier never stands in for a Struct with the same shape.
+    if (argument.kind === "value" && argument.value.kind === "artifact") {
+      return hostArgumentViolation(
+        "An Artifact value cannot satisfy a Struct parameter",
+        path,
+      );
+    }
+    return admitHostStructValue(rendered, destination, path);
+  }
   const channelSpec = hostParameterChannelSpec(destination);
   if (!channelSpec) {
     return hostArgumentViolation("Host argument type is incompatible", path);
@@ -718,8 +949,9 @@ export function judgeProducerLanding(
     case "dynamic":
       return judgeOneTimeLanding(undefined, destination);
     case "unusable":
-    case "struct":
       return { kind: "incompatible" };
+    case "struct":
+      return judgeStructEvidenceLanding(evidence, destination);
     case "alternatives":
       return reduceAlternativeJudgments(
         evidence.alternatives.map((alternative) =>
@@ -734,6 +966,32 @@ export function judgeProducerLanding(
         ),
       );
   }
+}
+
+/**
+ * Judges an authored object landing on a Struct guarantee: the object must name
+ * exactly the declared fields, and each field producer must land on its field.
+ */
+function judgeStructEvidenceLanding(
+  evidence: Extract<ProducerEvidence, { kind: "struct" }>,
+  destination: ChannelSpec,
+): CoherenceJudgment {
+  if (destination.type !== "struct" || !evidence.fields) {
+    return { kind: "incompatible" };
+  }
+  const fields = evidence.fields;
+  const names = Object.keys(fields);
+  if (
+    names.some((name) => !Object.hasOwn(destination.fields, name)) ||
+    Object.keys(destination.fields).some((name) => !Object.hasOwn(fields, name))
+  ) {
+    return { kind: "incompatible" };
+  }
+  return reduceAlternativeJudgments(
+    names.map((name) =>
+      judgeProducerLanding(fields[name]!, destination.fields[name]!),
+    ),
+  );
 }
 
 export function producerGuaranteesArtifact(
@@ -927,6 +1185,7 @@ export type ComparisonDecision = {
     | "boolean"
     | "artifact"
     | "array"
+    | "struct"
     | "dynamic";
   enumValues?: readonly string[];
   arrayElementFamily?: ArrayComparisonFamily;
@@ -1011,6 +1270,13 @@ export const comparisonRule = {
           left,
           right,
         );
+      case "struct":
+        return isPlainRecord(left) && isPlainRecord(right)
+          ? operationAdmitted({ left, right })
+          : operationViolation(
+              "invalid-struct-comparison",
+              "Struct equality requires Struct operands",
+            );
       case "dynamic":
         if (Array.isArray(left) || Array.isArray(right)) {
           return admitArrayComparisonValues(undefined, left, right);
@@ -1079,20 +1345,38 @@ function decideComparison(
   }
   if (known === "array") {
     if (ordering) return decision("incompatible", "array");
-    const elementFamilies = new Set<ArrayComparisonFamily>();
+    const elementFamilies = new Set<StableFamily>();
     collectArrayElementFamilies(left, elementFamilies);
     collectArrayElementFamilies(right, elementFamilies);
     if (elementFamilies.size > 1) {
       return decision("incompatible", "array");
     }
     const arrayElementFamily = elementFamilies.values().next().value;
+    if (
+      arrayElementFamily !== undefined &&
+      !isArrayComparisonFamily(arrayElementFamily)
+    ) {
+      return decision("incompatible", "array");
+    }
+    if (arrayElementFamily === "struct") {
+      return {
+        judgment: judgeStructArrayEquality(left, right),
+        mode: "array",
+        arrayElementFamily,
+      };
+    }
     const judgment = reduceAlternativeJudgments([
       judgeArrayEvidence(left, arrayElementFamily),
       judgeArrayEvidence(right, arrayElementFamily),
     ]);
     return { judgment, mode: "array", arrayElementFamily };
   }
-  if (known === "dialog-cursor" || known === "struct" || known === "unusable") {
+  if (known === "struct") {
+    return ordering
+      ? decision("incompatible", "struct")
+      : { judgment: judgeStructEquality(left, right), mode: "struct" };
+  }
+  if (known === "dialog-cursor" || known === "unusable") {
     return decision("incompatible", "dynamic");
   }
   if (known === "boolean") {
@@ -1127,6 +1411,130 @@ function decision(
   return { judgment: { kind }, mode };
 }
 
+/**
+ * Judges equality of two Struct operands: they must declare the same field
+ * names, and each pair of fields must be comparable for equality, recursively.
+ * Field order is irrelevant.
+ */
+function judgeStructEquality(
+  left: ProducerEvidence,
+  right: ProducerEvidence,
+): CoherenceJudgment {
+  if (left.kind === "alternatives") {
+    return reduceAlternativeJudgments(
+      left.alternatives.map((alternative) =>
+        judgeStructEquality(alternative, right),
+      ),
+    );
+  }
+  if (right.kind === "alternatives") {
+    return reduceAlternativeJudgments(
+      right.alternatives.map((alternative) =>
+        judgeStructEquality(left, alternative),
+      ),
+    );
+  }
+  const leftFields = structOperandFields(left);
+  const rightFields = structOperandFields(right);
+  if (leftFields === undefined || rightFields === undefined) {
+    return INCOMPATIBLE;
+  }
+  if (leftFields === "dynamic" || rightFields === "dynamic") return UNKNOWN;
+  const names = Object.keys(leftFields);
+  if (
+    names.length !== Object.keys(rightFields).length ||
+    names.some((name) => !Object.hasOwn(rightFields, name))
+  ) {
+    return INCOMPATIBLE;
+  }
+  return reduceAlternativeJudgments(
+    names.map(
+      (name) =>
+        decideComparison("==", leftFields[name]!, rightFields[name]!).judgment,
+    ),
+  );
+}
+
+/**
+ * The field producers of a Struct operand, `"dynamic"` when its fields are
+ * known only at runtime, or `undefined` when the operand is not a Struct.
+ */
+function structOperandFields(
+  evidence: Exclude<ProducerEvidence, { kind: "alternatives" }>,
+): Record<string, ProducerEvidence> | "dynamic" | undefined {
+  switch (evidence.kind) {
+    case "struct":
+      return evidence.fields ?? "dynamic";
+    case "dynamic":
+      return "dynamic";
+    case "fact":
+      return evidence.fact.kind === "site" &&
+        evidence.fact.spec.type === "struct"
+        ? Object.fromEntries(
+            Object.entries(evidence.fact.spec.fields).map(([name, spec]) => [
+              name,
+              { kind: "fact", fact: { kind: "site", spec } },
+            ]),
+          )
+        : undefined;
+    case "array":
+    case "unusable":
+      return undefined;
+  }
+}
+
+/**
+ * Judges equality of two Struct-element arrays: every element producer on
+ * either side must be equality-comparable with the others.
+ */
+function judgeStructArrayEquality(
+  left: ProducerEvidence,
+  right: ProducerEvidence,
+): CoherenceJudgment {
+  const [first, ...rest] = [
+    ...arrayElementEvidence(left),
+    ...arrayElementEvidence(right),
+  ];
+  if (!first) return COMPATIBLE;
+  return reduceAlternativeJudgments(
+    rest.map((element) => judgeStructEquality(first, element)),
+  );
+}
+
+/**
+ * The element producers of an array operand: one per literal element, the
+ * declared element of an array site, or a dynamic or unusable placeholder.
+ */
+function arrayElementEvidence(evidence: ProducerEvidence): ProducerEvidence[] {
+  switch (evidence.kind) {
+    case "array":
+      return evidence.elements;
+    case "alternatives":
+      return evidence.alternatives.flatMap(arrayElementEvidence);
+    case "dynamic":
+      return [evidence];
+    case "struct":
+    case "unusable":
+      return [{ kind: "unusable" }];
+    case "fact": {
+      const fact = evidence.fact;
+      if (fact.kind === "empty-array") return [];
+      if (fact.kind === "array") {
+        return fact.elements.map((element) => ({
+          kind: "fact",
+          fact: element,
+        }));
+      }
+      if (fact.kind === "site" && fact.spec.type === "array") {
+        return [
+          { kind: "fact", fact: { kind: "site", spec: fact.spec.element } },
+        ];
+      }
+      return [{ kind: "unusable" }];
+    }
+  }
+}
+
 type StableFamily =
   | "boolean"
   | "string"
@@ -1139,7 +1547,12 @@ type StableFamily =
   | "dynamic";
 
 type ScalarComparisonFamily = "boolean" | "string" | "number";
-type ArrayComparisonFamily = ScalarComparisonFamily | "artifact";
+
+/** Element family of a comparable array whose elements compare as leaves. */
+type LeafComparisonFamily = ScalarComparisonFamily | "artifact";
+
+/** Element family of a comparable array. */
+type ArrayComparisonFamily = LeafComparisonFamily | "struct";
 
 function stableFamily(evidence: ProducerEvidence): StableFamily {
   switch (evidence.kind) {
@@ -1187,6 +1600,8 @@ function stableFamily(evidence: ProducerEvidence): StableFamily {
           return "dialog-cursor";
         case "array":
           return "array";
+        case "struct":
+          return "struct";
       }
     }
   }
@@ -1194,7 +1609,7 @@ function stableFamily(evidence: ProducerEvidence): StableFamily {
 
 function collectArrayElementFamilies(
   evidence: ProducerEvidence,
-  families: Set<ArrayComparisonFamily>,
+  families: Set<StableFamily>,
 ): void {
   switch (evidence.kind) {
     case "alternatives":
@@ -1212,7 +1627,7 @@ function collectArrayElementFamilies(
         evidence.fact.kind === "site" &&
         evidence.fact.spec.type === "array"
       ) {
-        families.add(arrayComparisonFamily(evidence.fact.spec.element));
+        families.add(arrayElementFamily(evidence.fact.spec.element));
       } else if (evidence.fact.kind === "array") {
         for (const element of evidence.fact.elements) {
           collectScalarComparisonFamilies(
@@ -1231,7 +1646,7 @@ function collectArrayElementFamilies(
 
 function collectScalarComparisonFamilies(
   evidence: ProducerEvidence,
-  families: Set<ArrayComparisonFamily>,
+  families: Set<StableFamily>,
 ): void {
   if (evidence.kind === "alternatives") {
     for (const alternative of evidence.alternatives) {
@@ -1240,19 +1655,12 @@ function collectScalarComparisonFamilies(
     return;
   }
   const family = stableFamily(evidence);
-  if (
-    family === "boolean" ||
-    family === "string" ||
-    family === "number" ||
-    family === "artifact"
-  ) {
-    families.add(family);
-  }
+  if (isArrayComparisonFamily(family)) families.add(family);
 }
 
 function judgeArrayEvidence(
   evidence: ProducerEvidence,
-  elementFamily: ArrayComparisonFamily | undefined,
+  elementFamily: LeafComparisonFamily | undefined,
 ): CoherenceJudgment {
   switch (evidence.kind) {
     case "dynamic":
@@ -1287,7 +1695,7 @@ function judgeArrayEvidence(
         evidence.fact.kind === "site" &&
         evidence.fact.spec.type === "array"
       ) {
-        const family = arrayComparisonFamily(evidence.fact.spec.element);
+        const family = arrayElementFamily(evidence.fact.spec.element);
         return elementFamily === undefined || family === elementFamily
           ? { kind: "compatible" }
           : { kind: "incompatible" };
@@ -1301,7 +1709,7 @@ function judgeArrayEvidence(
 
 function judgeScalarComparisonEvidence(
   evidence: ProducerEvidence,
-  family: ArrayComparisonFamily | undefined,
+  family: LeafComparisonFamily | undefined,
 ): CoherenceJudgment {
   if (family !== undefined) return judgeFamily(evidence, family);
   if (evidence.kind === "dynamic") return { kind: "unknown" };
@@ -1321,8 +1729,21 @@ function judgeScalarComparisonEvidence(
     : { kind: "incompatible" };
 }
 
-function arrayComparisonFamily(spec: ArrayElementSpec): ArrayComparisonFamily {
+/** The stable family of an array element declaration. */
+function arrayElementFamily(spec: ArrayElementSpec): StableFamily {
   return spec.type === "enum" ? "string" : spec.type;
+}
+
+function isArrayComparisonFamily(
+  family: StableFamily,
+): family is ArrayComparisonFamily {
+  return (
+    family === "boolean" ||
+    family === "string" ||
+    family === "number" ||
+    family === "artifact" ||
+    family === "struct"
+  );
 }
 
 function judgeFamily(
@@ -1355,6 +1776,14 @@ function admitArrayComparisonValues(
       "invalid-array-operation",
       "Array equality requires array operands",
     );
+  }
+  if (elementFamily === "struct") {
+    return left.every(isPlainRecord) && right.every(isPlainRecord)
+      ? operationAdmitted({ left, right })
+      : operationViolation(
+          "invalid-array-operation",
+          "Struct array equality requires Struct elements",
+        );
   }
   if (elementFamily === "artifact") {
     const spec: ChannelSpec = {
@@ -1741,12 +2170,50 @@ function resolveArrayElementSpec(
   reference: ArrayReference,
   context: ProducerContext,
 ): ArrayElementSpec | undefined {
+  const spec = resolveReferenceSpec(reference, context);
+  return spec?.type === "array" ? spec.element : undefined;
+}
+
+/**
+ * Resolves the declared value guarantee of a cell, channel, or Struct field
+ * reference, projected to its bare channel-shaped spec.
+ */
+export function resolveReferenceSpec(
+  reference: ArrayReference,
+  context: ProducerContext,
+): ChannelSpec | undefined {
   if (reference.kind === "channel") {
-    const spec = context.signature?.[reference.namespace][reference.key];
-    return spec?.type === "array" ? spec.element : undefined;
+    return context.signature?.[reference.namespace][reference.key];
   }
-  const cell = findCell(context, reference.name);
-  return cell?.type === "array" ? cell.element : undefined;
+  if (reference.kind === "cell") {
+    const cell = findCell(context, reference.name);
+    return cell ? cellSpecToChannelSpec(cell) : undefined;
+  }
+  const receiver = resolveReceiverSpec(reference.receiver, context);
+  if (receiver?.type !== "struct") return undefined;
+  const field = fieldSpecAt(receiver, reference.path);
+  return field ? fieldSpecOf(field) : undefined;
+}
+
+/**
+ * Resolves the declared guarantee of a field receiver: a cell or channel, one
+ * element of an array reference, or the current `$map` element.
+ */
+function resolveReceiverSpec(
+  receiver: FieldReceiver,
+  context: ProducerContext,
+): ChannelSpec | ArrayElementSpec | undefined {
+  switch (receiver.kind) {
+    case "cell":
+    case "channel":
+      return resolveReferenceSpec(receiver, context);
+    case "arrayElementRead": {
+      const array = resolveReferenceSpec(receiver.array, context);
+      return array?.type === "array" ? array.element : undefined;
+    }
+    case "span":
+      return context.map?.receiverSpec;
+  }
 }
 
 function findCell(context: ProducerContext, name: string): Cell | undefined {

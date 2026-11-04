@@ -1151,13 +1151,14 @@ function applyReportResults(
   }
   for (const [id, value] of Object.entries(report.observations ?? {})) {
     if (!value) continue;
-    // The observation channel is shared: a grouped result carries `fields`, a
-    // single result carries `status`. Route each to its own result map so the
-    // matching apply reads it back.
-    if ("fields" in value) {
-      accum.observationGroupResults.set(id, value);
-    } else {
+    // The observation channel is shared. Admitted reports were validated
+    // against their brief's kind: a single outcome always carries `status`,
+    // while a group report is a bare member map. A Struct field result also
+    // carries `fields`, so `fields` alone does not identify a group.
+    if ("status" in value) {
       accum.observationResults.set(id, value);
+    } else {
+      accum.observationGroupResults.set(id, value);
     }
   }
   for (const [id, value] of Object.entries(report.hostCalls ?? {})) {

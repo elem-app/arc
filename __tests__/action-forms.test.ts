@@ -1387,7 +1387,7 @@ function Main() {
   artifact.$set(${expression});
 }
 `),
-        ).toThrow(/Artifact value/);
+        ).toThrow(/Artifact value|Artifact path expression/);
       },
     );
 
@@ -2133,6 +2133,42 @@ function Main() {
       expect(rootTraversal(done).cells.age).toBe(30);
     });
 
+    it("re-emits an observeOrAsk group while a field is unknown", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  let name = Str();
+  let age = Num();
+  $observeOrAsk({ name, age });
+}
+`);
+      const runtime = new Runtime().add("group-unknown-arc", document).init();
+      const seeded = runtime.newTraversal(arc("group-unknown-arc", "Main"));
+      seeded.phase = "entered";
+      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const id = brief.observations[0]!.id;
+      const pending = progressBrief(runtime, brief, {
+        move: "proceed",
+        observations: {
+          [id]: {
+            fields: {
+              name: { status: "resolved", value: "John" },
+              age: { status: "unknown" },
+            },
+          },
+        },
+      });
+      // Unknown blocks observeOrAsk like needs-user: no writes, whole re-emit.
+      expect(rootTraversal(pending).cells.name).toBeUndefined();
+      expect(groupObservation(pending.observations[0]).id).toBe(id);
+      expect(
+        groupObservation(pending.observations[0]).fields.map(
+          (field) => field.cell,
+        ),
+      ).toEqual(["name", "age"]);
+    });
+
     const GROUP_ARRAY_SOURCE = `
 "arc";
 
@@ -2276,6 +2312,348 @@ function Main() {
         }),
       ]);
       expect(rootTraversal(next).cells.scores).toBeUndefined();
+    });
+  });
+
+  describe("act.observe-struct", () => {
+    const STRUCT_SOURCE = (call: string, seed = "") => `
+"arc";
+
+function Main() {
+  let request = Struct(
+    {
+      destination: Str({ observing: \`the requested destination\` }),
+      preferences: Struct({
+        seating: Str({ observing: \`the requested seating\` }),
+        accessible: Bool({ observing: \`whether accessible seating is requested\` }),
+      }),
+    },
+    { observing: \`the travel request\` },
+  );
+  ${seed}
+  ${call};
+  $instruct(\`done\`);
+}
+`;
+
+    function startStructRun(call: string, seed = "") {
+      const runtime = new Runtime()
+        .add("struct-observe", parse(STRUCT_SOURCE(call, seed)))
+        .init();
+      const seeded = runtime.newTraversal(arc("struct-observe", "Main"));
+      seeded.phase = "entered";
+      return { runtime, brief: startRun(runtime, [seeded], EMPTY_DIALOG) };
+    }
+
+    const HELD = {
+      destination: "Osaka",
+      preferences: { seating: "aisle", accessible: false },
+    };
+    const SEED = `request.$set(${JSON.stringify(HELD)});`;
+    const OBSERVED = {
+      destination: "Tokyo",
+      preferences: { seating: "window", accessible: true },
+    };
+
+    it("observe-struct.brief describes the recursive field schema and questions and carries the whole current value", () => {
+      const unset = singleObservation(
+        startStructRun("$observe(request)").brief.observations[0],
+      );
+      expect(unset.cell).toBe("request");
+      expect(renderSemanticTextForTest(unset.question)).toBe(
+        "the travel request",
+      );
+      expect(unset.currentValue).toBeUndefined();
+      const held = singleObservation(
+        startStructRun("$observe(request)", SEED).brief.observations[0],
+      );
+      expect(held.currentValue).toEqual(HELD);
+      for (const observation of [unset, held]) {
+        expect(observation.meta).toEqual({
+          type: "struct",
+          fields: {
+            destination: {
+              question: "the requested destination",
+              meta: { type: "string" },
+            },
+            preferences: {
+              question: "observe request.preferences",
+              meta: {
+                type: "struct",
+                fields: {
+                  seating: {
+                    question: "the requested seating",
+                    meta: { type: "string" },
+                  },
+                  accessible: {
+                    question: "whether accessible seating is requested",
+                    meta: { type: "boolean" },
+                  },
+                },
+              },
+            },
+          },
+        });
+      }
+    });
+
+    it("observe-struct.plain writes a resolved record and settles", () => {
+      const { runtime, brief } = startStructRun("$observe(request)");
+      const next = progressBrief(runtime, brief, {
+        move: "proceed",
+        observations: {
+          [brief.observations[0]!.id]: { status: "resolved", value: OBSERVED },
+        },
+      });
+      expect(rootTraversal(next).cells.request).toEqual(OBSERVED);
+      expect(next.observations).toEqual([]);
+      expect(next.instructions.map((item) => item.text)).toEqual(["done"]);
+    });
+
+    it("observe-struct.plain unknown preserves the held record and settles", () => {
+      const { runtime, brief } = startStructRun("$observe(request)", SEED);
+      const next = progressBrief(runtime, brief, {
+        move: "proceed",
+        observations: { [brief.observations[0]!.id]: { status: "unknown" } },
+      });
+      expect(rootTraversal(next).cells.request).toEqual(HELD);
+      expect(next.observations).toEqual([]);
+    });
+
+    it("observe-struct.plain rejects needs-user", () => {
+      const { runtime, brief } = startStructRun("$observe(request)");
+      const next = progressBrief(runtime, brief, {
+        move: "proceed",
+        observations: { [brief.observations[0]!.id]: { status: "needs-user" } },
+      });
+      expect(next.issues).toEqual([
+        expect.objectContaining({
+          kind: "invalid-item",
+          reasonCode: "observation-needs-user",
+        }),
+      ]);
+      expect(rootTraversal(next).cells.request).toBeUndefined();
+      expect(next.observations).toHaveLength(1);
+    });
+
+    it.each([
+      [
+        "an invalid nested value",
+        {
+          status: "resolved",
+          value: {
+            destination: "Tokyo",
+            preferences: { seating: 1, accessible: true },
+          },
+        },
+        "observation-type",
+      ],
+      [
+        "a missing nested field",
+        {
+          status: "resolved",
+          value: { destination: "Tokyo", preferences: { seating: "aisle" } },
+        },
+        "observation-incomplete",
+      ],
+      [
+        "an undeclared field",
+        { status: "resolved", value: { ...OBSERVED, extra: 1 } },
+        "observation-type",
+      ],
+      [
+        "an empty record",
+        { status: "resolved", value: {} },
+        "observation-incomplete",
+      ],
+      [
+        "a resolved report without a value",
+        { status: "resolved" },
+        "observation-type",
+      ],
+      [
+        "a field results report",
+        {
+          status: "fields",
+          fields: {
+            destination: { status: "resolved", value: "Tokyo" },
+            preferences: { status: "unknown" },
+          },
+        },
+        "observation-status",
+      ],
+    ])(
+      "observe-struct.protocol rejects %s without writes",
+      (_case, report, reasonCode) => {
+        const { runtime, brief } = startStructRun("$observe(request)");
+        const next = progressBrief(runtime, brief, {
+          move: "proceed",
+          observations: { [brief.observations[0]!.id]: report as never },
+        });
+        expect(next.issues).toEqual([
+          expect.objectContaining({ kind: "invalid-item", reasonCode }),
+        ]);
+        expect(rootTraversal(next).cells.request).toBeUndefined();
+        expect(next.observations).toHaveLength(1);
+      },
+    );
+
+    it("observe-struct.empty sets an empty Struct from resolved {} and keeps it unset on unknown", () => {
+      const source = `
+"arc";
+
+function Main() {
+  let marker = Struct({});
+  $observe(marker);
+  $instruct(\`done\`);
+}
+`;
+      for (const [report, expected] of [
+        [{ status: "resolved", value: {} }, {}],
+        [{ status: "unknown" }, undefined],
+      ] as const) {
+        const runtime = new Runtime().add("struct-empty", parse(source)).init();
+        const seeded = runtime.newTraversal(arc("struct-empty", "Main"));
+        seeded.phase = "entered";
+        const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+        const next = progressBrief(runtime, brief, {
+          move: "proceed",
+          observations: { [brief.observations[0]!.id]: report },
+        });
+        expect(rootTraversal(next).cells.marker).toEqual(expected);
+        expect(next.observations).toEqual([]);
+      }
+    });
+
+    it("observe-struct.observe-or-ask writes nothing and re-yields until a report resolves the record", () => {
+      const { runtime, brief } = startStructRun("$observeOrAsk(request)", SEED);
+      const first = singleObservation(brief.observations[0]);
+      expect(first.mode).toBe("observeOrAsk");
+      for (const status of ["unknown", "needs-user"] as const) {
+        const pending = progressBrief(runtime, brief, {
+          move: "proceed",
+          observations: { [first.id]: { status } },
+        });
+        expect(pending.issues).toEqual([]);
+        expect(rootTraversal(pending).cells.request).toEqual(HELD);
+        const again = singleObservation(pending.observations[0]);
+        expect(again.id).toBe(first.id);
+        expect(again.currentValue).toEqual(HELD);
+      }
+      const done = progressBrief(runtime, brief, {
+        move: "proceed",
+        observations: { [first.id]: { status: "resolved", value: OBSERVED } },
+      });
+      expect(rootTraversal(done).cells.request).toEqual(OBSERVED);
+      expect(done.observations).toEqual([]);
+      expect(done.instructions.map((item) => item.text)).toEqual(["done"]);
+    });
+
+    it("observe-struct.field-target observes a subtree of a set record and writes it in place", () => {
+      const { runtime, brief } = startStructRun(
+        "$observe(request.preferences)",
+        SEED,
+      );
+      const observation = singleObservation(brief.observations[0]);
+      expect(observation.cell).toBe("request.preferences");
+      expect(observation.currentValue).toEqual(HELD.preferences);
+      expect(observation.meta).toMatchObject({
+        type: "struct",
+        fields: { seating: {}, accessible: {} },
+      });
+      const next = progressBrief(runtime, brief, {
+        move: "proceed",
+        observations: {
+          [observation.id]: {
+            status: "resolved",
+            value: { seating: "window", accessible: true },
+          },
+        },
+      });
+      expect(rootTraversal(next).cells.request).toEqual({
+        destination: "Osaka",
+        preferences: { seating: "window", accessible: true },
+      });
+    });
+
+    const GROUP_STRUCT_SOURCE = (method: string) => `
+"arc";
+
+function Main() {
+  let name = Str({ observing: \`the user's name\` });
+  let request = Struct({ destination: Str(), seat: Str() });
+  ${method}({ name, request });
+  $instruct(\`done\`);
+}
+`;
+
+    function startGroupStructRun(method: string) {
+      const runtime = new Runtime()
+        .add("struct-group", parse(GROUP_STRUCT_SOURCE(method)))
+        .init();
+      const seeded = runtime.newTraversal(arc("struct-group", "Main"));
+      seeded.phase = "entered";
+      return { runtime, brief: startRun(runtime, [seeded], EMPTY_DIALOG) };
+    }
+
+    const GROUP_WITH_UNKNOWN = {
+      fields: {
+        name: { status: "resolved", value: "Ada" },
+        request: { status: "unknown" },
+      },
+    } as const;
+
+    const GROUP_RESOLVED = {
+      fields: {
+        name: { status: "resolved", value: "Ada" },
+        request: {
+          status: "resolved",
+          value: { destination: "Tokyo", seat: "aisle" },
+        },
+      },
+    } as const;
+
+    it("observe-struct.group plain observation writes resolved members and settles", () => {
+      const { runtime, brief } = startGroupStructRun("$observe");
+      const group = groupObservation(brief.observations[0]);
+      expect(group.fields.map((field) => field.meta.type)).toEqual([
+        "string",
+        "struct",
+      ]);
+      const next = progressBrief(runtime, brief, {
+        move: "proceed",
+        observations: { [group.id]: GROUP_WITH_UNKNOWN },
+      });
+      expect(rootTraversal(next).cells.name).toBe("Ada");
+      expect(rootTraversal(next).cells.request).toBeUndefined();
+      expect(next.observations).toEqual([]);
+    });
+
+    it("observe-struct.group observe-or-ask re-yields the whole group until every member resolves", () => {
+      const { runtime, brief } = startGroupStructRun("$observeOrAsk");
+      const group = groupObservation(brief.observations[0]);
+      const pending = progressBrief(runtime, brief, {
+        move: "proceed",
+        observations: { [group.id]: GROUP_WITH_UNKNOWN },
+      });
+      expect(rootTraversal(pending).cells.name).toBeUndefined();
+      expect(rootTraversal(pending).cells.request).toBeUndefined();
+      const again = groupObservation(pending.observations[0]);
+      expect(again.id).toBe(group.id);
+      expect(again.fields.map((field) => field.cell)).toEqual([
+        "name",
+        "request",
+      ]);
+      const done = progressBrief(runtime, pending, {
+        move: "proceed",
+        observations: { [group.id]: GROUP_RESOLVED },
+      });
+      expect(rootTraversal(done).cells.name).toBe("Ada");
+      expect(rootTraversal(done).cells.request).toEqual({
+        destination: "Tokyo",
+        seat: "aisle",
+      });
+      expect(done.observations).toEqual([]);
     });
   });
 });

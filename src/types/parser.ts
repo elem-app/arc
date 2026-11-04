@@ -4,6 +4,7 @@
  */
 
 import {
+  fieldAtPath,
   isObservableCellSpec,
   isSettableCellSpec,
   type ArtifactArraySpec,
@@ -167,14 +168,52 @@ export type LiteralExpression = {
  */
 export type StringLiteralExpression = { kind: "literal"; value: string };
 
-/**
- * Reference to the array-valued cell or channel an element or length read
- * targets. The receiver of a bracket index / `length` read is always a direct
- * cell or channel reference.
- */
-export type ArrayReference =
+/** Reference to one declared cell or typed channel. */
+export type SlotReference =
   | { kind: "cell"; name: string }
   | { kind: "channel"; namespace: ChannelNamespace; key: string };
+
+/** Read of one element of an array-valued cell, channel, or Struct field. */
+export type ArrayElementRead = {
+  kind: "arrayElementRead";
+  array: ArrayReference;
+  index: LocalExpression;
+};
+
+/** `span.item`: the element the current `$map` member maps. */
+export type SpanItemReference = { kind: "span"; owner: "map"; key: "item" };
+
+/**
+ * Struct-valued receiver a field reference selects from: a declared cell or
+ * channel, one element of a Struct array, or the current `$map` element.
+ */
+export type FieldReceiver =
+  | SlotReference
+  | ArrayElementRead
+  | SpanItemReference;
+
+/**
+ * Reference to one declared field inside a Struct receiver. `path` names the
+ * field at each level, outermost first, and resolves against the receiver's
+ * declaration.
+ */
+export type FieldReference = {
+  kind: "field";
+  receiver: FieldReceiver;
+  path: [string, ...string[]];
+};
+
+/**
+ * Reference to the array-valued cell, channel, or Struct field an element or
+ * length read targets.
+ */
+export type ArrayReference = SlotReference | FieldReference;
+
+/**
+ * Output array a `$map` commits: an array cell name, or an array field of a
+ * Struct cell.
+ */
+export type MapResultsTarget = string | FieldReference;
 
 /** Expressions the runtime resolves locally. */
 export type LocalExpression =
@@ -183,7 +222,8 @@ export type LocalExpression =
   | { kind: "isUnset"; cell: string }
   | { kind: "channel"; namespace: ChannelNamespace; key: string }
   | { kind: "channelIsUnset"; namespace: ChannelNamespace; key: string }
-  | { kind: "arrayElementRead"; array: ArrayReference; index: LocalExpression }
+  | FieldReference
+  | ArrayElementRead
   | { kind: "arrayLength"; array: ArrayReference }
   | { kind: "span"; owner: "map"; key: "item" | "index" }
   | { kind: "deflectionEscaped"; target: EnterTarget }
@@ -284,6 +324,7 @@ export type ValueExpression =
   | ArtifactConstructExpression
   | ValueString
   | { kind: "arrayLiteral"; elements: ValueExpression[] }
+  | StructLiteralExpression
   | {
       kind: "regexTest";
       pattern: string;
@@ -313,6 +354,15 @@ export type ValueExpression =
     }
   | { kind: "unary"; op: "!"; argument: ValueExpression };
 
+/**
+ * Constructs one complete Struct value from named field expressions. The
+ * landing Struct declaration decides which fields are required.
+ */
+export type StructLiteralExpression = {
+  kind: "structLiteral";
+  fields: Record<string, ValueExpression>;
+};
+
 /** Numeric constraints applied only when accepting an observation result. */
 export type NumericObserveAs =
   | { kind: "number"; min?: number; max?: number }
@@ -334,25 +384,83 @@ type CellBase = {
   loc?: SourceRange;
 };
 
+/**
+ * Observable array declaration with one scalar or Struct element guarantee.
+ * Every element of a Struct array is a complete record.
+ */
+export type ObservableArray = {
+  type: "array";
+  element: ObservableScalar | ObservableStruct;
+};
+
+/**
+ * Observable Struct declaration: named fields, each recursively observable.
+ * `observing` is the whole-record question; each field keeps its own.
+ */
+export type ObservableStruct = {
+  type: "struct";
+  fields: Record<string, ObservableField>;
+  observing?: SemanticString;
+};
+
+/** Declaration of one field inside an observable Struct. */
+export type ObservableField =
+  | ObservableScalar
+  | ObservableArray
+  | ObservableStruct;
+
+/** Resolves the authored declaration of a non-empty field path in a Struct. */
+export function fieldDeclarationAt(
+  struct: ObservableStruct,
+  path: readonly string[],
+): ObservableField | undefined {
+  return fieldAtPath(struct, path, (field) =>
+    field.type === "struct" ? field : undefined,
+  );
+}
+
+/**
+ * Every authored observation question of an observable declaration: its own,
+ * its array element's, and each Struct field's, recursively.
+ */
+export function observingQuestions(
+  declaration: ObservableScalar | ObservableArray | ObservableStruct,
+): SemanticString[] {
+  switch (declaration.type) {
+    case "array":
+      return observingQuestions(declaration.element);
+    case "struct":
+      return [
+        ...(declaration.observing ? [declaration.observing] : []),
+        ...Object.values(declaration.fields).flatMap(observingQuestions),
+      ];
+    default:
+      return declaration.observing ? [declaration.observing] : [];
+  }
+}
+
 /** Scalar observable cell declaration visible in the lexical scope of a node. */
 export type ScalarObservableCell = ObservableScalar & CellBase;
 
 /**
- * Observable array declaration: an ordered collection with one scalar element
- * guarantee.
+ * Observable array declaration: an ordered collection with one scalar or Struct
+ * element guarantee.
  */
-export type ObservableArrayCell = {
-  type: "array";
-  element: ObservableScalar;
-} & CellBase;
+export type ObservableArrayCell = ObservableArray & CellBase;
+
+/** Observable Struct cell declaration with owned nested field state. */
+export type StructCell = ObservableStruct & CellBase;
 
 /** Observable cell declaration visible in the lexical scope of a node. */
-export type ObservableCell = ScalarObservableCell | ObservableArrayCell;
+export type ObservableCell =
+  | ScalarObservableCell
+  | ObservableArrayCell
+  | StructCell;
 
 /** Stored, readable, and settable Artifact-array declaration. */
 export type ArtifactArrayCell = ArtifactArraySpec & CellBase;
 
-/** One-level array declaration with either scalar or Artifact elements. */
+/** Array declaration with scalar, Struct, or Artifact elements. */
 export type ArrayCell = ObservableArrayCell | ArtifactArrayCell;
 
 /** Dialog-cursor cell declaration: a stored coordinate into the visible dialog. */
@@ -382,7 +490,27 @@ export function isArrayCell(cell: Cell): cell is ArrayCell {
 export function isScalarObservableCell(
   cell: Cell,
 ): cell is ScalarObservableCell {
-  return isObservableCell(cell) && cell.type !== "array";
+  return (
+    isObservableCell(cell) && cell.type !== "array" && cell.type !== "struct"
+  );
+}
+
+/**
+ * The cell a `$map` results target writes, or `undefined` for a field whose
+ * receiver is not a cell.
+ */
+export function mapResultsCell(target: MapResultsTarget): string | undefined {
+  if (typeof target === "string") return target;
+  return target.receiver.kind === "cell" ? target.receiver.name : undefined;
+}
+
+/**
+ * Canonical label of a `$map` results target: the cell name followed by each
+ * field name, dot-separated.
+ */
+export function mapResultsLabel(target: MapResultsTarget): string {
+  if (typeof target === "string") return target;
+  return [mapResultsCell(target) ?? "", ...target.path].join(".");
 }
 
 export function isArtifactCell(cell: Cell): cell is ArtifactCell {
@@ -674,8 +802,9 @@ export type InvokeAction = {
  * is bound) commits one constructed output array in a single write when it
  * resolves. It never writes its receiver.
  *
- * `receiver` is the input array — a lexical array cell or a typed read-only
- * array channel. `results` is the output array cell name when present; omitting
+ * `receiver` is the input array — a lexical array cell, a typed read-only
+ * array channel, or an array field of either. `results` is the output array
+ * when present: an array cell name, or an array field of a Struct cell; omitting
  * it is the forEach shape (members run for their effects, no output, and
  * `span.result` is unbound). `body` is the callback statement graph, run under
  * the invoke dialect, its element ids stamped under this action's id.
@@ -684,7 +813,7 @@ export type MapAction = {
   id: ElementId;
   kind: "map";
   receiver: ArrayReference;
-  results?: string;
+  results?: MapResultsTarget;
   body: Statement[];
   loc?: SourceRange;
 };

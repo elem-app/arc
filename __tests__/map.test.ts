@@ -1103,6 +1103,234 @@ function Main() {
     });
   });
 
+  describe("map.struct-fields", () => {
+    it("maps a Struct field receiver into a sibling field and keeps the other fields", () => {
+      const { brief } = runTerminal(
+        `
+"arc";
+function Main() {
+  let req = Struct({ tags: Array(Str()), labels: Array(Str()), owner: Str() });
+  req.$set({ tags: ["a", "b"], labels: ["old"], owner: "o" });
+  req.tags.$map(() => span.result.$set(span.item), req.labels);
+}
+`,
+        "map-struct-field-sibling-arc",
+      );
+
+      expect(rootTraversal(brief).cells.req).toEqual({
+        tags: ["a", "b"],
+        labels: ["a", "b"],
+        owner: "o",
+      });
+    });
+
+    it.each([
+      ["a mapped input", '["p"]'],
+      ["an empty input", "[]"],
+    ])(
+      "rejects a field results commit into an unset Struct for %s",
+      (_case, input) => {
+        const { brief } = runTerminal(
+          `
+"arc";
+function Main() {
+  let xs = Array(Str());
+  let req = Struct({ labels: Array(Str()), owner: Str() });
+  xs.$set(${input});
+  xs.$map(() => span.result.$set(span.item), req.labels);
+}
+`,
+          "map-struct-field-unset-arc",
+        );
+
+        expect(brief.outcome).toBe("poisoned");
+        expect(brief.issues).toContainEqual(
+          expect.objectContaining({
+            kind: "poisoned-traversal",
+            reasonCode: "unset-value",
+          }),
+        );
+        expect(rootTraversal(brief).cells.req).toBeUndefined();
+      },
+    );
+
+    it("maps an array field of a Struct args channel", () => {
+      const { brief } = runTerminal(
+        `
+"arc";
+function Main() {
+  let req = Struct({ tags: Array(Str()) });
+  let out = Array(Str());
+  req.$set({ tags: ["x", "y"] });
+  $enter(Child, { args: { req }, returns: { out } });
+  function Child(args = { req: Struct({ tags: Array(Str()) }) }, returns = { out: Array(Str()) }) {
+    let copied = Array(Str());
+    args.req.tags.$map(() => span.result.$set(span.item), copied);
+    this.effects = () => {
+      returns.out.$set(copied);
+    };
+  }
+}
+`,
+        "map-struct-channel-field-arc",
+      );
+
+      expect(rootTraversal(brief).cells.out).toEqual(["x", "y"]);
+    });
+
+    it("resumes a blocked member across a JSON round-trip and commits field results", () => {
+      const { runtime, brief } = run(
+        `
+"arc";
+function Main() {
+  let req = Struct({ tags: Array(Str()), labels: Array(Str()) });
+  let label = Str();
+  req.$set({ tags: ["p", "q"], labels: [] });
+  req.tags.$map(() => {
+    $observeOrAsk(label);
+    span.result.$set(label);
+  }, req.labels);
+}
+`,
+        "map-struct-field-json-restart-arc",
+      );
+      const afterFirst = progressBrief(runtime, brief, {
+        move: "proceed",
+        observations: {
+          [brief.observations[0]!.id]: { status: "resolved", value: "P" },
+        },
+      });
+      const revived = JSON.parse(
+        JSON.stringify(afterFirst.traversals),
+      ) as ArcTraversalSet;
+      const mapState = Object.values(revived[0]!.frame.actionStates).find(
+        (state) => state?.kind === "map" && state.map,
+      );
+      expect(mapState?.kind === "map" && mapState.map?.results).toBe(
+        "req.labels",
+      );
+      const revivedBrief = actionProgress(runtime.start(revived, EMPTY_DIALOG));
+
+      const done = progressTerminal(runtime, revivedBrief, {
+        move: "proceed",
+        observations: {
+          [revivedBrief.observations[0]!.id]: {
+            status: "resolved",
+            value: "Q",
+          },
+        },
+      });
+
+      expect(rootTraversal(done).cells.req).toEqual({
+        tags: ["p", "q"],
+        labels: ["P", "Q"],
+      });
+    });
+
+    it("maps Struct elements through a newcopy child that reads their fields", () => {
+      const { brief } = runTerminal(
+        `
+"arc";
+function Main() {
+  let people = Array(Struct({ name: Str(), age: Num() }));
+  let names = Array(Str());
+  people.$set([{ name: "Ann", age: 30 }, { name: "Bo", age: 4 }]);
+  people.$map(() => {
+    $enter(newcopy(Name), { args: { person: span.item }, returns: { name: span.result } });
+  }, names);
+  function Name(args = { person: Struct({ name: Str(), age: Num() }) }, returns = { name: Str() }) {
+    this.effects = () => {
+      returns.name.$set(args.person.name);
+    };
+  }
+}
+`,
+        "map-struct-elements-arc",
+      );
+
+      expect(rootTraversal(brief).cells.names).toEqual(["Ann", "Bo"]);
+    });
+
+    it("reads span.item fields directly in a callback", () => {
+      const { brief } = runTerminal(
+        `
+"arc";
+function Main() {
+  let people = Array(Struct({ name: Str(), pets: Array(Str()) }));
+  let lines = Array(Str());
+  people.$set([{ name: "Ann", pets: ["cat"] }, { name: "Bo", pets: [] }]);
+  people.$map(() => {
+    if (span.item.pets.length > 0) {
+      span.result.$set(\`\${span.item.name} has \${span.item.pets[0]}\`);
+    } else {
+      span.result.$set(span.item.name);
+    }
+  }, lines);
+}
+`,
+        "map-span-item-fields-arc",
+      );
+
+      expect(rootTraversal(brief).cells.lines).toEqual(["Ann has cat", "Bo"]);
+    });
+
+    const structSource = (statement: string) => `
+"arc";
+function Main() {
+  let req = Struct({ tags: Array(Str()), labels: Array(Str()), owner: Str() });
+  let other = Struct({ tags: Array(Str()) });
+  req.tags.$set(["a"]);
+  ${statement}
+}
+`;
+
+    it("allows a callback to write a sibling of its Struct field receiver", () => {
+      expect(() =>
+        parse(
+          structSource(
+            `req.tags.$map(() => { req.owner.$set(span.item); span.result.$set(span.item); }, req.labels);`,
+          ),
+        ),
+      ).not.toThrow();
+    });
+
+    it.each([
+      ["the receiver field", `req.tags.$set(["b"]);`],
+      [
+        "the receiver's Struct",
+        `req.$set({ tags: [], labels: [], owner: "" });`,
+      ],
+      ["a receiver element", `req.tags[0].$set("b");`],
+    ])("rejects a callback write to %s", (_label, write) => {
+      expect(() =>
+        parse(structSource(`req.tags.$map(() => { ${write} });`)),
+      ).toThrow(/MAP_RECEIVER_WRITE/);
+    });
+
+    it.each([
+      ["a non-array field", `req.owner`, /MAP_RESULTS_NON_ARRAY/],
+      ["an undeclared field", `req.missing`, /has no declared field "missing"/],
+      [
+        "a channel field",
+        `args.req.tags`,
+        /\$map results must be an array cell or a Struct cell field/,
+      ],
+      [
+        "an expression",
+        `[]`,
+        /\$map results must be an array cell or a Struct cell field/,
+      ],
+    ])("rejects results naming %s", (_label, results, message) => {
+      expect(() =>
+        parse(
+          structSource(
+            `req.tags.$map(() => span.result.$set(span.item), ${results});`,
+          ),
+        ),
+      ).toThrow(message);
+    });
+  });
+
   describe("map.rejections", () => {
     const mapSource = (callbackAndResults: string) => `
 "arc";

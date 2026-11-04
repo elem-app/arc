@@ -1,8 +1,12 @@
-import { reusableSpecCompatible } from "../spec/resolution.js";
+import {
+  resolveReferenceSpec,
+  reusableSpecCompatible,
+} from "../spec/resolution.js";
 import type {
   ArrayReference,
   Cell,
   EnterChannelBindingSource,
+  MapResultsTarget,
   Node,
   NodeSignature,
   Statement,
@@ -173,7 +177,7 @@ function walkStatements(
             result:
               statement.results === undefined
                 ? undefined
-                : arrayCellElementSpec(statement.results, cells),
+                : mapResultsElementSpec(statement.results, cells),
           },
           entry,
           entries,
@@ -354,18 +358,20 @@ function arrayReferenceElementSpec(
   cells: readonly Cell[],
   signature: NodeSignature | undefined,
 ): ArrayElementSpec | undefined {
-  if (reference.kind === "channel") {
-    const spec = signature?.[reference.namespace][reference.key];
-    return spec?.type === "array" ? spec.element : undefined;
-  }
-  const cell = findInnermostCell(cells, reference.name);
-  return cell?.type === "array" ? cell.element : undefined;
+  const spec = resolveReferenceSpec(reference, {
+    cells: [...cells],
+    signature,
+  });
+  return spec?.type === "array" ? spec.element : undefined;
 }
 
-function arrayCellElementSpec(
-  name: string,
+function mapResultsElementSpec(
+  results: MapResultsTarget,
   cells: readonly Cell[],
 ): ArrayElementSpec | undefined {
-  const cell = findInnermostCell(cells, name);
-  return cell?.type === "array" ? cell.element : undefined;
+  return arrayReferenceElementSpec(
+    typeof results === "string" ? { kind: "cell", name: results } : results,
+    cells,
+    undefined,
+  );
 }

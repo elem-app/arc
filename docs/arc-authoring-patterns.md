@@ -79,7 +79,7 @@ let wantsPricing = Bool({
 
 ### Choose `observe` vs `observeOrAsk` by whether the walk can proceed without a value
 
-`$observe(...)` is passive and best-effort: if the host cannot extract a value it reports `unknown`, and the walk continues with whatever value was already there. `$observeOrAsk(...)` blocks until a concrete value exists, asking the user directly if extraction fails.
+`$observe(...)` is passive and best-effort: if the host cannot extract a value it reports `unknown`, and the walk continues with whatever value was already there. `$observeOrAsk(...)` blocks until a concrete value exists, asking a participant of the run if extraction fails. The question determines who is asked.
 
 Prefer `$observe(...)` when a missing value is acceptable — reading the room, gathering bookkeeping in `this.effects` or `this.trigger`, or any branch that has a sensible default.
 
@@ -303,7 +303,7 @@ A `$map` can run an element twice: a deflection escaping an element abandons the
 | --- | --- | --- |
 | Re-firing a resolved-once action to repeat work (e.g. `$set` as a per-turn counter) | A resolved-once action is skipped for the rest of the entry, and a canonical re-entry skips it too | Use `$instructLoop` for repeated instructions, or `$enterLoop` with an explicit `forgetful` / `newcopy` target for repeated node work |
 | Arc vocabulary in semantic text (`this.deflection`, `node`, `route`, `state`) | The host worker sees only the conversation; these words name nothing it can observe | Phrase the text as a question or instruction about the dialog |
-| `$observeOrAsk(...)` for an incidental value | Forces the user to answer something the walk does not actually need | Use `$observe(...)` and continue on `unknown` |
+| `$observeOrAsk(...)` for an incidental value | Forces a participant to answer something the walk does not actually need | Use `$observe(...)` and continue on `unknown` |
 | `$set(...)` then expecting `$observe(...)` to resolve | A prior write supplies the current value but does not satisfy the observe | Branch on the known value directly |
 | Sentinel wedged into the middle of an enum | Breaks ordinal `>=` / `<=` comparisons | Put `"unknown"` at one end of the value list |
 | Reaching for deflection where a local branch fits | Deflection is exception-like and non-local; a known, in-place decision reads clearer as a branch | Branch with `if` / `.state` at the decision point; deflect for interruptions that can arise from anywhere |

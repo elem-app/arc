@@ -8,6 +8,7 @@ import {
   admitValue,
   isRenderedSemanticText,
   resolveHostOperation,
+  resolveReferenceSpec,
 } from "../spec/resolution.js";
 import type {
   ActionBrief,
@@ -18,6 +19,8 @@ import type {
 } from "../types/host-interaction.js";
 import type {
   ActionStatement,
+  ArrayReference,
+  Cell,
   Document,
   EffectStatement,
   ElementId,
@@ -28,6 +31,7 @@ import type {
   Statement,
   ValidationIssue,
 } from "../types/parser.js";
+import { mapResultsLabel } from "../types/parser.js";
 import type {
   ActionState,
   ArcRef,
@@ -941,16 +945,22 @@ function assertPersistedMapState(
   action: MapAction,
   map: NonNullable<Extract<ActionState, { kind: "map" }>["map"]>,
 ): void {
-  if (map.results !== action.results) {
+  if (
+    map.results !==
+    (action.results === undefined ? undefined : mapResultsLabel(action.results))
+  ) {
     throw invalidPersistedState(
       "$map arena result target does not match its action",
     );
   }
 
-  const receiver =
-    action.receiver.kind === "channel"
-      ? node.signature?.[action.receiver.namespace][action.receiver.key]
-      : findLexicalCellSpec(entries, traversal, action.receiver.name);
+  const lexical = (reference: ArrayReference) =>
+    resolveReferenceSpec(reference, {
+      cells: [],
+      signature: node.signature,
+      resolveCell: (name) => findLexicalCellSpec(entries, traversal, name),
+    });
+  const receiver = lexical(action.receiver);
   if (!receiver || receiver.type !== "array") {
     throw invalidPersistedState(
       "$map receiver has no registered array authority",
@@ -971,7 +981,11 @@ function assertPersistedMapState(
     return;
   }
 
-  const result = findLexicalCellSpec(entries, traversal, action.results);
+  const result = lexical(
+    typeof action.results === "string"
+      ? { kind: "cell", name: action.results }
+      : action.results,
+  );
   if (!result || result.type !== "array") {
     throw invalidPersistedState(
       "$map result has no registered array authority",
@@ -1118,7 +1132,7 @@ function findLexicalCellSpec(
   entries: ReadonlyMap<ArcRef, RegistryEntry>,
   traversal: Traversal,
   name: string,
-): CellSpec | undefined {
+): Cell | undefined {
   let ref: NodeRef | undefined = traversalToNodeRef(traversal);
   while (ref) {
     const entry = getEntryForRef(entries, ref);
@@ -1295,6 +1309,7 @@ export type {
   ActionBrief,
   ActionPoisonReason,
   ActionReport,
+  ArrayObservationMeta,
   HostCallBrief,
   HostCallReport,
   InstructionBrief,
@@ -1305,9 +1320,11 @@ export type {
   ObservationGroupBrief,
   ObservationGroupField,
   ObservationGroupReport,
+  ObservationMeta,
   ObservationReport,
-  ObservationValueMeta,
   ScalarObservationMeta,
+  StructObservationField,
+  StructObservationMeta,
   TerminalBrief,
   TriggerBrief,
   TriggerReport,
@@ -1337,10 +1354,13 @@ export type {
   Dialog,
   DialogCursor,
   DialogTurn,
+  ObservedStructValue,
+  ObservedValue,
   PayloadValue,
   PrimitiveArrayValue,
   PrimitiveValue,
   SemanticText,
   SemanticTextPart,
+  StructValue,
 } from "../types/value.js";
 export { createArtifactValue, isArtifactValue };

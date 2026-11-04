@@ -1,4 +1,5 @@
 import type {
+  ArrayReference,
   CatchDeflectionStatement,
   Cell,
   CellTarget,
@@ -16,9 +17,10 @@ import type {
   ValueExpression,
 } from "../types/parser.js";
 import {
-  isArrayCell,
-  isScalarObservableCell,
+  isObservableCell,
   isValueExpressionCell,
+  mapResultsCell,
+  observingQuestions,
 } from "../types/parser.js";
 
 type LintRule = {
@@ -124,12 +126,10 @@ export function lintNodeBareCellBooleans(
     emitLintIssue(lintIssues, "bare-cell-boolean", node.loc);
   }
   for (const cell of node.cells) {
-    const observing = isScalarObservableCell(cell)
-      ? cell.observing
-      : isArrayCell(cell) && cell.element.type !== "artifact"
-        ? cell.element.observing
-        : undefined;
-    if (observing && semanticStringContainsBareCellBoolean(observing)) {
+    if (
+      isObservableCell(cell) &&
+      observingQuestions(cell).some(semanticStringContainsBareCellBoolean)
+    ) {
       emitLintIssue(lintIssues, "bare-cell-boolean", cell.loc);
     }
     if (
@@ -702,19 +702,45 @@ function collectExpressionReads(
       }
       return;
     case "arrayElementRead":
-      if (expression.array.kind === "cell") into.add(expression.array.name);
+      collectReferenceRead(expression.array, into);
       collectExpressionReads(expression.index, into);
       return;
     case "arrayLength":
-      if (expression.array.kind === "cell") into.add(expression.array.name);
+      collectReferenceRead(expression.array, into);
+      return;
+    case "field":
+      collectReferenceRead(expression, into);
       return;
     case "arrayLiteral":
       for (const element of expression.elements) {
         collectExpressionReads(element, into);
       }
       return;
+    case "structLiteral":
+      for (const field of Object.values(expression.fields)) {
+        collectExpressionReads(field, into);
+      }
+      return;
     default:
       return;
+  }
+}
+
+/** Adds the root cell read by an array, slot, or Struct field reference. */
+function collectReferenceRead(
+  reference: ArrayReference,
+  into: Set<string>,
+): void {
+  if (reference.kind === "cell") {
+    into.add(reference.name);
+    return;
+  }
+  if (reference.kind !== "field") return;
+  const receiver = reference.receiver;
+  if (receiver.kind === "cell") {
+    into.add(receiver.name);
+  } else if (receiver.kind === "arrayElementRead") {
+    collectExpressionReads(receiver, into);
   }
 }
 
@@ -798,13 +824,20 @@ function collectReadsAndWrites(
           }
         }
         break;
-      case "map":
-        if (statement.receiver.kind === "cell") {
-          onRead(statement.receiver.name, statement.loc);
-        }
+      case "map": {
+        const receiverReads = new Set<string>();
+        collectReferenceRead(statement.receiver, receiverReads);
+        for (const name of receiverReads) onRead(name, statement.loc);
         collectReadsAndWrites(statement.body, onRead, onWrite);
-        if (statement.results) onWrite(statement.results, statement.loc);
+        // A field commit replaces one field of a set Struct, so it reads its
+        // root rather than assigning it.
+        if (typeof statement.results === "string") {
+          onWrite(statement.results, statement.loc);
+        } else if (statement.results) {
+          onRead(mapResultsCell(statement.results)!, statement.loc);
+        }
         break;
+      }
       case "set-span":
       case "set-return":
         emitExpressionReads(statement.value, statement.loc, onRead);
@@ -957,12 +990,8 @@ function collectArcCellUsage(
   // Node-level rendered semantic text also reads any cell it interpolates.
   if (node.guidance) emitSemanticReads(node.guidance, node.loc, onRead);
   for (const cell of node.cells) {
-    const observing = isScalarObservableCell(cell)
-      ? cell.observing
-      : isArrayCell(cell) && cell.element.type !== "artifact"
-        ? cell.element.observing
-        : undefined;
-    if (observing) {
+    if (!isObservableCell(cell)) continue;
+    for (const observing of observingQuestions(cell)) {
       emitSemanticReads(observing, cell.loc, onRead);
     }
   }
@@ -1145,9 +1174,9 @@ function walkReadBeforeSet(
         }
         break;
       case "map": {
-        if (statement.receiver.kind === "cell") {
-          report(statement.receiver.name, statement.loc);
-        }
+        const receiverReads = new Set<string>();
+        collectReferenceRead(statement.receiver, receiverReads);
+        for (const name of receiverReads) report(name, statement.loc);
         // The callback may not run at all, so its writes are not definite.
         walkReadBeforeSet(
           statement.body,
@@ -1157,7 +1186,11 @@ function walkReadBeforeSet(
           reported,
           lintIssues,
         );
-        if (statement.results) assigned.add(statement.results);
+        if (typeof statement.results === "string") {
+          assigned.add(statement.results);
+        } else if (statement.results) {
+          report(mapResultsCell(statement.results)!, statement.loc);
+        }
         break;
       }
       case "set-span":

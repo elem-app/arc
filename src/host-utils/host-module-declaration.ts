@@ -18,6 +18,18 @@ type DeclarationToken<Spec extends HostParameterSpec = HostParameterSpec> = {
   readonly [tokenType]: Spec;
 };
 
+/** The spec a declaration token carries. */
+type TokenSpec<Token> =
+  Token extends DeclarationToken<infer Spec> ? Spec : never;
+
+/** The Struct spec `hmd.Struct(fields)` captures, field by field. */
+type StructTokenSpec<
+  Fields extends Readonly<Record<string, DeclarationToken>>,
+> = {
+  type: "struct";
+  fields: { -readonly [Name in keyof Fields]: TokenSpec<Fields[Name]> };
+};
+
 type OperationDeclaration = (
   ...parameters: never[]
 ) => DeclarationToken<ChannelSpec> | void;
@@ -297,12 +309,9 @@ function omittableToken(
   return createToken({ type: "omittable", spec }, [value]);
 }
 
-function structToken(
-  fields: Readonly<Record<string, DeclarationToken>>,
-): DeclarationToken<{
-  type: "struct";
-  fields: Record<string, HostParameterSpec>;
-}> {
+function structToken<
+  const Fields extends Readonly<Record<string, DeclarationToken>>,
+>(fields: Fields): DeclarationToken<StructTokenSpec<Fields>> {
   const path = activeCapture?.path ?? "$";
   const object = inspectNamespace(fields, path);
   const children: DeclarationToken[] = [];
@@ -331,10 +340,12 @@ function structToken(
   children.sort(
     (left, right) => captured.indexOf(left) - captured.indexOf(right),
   );
+  // The captured field specs are exactly `TokenSpec<Fields[Name]>`, which the
+  // phantom token type records and `Object.fromEntries` cannot express.
   return createToken(
     { type: "struct", fields: Object.fromEntries(entries) },
     children,
-  );
+  ) as DeclarationToken<StructTokenSpec<Fields>>;
 }
 
 function valueTokenSpec(
@@ -455,12 +466,36 @@ function isChannelSpec(spec: HostParameterSpec): spec is ChannelSpec {
         spec.element.type === "string" ||
         spec.element.type === "enum" ||
         spec.element.type === "number" ||
-        spec.element.type === "artifact"
+        spec.element.type === "artifact" ||
+        isObservableFieldSpec(spec.element)
       );
+    case "struct":
+      return Object.values(spec.fields).every(isObservableFieldSpec);
     case "omittable":
     case "tuple":
-    case "struct":
     case "semanticText":
+      return false;
+  }
+}
+
+/**
+ * Whether a Struct result field is an observable Arc field: a scalar, an array
+ * of scalars or Structs, or a nested Struct of such fields.
+ */
+function isObservableFieldSpec(spec: HostParameterSpec): boolean {
+  switch (spec.type) {
+    case "boolean":
+    case "string":
+    case "enum":
+    case "number":
+      return true;
+    case "array":
+      return (
+        spec.element.type !== "array" && isObservableFieldSpec(spec.element)
+      );
+    case "struct":
+      return Object.values(spec.fields).every(isObservableFieldSpec);
+    default:
       return false;
   }
 }

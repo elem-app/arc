@@ -7,20 +7,26 @@ import type {
   ObservationBrief,
   ObservationGroupBrief,
   ObservationGroupReport,
+  ObservationMeta,
   ObservationReport,
-  ObservationValueMeta,
   ScalarObservationMeta,
+  StructObservationMeta,
   TriggerBrief,
   TriggerReport,
 } from "../types/host-interaction.js";
 import type {
   ActionStatement,
+  ArrayElementRead,
+  ArrayReference,
   CellTarget,
   Document,
   DocumentRewalkPlan,
   ElementId,
+  FieldReceiver,
+  FieldReference,
   HostCallArgument,
   InstructionAction,
+  LocalExpression,
   Node,
   ObserveAction,
   ObserveGroupAction,
@@ -64,6 +70,7 @@ import type {
   CellValue,
   Dialog,
   DialogCursor,
+  ObservedValue,
   PayloadValue,
   SemanticText,
 } from "../types/value.js";
@@ -562,7 +569,11 @@ export function cellValuesEqual(
   return payloadValuesEqual(a, b);
 }
 
-function payloadValuesEqual(a: unknown, b: unknown): boolean {
+/**
+ * Structural equality of payload carriers: arrays compare in order and records
+ * compare by key regardless of insertion order.
+ */
+export function payloadValuesEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
   if (Array.isArray(a) || Array.isArray(b)) {
     if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
@@ -745,17 +756,99 @@ function cloneScalarObservationMeta(
   }
 }
 
-/** Clones observation value metadata, dispatching on the scalar vs array variant. */
-function cloneObservationValueMeta(
-  meta: ObservationValueMeta,
-): ObservationValueMeta {
-  if (meta.type === "array") {
-    return {
-      type: "array",
-      element: cloneScalarObservationMeta(meta.element),
-    };
+/** Clones observation value metadata, recursing through Struct fields. */
+function cloneObservationMeta(meta: ObservationMeta): ObservationMeta {
+  switch (meta.type) {
+    case "array":
+      return {
+        type: "array",
+        element:
+          meta.element.type === "struct"
+            ? cloneStructObservationMeta(meta.element)
+            : cloneScalarObservationMeta(meta.element),
+      };
+    case "struct":
+      return cloneStructObservationMeta(meta);
+    default:
+      return cloneScalarObservationMeta(meta);
   }
-  return cloneScalarObservationMeta(meta);
+}
+
+function cloneStructObservationMeta(
+  meta: StructObservationMeta,
+): StructObservationMeta {
+  return {
+    type: "struct",
+    fields: Object.fromEntries(
+      Object.entries(meta.fields).map(([name, field]) => [
+        name,
+        {
+          question: cloneSemanticText(field.question),
+          meta: cloneObservationMeta(field.meta),
+        },
+      ]),
+    ),
+  };
+}
+
+function cloneObservedValue(
+  value: ObservedValue | undefined,
+): ObservedValue | undefined {
+  // A payload clone preserves the carrier's shape.
+  return value === undefined
+    ? undefined
+    : (clonePayloadValue(value) as ObservedValue);
+}
+
+/** Deep-clones an array, slot, or Struct field reference. */
+function cloneArrayReference(reference: ArrayReference): ArrayReference {
+  return reference.kind === "field"
+    ? cloneFieldReference(reference)
+    : { ...reference };
+}
+
+/** Deep-clones a Struct field reference. */
+function cloneFieldReference(reference: FieldReference): FieldReference {
+  return {
+    kind: "field",
+    receiver: cloneFieldReceiver(reference.receiver),
+    path: [...reference.path],
+  };
+}
+
+function cloneFieldReceiver(receiver: FieldReceiver): FieldReceiver {
+  if (receiver.kind !== "arrayElementRead") return { ...receiver };
+  return cloneArrayElementRead(receiver);
+}
+
+function cloneArrayElementRead(read: ArrayElementRead): ArrayElementRead {
+  return {
+    kind: "arrayElementRead",
+    array: cloneArrayReference(read.array),
+    // Cloning preserves the expression kind, so a local index stays local.
+    index: cloneValueExpression(read.index) as LocalExpression,
+  };
+}
+
+/** Normalized comparison form of an array, slot, or Struct field reference. */
+function normalizeArrayReference(reference: ArrayReference): unknown {
+  if (reference.kind !== "field") return { ...reference };
+  return {
+    kind: "field",
+    receiver:
+      reference.receiver.kind === "arrayElementRead"
+        ? normalizeArrayElementRead(reference.receiver)
+        : { ...reference.receiver },
+    path: [...reference.path],
+  };
+}
+
+function normalizeArrayElementRead(read: ArrayElementRead): unknown {
+  return {
+    kind: "arrayElementRead",
+    array: normalizeArrayReference(read.array),
+    index: normalizeValueExpression(read.index),
+  };
 }
 
 export function cloneObservationBrief(
@@ -769,11 +862,9 @@ export function cloneObservationBrief(
     cell: brief.cell,
     mode: brief.mode,
     question: cloneSemanticText(brief.question),
-    currentValue: Array.isArray(brief.currentValue)
-      ? [...brief.currentValue]
-      : brief.currentValue,
+    currentValue: cloneObservedValue(brief.currentValue),
     hostParams: clonePayloadValue(brief.hostParams),
-    meta: cloneObservationValueMeta(brief.meta),
+    meta: cloneObservationMeta(brief.meta),
   };
 }
 
@@ -799,10 +890,8 @@ export function cloneObservationGroupBrief(
     fields: brief.fields.map((field) => ({
       cell: field.cell,
       question: cloneSemanticText(field.question),
-      currentValue: Array.isArray(field.currentValue)
-        ? [...field.currentValue]
-        : field.currentValue,
-      meta: cloneObservationValueMeta(field.meta),
+      currentValue: cloneObservedValue(field.currentValue),
+      meta: cloneObservationMeta(field.meta),
     })),
   };
 }
@@ -951,15 +1040,14 @@ export function cloneValueExpression(
     case "nodeState":
       return { kind: "nodeState", identifier: expression.identifier };
     case "arrayElementRead":
-      return {
-        kind: "arrayElementRead",
-        array: { ...expression.array },
-        index: cloneValueExpression(
-          expression.index,
-        ) as typeof expression.index,
-      };
+      return cloneArrayElementRead(expression);
     case "arrayLength":
-      return { kind: "arrayLength", array: { ...expression.array } };
+      return {
+        kind: "arrayLength",
+        array: cloneArrayReference(expression.array),
+      };
+    case "field":
+      return cloneFieldReference(expression);
     case "span":
       return { kind: "span", owner: expression.owner, key: expression.key };
     case "arrayLiteral":
@@ -967,6 +1055,16 @@ export function cloneValueExpression(
         kind: "arrayLiteral",
         elements: expression.elements.map((element) =>
           cloneValueExpression(element),
+        ),
+      };
+    case "structLiteral":
+      return {
+        kind: "structLiteral",
+        fields: Object.fromEntries(
+          Object.entries(expression.fields).map(([name, field]) => [
+            name,
+            cloneValueExpression(field),
+          ]),
         ),
       };
     case "judge":
@@ -1707,13 +1805,14 @@ export function normalizeValueExpression(expression: ValueExpression): unknown {
     case "nodeState":
       return { kind: "nodeState", node: expression.identifier };
     case "arrayElementRead":
-      return {
-        kind: "arrayElementRead",
-        array: { ...expression.array },
-        index: normalizeValueExpression(expression.index),
-      };
+      return normalizeArrayElementRead(expression);
     case "arrayLength":
-      return { kind: "arrayLength", array: { ...expression.array } };
+      return {
+        kind: "arrayLength",
+        array: normalizeArrayReference(expression.array),
+      };
+    case "field":
+      return normalizeArrayReference(expression);
     case "span":
       return { kind: "span", owner: expression.owner, key: expression.key };
     case "arrayLiteral":
@@ -1722,6 +1821,14 @@ export function normalizeValueExpression(expression: ValueExpression): unknown {
         elements: expression.elements.map((element) =>
           normalizeValueExpression(element),
         ),
+      };
+    case "structLiteral":
+      return {
+        kind: "structLiteral",
+        fields: Object.entries(expression.fields).map(([name, field]) => [
+          name,
+          normalizeValueExpression(field),
+        ]),
       };
     case "judge":
       return {

@@ -28,16 +28,31 @@ export type ArtifactValue = {
   readonly path: string;
 };
 
-/** Element carriers stored by one-level Arc arrays. */
-export type ArrayElementValue = PrimitiveValue | ArtifactValue;
+/** Element carriers stored by Arc arrays. */
+export type ArrayElementValue = PrimitiveValue | ArtifactValue | StructValue;
 
-/** One-level ordered carrier stored by Arc cells and channels. */
+/** Ordered carrier stored by Arc cells and channels. */
 export type ArrayValue = ArrayElementValue[];
 
 /** Recursively nested object carrier in an Arc-host payload. */
 export type StructValue = {
   readonly [key: string]: PayloadValue;
 };
+
+/**
+ * Carrier of an observable position's value across the brief/report boundary:
+ * a scalar, a scalar list, a Struct record keyed by field name, or a list of
+ * records. Admission under the position's spec establishes that each record
+ * carries exactly its declared fields.
+ */
+export type ObservedValue =
+  | PrimitiveValue
+  | PrimitiveArrayValue
+  | ObservedStructValue
+  | ObservedStructValue[];
+
+/** Struct record carrier keyed by field name. */
+export type ObservedStructValue = { [field: string]: ObservedValue };
 
 /**
  * TypeScript representation of values passed across the Arc-host boundary.
@@ -120,7 +135,6 @@ export type CellValue =
   | ArtifactValue
   | DialogCursor
   | ArrayValue
-  // Included for the future addition of the `Struct()` cell type.
   | StructValue;
 
 /** One segment inside host-facing rendered semantic text. */

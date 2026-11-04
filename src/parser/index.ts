@@ -19,9 +19,11 @@ import {
   producerGuaranteesArtifact,
   resolveHostOperation,
   resolveProducer,
+  resolveReferenceSpec,
   reusableSpecCompatible,
   stringOperandRule,
 } from "../spec/resolution.js";
+import { isStructFieldName } from "../spec/struct.js";
 import type {
   ArrayReference,
   BreakStatement,
@@ -35,6 +37,7 @@ import type {
   ElementId,
   EnterChannelBindings,
   EnterTarget,
+  FieldReference,
   GuardStatement,
   HostCall,
   HostCallArgument,
@@ -44,12 +47,16 @@ import type {
   InvokeAction,
   LabelStatement,
   LintIssue,
+  LocalExpression,
   MapAction,
+  MapResultsTarget,
   Node,
   NodeReadSet,
   NodeSignature,
   NumericObserveAs,
+  ObservableField,
   ObservableScalar,
+  ObservableStruct,
   ObserveAction,
   ObserveGroupAction,
   ObserveOrAskAction,
@@ -71,8 +78,12 @@ import type {
 } from "../types/parser.js";
 import {
   isArrayCell,
+  isObservableCell,
   isScalarObservableCell,
   isValueExpressionCell,
+  mapResultsCell,
+  mapResultsLabel,
+  observingQuestions,
   UNSTAMPED_ID,
 } from "../types/parser.js";
 import { invokeSegKey, nodeSegKey } from "../types/runtime.js";
@@ -82,28 +93,39 @@ import type {
   CellSpec,
   ChannelSpec,
   HostModuleSpec,
+  ObservableFieldSpec,
+  StructSpec,
 } from "../types/spec.js";
 import {
   cellSpecToChannelSpec,
+  fieldSpecAt,
   isObservableCellSpec,
+  isObservableFieldSpec,
   isSettableCellSpec,
 } from "../types/spec.js";
 import type { PayloadValue, StructValue } from "../types/value.js";
 import {
   containsBriefableExpression,
   type ExpressionParseContext,
+  formatReference,
   getBlockStatements,
   getFunctionBody,
   getHookBodyStatements,
   getMemberTarget,
   getThisProperty,
   locOf,
+  parseArrayReference,
   parseArtifactConstructCall,
   parseCellTarget,
   parseExpression,
+  parseFieldReference,
   parseHostCallArgument,
   parseHostCallTarget,
   parseSemanticString,
+  resetDeclarationScope,
+  scopedReferenceSpec,
+  withDeclarationScope,
+  withMapItemScope,
 } from "./ast.js";
 import {
   instructionResolutionIssue,
@@ -158,6 +180,7 @@ const ARC_RESERVED_IMPORT_ALIAS_NAMES: ReadonlySet<string> = new Set([
  * semantic validation before returning.
  */
 export function parse(source: string): Document {
+  resetDeclarationScope();
   const program = acornParse(source, {
     ecmaVersion: "latest",
     sourceType: "module",
@@ -536,7 +559,66 @@ function parseNode(
 
   const signature = parseNodeSignature(fn.params);
 
-  const cells: Cell[] = [];
+  // Declaration shapes are collected before any expression is parsed, so
+  // member access on a cell is interpreted by its declared role wherever it
+  // appears, including in another declaration's observing question.
+  const declarationStatements = fn.body.body.filter(
+    (statement): statement is acorn.VariableDeclaration =>
+      statement.type === "VariableDeclaration",
+  );
+  const shapes = parseNodeCellDeclarations(declarationStatements, {
+    hostModules: availableHostModules,
+    expressions: false,
+  });
+  return withDeclarationScope(
+    { cells: new Map(shapes.map((cell) => [cell.name, cell])), signature },
+    () =>
+      parseNodeBody(
+        fn,
+        fn.id!.name,
+        signature,
+        parseNodeCellDeclarations(declarationStatements, {
+          hostModules: availableHostModules,
+          expressions: true,
+        }),
+        new Set(declarationStatements),
+        availableImports,
+        availableHostModules,
+        visibleNodeNames,
+        visibleCellNames,
+        inheritedDeflectWhen,
+      ),
+  );
+}
+
+/** Parses every cell declaration statement of one node body, in order. */
+function parseNodeCellDeclarations(
+  statements: readonly acorn.VariableDeclaration[],
+  context: DeclarationParseContext,
+): Cell[] {
+  return statements.flatMap((statement) => {
+    const cells = parseCellDeclarations(statement, context);
+    if (cells.length !== statement.declarations.length) {
+      throw new Error(
+        "Node-body declarations must use supported Arc cell constructors",
+      );
+    }
+    return cells;
+  });
+}
+
+function parseNodeBody(
+  fn: acorn.FunctionDeclaration | acorn.AnonymousFunctionDeclaration,
+  identifier: string,
+  signature: NodeSignature | undefined,
+  cells: Cell[],
+  declarationStatements: ReadonlySet<acorn.Statement>,
+  availableImports: Set<string>,
+  availableHostModules: Map<string, string>,
+  visibleNodeNames: Set<string>,
+  visibleCellNames: Set<string>,
+  inheritedDeflectWhen: ResolutionStatement[] | undefined,
+): Node {
   const childFunctions = new Map<string, acorn.FunctionDeclaration>();
   let forgetfulEntry = false;
   const writeDiffMode: WriteDiffMode = "advance";
@@ -557,17 +639,7 @@ function parseNode(
   const handledStatements = new Set<acorn.Statement>();
 
   for (const statement of fn.body.body) {
-    if (statement.type === "VariableDeclaration") {
-      const parsedCells = parseCellDeclarations(
-        statement,
-        availableHostModules,
-      );
-      if (parsedCells.length !== statement.declarations.length) {
-        throw new Error(
-          "Node-body declarations must use supported Arc cell constructors",
-        );
-      }
-      cells.push(...parsedCells);
+    if (declarationStatements.has(statement)) {
       handledStatements.add(statement);
       continue;
     }
@@ -755,7 +827,7 @@ function parseNode(
     ...cells.map((entry) => entry.name),
   ]);
   const enclosing: EnclosingNode = {
-    identifier: fn.id.name,
+    identifier: identifier,
     childNames: new Set(childFunctions.keys()),
   };
   if (catchInterruptionBody) {
@@ -813,7 +885,7 @@ function parseNode(
   const children = [...childFunctionNodes];
 
   return {
-    identifier: fn.id.name,
+    identifier: identifier,
     displayName,
     description,
     guidance,
@@ -952,6 +1024,9 @@ function parseChannelSpec(
     }
     return { type: "artifact" };
   }
+  if (name === "Struct") {
+    return parseStructChannelSpec(expression, owner);
+  }
   if (name === "Index") {
     if (expression.arguments.length !== 0) {
       throw new Error(`${owner} Index() takes no arguments`);
@@ -1021,12 +1096,64 @@ function parseChannelSpec(
     }
     if (element.type === "index" || element.type === "dialogCursor") {
       throw new Error(
-        `${owner} Array() element must be a scalar or Artifact channel type`,
+        `${owner} Array() element must be a scalar, Artifact, or Struct channel type`,
       );
     }
     return { type: "array", element };
   }
   throw new Error(`${owner} unsupported channel spec: ${name}`);
+}
+
+/**
+ * Parses a `Struct({ ... })` channel spec. Fields use bare channel constructors
+ * for observable scalars, observable arrays, and nested Structs.
+ */
+function parseStructChannelSpec(
+  expression: acorn.CallExpression,
+  owner: string,
+): StructSpec {
+  const fieldsArg = expression.arguments[0];
+  if (
+    expression.arguments.length !== 1 ||
+    !fieldsArg ||
+    fieldsArg.type !== "ObjectExpression"
+  ) {
+    throw new Error(`${owner} Struct() channel spec takes one field object`);
+  }
+  const fields: Record<string, ObservableFieldSpec> = {};
+  for (const property of fieldsArg.properties) {
+    if (
+      property.type === "SpreadElement" ||
+      property.computed ||
+      property.kind !== "init" ||
+      property.method
+    ) {
+      throw new Error(`${owner} Struct() fields must be named data properties`);
+    }
+    const name =
+      property.key.type === "Identifier"
+        ? property.key.name
+        : property.key.type === "Literal" &&
+            typeof property.key.value === "string"
+          ? property.key.value
+          : undefined;
+    if (name === undefined || !isStructFieldName(name)) {
+      throw new Error(
+        `${owner} Struct() has an invalid field name ${JSON.stringify(name ?? "<computed>")}`,
+      );
+    }
+    if (Object.hasOwn(fields, name)) {
+      throw new Error(`${owner} Struct() repeats field ${name}`);
+    }
+    const field = parseChannelSpec(property.value, `${owner}.${name}`);
+    if (!isObservableFieldSpec(field)) {
+      throw new Error(
+        `${owner}.${name} must be an observable scalar, observable array, or Struct`,
+      );
+    }
+    fields[name] = field;
+  }
+  return { type: "struct", fields };
 }
 
 function collectNewCopyNodeAliases(
@@ -1335,9 +1462,20 @@ function applyElementId(
   }
 }
 
+/**
+ * Inputs to one declaration-parsing pass. The shape pass (`expressions:
+ * false`) collects each declaration's spec without parsing its `observing`
+ * templates or Artifact initializer; the expression pass parses them with the
+ * node's declarations in scope.
+ */
+type DeclarationParseContext = {
+  hostModules: ReadonlyMap<string, string>;
+  expressions: boolean;
+};
+
 function parseCellDeclarations(
   statement: acorn.VariableDeclaration,
-  availableHostModules: ReadonlyMap<string, string>,
+  context: DeclarationParseContext,
 ): Cell[] {
   const cells: Cell[] = [];
 
@@ -1393,10 +1531,14 @@ function parseCellDeclarations(
         });
         continue;
       }
+      if (!context.expressions) {
+        cells.push({ name: id.name, type: "artifact", loc: locOf(id) });
+        continue;
+      }
       const initializer = parseArtifactConstructCall(
         declaration.init,
         `Artifact ${id.name}`,
-        availableHostModules,
+        context.hostModules,
         true,
       );
       if (containsBriefableExpression(initializer)) {
@@ -1419,11 +1561,20 @@ function parseCellDeclarations(
       );
     }
 
+    if (callee.name === "Struct") {
+      cells.push({
+        name: id.name,
+        ...parseStructDeclaration(declaration.init, id.name, context),
+        loc: locOf(id),
+      });
+      continue;
+    }
+
     if (callee.name === "Array") {
       const element = parseArrayElementSpec(
         id.name,
         declaration.init.arguments,
-        availableHostModules,
+        context,
       );
       if (element.type === "artifact") {
         cells.push({
@@ -1446,7 +1597,7 @@ function parseCellDeclarations(
     const scalar = parseScalarConstructorSpec(
       declaration.init,
       id.name,
-      availableHostModules,
+      context,
     );
     if (scalar) {
       cells.push({ name: id.name, ...scalar, loc: locOf(id) });
@@ -1454,6 +1605,92 @@ function parseCellDeclarations(
   }
 
   return cells;
+}
+
+/**
+ * Parses `Struct({ field: Constructor(...), ... }, config?)`. Each field is an
+ * observable scalar, an observable array of scalars or Structs, or a nested
+ * Struct; `config.observing` is the whole-record question.
+ */
+function parseStructDeclaration(
+  call: acorn.CallExpression,
+  owner: string,
+  context: DeclarationParseContext,
+): ObservableStruct {
+  if (call.arguments.length < 1 || call.arguments.length > 2) {
+    throw new Error(
+      `Struct ${owner} takes a field object and an optional config argument`,
+    );
+  }
+  const fieldsArg = call.arguments[0];
+  if (!fieldsArg || fieldsArg.type !== "ObjectExpression") {
+    throw new Error(`Struct ${owner} fields must be an object literal`);
+  }
+  const fields: Record<string, ObservableField> = {};
+  for (const property of fieldsArg.properties) {
+    if (property.type === "SpreadElement") {
+      throw new Error(`Struct ${owner} fields do not support spread`);
+    }
+    if (property.computed || property.kind !== "init" || property.method) {
+      throw new Error(
+        `Struct ${owner} fields must be named data properties without computed keys`,
+      );
+    }
+    const name =
+      property.key.type === "Identifier"
+        ? property.key.name
+        : property.key.type === "Literal" &&
+            typeof property.key.value === "string"
+          ? property.key.value
+          : undefined;
+    if (name === undefined || !isStructFieldName(name)) {
+      throw new Error(
+        `Struct ${owner} has an invalid field name ${JSON.stringify(name ?? "<computed>")}`,
+      );
+    }
+    if (Object.hasOwn(fields, name)) {
+      throw new Error(`Struct ${owner} repeats field ${name}`);
+    }
+    fields[name] = parseStructFieldDeclaration(
+      property.value,
+      `${owner}.${name}`,
+      context,
+    );
+  }
+  const config = parseCellConfig(owner, "Struct", call.arguments[1], context);
+  return { type: "struct", fields, ...config };
+}
+
+function parseStructFieldDeclaration(
+  expression: acorn.Expression | acorn.Pattern,
+  owner: string,
+  context: DeclarationParseContext,
+): ObservableField {
+  if (expression.type !== "CallExpression") {
+    throw new Error(
+      `Struct field ${owner} must be a constructed observable field, e.g. Str()`,
+    );
+  }
+  const callee = expression.callee;
+  if (callee.type === "Identifier" && callee.name === "Struct") {
+    return parseStructDeclaration(expression, owner, context);
+  }
+  if (callee.type === "Identifier" && callee.name === "Array") {
+    const element = parseArrayElementSpec(owner, expression.arguments, context);
+    if (element.type === "artifact") {
+      throw new Error(
+        `Struct field ${owner} cannot hold Artifact elements; Struct fields must be observable`,
+      );
+    }
+    return { type: "array", element };
+  }
+  const scalar = parseScalarConstructorSpec(expression, owner, context);
+  if (!scalar) {
+    throw new Error(
+      `Struct field ${owner} must be an observable scalar, observable array, or Struct constructor`,
+    );
+  }
+  return scalar;
 }
 
 /**
@@ -1468,19 +1705,14 @@ function parseCellDeclarations(
 function parseScalarConstructorSpec(
   call: acorn.CallExpression,
   owner: string,
-  availableHostModules: ReadonlyMap<string, string>,
+  context: DeclarationParseContext,
 ): ObservableScalar | undefined {
   if (call.callee.type !== "Identifier") return undefined;
   const name = call.callee.name;
 
   if (name === "Enum") {
     const arg = call.arguments[0];
-    const config = parseCellConfig(
-      owner,
-      name,
-      call.arguments[1],
-      availableHostModules,
-    );
+    const config = parseCellConfig(owner, name, call.arguments[1], context);
     if (
       !arg ||
       arg.type === "SpreadElement" ||
@@ -1502,22 +1734,12 @@ function parseScalarConstructorSpec(
   }
 
   if (name === "Bool") {
-    const config = parseCellConfig(
-      owner,
-      name,
-      call.arguments[0],
-      availableHostModules,
-    );
+    const config = parseCellConfig(owner, name, call.arguments[0], context);
     return { type: "boolean", ...config };
   }
 
   if (name === "Str") {
-    const config = parseCellConfig(
-      owner,
-      name,
-      call.arguments[0],
-      availableHostModules,
-    );
+    const config = parseCellConfig(owner, name, call.arguments[0], context);
     return { type: "string", ...config };
   }
 
@@ -1526,7 +1748,7 @@ function parseScalarConstructorSpec(
       owner,
       name,
       call.arguments[0],
-      availableHostModules,
+      context,
     );
     if (call.arguments.length > 1) {
       throw new Error(`Num cell ${owner} accepts at most one config argument`);
@@ -1542,12 +1764,7 @@ function parseScalarConstructorSpec(
     }
     const minArg = call.arguments[0];
     const maxArg = call.arguments[1];
-    const config = parseCellConfig(
-      owner,
-      name,
-      call.arguments[2],
-      availableHostModules,
-    );
+    const config = parseCellConfig(owner, name, call.arguments[2], context);
     const min = parseSignedNumericLiteral(minArg);
     const max = parseSignedNumericLiteral(maxArg);
     if (min === undefined || max === undefined) {
@@ -1572,15 +1789,15 @@ function parseScalarConstructorSpec(
 
 /**
  * Parses the single element constructor of an `Array(elementCell)` declaration
- * into an {@link ObservableScalar}. The element must be a constructed scalar
- * cell: a bare constructor (`Array(Str)`), a nested array, extra arguments, or a
- * non-scalar constructor are all rejected.
+ * into a scalar, Artifact, or Struct element. The element must be a constructed
+ * cell: a bare constructor (`Array(Str)`), a nested array, extra arguments, or
+ * any other constructor are all rejected.
  */
 function parseArrayElementSpec(
   cellName: string,
   args: readonly (acorn.Expression | acorn.SpreadElement)[],
-  availableHostModules: ReadonlyMap<string, string>,
-): ObservableScalar | ArtifactSpec {
+  context: DeclarationParseContext,
+): ObservableScalar | ObservableStruct | ArtifactSpec {
   const arg = args[0];
   if (args.length !== 1 || !arg || arg.type === "SpreadElement") {
     throw new Error(
@@ -1603,14 +1820,13 @@ function parseArrayElementSpec(
     }
     return { type: "artifact" };
   }
-  const element = parseScalarConstructorSpec(
-    arg,
-    cellName,
-    availableHostModules,
-  );
+  if (arg.callee.type === "Identifier" && arg.callee.name === "Struct") {
+    return parseStructDeclaration(arg, `${cellName}[]`, context);
+  }
+  const element = parseScalarConstructorSpec(arg, cellName, context);
   if (!element) {
     throw new Error(
-      `Array cell ${cellName} element must be a scalar or Artifact cell constructor`,
+      `Array cell ${cellName} element must be a scalar, Artifact, or Struct cell constructor`,
     );
   }
   return element;
@@ -1620,7 +1836,7 @@ function parseCellConfig(
   cellName: string,
   typeName: string,
   arg: acorn.Expression | acorn.SpreadElement | undefined,
-  availableHostModules: ReadonlyMap<string, string>,
+  context: DeclarationParseContext,
 ): Pick<ObservableScalar, "observing"> {
   if (!arg) return {};
   if (arg.type === "SpreadElement" || arg.type !== "ObjectExpression") {
@@ -1653,10 +1869,12 @@ function parseCellConfig(
         `Duplicate cell config assignment: ${cellName}.observing`,
       );
     }
-    config.observing = parseSemanticString(
-      property.value,
-      availableHostModules,
-    );
+    if (context.expressions) {
+      config.observing = parseSemanticString(
+        property.value,
+        context.hostModules,
+      );
+    }
   }
   return config;
 }
@@ -1665,7 +1883,7 @@ function parseNumericCellConfig(
   cellName: string,
   typeName: string,
   arg: acorn.Expression | acorn.SpreadElement | undefined,
-  availableHostModules: ReadonlyMap<string, string>,
+  context: DeclarationParseContext,
 ): { observing?: SemanticString; observeAs?: NumericObserveAs } {
   if (!arg) return {};
   if (arg.type === "SpreadElement" || arg.type !== "ObjectExpression") {
@@ -1694,10 +1912,12 @@ function parseNumericCellConfig(
           `Duplicate cell config assignment: ${cellName}.observing`,
         );
       }
-      config.observing = parseSemanticString(
-        property.value,
-        availableHostModules,
-      );
+      if (context.expressions) {
+        config.observing = parseSemanticString(
+          property.value,
+          context.hostModules,
+        );
+      }
       continue;
     }
     if (key === "observeAs") {
@@ -2161,9 +2381,10 @@ function parseSetSpanCall(
 
 /**
  * Parses `receiver.$map(callback, results?)` into a `MapAction`. The receiver is
- * an array cell or a typed array channel; the callback is a zero-arg arrow
- * parsed under the invoke dialect in the enclosing node's scope; `results`, when
- * present, is a bare output array cell.
+ * an array cell, a typed array channel, or a Struct field of either; the
+ * callback is a zero-arg arrow parsed under the invoke dialect in the enclosing
+ * node's scope; `results`, when present, is an output array cell or a Struct
+ * cell field.
  */
 function parseMapCall(
   expression: acorn.CallExpression,
@@ -2182,10 +2403,10 @@ function parseMapCall(
   ) {
     throw new Error("$map must be called as receiver.$map(...)");
   }
-  const receiver = mapReceiverFrom(callee.object, availableHostModules);
+  const receiver = parseArrayReference(callee.object, availableHostModules);
   if (!receiver) {
     throw new Error(
-      "$map receiver must be an array cell or a typed array channel",
+      "$map receiver must be an array cell, a typed array channel, or a Struct field",
     );
   }
 
@@ -2205,46 +2426,25 @@ function parseMapCall(
     throw new Error("A $map callback cannot declare parameters");
   }
 
-  let results: string | undefined;
+  let results: MapResultsTarget | undefined;
   if (resultsArg) {
-    if (resultsArg.type !== "Identifier") {
-      throw new Error("$map results must be a bare array cell");
-    }
-    results = resultsArg.name;
+    results = parseMapResults(resultsArg, availableHostModules);
   }
 
-  const bodyChildFunctions = new Map<string, acorn.FunctionDeclaration>();
-  const bodyHandledStatements = new Set<acorn.Statement>();
-  const block = getFunctionBody(arrow);
-  let body: Statement[];
-  if (block) {
-    body = parseStatementList(
-      block,
-      bodyChildFunctions,
-      bodyHandledStatements,
-      availableImports,
-      visibleNodeNames,
-      visibleCellNames,
-      availableHostModules,
-      defaultDeflectWhen,
-      enclosing,
-    );
-  } else {
-    const action = parseActionExpression(
-      arrow.body as acorn.Expression,
-      bodyChildFunctions,
-      availableImports,
-      visibleNodeNames,
-      visibleCellNames,
-      availableHostModules,
-      defaultDeflectWhen,
-      enclosing,
-    );
-    if (!action) {
-      throw new Error("Unsupported $map callback expression");
-    }
-    body = [action];
-  }
+  const receiverSpec = scopedReferenceSpec(receiver);
+  const body = withMapItemScope(
+    receiverSpec?.type === "array" ? receiverSpec.element : undefined,
+    () =>
+      parseMapCallback(
+        arrow,
+        availableImports,
+        visibleNodeNames,
+        visibleCellNames,
+        availableHostModules,
+        defaultDeflectWhen,
+        enclosing,
+      ),
+  );
 
   return {
     id: UNSTAMPED_ID,
@@ -2256,29 +2456,64 @@ function parseMapCall(
   };
 }
 
-/** Builds a `$map` receiver `ArrayReference` from its callee object expression. */
-function mapReceiverFrom(
-  node: acorn.Expression,
+/** Parses a `$map` callback arrow's body into its statement graph. */
+function parseMapCallback(
+  arrow: acorn.ArrowFunctionExpression,
+  availableImports: Set<string>,
+  visibleNodeNames: Set<string>,
+  visibleCellNames: Set<string>,
   availableHostModules: Map<string, string>,
-): ArrayReference | undefined {
-  if (node.type === "Identifier") {
-    if (availableHostModules.has(node.name)) return undefined;
-    return { kind: "cell", name: node.name };
+  defaultDeflectWhen: ResolutionStatement[] | undefined,
+  enclosing: EnclosingNode,
+): Statement[] {
+  const bodyChildFunctions = new Map<string, acorn.FunctionDeclaration>();
+  const bodyHandledStatements = new Set<acorn.Statement>();
+  if (arrow.body.type === "BlockStatement") {
+    return parseStatementList(
+      arrow.body.body,
+      bodyChildFunctions,
+      bodyHandledStatements,
+      availableImports,
+      visibleNodeNames,
+      visibleCellNames,
+      availableHostModules,
+      defaultDeflectWhen,
+      enclosing,
+    );
   }
-  if (
-    node.type === "MemberExpression" &&
-    !node.computed &&
-    node.object.type === "Identifier" &&
-    (node.object.name === "args" || node.object.name === "returns") &&
-    node.property.type === "Identifier"
-  ) {
-    return {
-      kind: "channel",
-      namespace: node.object.name,
-      key: node.property.name,
-    };
+  const action = parseActionExpression(
+    arrow.body,
+    bodyChildFunctions,
+    availableImports,
+    visibleNodeNames,
+    visibleCellNames,
+    availableHostModules,
+    defaultDeflectWhen,
+    enclosing,
+  );
+  if (!action) {
+    throw new Error("Unsupported $map callback expression");
   }
-  return undefined;
+  return [action];
+}
+
+/**
+ * Parses a `$map` results argument: a bare array cell, or a declared field of a
+ * Struct cell.
+ */
+function parseMapResults(
+  node: acorn.Expression | acorn.SpreadElement,
+  availableHostModules: Map<string, string>,
+): MapResultsTarget {
+  if (node.type === "Identifier" && !availableHostModules.has(node.name)) {
+    return node.name;
+  }
+  const field =
+    node.type === "MemberExpression"
+      ? parseFieldReference(node, availableHostModules)
+      : undefined;
+  if (field?.receiver.kind === "cell") return field;
+  throw new Error("$map results must be an array cell or a Struct cell field");
 }
 
 /**
@@ -2975,9 +3210,6 @@ function parseCellMutationCall(
       expressionContext,
     );
     assertOrdinaryCellTarget(target, "$unset()");
-    if (target.length !== 1) {
-      throw new Error("$unset() requires a direct cell target");
-    }
     return {
       id: UNSTAMPED_ID,
       kind: "unset",
@@ -4031,8 +4263,13 @@ function validateDeflectionTarget(
   }
 }
 
+/**
+ * The declaration a cell target selects: the root cell itself, a declared
+ * Struct field or subtree, or an array element.
+ */
 type ResolvedCellTargetSpec =
   | { kind: "direct"; spec: CellSpec }
+  | { kind: "field"; spec: ObservableFieldSpec }
   | { kind: "decorated"; spec: ArrayElementSpec };
 
 function cellTargetRoot(target: CellTarget): string {
@@ -4054,36 +4291,40 @@ function formatCellTarget(target: CellTarget): string {
   return rendered;
 }
 
-function descendCellTargetSpec(
-  spec: CellSpec,
-  remainingAccessors: number,
-  onNonContainer?: () => void,
-): ArrayElementSpec | undefined {
-  if (spec.type !== "array") {
-    onNonContainer?.();
-    return undefined;
-  }
-  const leafSpec = spec.element;
-  if (remainingAccessors === 1) return leafSpec;
-  return descendCellTargetSpec(
-    leafSpec,
-    remainingAccessors - 1,
-    onNonContainer,
-  );
-}
-
+/**
+ * Walks target accessors through the root declaration. A Struct accessor must
+ * be a literal string naming a declared field; an array accessor selects one
+ * element; any other receiver is not a container.
+ */
 function resolveCellTargetSpec(
   rootSpec: CellSpec,
-  accessorCount: number,
+  accessors: readonly LocalExpression[],
   onNonContainer?: () => void,
+  onUnknownField?: (name: string | undefined) => void,
 ): ResolvedCellTargetSpec | undefined {
-  if (accessorCount === 0) return { kind: "direct", spec: rootSpec };
-  const leafSpec = descendCellTargetSpec(
-    rootSpec,
-    accessorCount,
-    onNonContainer,
-  );
-  return leafSpec ? { kind: "decorated", spec: leafSpec } : undefined;
+  let resolved: ResolvedCellTargetSpec = { kind: "direct", spec: rootSpec };
+  for (const accessor of accessors) {
+    const spec: CellSpec | ObservableFieldSpec | ArrayElementSpec =
+      resolved.spec;
+    if (spec.type === "struct") {
+      const name =
+        accessor.kind === "literal" && typeof accessor.value === "string"
+          ? accessor.value
+          : undefined;
+      if (name === undefined || !Object.hasOwn(spec.fields, name)) {
+        onUnknownField?.(name);
+        return undefined;
+      }
+      resolved = { kind: "field", spec: spec.fields[name]! };
+      continue;
+    }
+    if (spec.type !== "array") {
+      onNonContainer?.();
+      return undefined;
+    }
+    resolved = { kind: "decorated", spec: spec.element };
+  }
+  return resolved;
 }
 
 function cellTargetSpec(
@@ -4092,7 +4333,8 @@ function cellTargetSpec(
 ): ResolvedCellTargetSpec | undefined {
   const rootSpec = findCell(cells, cellTargetRoot(target));
   if (!rootSpec) return undefined;
-  return resolveCellTargetSpec(rootSpec, target.length - 1);
+  const [, ...accessors] = target;
+  return resolveCellTargetSpec(rootSpec, accessors);
 }
 
 function validateCellTarget(
@@ -4117,6 +4359,7 @@ function validateCellTarget(
   }
 
   for (const accessor of accessors) {
+    if (accessor.kind === "literal") continue;
     validateExpression(accessor, cells, nodes, issues, options);
     if (
       expressionIsArray(
@@ -4135,13 +4378,27 @@ function validateCellTarget(
   }
 
   if (!rootCell) return undefined;
-  return resolveCellTargetSpec(rootCell, accessors.length, () => {
-    issues.push({
-      code: "CELL_TARGET_NON_CONTAINER",
-      message: `Cell target ${formatCellTarget(target)} accesses through a non-container value`,
-      loc,
-    });
-  });
+  return resolveCellTargetSpec(
+    rootCell,
+    accessors,
+    () => {
+      issues.push({
+        code: "CELL_TARGET_NON_CONTAINER",
+        message: `Cell target ${formatCellTarget(target)} accesses through a non-container value`,
+        loc,
+      });
+    },
+    (name) => {
+      issues.push({
+        code: "UNKNOWN_STRUCT_FIELD",
+        message:
+          name === undefined
+            ? `Cell target ${formatCellTarget(target)} must name a Struct field with a literal string`
+            : `Cell target ${formatCellTarget(target)} names an undeclared Struct field ${JSON.stringify(name)}`,
+        loc,
+      });
+    },
+  );
 }
 
 function validateObserveTarget(
@@ -4335,22 +4592,10 @@ function validateNode(
         baseOptions,
       );
     for (const cell of node.cells) {
-      if (isScalarObservableCell(cell) && cell.observing !== undefined) {
+      const questions = isObservableCell(cell) ? observingQuestions(cell) : [];
+      for (const question of questions) {
         validateSemanticString(
-          cell.observing,
-          cells,
-          nodeNames,
-          context.issues,
-          baseOptions,
-        );
-      }
-      if (
-        isArrayCell(cell) &&
-        cell.element.type !== "artifact" &&
-        cell.element.observing !== undefined
-      ) {
-        validateSemanticString(
-          cell.element.observing,
+          question,
           cells,
           nodeNames,
           context.issues,
@@ -4686,17 +4931,23 @@ function arrayReferenceElementSpec(
     const cell = findCell(cells, ref.name);
     return cell && isArrayCell(cell) ? cell.element : undefined;
   }
-  const spec = signature?.[ref.namespace]?.[ref.key];
+  const spec = resolveReferenceSpec(ref, { cells, signature });
   return spec?.type === "array" ? spec.element : undefined;
 }
 
-/** The element schema of a `$map` `results` cell, for typing `span.result`. */
-function arrayCellElementSpec(
-  name: string,
+/** The element schema of a `$map` `results` target, for typing `span.result`. */
+function mapResultsElementSpec(
+  results: MapResultsTarget,
   cells: Cell[],
 ): ArrayElementSpec | undefined {
-  const cell = findCell(cells, name);
-  return cell && isArrayCell(cell) ? cell.element : undefined;
+  const cell = findCell(cells, mapResultsCell(results)!);
+  if (!cell) return undefined;
+  if (typeof results === "string") {
+    return isArrayCell(cell) ? cell.element : undefined;
+  }
+  const spec =
+    cell.type === "struct" ? fieldSpecAt(cell, results.path) : undefined;
+  return spec?.type === "array" ? spec.element : undefined;
 }
 
 function producerContext(
@@ -4850,28 +5101,20 @@ function validateMapStatement(
   options: ValidationOptions,
 ): void {
   const signature = options.references?.currentNode.signature;
-  validateArrayReference(statement.receiver, "index", cells, issues, signature);
+  validateArrayReference(
+    statement.receiver,
+    "index",
+    cells,
+    nodes,
+    issues,
+    options,
+  );
   if (statement.results !== undefined) {
-    const cell = findCell(cells, statement.results);
-    if (!cell) {
-      issues.push({
-        code: "UNKNOWN_CELL",
-        message: `Unknown cell: ${statement.results}`,
-        loc: statement.loc,
-      });
-    } else if (!isArrayCell(cell)) {
-      issues.push({
-        code: "MAP_RESULTS_NON_ARRAY",
-        message: `$map() results cell ${statement.results} is not an array`,
-        loc: statement.loc,
-      });
-    }
+    validateMapResults(statement.results, cells, issues, statement.loc);
   }
-  const receiverCell =
-    statement.receiver.kind === "cell" ? statement.receiver.name : undefined;
   checkMapCallbackBody(
     statement.body,
-    receiverCell,
+    mapReceiverPath(statement.receiver),
     statement.results !== undefined,
     issues,
   );
@@ -4884,7 +5127,7 @@ function validateMapStatement(
     ),
     resultsSpec:
       statement.results !== undefined
-        ? arrayCellElementSpec(statement.results, cells)
+        ? mapResultsElementSpec(statement.results, cells)
         : undefined,
   };
   const mapBuilder: ReadSetBuilder = {
@@ -4909,6 +5152,103 @@ function validateMapStatement(
 }
 
 /**
+ * Validates a `$map` `results` target: an array cell, or a declared array field
+ * of a Struct cell.
+ */
+function validateMapResults(
+  results: MapResultsTarget,
+  cells: Cell[],
+  issues: ValidationIssue[],
+  loc: SourceRange | undefined,
+): void {
+  const label = mapResultsLabel(results);
+  const root = mapResultsCell(results)!;
+  const cell = findCell(cells, root);
+  if (!cell) {
+    issues.push({
+      code: "UNKNOWN_CELL",
+      message: `Unknown cell: ${root}`,
+      loc,
+    });
+    return;
+  }
+  // Committing one field reads the current Struct before replacing the field.
+  if (typeof results !== "string") recordCellRead(root);
+  const spec =
+    typeof results === "string"
+      ? cell
+      : cell.type === "struct"
+        ? fieldSpecAt(cell, results.path)
+        : undefined;
+  if (spec === undefined) {
+    issues.push({
+      code:
+        cell.type === "struct"
+          ? "UNKNOWN_STRUCT_FIELD"
+          : "FIELD_READ_NON_STRUCT",
+      message: `$map() results ${label} does not name a declared Struct field`,
+      loc,
+    });
+    return;
+  }
+  if (spec.type !== "array") {
+    issues.push({
+      code: "MAP_RESULTS_NON_ARRAY",
+      message: `$map() results ${label} is not an array`,
+      loc,
+    });
+  }
+}
+
+/**
+ * The cell and field path a `$map` receiver reads, or `undefined` for a
+ * channel-rooted receiver, which a callback cannot write. A receiver inside an
+ * array element protects that whole array, since the element index is dynamic.
+ */
+function mapReceiverPath(
+  receiver: ArrayReference,
+): MapReceiverPath | undefined {
+  if (receiver.kind === "cell") return { cell: receiver.name, path: [] };
+  if (receiver.kind !== "field") return undefined;
+  const root = receiver.receiver;
+  if (root.kind === "cell") return { cell: root.name, path: receiver.path };
+  return root.kind === "arrayElementRead"
+    ? mapReceiverPath(root.array)
+    : undefined;
+}
+
+/** The cell and Struct field path a `$map` receiver reads. */
+type MapReceiverPath = { cell: string; path: readonly string[] };
+
+function formatMapReceiver(receiver: MapReceiverPath): string {
+  return [receiver.cell, ...receiver.path].join(".");
+}
+
+/**
+ * Whether a write target overlaps the receiver: it names the receiver's cell
+ * and its field accessors neither diverge from nor stop short of a distinct
+ * sibling of the receiver's field path.
+ */
+function targetWritesReceiver(
+  target: CellTarget,
+  receiver: MapReceiverPath,
+): boolean {
+  const [root, ...accessors] = target;
+  if (root !== receiver.cell) return false;
+  const shared = Math.min(accessors.length, receiver.path.length);
+  for (let index = 0; index < shared; index += 1) {
+    const accessor = accessors[index]!;
+    if (
+      accessor.kind !== "literal" ||
+      accessor.value !== receiver.path[index]
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Walks a `$map` callback body — descending `if` / `label` / `invoke` bodies —
  * and records the callback-only rejections: a nested `$map`, a non-`newcopy`
  * enter target at any depth, a write to the receiver cell, and any `span.result`
@@ -4916,7 +5256,7 @@ function validateMapStatement(
  */
 function checkMapCallbackBody(
   body: readonly Statement[],
-  receiverCell: string | undefined,
+  receiver: MapReceiverPath | undefined,
   hasResults: boolean,
   issues: ValidationIssue[],
 ): void {
@@ -4962,15 +5302,15 @@ function checkMapCallbackBody(
             });
           }
           if (
-            receiverCell !== undefined &&
+            receiver !== undefined &&
             Object.values(statement.returns ?? {}).some(
               (source) =>
-                source.kind === "cell" && source.cell === receiverCell,
+                source.kind === "cell" && source.cell === receiver.cell,
             )
           ) {
             issues.push({
               code: "MAP_RECEIVER_WRITE",
-              message: `$map callback cannot write its receiver ${receiverCell}`,
+              message: `$map callback cannot write its receiver ${receiver.cell}`,
               loc: statement.loc,
             });
           }
@@ -4980,12 +5320,12 @@ function checkMapCallbackBody(
         case "observe":
         case "observeOrAsk":
           if (
-            receiverCell !== undefined &&
-            cellTargetRoot(statement.target) === receiverCell
+            receiver !== undefined &&
+            targetWritesReceiver(statement.target, receiver)
           ) {
             issues.push({
               code: "MAP_RECEIVER_WRITE",
-              message: `$map callback cannot write its receiver ${receiverCell}`,
+              message: `$map callback cannot write its receiver ${formatMapReceiver(receiver)}`,
               loc: statement.loc,
             });
           }
@@ -4993,14 +5333,14 @@ function checkMapCallbackBody(
         case "observeGroup":
         case "observeOrAskGroup":
           if (
-            receiverCell !== undefined &&
-            statement.targets.some(
-              (target) => cellTargetRoot(target) === receiverCell,
+            receiver !== undefined &&
+            statement.targets.some((target) =>
+              targetWritesReceiver(target, receiver),
             )
           ) {
             issues.push({
               code: "MAP_RECEIVER_WRITE",
-              message: `$map callback cannot write its receiver ${receiverCell}`,
+              message: `$map callback cannot write its receiver ${formatMapReceiver(receiver)}`,
               loc: statement.loc,
             });
           }
@@ -5824,13 +6164,86 @@ function checkBooleanValue(
 }
 
 /** Validates an array element / length read receiver and records its read. */
+/**
+ * Validates a Struct field reference against its receiver's declaration and
+ * records the receiver read. Returns the selected field's declaration.
+ */
+function validateFieldReference(
+  field: FieldReference,
+  cells: Cell[],
+  nodes: string[],
+  issues: ValidationIssue[],
+  options: ValidationOptions,
+): ObservableFieldSpec | undefined {
+  const signature = options.references?.currentNode.signature;
+  const receiver = field.receiver;
+  let receiverSpec: ChannelSpec | CellSpec | ArrayElementSpec | undefined;
+  let label: string;
+  if (receiver.kind === "arrayElementRead" || receiver.kind === "span") {
+    validateExpression(receiver, cells, nodes, issues, options);
+    label = formatReference(receiver);
+    receiverSpec =
+      receiver.kind === "span"
+        ? mapContextStack.at(-1)?.receiverSpec
+        : arrayReferenceElementSpec(receiver.array, cells, signature);
+    // An unresolvable element spec is reported by the element read itself.
+    if (!receiverSpec) return undefined;
+  } else if (receiver.kind === "channel") {
+    recordChannelRead(receiver.namespace, receiver.key);
+    label = `${receiver.namespace}.${receiver.key}`;
+    receiverSpec = signature?.[receiver.namespace][receiver.key];
+    if (!receiverSpec) {
+      issues.push({
+        code: "UNKNOWN_CHANNEL_KEY",
+        message: `Unknown ${label} channel for a Struct field read`,
+      });
+      return undefined;
+    }
+  } else {
+    recordCellRead(receiver.name);
+    label = receiver.name;
+    receiverSpec = findCell(cells, receiver.name);
+    if (!receiverSpec) {
+      issues.push({ code: "UNKNOWN_CELL", message: `Unknown cell: ${label}` });
+      return undefined;
+    }
+  }
+  if (receiverSpec.type !== "struct") {
+    issues.push({
+      code: "FIELD_READ_NON_STRUCT",
+      message: `${label} is not a Struct; cannot read field ${field.path.join(".")}`,
+    });
+    return undefined;
+  }
+  const spec = fieldSpecAt(receiverSpec, field.path);
+  if (!spec) {
+    issues.push({
+      code: "UNKNOWN_STRUCT_FIELD",
+      message: `${label} has no declared field ${field.path.join(".")}`,
+    });
+  }
+  return spec;
+}
+
 function validateArrayReference(
-  array: Extract<ValueExpression, { kind: "arrayElementRead" }>["array"],
+  array: ArrayReference,
   operation: "index" | "length",
   cells: Cell[],
+  nodes: string[],
   issues: ValidationIssue[],
-  signature: NodeSignature | undefined,
+  options: ValidationOptions,
 ): void {
+  const signature = options.references?.currentNode.signature;
+  if (array.kind === "field") {
+    const spec = validateFieldReference(array, cells, nodes, issues, options);
+    if (spec && spec.type !== "array") {
+      issues.push({
+        code: operation === "index" ? "INDEX_NON_ARRAY" : "LENGTH_NON_ARRAY",
+        message: `Struct field ${array.path.join(".")} is not an array; cannot read ${operation}`,
+      });
+    }
+    return;
+  }
   if (array.kind === "channel") {
     recordChannelRead(array.namespace, array.key);
     // A channel receiver must be a declared array channel. An undeclared key or
@@ -5875,8 +6288,9 @@ function validateExpression(
         expression.array,
         "index",
         cells,
+        nodes,
         issues,
-        signature,
+        options,
       );
       validateExpression(expression.index, cells, nodes, issues, options);
       if (expressionIsArray(expression.index, cells, signature, options)) {
@@ -5891,14 +6305,29 @@ function validateExpression(
         expression.array,
         "length",
         cells,
+        nodes,
         issues,
-        signature,
+        options,
       );
       return;
     case "arrayLiteral":
       for (const element of expression.elements) {
         validateExpression(element, cells, nodes, issues, options);
       }
+      return;
+    case "structLiteral":
+      for (const [name, field] of Object.entries(expression.fields)) {
+        if (!isStructFieldName(name)) {
+          issues.push({
+            code: "INVALID_STRUCT_FIELD_NAME",
+            message: `Invalid Struct field name ${JSON.stringify(name)}`,
+          });
+        }
+        validateExpression(field, cells, nodes, issues, options);
+      }
+      return;
+    case "field":
+      validateFieldReference(expression, cells, nodes, issues, options);
       return;
     case "span":
       if (mapContextStack.length === 0) {

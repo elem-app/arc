@@ -1,4 +1,5 @@
 import { isHostStructFieldName } from "../spec/host-parameters.js";
+import { isStructFieldName } from "../spec/struct.js";
 import { validateSpec } from "../spec/validation.js";
 import type * as IR from "../types/parser.js";
 import type { ArrayElementSpec, ChannelSpec } from "../types/spec.js";
@@ -196,17 +197,52 @@ const target = record<IR.EnterTarget>({
     "INVALID_TARGET_MODE",
   ),
 });
-const arrayReference = variants("kind", {
-  cell: record<Extract<IR.ArrayReference, { kind: "cell" }>>({
+const slotReferenceRules = {
+  cell: record<Extract<IR.SlotReference, { kind: "cell" }>>({
     kind: oneOf("cell"),
     name,
   }),
-  channel: record<Extract<IR.ArrayReference, { kind: "channel" }>>({
+  channel: record<Extract<IR.SlotReference, { kind: "channel" }>>({
     kind: oneOf("channel"),
     namespace: oneOf("args", "returns"),
     key: name,
   }),
+} satisfies Record<IR.SlotReference["kind"], Rule>;
+const structFieldName = predicate(
+  (v) => typeof v === "string" && isStructFieldName(v),
+  "invalid Struct field name",
+);
+const fieldReference: Rule = (value, path, issues) =>
+  record<IR.FieldReference>({
+    kind: oneOf("field"),
+    receiver: variants("kind", {
+      ...slotReferenceRules,
+      arrayElementRead: (element, elementPath, elementIssues) =>
+        expressionRules.arrayElementRead(element, elementPath, elementIssues),
+      span: record<IR.SpanItemReference>({
+        kind: oneOf("span"),
+        owner: oneOf("map"),
+        key: oneOf("item"),
+      }),
+    } satisfies Record<IR.FieldReceiver["kind"], Rule>),
+    path: array(structFieldName, 1),
+  })(value, path, issues);
+const arrayReference = variants("kind", {
+  ...slotReferenceRules,
+  field: fieldReference,
 } satisfies Record<IR.ArrayReference["kind"], Rule>);
+/** A `$map` results target: an array cell name or a field of a Struct cell. */
+const mapResults: Rule = (value, path, issues) => {
+  if (typeof value === "string") {
+    name(value, path, issues);
+    return;
+  }
+  record<IR.FieldReference>({
+    kind: oneOf("field"),
+    receiver: slotReferenceRules.cell,
+    path: array(structFieldName, 1),
+  })(value, path, issues);
+};
 const cellTarget: Rule = (value, path, issues) => {
   if (!Array.isArray(value) || value.length === 0) {
     issue(issues, path, "expected a cell target with a root");
@@ -252,6 +288,11 @@ const expressionRules = {
     kind: oneOf("channelIsUnset"),
     namespace: oneOf("args", "returns"),
     key: name,
+  }),
+  field: fieldReference,
+  structLiteral: expr<"structLiteral">({
+    kind: oneOf("structLiteral"),
+    fields: map(valueChild, structFieldName),
   }),
   arrayElementRead: expr<"arrayElementRead">({
     kind: oneOf("arrayElementRead"),
@@ -415,6 +456,7 @@ const localKinds = {
   isUnset: true,
   channel: true,
   channelIsUnset: true,
+  field: true,
   arrayElementRead: true,
   arrayLength: true,
   span: true,
@@ -566,7 +608,13 @@ const observeAs: Rule = coded((value, path, issues) => {
         );
     }
 }, "INVALID_NUMERIC_OBSERVE_AS");
-type SpecRole = "cell" | "channel" | "cell-element" | "channel-element";
+type SpecRole =
+  | "cell"
+  | "channel"
+  | "cell-element"
+  | "channel-element"
+  | "cell-field"
+  | "channel-field";
 const specTypes = {
   boolean: true,
   string: true,
@@ -576,6 +624,7 @@ const specTypes = {
   dialogCursor: true,
   index: true,
   array: true,
+  struct: true,
 } satisfies Record<
   IR.Cell["type"] | ChannelSpec["type"] | ArrayElementSpec["type"],
   true
@@ -601,7 +650,9 @@ function spec(role: SpecRole): Rule {
       !Object.hasOwn(specTypes, type) ||
       (role === "cell" && type === "index") ||
       (role.endsWith("element") &&
-        ["array", "index", "dialogCursor"].includes(type))
+        ["array", "index", "dialogCursor"].includes(type)) ||
+      (role.endsWith("field") &&
+        ["artifact", "index", "dialogCursor"].includes(type))
     ) {
       issue(
         issues,
@@ -615,13 +666,32 @@ function spec(role: SpecRole): Rule {
     if (role === "cell")
       Object.assign(fields, { name, loc: optional(location) });
     if (type === "enum") fields.values = array(string);
+    const cellRole =
+      role === "cell" || role === "cell-element" || role === "cell-field";
     if (type === "array")
-      fields.element = spec(
-        role === "cell" ? "cell-element" : "channel-element",
+      fields.element = role.endsWith("field")
+        ? refine(
+            spec(cellRole ? "cell-element" : "channel-element"),
+            (v, p, i) => {
+              if (isRecord(v) && v.type === "artifact")
+                issue(
+                  i,
+                  p,
+                  "Struct field arrays require observable elements",
+                  "INVALID_SPEC",
+                );
+            },
+          )
+        : spec(cellRole ? "cell-element" : "channel-element");
+    if (type === "struct") {
+      fields.fields = map(
+        spec(cellRole ? "cell-field" : "channel-field"),
+        structFieldName,
       );
+      if (cellRole) fields.observing = optional(semanticChild);
+    }
     const observable =
-      (role === "cell" || role === "cell-element") &&
-      ["boolean", "string", "enum", "number"].includes(type);
+      cellRole && ["boolean", "string", "enum", "number"].includes(type);
     if (observable) fields.observing = optional(semanticChild);
     if (observable && type === "number") fields.observeAs = optional(observeAs);
     if (role === "cell" && type === "artifact")
@@ -857,7 +927,7 @@ function statement(role: Body): Rule {
       ...meta,
       kind: oneOf("map"),
       receiver: arrayReference,
-      results: optional(name),
+      results: optional(mapResults),
       body: body("action"),
     }),
     "host-call": expressionRules["host-call"],

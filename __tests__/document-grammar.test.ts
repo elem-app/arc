@@ -148,6 +148,12 @@ const expressions = {
     array: { kind: "channel", namespace: "args", key: "items" },
   },
   span: { kind: "span", owner: "map", key: "item" },
+  field: {
+    kind: "field",
+    receiver: { kind: "cell", name: "request" },
+    path: ["name"],
+  },
+  structLiteral: { kind: "structLiteral", fields: { name: text } },
   deflectionEscaped: { kind: "deflectionEscaped", target },
   dialogCursor: { kind: "dialogCursor" },
   dialogTurnsSince: {
@@ -450,6 +456,7 @@ const specs = {
   dialogCursor: { type: "dialogCursor" },
   index: { type: "index" },
   array: { type: "array", element: { type: "string" } },
+  struct: { type: "struct", fields: { name: { type: "string" } } },
 } satisfies { [K in ChannelSpec["type"]]: Extract<ChannelSpec, { type: K }> };
 for (const [type, spec] of Object.entries(specs)) {
   const document = emptyDocument();

@@ -3,7 +3,9 @@ import type {
   HostParameterSpec,
   SpecViolation,
 } from "../types/spec.js";
+import { isPlainRecord } from "../value-utils.js";
 import { isHostStructFieldName } from "./host-parameters.js";
+import { isStructFieldName } from "./struct.js";
 
 type HostSpecValidationContext = "parameter" | "field" | "argument" | "result";
 
@@ -188,12 +190,13 @@ function validateHostParameterSpec(
           element.type !== "string" &&
           element.type !== "enum" &&
           element.type !== "number" &&
-          element.type !== "artifact"
+          element.type !== "artifact" &&
+          element.type !== "struct"
         ) {
           hostSpecIssue(
             issues,
             `${path}.element`,
-            "result array element must be a scalar or Artifact Arc spec",
+            "result array element must be a scalar, Artifact, or Struct Arc spec",
           );
           return;
         }
@@ -240,11 +243,11 @@ function validateHostParameterSpec(
       return;
     }
     if (type === "struct") {
+      if (!exactHostSpecKeys(object, ["type", "fields"], path, issues)) return;
       if (context === "result") {
-        hostSpecIssue(issues, path, "struct specs are parameter-only");
+        validateHostStructResultSpec(object, path, issues, state);
         return;
       }
-      if (!exactHostSpecKeys(object, ["type", "fields"], path, issues)) return;
       const fields = inspectHostSpecObject(
         object.fields,
         `${path}.fields`,
@@ -308,6 +311,49 @@ function validateHostParameterSpec(
     if (violation) hostSpecIssue(issues, path, violation.detail);
   } finally {
     state.visiting.delete(object);
+  }
+}
+
+/**
+ * Validates a Struct result: every field is an observable Arc field — a
+ * scalar, an array of scalars or Structs, or a nested Struct — so a complete
+ * result can land on an observable Struct cell.
+ */
+function validateHostStructResultSpec(
+  object: Record<string, unknown>,
+  path: string,
+  issues: HostModuleSpecIssue[],
+  state: HostSpecValidationState,
+): void {
+  const fields = inspectHostSpecObject(object.fields, `${path}.fields`, issues);
+  if (!fields) return;
+  for (const [name, field] of Object.entries(fields)) {
+    const fieldPath = `${path}.fields[${JSON.stringify(name)}]`;
+    if (!isStructFieldName(name)) {
+      hostSpecIssue(issues, fieldPath, "invalid Struct result field name");
+      continue;
+    }
+    const fieldObject = inspectHostSpecObject(field, fieldPath, issues);
+    if (!fieldObject) continue;
+    const elementType =
+      fieldObject.type === "array" && isPlainRecord(fieldObject.element)
+        ? fieldObject.element.type
+        : undefined;
+    if (
+      fieldObject.type === "artifact" ||
+      fieldObject.type === "dialogCursor" ||
+      fieldObject.type === "index" ||
+      fieldObject.type === "omittable" ||
+      elementType === "artifact"
+    ) {
+      hostSpecIssue(
+        issues,
+        fieldPath,
+        "Struct result fields must be observable scalars, observable arrays, or Structs",
+      );
+      continue;
+    }
+    validateHostParameterSpec(field, fieldPath, "result", issues, state);
   }
 }
 
@@ -469,14 +515,18 @@ export function validateSpec(spec: unknown): SpecViolation | undefined {
       elementType !== "string" &&
       elementType !== "enum" &&
       elementType !== "number" &&
-      elementType !== "artifact"
+      elementType !== "artifact" &&
+      elementType !== "struct"
     ) {
       return {
         code: "invalid-spec-shape",
-        detail: "Array element spec must be scalar or Artifact",
+        detail: "Array element spec must be scalar, Artifact, or Struct",
       };
     }
     return undefined;
+  }
+  if (object.type === "struct") {
+    return validateStructSpec(object);
   }
   if (object.type === "enum") {
     if (
@@ -515,6 +565,49 @@ export function validateSpec(spec: unknown): SpecViolation | undefined {
       code: "invalid-spec-shape",
       detail: `Unsupported spec type ${JSON.stringify(object.type)}`,
     };
+  }
+  return undefined;
+}
+
+/**
+ * Validates a Struct spec: safe field names, each field an observable scalar,
+ * an observable array of scalars or Structs, or a nested Struct.
+ */
+function validateStructSpec(
+  object: Record<string, unknown>,
+): SpecViolation | undefined {
+  const fields = object.fields;
+  if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
+    return {
+      code: "invalid-spec-shape",
+      detail: "Struct spec requires a fields record",
+    };
+  }
+  for (const [name, field] of Object.entries(fields)) {
+    if (!isStructFieldName(name)) {
+      return {
+        code: "invalid-spec-shape",
+        detail: `Invalid Struct field name ${JSON.stringify(name)}`,
+      };
+    }
+    const violation = validateSpec(field);
+    if (violation) return violation;
+    if (!isPlainRecord(field)) continue;
+    const elementType =
+      field.type === "array" && isPlainRecord(field.element)
+        ? field.element.type
+        : undefined;
+    if (
+      field.type === "artifact" ||
+      field.type === "dialogCursor" ||
+      field.type === "index" ||
+      elementType === "artifact"
+    ) {
+      return {
+        code: "invalid-spec-shape",
+        detail: `Struct field ${JSON.stringify(name)} must be observable`,
+      };
+    }
   }
   return undefined;
 }

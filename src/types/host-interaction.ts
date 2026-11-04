@@ -15,9 +15,8 @@ import type {
 } from "./runtime.js";
 import type {
   CellValue,
+  ObservedValue,
   PayloadValue,
-  PrimitiveArrayValue,
-  PrimitiveValue,
   SemanticText,
 } from "./value.js";
 
@@ -45,11 +44,33 @@ export type ScalarObservationMeta =
 /**
  * Type metadata describing an observed value. A scalar carries its own
  * type/bounds; an array carries its element shape so the host extracts a
- * complete element-typed list.
+ * complete element-typed list; a Struct carries one entry per declared field.
  */
-export type ObservationValueMeta =
+export type ObservationMeta =
   | ScalarObservationMeta
-  | { type: "array"; element: ScalarObservationMeta };
+  | ArrayObservationMeta
+  | StructObservationMeta;
+
+/** Element shape of an observed list; every element is a complete value. */
+export type ArrayObservationMeta = {
+  type: "array";
+  element: ScalarObservationMeta | StructObservationMeta;
+};
+
+/** Recursive field schema of an observed Struct. */
+export type StructObservationMeta = {
+  type: "struct";
+  fields: Record<string, StructObservationField>;
+};
+
+/**
+ * One declared field of an observed Struct: its rendered question and its type
+ * metadata. A Struct's current value is carried whole by the brief.
+ */
+export type StructObservationField = {
+  question: SemanticText;
+  meta: ObservationMeta;
+};
 
 /**
  * An observation opportunity the host may resolve for this turn.
@@ -74,9 +95,9 @@ export type ObservationBrief = {
   cell: string;
   mode: "observe" | "observeOrAsk";
   question: SemanticText;
-  currentValue?: PrimitiveValue | PrimitiveArrayValue;
+  currentValue?: ObservedValue;
   hostParams: PayloadValue;
-  meta: ObservationValueMeta;
+  meta: ObservationMeta;
 };
 
 /**
@@ -89,10 +110,10 @@ export type ObservationGroupField = {
   cell: string;
   /** Rendered observation question from the cell's `observing`. */
   question: SemanticText;
-  /** Current value, if any. */
-  currentValue?: PrimitiveValue | PrimitiveArrayValue;
+  /** Current value, present only when the member is set. */
+  currentValue?: ObservedValue;
   /** Cell type metadata for host-side validation/UI. */
-  meta: ObservationValueMeta;
+  meta: ObservationMeta;
 };
 
 /**
@@ -291,27 +312,27 @@ export type TerminalBrief = {
 /**
  * Outcome for one observation reported back by the host.
  *
- * - `resolved`: a value was inferred and may be committed into traversal state
+ * - `resolved`: a complete concrete value of the observed type, committed into
+ *   traversal state
  * - `unknown`: no value could be inferred this turn; for `$observe()` this
  *   consumes the action without writing a new value, while `$observeOrAsk()`
  *   remains pending
- * - `needs-user`: the host determined the user must be asked; this is intended
- *   for `$observeOrAsk()` and leaves the action pending
+ * - `needs-user`: the host determined a participant must be asked; valid only for
+ *   `$observeOrAsk()`, and leaves the action pending
  */
-export type ObservationReport = {
-  status: "resolved" | "unknown" | "needs-user";
-  value?: PrimitiveValue | PrimitiveArrayValue;
-};
+export type ObservationReport =
+  | { status: "resolved"; value: ObservedValue }
+  | { status: "unknown" | "needs-user"; value?: never };
 
 /**
  * Outcome for one grouped observation reported back by the host. It must carry
- * an entry for every field in the brief; a report that omits a field is invalid
- * and re-emits the group.
+ * an entry for every member in the brief; a report that omits a member is
+ * invalid and re-emits the group. Each member outcome follows
+ * {@link ObservationReport}.
  *
- * Per field: `resolved` writes the value; `unknown` skips the field, leaving its
- * cell unchanged; `needs-user` (observeOrAsk only) leaves the whole group
- * pending. The group commits — writing all `resolved` fields together and
- * advancing past the action — only when no field is `needs-user`.
+ * Plain `$observe({ ... })` writes every resolved member together and settles.
+ * `$observeOrAsk({ ... })` writes and settles only when every member resolves;
+ * otherwise it writes nothing and re-emits the whole group.
  *
  * Neither report type carries a discriminating tag. Read them apart by the
  * presence of `fields`, or by the kind of the brief the id came from.

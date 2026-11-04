@@ -93,10 +93,10 @@ function Main(
     ).toThrow(/cannot nest arrays/);
     expect(() =>
       parse(`"arc"; function Main() { let values = Array(Dialog.Cursor()); }`),
-    ).toThrow(/scalar or Artifact cell constructor/);
+    ).toThrow(/scalar, Artifact, or Struct cell constructor/);
     expect(() =>
       parse(`"arc"; function Main() { let values = Array(Index()); }`),
-    ).toThrow(/scalar or Artifact cell constructor/);
+    ).toThrow(/scalar, Artifact, or Struct cell constructor/);
   });
 
   it("artifact-array.public-ir rejects declaration metadata on Artifact elements through validate and Runtime.add", () => {

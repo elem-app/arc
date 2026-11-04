@@ -1,9 +1,10 @@
 import { cloneParameterSpec } from "../spec/host-parameters.js";
 import { validateHostModuleSpec } from "../spec/validation.js";
-import type {
-  ChannelSpec,
-  HostModuleSpec,
-  HostOperationSpec,
+import {
+  structSpecOf,
+  type ChannelSpec,
+  type HostModuleSpec,
+  type HostOperationSpec,
 } from "../types/spec.js";
 
 /** Validates and privately clones a runtime's complete injected registry. */
@@ -67,6 +68,8 @@ function cloneChannelSpec(spec: ChannelSpec): ChannelSpec {
         type: "array",
         element: cloneParameterSpec(spec.element),
       } as ChannelSpec;
+    case "struct":
+      return structSpecOf(spec);
     default:
       return { type: spec.type };
   }

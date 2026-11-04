@@ -2,32 +2,28 @@ import { admitValue, resolveHostOperation } from "../spec/resolution.js";
 import type {
   ActionPoisonReason,
   ActionReport,
+  ArrayObservationMeta,
   HostCallBrief,
   HostCallReport,
   ObservationBrief,
   ObservationGroupBrief,
   ObservationGroupReport,
+  ObservationMeta,
   ObservationReport,
   ScalarObservationMeta,
+  StructObservationMeta,
   TriggerReport,
 } from "../types/host-interaction.js";
 import type { SourceRange } from "../types/parser.js";
 import type { ArcRef, NodeRef, RuntimeIssue } from "../types/runtime.js";
-import type {
-  HostModuleSpec,
-  ObservableCellSpec,
-  ScalarValueSpec,
-} from "../types/spec.js";
-import type {
-  PayloadValue,
-  PrimitiveArrayValue,
-  PrimitiveValue,
-} from "../types/value.js";
+import type { HostModuleSpec, ScalarValueSpec } from "../types/spec.js";
+import type { ObservedValue, PayloadValue } from "../types/value.js";
 import {
   clonePayloadValue,
   cloneWithCanonicalNumbers,
   firstInvalidPayloadValue,
   firstNonFiniteNumberPath,
+  isPlainRecord,
 } from "../value-utils.js";
 
 export type ReportValidation<TReport> = {
@@ -369,106 +365,167 @@ function validateSingleReportEntry(
   raw: unknown,
   reportKind: string,
 ): { report?: ObservationReport; issue?: RuntimeIssue } {
-  const id = observation.id;
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+  const admission = admitObservationOutcome(
+    observation.meta,
+    raw,
+    observation.mode,
+    observation.cell,
+  );
+  if ("fault" in admission) {
     return {
       issue: buildInvalidItemIssue(
-        id,
-        "observation-shape",
-        `Invalid observation result in ${reportKind}: ${id}`,
+        observation.id,
+        admission.fault.code,
+        `Invalid observation result in ${reportKind} for ${admission.fault.position}: ${admission.fault.detail}`,
       ),
     };
   }
-
-  const report = raw as { status?: unknown; value?: unknown };
-  if (
-    report.status !== "resolved" &&
-    report.status !== "unknown" &&
-    report.status !== "needs-user"
-  ) {
-    return {
-      issue: buildInvalidItemIssue(
-        id,
-        "observation-status",
-        `Invalid observation status in ${reportKind} for ${observation.cell}: ${String(report.status)}`,
-      ),
-    };
-  }
-  if (report.status === "needs-user" && observation.mode !== "observeOrAsk") {
-    return {
-      issue: buildInvalidItemIssue(
-        id,
-        "observation-needs-user",
-        `Observation ${observation.cell} in ${reportKind} cannot use needs-user`,
-      ),
-    };
-  }
-  if (report.status === "resolved") {
-    const valueIssue = validateResolvedObservationValue(
-      observation,
-      report.value,
-      reportKind,
-    );
-    if (valueIssue) return { issue: valueIssue };
-    return {
-      report: {
-        status: "resolved",
-        value: cloneWithCanonicalNumbers(
-          report.value as PrimitiveValue | PrimitiveArrayValue,
-        ),
-      },
-    };
-  }
-  return { report: { status: report.status } };
+  return { report: admission.report };
 }
 
-function validateResolvedObservationValue(
-  observation: ObservationBrief,
-  value: unknown,
-  reportKind: string,
-): RuntimeIssue | undefined {
-  const fault = observationValueFault(observation.meta, value);
-  if (!fault) return undefined;
-  return buildInvalidItemIssue(
-    observation.id,
-    fault.code,
-    `Invalid observation value in ${reportKind} for ${observation.cell}: ${fault.detail}`,
-  );
+/** First fault found while admitting one observation outcome. */
+type OutcomeFault = { code: string; detail: string; position: string };
+
+/**
+ * Validates one reported outcome against the observed position's metadata and
+ * returns its canonical, privately owned form. A resolved value is validated
+ * whole, so an invalid element or field rejects the whole outcome.
+ */
+export function admitObservationOutcome(
+  meta: ObservationMeta,
+  raw: unknown,
+  mode: ObservationBrief["mode"],
+  position: string,
+): { report: ObservationReport } | { fault: OutcomeFault } {
+  if (!isPlainRecord(raw)) {
+    return outcomeFault("observation-shape", "expected an outcome", position);
+  }
+  switch (raw.status) {
+    case "resolved": {
+      const fault = observationValueFault(meta, raw.value);
+      if (fault) return { fault: { ...fault, position } };
+      // `observationValueFault` admitted the value under `meta`.
+      const value = raw.value as ObservedValue;
+      return {
+        report: { status: "resolved", value: cloneWithCanonicalNumbers(value) },
+      };
+    }
+    case "unknown":
+      return { report: { status: "unknown" } };
+    case "needs-user":
+      return mode === "observeOrAsk"
+        ? { report: { status: "needs-user" } }
+        : outcomeFault(
+            "observation-needs-user",
+            "needs-user is valid only for $observeOrAsk()",
+            position,
+          );
+    default:
+      return outcomeFault(
+        "observation-status",
+        `invalid status ${String(raw.status)}`,
+        position,
+      );
+  }
+}
+
+function outcomeFault(
+  code: string,
+  detail: string,
+  position: string,
+): { fault: OutcomeFault } {
+  return { fault: { code, detail, position } };
 }
 
 /**
- * Checks a reported value against a cell's observation metadata, shared by the
- * single and grouped observation validators. Returns the fault's reason code and
- * a human-readable detail, or `undefined` when the value is valid.
+ * Checks a reported value against a position's observation metadata, shared by
+ * the single and grouped observation validators. Returns the fault's reason
+ * code and a human-readable detail, or `undefined` when the value is valid.
  */
 function observationValueFault(
-  meta: ObservationBrief["meta"],
+  meta: ObservationMeta,
   value: unknown,
 ): { code: string; detail: string } | undefined {
-  const metaFault = observationMetaFault(meta);
-  if (metaFault) return metaFault;
-
-  const admission = admitValue(observationSpec(meta), value);
-  if (!admission.admitted) {
-    return observationAdmissionFault(meta, admission.violation.code);
+  switch (meta.type) {
+    case "struct":
+      return structObservationValueFault(meta, value);
+    case "array":
+      return arrayObservationValueFault(meta, value);
+    default:
+      return scalarObservationValueFault(meta, value);
   }
+}
 
-  if (meta.type !== "array") {
-    return scalarObservationConstraintFault(meta, value);
+/**
+ * A resolved list must be an array whose every element is a complete value of
+ * the element shape. Every element is checked before the observation can write
+ * any part of the list.
+ */
+function arrayObservationValueFault(
+  meta: ArrayObservationMeta,
+  value: unknown,
+): { code: string; detail: string } | undefined {
+  if (meta.element.type !== "struct") {
+    const metaFault = scalarObservationMetaFault(meta.element);
+    if (metaFault) return metaFault;
   }
-  // All-or-nothing: validate every observation-only element constraint before
-  // the group or scalar observation can write any part of the list.
-  for (const element of value as PrimitiveArrayValue) {
-    const fault = scalarObservationConstraintFault(meta.element, element);
-    if (fault) return fault;
+  if (!Array.isArray(value)) {
+    return { code: "observation-type", detail: "expected an array" };
+  }
+  for (const [index, entry] of value.entries()) {
+    const fault = observationValueFault(meta.element, entry);
+    if (fault)
+      return { code: fault.code, detail: `[${index}]: ${fault.detail}` };
   }
   return undefined;
 }
 
-function observationSpec(meta: ObservationBrief["meta"]): ObservableCellSpec {
-  return meta.type === "array"
-    ? { type: "array", element: scalarObservationSpec(meta.element) }
-    : scalarObservationSpec(meta);
+function scalarObservationValueFault(
+  meta: ScalarObservationMeta,
+  value: unknown,
+): { code: string; detail: string } | undefined {
+  const metaFault = scalarObservationMetaFault(meta);
+  if (metaFault) return metaFault;
+  const admission = admitValue(scalarObservationSpec(meta), value);
+  if (!admission.admitted) {
+    return scalarAdmissionFault(meta, admission.violation.code);
+  }
+  return scalarObservationConstraintFault(meta, value);
+}
+
+/**
+ * A resolved Struct value must be a plain data record carrying every declared
+ * field with a valid concrete value. An incomplete record, including `{}` for
+ * a nonempty Struct, never stands in for unknown.
+ */
+function structObservationValueFault(
+  meta: StructObservationMeta,
+  value: unknown,
+): { code: string; detail: string } | undefined {
+  if (!isPlainRecord(value) || firstInvalidPayloadValue(value) !== undefined) {
+    return { code: "observation-type", detail: "expected a Struct value" };
+  }
+  for (const name of Object.keys(value)) {
+    if (!Object.hasOwn(meta.fields, name)) {
+      return {
+        code: "observation-type",
+        detail: `undeclared Struct field ${JSON.stringify(name)}`,
+      };
+    }
+  }
+  for (const [name, field] of Object.entries(meta.fields)) {
+    if (!Object.hasOwn(value, name)) {
+      return {
+        code: "observation-incomplete",
+        detail: `Struct value omits field ${JSON.stringify(name)}`,
+      };
+    }
+    const fault = observationValueFault(field.meta, value[name]);
+    if (fault) {
+      return { code: fault.code, detail: `${name}: ${fault.detail}` };
+    }
+  }
+  return undefined;
 }
 
 function scalarObservationSpec(meta: ScalarObservationMeta): ScalarValueSpec {
@@ -483,14 +540,6 @@ function scalarObservationSpec(meta: ScalarObservationMeta): ScalarValueSpec {
     case "number":
       return { type: "number" };
   }
-}
-
-function observationMetaFault(
-  meta: ObservationBrief["meta"],
-): { code: string; detail: string } | undefined {
-  return meta.type === "array"
-    ? scalarObservationMetaFault(meta.element)
-    : scalarObservationMetaFault(meta);
 }
 
 function scalarObservationMetaFault(
@@ -524,14 +573,10 @@ function scalarObservationMetaFault(
   return undefined;
 }
 
-function observationAdmissionFault(
-  meta: ObservationBrief["meta"],
+function scalarAdmissionFault(
+  scalar: ScalarObservationMeta,
   code: string,
 ): { code: string; detail: string } {
-  const scalar = meta.type === "array" ? meta.element : meta;
-  if (code === "invalid-array") {
-    return { code: "observation-type", detail: "expected an array" };
-  }
   if (code === "invalid-enum") {
     return {
       code: "observation-enum",
@@ -589,11 +634,10 @@ function scalarObservationConstraintFault(
 
 /**
  * Validates one grouped observation report entry. The report must address every
- * field in its brief; a report that omits a field, or is not a well-formed
- * fields object, is rejected whole as an `invalid-item` so the group writes
- * nothing and re-emits. Per-field, `needs-user` is allowed only for
- * `observeOrAsk` groups, and a `resolved` value must satisfy the field's cell
- * type.
+ * member in its brief and no other; a report that omits a member, names an
+ * undeclared one, or is not a well-formed fields object is rejected whole as an
+ * `invalid-item` so the group writes nothing and re-emits. Each member outcome
+ * is admitted by {@link admitObservationOutcome}.
  */
 function validateGroupReportEntry(
   group: ObservationGroupBrief,
@@ -610,15 +654,50 @@ function validateGroupReportEntry(
       ),
     };
   }
+  const members = new Set(group.fields.map((field) => field.cell));
+  for (const key of Object.keys(providedFields)) {
+    if (!members.has(key)) {
+      return {
+        issue: buildInvalidItemIssue(
+          group.id,
+          "observation-group-shape",
+          `Grouped observation in ${reportKind} names undeclared member ${key}`,
+        ),
+      };
+    }
+  }
 
   const fields: ObservationGroupReport["fields"] = {};
-  const fieldIssue = collectGroupFields(
-    group,
-    providedFields,
-    reportKind,
-    fields,
-  );
-  if (fieldIssue) return { issue: fieldIssue };
+  for (const field of group.fields) {
+    const memberRaw = providedFields[field.cell];
+    if (memberRaw === undefined) {
+      return {
+        issue: buildInvalidItemIssue(
+          group.id,
+          "observation-group-incomplete",
+          `Grouped observation in ${reportKind} omits field ${field.cell}`,
+        ),
+      };
+    }
+    const admission = admitObservationOutcome(
+      field.meta,
+      memberRaw,
+      group.mode,
+      field.cell,
+    );
+    if ("fault" in admission) {
+      return {
+        issue: buildInvalidItemIssue(
+          group.id,
+          admission.fault.code === "observation-shape"
+            ? "observation-group-shape"
+            : admission.fault.code,
+          `Invalid grouped observation result in ${reportKind} for ${admission.fault.position}: ${admission.fault.detail}`,
+        ),
+      };
+    }
+    fields[field.cell] = admission.report;
+  }
   return { report: { fields } };
 }
 
@@ -629,72 +708,4 @@ function groupReportFields(raw: unknown): Record<string, unknown> | undefined {
     return undefined;
   }
   return fields as Record<string, unknown>;
-}
-
-/**
- * Validates every field of a group into `fields`, returning the first fault as
- * an `invalid-item` issue (which rejects the whole group) or `undefined` on
- * success.
- */
-function collectGroupFields(
-  group: ObservationGroupBrief,
-  providedFields: Record<string, unknown>,
-  reportKind: string,
-  fields: ObservationGroupReport["fields"],
-): RuntimeIssue | undefined {
-  for (const field of group.fields) {
-    const raw = providedFields[field.cell];
-    if (raw === undefined) {
-      return buildInvalidItemIssue(
-        group.id,
-        "observation-group-incomplete",
-        `Grouped observation in ${reportKind} omits field ${field.cell}`,
-      );
-    }
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-      return buildInvalidItemIssue(
-        group.id,
-        "observation-group-shape",
-        `Invalid field ${field.cell} in grouped observation in ${reportKind}`,
-      );
-    }
-    const report = raw as { status?: unknown; value?: unknown };
-    if (
-      report.status !== "resolved" &&
-      report.status !== "unknown" &&
-      report.status !== "needs-user"
-    ) {
-      return buildInvalidItemIssue(
-        group.id,
-        "observation-status",
-        `Invalid status for field ${field.cell} in ${reportKind}: ${String(report.status)}`,
-      );
-    }
-    if (report.status === "needs-user" && group.mode !== "observeOrAsk") {
-      return buildInvalidItemIssue(
-        group.id,
-        "observation-needs-user",
-        `Field ${field.cell} in ${reportKind} cannot use needs-user`,
-      );
-    }
-    if (report.status === "resolved") {
-      const fault = observationValueFault(field.meta, report.value);
-      if (fault) {
-        return buildInvalidItemIssue(
-          group.id,
-          fault.code,
-          `Invalid value for field ${field.cell} in ${reportKind}: ${fault.detail}`,
-        );
-      }
-      fields[field.cell] = {
-        status: "resolved",
-        value: cloneWithCanonicalNumbers(
-          report.value as PrimitiveValue | PrimitiveArrayValue,
-        ),
-      };
-      continue;
-    }
-    fields[field.cell] = { status: report.status };
-  }
-  return undefined;
 }

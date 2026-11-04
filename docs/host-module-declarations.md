@@ -47,15 +47,16 @@ An argument can use any value marker in the reference below. Arrays, tuples, and
 
 An operation’s returned value can be declared with `hmd.Bool()`, `hmd.Str()`, `hmd.Enum(...)`, `hmd.Num()`, `hmd.Index()`, `hmd.Artifact()`, or `hmd.Dialog.Cursor()`.
 
-An operation can also return a one-level array of booleans, strings, Enum members, finite numbers, or Artifacts. For example:
+An operation can also return a `hmd.Struct({...})` record, or a one-level array of booleans, strings, Enum members, finite numbers, Artifacts, or Struct records. A returned Struct's fields use `Bool`, `Str`, `Enum`, `Num`, a nested `Struct`, or a one-level array of any of these, and none is `Omittable`. For example:
 
 ```js
 const storeModule = hmd.define({
   related: (artifact = hmd.Artifact()) => hmd.Array(hmd.Artifact()),
+  contacts: () => hmd.Array(hmd.Struct({ name: hmd.Str(), age: hmd.Num() })),
 });
 ```
 
-`Tuple`, `Struct`, and `SemanticText` describe arguments only.
+`Tuple` and `SemanticText` describe arguments only.
 
 An Arc caller can use an operation's returned value in an expression, such as `Store.lookup("notes")`. To call an operation as an action, the caller adds `$`, as in `Store.$archive(artifact)`. An action call waits for completion and discards any returned value. An operation with no returned value can only be called as an action. Declared operation names omit `$`, including names of operations that return no value.
 

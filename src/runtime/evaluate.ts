@@ -14,18 +14,24 @@ import {
   producerGuaranteesArtifact,
   resolveHostOperation,
   resolveProducer,
+  resolveReferenceSpec,
   stringOperandRule,
   type ProducerContext,
 } from "../spec/resolution.js";
+import { fieldValueAt } from "../spec/struct.js";
 import type {
   HostCallBrief,
   ObservationGroupField,
-  ObservationValueMeta,
+  ObservationMeta,
   ScalarObservationMeta,
+  StructObservationField,
+  StructObservationMeta,
 } from "../types/host-interaction.js";
 import type {
   ActionStatement,
   ArithmeticOperator,
+  ArrayCell,
+  ArrayElementRead,
   ArrayReference,
   ArtifactConstructExpression,
   Cell,
@@ -33,12 +39,17 @@ import type {
   ComparisonOperator,
   ElementId,
   EnterTarget,
+  FieldReceiver,
+  FieldReference,
   HostCall,
   HostCallArgument,
   JudgeExpression,
   LocalExpression,
   Node,
+  ObservableArray,
+  ObservableField,
   ObservableScalar,
+  ObservableStruct,
   ObserveAction,
   ObserveGroupAction,
   ObserveOrAskAction,
@@ -48,7 +59,7 @@ import type {
   UnsetAction,
   ValueExpression,
 } from "../types/parser.js";
-import { isSettableCell } from "../types/parser.js";
+import { fieldDeclarationAt, isSettableCell } from "../types/parser.js";
 import type {
   ArcRef,
   NodeRef,
@@ -59,9 +70,10 @@ import { qualifiedBriefSite } from "../types/runtime.js";
 import type {
   ArrayElementSpec,
   CellSpec,
-  ObservableCellSpec,
+  ChannelSpec,
+  ObservableFieldSpec,
 } from "../types/spec.js";
-import { isObservableCellSpec } from "../types/spec.js";
+import { fieldSpecAt, isObservableCellSpec } from "../types/spec.js";
 import {
   classifyArtifactValue,
   isArtifactValue,
@@ -70,19 +82,20 @@ import {
   type ArtifactValue,
   type CellValue,
   type DialogCursor,
+  type ObservedValue,
   type PayloadValue,
-  type PrimitiveArrayValue,
-  type PrimitiveValue,
   type SemanticText,
   type SemanticTextPart,
   type StructValue,
 } from "../types/value.js";
 import {
+  clonePayloadValue,
   cloneWithCanonicalNumbers,
   createArtifactValue,
   describeArtifactValueIssue,
   firstInvalidPayloadValue,
   firstNonFiniteNumberPath,
+  isPlainRecord,
 } from "../value-utils.js";
 import {
   assertAssignableChannelValue,
@@ -119,6 +132,7 @@ import {
   makeObservationGroupId,
   makeObservationId,
   noteBriefYield,
+  payloadValuesEqual,
   type Accumulator,
 } from "./state.js";
 
@@ -130,15 +144,22 @@ type ResolvedCellTarget = {
   ownerTraversal: Traversal;
   root: string;
   rootCell: Cell;
-  path: number[];
-  leafSpec: Cell | ArrayElementSpec;
+  /** Struct field names and array indices below the root, outermost first. */
+  path: (string | number)[];
+  leaf: CellTargetLeaf;
   label: string;
-  value: CellValue | undefined;
+  /** Stored value at the target, or `undefined` when it is unset. */
+  state: PayloadValue;
 };
 
-type ObservableTargetSpec =
-  | ObservableScalar
-  | { type: "array"; element: ObservableScalar };
+/**
+ * Parser IR of the position a cell target selects: the root cell, a Struct
+ * field, or an array element.
+ */
+type CellTargetLeaf = Cell | ObservableField | ArrayCell["element"];
+
+/** A cell target's leaf narrowed to its observable forms. */
+type ObservableTarget = ObservableScalar | ObservableArray | ObservableStruct;
 
 function formatAuthoredCellTarget(target: CellTarget): string {
   const [root, ...accessors] = target;
@@ -146,9 +167,12 @@ function formatAuthoredCellTarget(target: CellTarget): string {
 }
 
 /**
- * Resolves a lexical cell target against the live traversal state. Accessors
- * evaluate through the ordinary local-expression path, so non-literal indices
- * are pinned by the containing statement's pin tape.
+ * Resolves a lexical cell target against the live traversal state. A Struct
+ * accessor selects a declared field from the schema and requires a set Struct.
+ * Array accessors evaluate through the ordinary local-expression path, so
+ * non-literal indices are pinned by the containing statement's pin tape, and
+ * require a set array. An unset container fails here, before the action
+ * evaluates its value or emits a brief.
  */
 function resolveCellTarget(
   target: CellTarget,
@@ -165,24 +189,47 @@ function resolveCellTarget(
     );
   }
 
-  let leafSpec: Cell | ArrayElementSpec = owner.cell;
-  let value = owner.traversal.cells[root];
-  const path: number[] = [];
+  let leaf: CellTargetLeaf = owner.cell;
+  let state: PayloadValue = owner.traversal.cells[root];
+  const path: (string | number)[] = [];
   let label = root;
   for (const accessor of accessors) {
-    if (leafSpec.type !== "array") {
+    if (leaf.type === "struct") {
+      const name =
+        accessor.kind === "literal" && typeof accessor.value === "string"
+          ? accessor.value
+          : undefined;
+      if (name === undefined || !Object.hasOwn(leaf.fields, name)) {
+        throw runtimeError(
+          "invalid-cell-target",
+          `Cell target ${label} names an undeclared Struct field`,
+        );
+      }
+      if (!isPlainRecord(state)) {
+        throw runtimeError(
+          "unset-value",
+          `Cannot access a field of unset Struct ${label}`,
+        );
+      }
+      path.push(name);
+      label += `.${name}`;
+      state = state[name];
+      leaf = leaf.fields[name]!;
+      continue;
+    }
+    if (leaf.type !== "array") {
       throw runtimeError(
         "invalid-cell-target",
         `Cell target ${label} accesses through a non-container value`,
       );
     }
-    if (value === undefined) {
+    if (state === undefined) {
       throw runtimeError(
         "unset-value",
         `Cannot access an element of unset array ${label}`,
       );
     }
-    if (!Array.isArray(value)) {
+    if (!Array.isArray(state)) {
       throw runtimeError(
         "invalid-array-operation",
         `Cannot access an element of non-array target ${label}`,
@@ -206,16 +253,16 @@ function resolveCellTarget(
         `Array index must be a non-negative integer, got ${String(position)}`,
       );
     }
-    if (position >= value.length) {
+    if (position >= state.length) {
       throw runtimeError(
         "array-index-out-of-range",
-        `Array index ${position} is out of range for length ${value.length}`,
+        `Array index ${position} is out of range for length ${state.length}`,
       );
     }
     path.push(position);
     label += `[${position}]`;
-    value = value[position];
-    leafSpec = leafSpec.element;
+    state = state[position];
+    leaf = leaf.element;
   }
 
   return {
@@ -225,57 +272,161 @@ function resolveCellTarget(
       root,
       rootCell: owner.cell,
       path,
-      leafSpec,
+      leaf,
       label,
-      value,
+      state,
     },
   };
 }
 
+/**
+ * Returns new root state with the position at `path` replaced by an admitted
+ * `value`. Struct siblings and array siblings are preserved. Every container on
+ * the path must be set, because a write never leaves a composite incomplete.
+ * The input state is never mutated.
+ */
+function replaceRootState(
+  rootCell: Cell,
+  state: CellValue | undefined,
+  path: readonly (string | number)[],
+  value: CellValue,
+  label: string,
+): CellValue {
+  // Each position keeps the shape of its declaration and the replaced leaf was
+  // admitted under its own spec, so the rebuilt root is a value of the root
+  // cell's declaration.
+  return replaceTargetState(rootCell, state, path, value, label) as CellValue;
+}
+
+function replaceTargetState(
+  spec: Cell | ObservableField | ArrayElementSpec,
+  state: PayloadValue,
+  path: readonly (string | number)[],
+  value: CellValue,
+  label: string,
+): PayloadValue {
+  const [segment, ...rest] = path;
+  if (segment === undefined) return clonePayloadValue(value);
+  if (typeof segment === "string") {
+    if (spec.type !== "struct" || !Object.hasOwn(spec.fields, segment)) {
+      throw new Error(
+        `Internal invariant: ${label} descends through an undeclared Struct field`,
+      );
+    }
+    if (!isPlainRecord(state)) {
+      throw runtimeError(
+        "unset-value",
+        `Cannot write field target ${label} because its Struct is not set`,
+      );
+    }
+    return {
+      ...state,
+      [segment]: replaceTargetState(
+        spec.fields[segment]!,
+        state[segment],
+        rest,
+        value,
+        label,
+      ),
+    };
+  }
+  if (spec.type !== "array") {
+    throw new Error(
+      `Internal invariant: ${label} indexes a non-array declaration`,
+    );
+  }
+  if (!Array.isArray(state)) {
+    throw runtimeError(
+      state === undefined ? "unset-value" : "invalid-array-operation",
+      `Cannot write element target ${label} because its array is not set`,
+    );
+  }
+  if (segment >= state.length) {
+    throw runtimeError(
+      "array-index-out-of-range",
+      `Array index ${segment} is out of range for length ${state.length}`,
+    );
+  }
+  const next = state.map(clonePayloadValue);
+  next[segment] = replaceTargetState(
+    spec.element,
+    state[segment],
+    rest,
+    value,
+    label,
+  );
+  return next;
+}
+
+/**
+ * Validates and writes one complete concrete value at a resolved target. A
+ * Struct root or subtree is replaced as a whole, and a field write replaces one
+ * field of a set Struct.
+ */
 function writeResolvedCellTarget(
   target: ResolvedCellTarget,
   value: unknown,
 ): { changed: boolean } {
-  if (target.path.length === 0) {
-    return writeOwnedCellValue(
-      target.ownerTraversal,
-      target.root,
-      target.leafSpec,
+  assertAssignableValue(target.label, target.leaf, value);
+  return writeOwnedCell(
+    target.ownerTraversal,
+    target.root,
+    replaceRootState(
+      target.rootCell,
+      target.ownerTraversal.cells[target.root],
+      target.path,
       value,
       target.label,
-    );
-  }
-  if (target.path.length !== 1) {
+    ),
+  );
+}
+
+/**
+ * Validates and writes one complete concrete value at a cell or at a declared
+ * Struct field path of that cell, preserving the field's siblings. A field
+ * path requires a set Struct; the replacement path checks it.
+ */
+export function writeOwnedCellPath(
+  ownerTraversal: Traversal,
+  rootCell: Cell,
+  path: readonly string[],
+  value: unknown,
+): { changed: boolean } {
+  const leaf =
+    path.length === 0
+      ? rootCell
+      : rootCell.type === "struct"
+        ? fieldDeclarationAt(rootCell, path)
+        : undefined;
+  const label = [rootCell.name, ...path].join(".");
+  if (!leaf) {
     throw runtimeError(
       "invalid-cell-target",
-      `${target.label} exceeds the supported array target depth`,
+      `Cell target ${label} names an undeclared Struct field`,
     );
   }
-  assertAssignableValue(target.label, target.leafSpec, value);
-  const current = target.ownerTraversal.cells[target.root];
-  if (!Array.isArray(current)) {
-    throw runtimeError(
-      current === undefined ? "unset-value" : "invalid-array-operation",
-      `Cannot write element target ${target.label} because its root is not a set array`,
-    );
-  }
-  const [position] = target.path;
-  if (position === undefined || position >= current.length) {
-    throw runtimeError(
-      "array-index-out-of-range",
-      `Array index ${String(position)} is out of range for length ${current.length}`,
-    );
-  }
-  const next = cloneCellValue(current);
-  if (!Array.isArray(next)) {
-    throw new Error("Internal invariant: cloned array target is not an array");
-  }
-  const replacement = cloneCellValue(value);
-  if (replacement === undefined) {
-    throw new Error("Internal invariant: admitted array element is unset");
-  }
-  next[position] = replacement as ArrayElementValue;
-  return writeOwnedCell(target.ownerTraversal, target.root, next);
+  return writeResolvedCellTarget(
+    {
+      ownerTraversal,
+      root: rootCell.name,
+      rootCell,
+      path: [...path],
+      leaf,
+      label,
+      state: undefined,
+    },
+    value,
+  );
+}
+
+/**
+ * The privately owned current value of an observation target, or `undefined`
+ * when it is unset.
+ */
+function storedObservedValue(state: PayloadValue): ObservedValue | undefined {
+  // Stored state at an observable position was admitted under its spec, so a
+  // set position holds an observed value.
+  return clonePayloadValue(state) as ObservedValue | undefined;
 }
 
 export function applyObserve(
@@ -292,7 +443,7 @@ export function applyObserve(
   );
   if (targetResult.status === "blocked") return targetResult;
   const target = targetResult.value;
-  const observableSpec = requireObservableTarget(target);
+  const observable = requireObservableTarget(target);
 
   const workId = makeObservationId(
     accum.entry.arc,
@@ -302,8 +453,7 @@ export function applyObserve(
   const resolution = accum.observationResults.get(workId);
 
   if (resolution) {
-    if (resolution.status === "resolved" && resolution.value !== undefined) {
-      assertAssignableValue(target.label, target.leafSpec, resolution.value);
+    if (resolution.status === "resolved") {
       return {
         status: "resolved",
         value: writeResolvedCellTarget(target, resolution.value),
@@ -323,24 +473,29 @@ export function applyObserve(
       sourceRef: traversalToNodeRef(traversal),
       cell: target.label,
       mode: statement.kind,
-      question: renderObservationQuestion(
-        statement,
-        target,
-        observableSpec,
-        traversal,
-        node,
-        accum,
-      ),
+      question:
+        statement.question !== undefined
+          ? renderSemanticText(statement.question, traversal, node, accum)
+          : renderCellObservingQuestion(
+              observable,
+              target.label,
+              traversal,
+              node,
+              accum,
+            ),
       guidance: renderNodeGuidance(traversal, node, accum),
-      currentValue: cloneCellValue(target.value) as
-        | PrimitiveValue
-        | PrimitiveArrayValue
-        | undefined,
+      currentValue: storedObservedValue(target.state),
       hostParams: admitFinitePayload(
         effectiveHostParams(node, accum),
         "host-bound emission",
       ),
-      meta: observationMetaForTarget(observableSpec),
+      meta: observationMetaForTarget(
+        observable,
+        target.label,
+        traversal,
+        node,
+        accum,
+      ),
     });
   }
   return { status: "blocked" };
@@ -348,11 +503,12 @@ export function applyObserve(
 
 /**
  * Applies a grouped observation `$observe({ a, b })` as one atomic action. On
- * the plan phase it emits a single `ObservationGroupBrief` carrying every cell's
- * question and type metadata. On resolution it applies one report that addresses
- * all fields: any `needs-user` field keeps the whole group blocked (the group
- * re-emits and writes nothing), otherwise every `resolved` field is written
- * together and the group settles before execution advances.
+ * the plan phase it emits a single `ObservationGroupBrief` carrying every
+ * member's question and type metadata. On resolution it applies one report
+ * that addresses every member: plain observation writes every resolved
+ * member together and settles; `$observeOrAsk` writes and settles only when
+ * every member resolves, and otherwise writes nothing and re-emits the whole
+ * group.
  */
 export function applyObserveGroup(
   statement: ObserveGroupAction | ObserveOrAskGroupAction,
@@ -363,14 +519,14 @@ export function applyObserveGroup(
   const mode = statement.kind === "observeGroup" ? "observe" : "observeOrAsk";
   const targets: {
     target: ResolvedCellTarget;
-    observableSpec: ObservableCellSpec;
+    observable: ObservableTarget;
   }[] = [];
   for (const authoredTarget of statement.targets) {
     const result = resolveCellTarget(authoredTarget, traversal, node, accum);
     if (result.status === "blocked") return result;
     targets.push({
       target: result.value,
-      observableSpec: requireObservableTarget(result.value),
+      observable: requireObservableTarget(result.value),
     });
   }
   const workId = makeObservationGroupId(
@@ -381,22 +537,29 @@ export function applyObserveGroup(
   const resolution = accum.observationGroupResults.get(workId);
 
   if (resolution) {
-    for (const { target } of targets) {
-      if (resolution.fields[target.label]?.status === "needs-user") {
-        return { status: "blocked" };
+    const members = targets.map(({ target }) => {
+      const member = resolution.fields[target.label];
+      if (!member) {
+        throw new Error(
+          `Internal invariant: admitted group report omits ${target.label}`,
+        );
       }
+      return { target, member };
+    });
+    if (
+      members.some(({ member }) =>
+        mode === "observeOrAsk"
+          ? member.status !== "resolved"
+          : member.status === "needs-user",
+      )
+    ) {
+      return { status: "blocked" };
     }
-    const writes: {
-      target: ResolvedCellTarget;
-      value: PrimitiveValue | PrimitiveArrayValue;
-    }[] = [];
-    for (const { target } of targets) {
-      const field = resolution.fields[target.label];
-      if (!field || field.status !== "resolved" || field.value === undefined) {
-        continue;
-      }
-      assertAssignableValue(target.label, target.leafSpec, field.value);
-      writes.push({ target, value: field.value });
+    const writes: { target: ResolvedCellTarget; value: ObservedValue }[] = [];
+    for (const { target, member } of members) {
+      if (member.status !== "resolved") continue;
+      assertAssignableValue(target.label, target.leaf, member.value);
+      writes.push({ target, value: member.value });
     }
     let changed = false;
     for (const write of writes) {
@@ -409,21 +572,24 @@ export function applyObserveGroup(
   if (accum.phase === "plan") {
     noteBriefYield(accum, traversal);
     const fields: ObservationGroupField[] = targets.map(
-      ({ target, observableSpec }) => {
+      ({ target, observable }) => {
         return {
           cell: target.label,
           question: renderCellObservingQuestion(
-            observableSpec,
+            observable,
             target.label,
             traversal,
             node,
             accum,
           ),
-          currentValue: cloneCellValue(target.value) as
-            | PrimitiveValue
-            | PrimitiveArrayValue
-            | undefined,
-          meta: observationMetaForTarget(observableSpec),
+          currentValue: storedObservedValue(target.state),
+          meta: observationMetaForTarget(
+            observable,
+            target.label,
+            traversal,
+            node,
+            accum,
+          ),
         };
       },
     );
@@ -446,76 +612,137 @@ export function applyObserveGroup(
 /**
  * Requires the resolved leaf to be observable.
  */
-function requireObservableTarget(
-  target: ResolvedCellTarget,
-): ObservableTargetSpec {
-  if (!isObservableCellSpec(target.leafSpec)) {
+function requireObservableTarget(target: ResolvedCellTarget): ObservableTarget {
+  const leaf = target.leaf;
+  if (!isObservableCellSpec(leaf)) {
     throw runtimeError(
       "invalid-observation-target",
       `$observe() cannot target ${target.label}`,
     );
   }
-  return target.leafSpec;
+  return leaf;
 }
 
 /**
- * The extraction question authored on a cell: its own `observing` for a scalar
- * cell, or the element's `observing` for an array cell.
+ * The extraction question authored on a target: its own `observing` for a
+ * scalar or Struct, or the element's `observing` for an array.
  */
 function cellObservingText(
-  spec: ObservableTargetSpec,
+  observable: ObservableTarget,
 ): SemanticString | undefined {
-  return spec.type === "array" ? spec.element.observing : spec.observing;
+  return observable.type === "array"
+    ? observable.element.observing
+    : observable.observing;
 }
 
-/** The bare scalar shape of a declaration, without its authoring extras. */
-function scalarMetaOf(spec: ObservableScalar): ScalarObservationMeta {
-  switch (spec.type) {
+/** Observation metadata for a scalar target or element, with its `observeAs` bounds. */
+function scalarMetaOf(observable: ObservableScalar): ScalarObservationMeta {
+  switch (observable.type) {
     case "boolean":
       return { type: "boolean" };
     case "string":
       return { type: "string" };
     case "enum":
-      return { type: "enum", values: spec.values };
+      return { type: "enum", values: observable.values };
     case "number":
-      if (spec.observeAs?.kind === "integer") {
+      if (observable.observeAs?.kind === "integer") {
         return {
           type: "rangedInt",
-          min: spec.observeAs.min ?? Number.MIN_SAFE_INTEGER,
-          max: spec.observeAs.max ?? Number.MAX_SAFE_INTEGER,
+          min: observable.observeAs.min ?? Number.MIN_SAFE_INTEGER,
+          max: observable.observeAs.max ?? Number.MAX_SAFE_INTEGER,
         };
       }
       return {
         type: "number",
-        ...(spec.observeAs?.min !== undefined
-          ? { min: spec.observeAs.min }
+        ...(observable.observeAs?.min !== undefined
+          ? { min: observable.observeAs.min }
           : {}),
-        ...(spec.observeAs?.max !== undefined
-          ? { max: spec.observeAs.max }
+        ...(observable.observeAs?.max !== undefined
+          ? { max: observable.observeAs.max }
           : {}),
       };
   }
 }
 
-/** Observation value metadata for a scalar or array cell. */
+/**
+ * Observation value metadata for a scalar, array, or Struct target. A Struct
+ * describes every declared field recursively with its rendered question.
+ */
 function observationMetaForTarget(
-  spec: ObservableTargetSpec,
-): ObservationValueMeta {
-  if (spec.type === "array") {
-    return { type: "array", element: scalarMetaOf(spec.element) };
+  observable: ObservableTarget,
+  label: string,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): ObservationMeta {
+  if (observable.type === "array") {
+    return {
+      type: "array",
+      element:
+        observable.element.type === "struct"
+          ? structMetaOf(
+              observable.element,
+              `${label}[]`,
+              traversal,
+              node,
+              accum,
+            )
+          : scalarMetaOf(observable.element),
+    };
   }
-  return scalarMetaOf(spec);
+  if (observable.type === "struct") {
+    return structMetaOf(observable, label, traversal, node, accum);
+  }
+  return scalarMetaOf(observable);
 }
 
-/** Renders a cell's own `observing` question, or a default when it declares none. */
+/**
+ * Observation metadata for a Struct target or Struct array element: every
+ * declared field with its rendered question and type metadata.
+ */
+function structMetaOf(
+  observable: ObservableStruct,
+  label: string,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): StructObservationMeta {
+  return {
+    type: "struct",
+    fields: Object.fromEntries(
+      Object.entries(observable.fields).map(([name, field]) => {
+        const fieldLabel = `${label}.${name}`;
+        const entry: StructObservationField = {
+          question: renderCellObservingQuestion(
+            field,
+            fieldLabel,
+            traversal,
+            node,
+            accum,
+          ),
+          meta: observationMetaForTarget(
+            field,
+            fieldLabel,
+            traversal,
+            node,
+            accum,
+          ),
+        };
+        return [name, entry];
+      }),
+    ),
+  };
+}
+
+/** Renders a target's own `observing` question, or a default when it declares none. */
 function renderCellObservingQuestion(
-  spec: ObservableTargetSpec,
+  observable: ObservableTarget,
   targetLabel: string,
   traversal: Traversal,
   node: Node,
   accum: Accumulator,
 ): SemanticText {
-  const observing = cellObservingText(spec);
+  const observing = cellObservingText(observable);
   if (observing === undefined) return `observe ${targetLabel}`;
   return renderSemanticText(observing, traversal, node, accum);
 }
@@ -547,6 +774,7 @@ export function applySet(
   };
 }
 
+/** Clears a whole cell. */
 export function applyUnset(
   statement: UnsetAction,
   traversal: Traversal,
@@ -858,7 +1086,8 @@ function isCompoundValueExpression(
     expression.kind === "numIsFinite" ||
     expression.kind === "artifact" ||
     expression.kind === "template-string" ||
-    expression.kind === "arrayLiteral"
+    expression.kind === "arrayLiteral" ||
+    expression.kind === "structLiteral"
   );
 }
 
@@ -987,6 +1216,16 @@ function computeCompoundValueExpression(
     );
     if (!admitted.admitted) {
       throw runtimeError(admitted.violation.code, admitted.violation.detail);
+    }
+    if (decision.mode === "struct") {
+      const equal = payloadValuesEqual(
+        admitted.value.left,
+        admitted.value.right,
+      );
+      return {
+        status: "resolved",
+        value: expression.op === "==" ? equal : !equal,
+      };
     }
     if (isOrdering && decision.mode === "enum") {
       const enumValues = decision.enumValues ?? [];
@@ -1157,6 +1396,30 @@ function computeCompoundValueExpression(
     }
     return { status: "resolved", value: elements };
   }
+  if (expression.kind === "structLiteral") {
+    // A Struct value is concrete only when every field is concrete: an unset
+    // field makes the whole literal unset, and its consumer applies its own
+    // absence rule.
+    const fields: Record<string, PayloadValue> = {};
+    let incomplete = false;
+    for (const [name, field] of Object.entries(expression.fields)) {
+      const value = evaluateValueExpression(field, traversal, node, accum);
+      if (value.status === "blocked") return value;
+      if (value.value === undefined) {
+        incomplete = true;
+        continue;
+      }
+      const issue = firstInvalidPayloadValue(value.value);
+      if (issue || value.value === null) {
+        throw runtimeError(
+          "invalid-struct-literal",
+          `Invalid Struct field ${JSON.stringify(name)}${issue ? ` at ${issue.path}: ${issue.detail}` : ""}`,
+        );
+      }
+      fields[name] = cloneWithCanonicalNumbers(value.value);
+    }
+    return { status: "resolved", value: incomplete ? undefined : fields };
+  }
   throw new Error("Unknown compound value expression");
 }
 
@@ -1280,6 +1543,11 @@ function computeLocalExpression(
             accum,
           ) === undefined,
       };
+    case "field":
+      return {
+        status: "resolved",
+        value: readFieldValue(expression, traversal, node, accum),
+      };
     case "deflectionEscaped":
       return {
         status: "resolved",
@@ -1370,43 +1638,13 @@ function computeLocalExpression(
         value: ref ? childState(accum.traversals, ref) : undefined,
       };
     }
-    case "arrayElementRead": {
-      const array = requireArrayValue(
-        expression.array,
-        traversal,
-        accum,
-        "index",
-      );
-      const index = evaluateLocalExpression(
-        expression.index,
-        traversal,
-        node,
-        accum,
-      );
-      if (index.status === "blocked") return index;
-      const position = index.value;
-      if (
-        typeof position !== "number" ||
-        !Number.isSafeInteger(position) ||
-        position < 0
-      ) {
-        throw runtimeError(
-          "invalid-array-index",
-          `Array index must be a non-negative integer, got ${String(position)}`,
-        );
-      }
-      if (position >= array.length) {
-        throw runtimeError(
-          "array-index-out-of-range",
-          `Array index ${position} is out of range for length ${array.length}`,
-        );
-      }
-      return { status: "resolved", value: array[position] };
-    }
+    case "arrayElementRead":
+      return readArrayElement(expression, traversal, node, accum);
     case "arrayLength": {
       const array = requireArrayValue(
         expression.array,
         traversal,
+        node,
         accum,
         "length",
       );
@@ -1456,6 +1694,47 @@ function computeLocalExpression(
   }
 }
 
+/** Reads one existing element of an array reference by a local index. */
+function readArrayElement(
+  expression: ArrayElementRead,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): ActionOutcome<ArrayElementValue> {
+  const array = requireArrayValue(
+    expression.array,
+    traversal,
+    node,
+    accum,
+    "index",
+  );
+  const index = evaluateLocalExpression(
+    expression.index,
+    traversal,
+    node,
+    accum,
+  );
+  if (index.status === "blocked") return index;
+  const position = index.value;
+  if (
+    typeof position !== "number" ||
+    !Number.isSafeInteger(position) ||
+    position < 0
+  ) {
+    throw runtimeError(
+      "invalid-array-index",
+      `Array index must be a non-negative integer, got ${String(position)}`,
+    );
+  }
+  if (position >= array.length) {
+    throw runtimeError(
+      "array-index-out-of-range",
+      `Array index ${position} is out of range for length ${array.length}`,
+    );
+  }
+  return { status: "resolved", value: array[position]! };
+}
+
 /**
  * Reads an array reference's current value, requiring it to be a set array.
  * Reading an element or `length` of an unset array is a runtime error, as is a
@@ -1465,13 +1744,16 @@ function computeLocalExpression(
 export function requireArrayValue(
   array: ArrayReference,
   traversal: Traversal,
+  node: Node,
   accum: Accumulator,
   operation: string,
 ): ArrayValue {
   const value =
     array.kind === "cell"
       ? getCellValue(array.name, traversal, accum)
-      : readChannelValue(traversal, array.namespace, array.key, accum);
+      : array.kind === "channel"
+        ? readChannelValue(traversal, array.namespace, array.key, accum)
+        : readFieldValue(array, traversal, node, accum);
   if (value === undefined) {
     throw runtimeError(
       "unset-value",
@@ -1627,6 +1909,118 @@ export function getCellValue(
   );
 }
 
+/**
+ * Resolves the spec and stored value of a Struct field reference. The field
+ * path is resolved from the receiver's spec, and a field of an unset Struct
+ * reads as unset.
+ */
+function readFieldState(
+  field: FieldReference,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): { spec: ObservableFieldSpec; state: PayloadValue } {
+  const receiver = readReceiverState(field.receiver, traversal, node, accum);
+  const spec =
+    receiver.spec?.type === "struct"
+      ? fieldSpecAt(receiver.spec, field.path)
+      : undefined;
+  if (!spec) {
+    throw runtimeError(
+      "invalid-field-read",
+      `Cannot read undeclared Struct field ${field.path.join(".")}`,
+    );
+  }
+  return { spec, state: fieldValueAt(receiver.state, field.path) };
+}
+
+/** Resolves the spec and stored value of a field reference's receiver. */
+function readReceiverState(
+  receiver: FieldReceiver,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): {
+  spec: CellSpec | ChannelSpec | ArrayElementSpec | undefined;
+  state: PayloadValue;
+} {
+  switch (receiver.kind) {
+    case "cell": {
+      const owner = findCellOwner(receiver.name, traversal, accum);
+      if (!owner) {
+        throw runtimeError("unknown-cell", `Unknown cell: ${receiver.name}`);
+      }
+      return {
+        spec: owner.cell,
+        state: owner.traversal.cells[receiver.name],
+      };
+    }
+    case "channel":
+      return {
+        spec: nodeForTraversal(traversal, accum)?.signature?.[
+          receiver.namespace
+        ][receiver.key],
+        state: readChannelValue(
+          traversal,
+          receiver.namespace,
+          receiver.key,
+          accum,
+        ),
+      };
+    case "arrayElementRead": {
+      const element = readArrayElement(receiver, traversal, node, accum);
+      if (element.status === "blocked") {
+        throw new Error("Internal invariant: a local element read blocked");
+      }
+      return {
+        spec: runtimeArrayElementSpec(receiver.array, traversal, node, accum),
+        state: element.value,
+      };
+    }
+    case "span": {
+      const member = accum.mapMember;
+      if (!member) {
+        throw runtimeError(
+          "span-outside-map",
+          "span is only available inside a $map callback",
+        );
+      }
+      return { spec: member.receiverSpec, state: member.item };
+    }
+  }
+}
+
+/**
+ * The element spec of an array reference resolved against the live
+ * traversal: a cell, a channel, or an array field of any field receiver.
+ */
+export function runtimeArrayElementSpec(
+  reference: ArrayReference,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): ArrayElementSpec | undefined {
+  const spec = resolveReferenceSpec(reference, {
+    cells: [],
+    signature: node.signature,
+    resolveCell: (name) => findCellOwner(name, traversal, accum)?.cell,
+    map: { receiverSpec: accum.mapMember?.receiverSpec },
+  });
+  return spec?.type === "array" ? spec.element : undefined;
+}
+
+/** Reads a Struct field's value, or `undefined` when its Struct is unset. */
+function readFieldValue(
+  field: FieldReference,
+  traversal: Traversal,
+  node: Node,
+  accum: Accumulator,
+): CellValue | undefined {
+  const { state } = readFieldState(field, traversal, node, accum);
+  // A set field holds a value admitted under its observable field spec.
+  return cloneCellValue(state as CellValue | undefined);
+}
+
 function resolvedCellRead(
   name: string,
   traversal: Traversal,
@@ -1741,21 +2135,6 @@ export function writeOwnedCellValue(
 ): { changed: boolean } {
   assertAssignableValue(label, spec, value);
   return writeOwnedCell(ownerTraversal, name, value);
-}
-
-export function renderObservationQuestion(
-  statement: ObserveAction | ObserveOrAskAction,
-  target: ResolvedCellTarget,
-  spec: ObservableTargetSpec,
-  traversal: Traversal,
-  node: Node,
-  accum: Accumulator,
-): SemanticText {
-  if (statement.question !== undefined)
-    return renderSemanticText(statement.question, traversal, node, accum);
-  const observing = cellObservingText(spec);
-  if (observing === undefined) return `observe ${target.label}`;
-  return renderSemanticText(observing, traversal, node, accum);
 }
 
 export function assertAssignableValue(

@@ -114,6 +114,8 @@ Cells are a node's persistent typed state. Each cell is scoped to the node that 
 
 Inner values are written only through dedicated channels: `cell.$set(...)`, a resolved `$observe(...)` or `$observeOrAsk(...)` report, and `returns` committed by a covered `$enter(...)` (see [Control Transfer](#control-transfer)).
 
+`$set(...)` stores a deep copy of its value and keeps no connection to the cells that value was read from. After `people[0].$set(person)`, a later write to `person` or to `people[0]` changes only that target, and the same holds for a cell read inside a Struct or array literal, such as `person.$set({ name: nickname })`.
+
 A cell starts _unset_ and stays so until a write action provides its inner value. An Artifact declaration with a path instead initializes on first entry. A cell becomes unset again when `cell.$unset()` resolves. Using a cell in a value position attempts its inner value: a set cell produces the inner value, while an unset cell resolves only where [Operators](#operators) define a result for an unset operand, and any other evaluation of it raises a runtime error. Member forms target the cell itself rather than its inner value and stay available while unset: `cell.isUnset()` reports whether the cell is unset, and `$set`, `$unset`, `observing`, and observation calls work the same way on set and unset cells.
 
 Cells are declared with `let` inside a node body:
@@ -143,7 +145,7 @@ let reportName = Str();
 let report = Artifact(`reports/${reportName}.md`);
 ```
 
-`observing` sets the default observation question for `$observe(cell)` and `$observeOrAsk(cell)`. It may be defined once, either in the declaration config or later with `cell.observing = ...`. A second definition is a parse error. The question can be overridden per-call with a second argument.
+`observing` declares the question the host answers when the cell is observed. See [Observations](#observations).
 
 | Cell type | Description | Params |
 | --- | --- | --- |
@@ -154,7 +156,8 @@ let report = Artifact(`reports/${reportName}.md`);
 | `RangedInt(min, max, config?)` | Authoring shorthand for an integer-observed `Num`. | `min: safe integer, max: safe integer` |
 | `Dialog.Cursor()` | Snapshot of a scoped dialog cursor. |  |
 | `Artifact(path?)` | Nominal host Artifact value, optionally initialized from a logical path. | `path?: string-valued expression` |
-| `Array(elementCell)` | Ordered list of one scalar or Artifact element shape. See [Arrays](#arrays). | `elementCell: constructed scalar observable cell or zero-argument Artifact()` |
+| `Array(elementCell)` | Ordered list of one scalar, Struct, or Artifact element shape. See [Arrays](#arrays). | `elementCell: constructed scalar observable cell, Struct(...), or zero-argument Artifact()` |
+| `Struct(fields, config?)` | Record of named observable fields. See [Structs](#structs). | `fields: object literal of constructed observable cells` |
 
 The optional `config` object supports `observing`, a string literal or template literal. `Num` additionally supports `observeAs`, which constrains values accepted from observation reports:
 
@@ -179,7 +182,7 @@ Bounds are inclusive, finite, and ordered. Integer-observation bounds must thems
 
 `RangedInt(min, max, config?)` is shorthand for `Num({ ...config, observeAs: { kind: "integer", min, max } })`. Its `min` and `max` must be ordered safe integers, and its config supports `observing` but not another `observeAs`. For example, a `let cell = RangedInt(1, 10)` observation must be an integer from 1 through 10, while `cell.$set(10.5)` and `cell.$set(20)` are valid direct writes.
 
-Only `Enum`, `Bool`, `Str`, `Num`, `RangedInt`, and arrays of those scalar elements are observable. `$observe(...)` and `$observeOrAsk(...)` accept only these types, whether observed singly or in a group (see [Grouped Observation](#grouped-observation)). `Array` cells are covered under [Arrays](#arrays).
+Only `Enum`, `Bool`, `Str`, `Num`, `RangedInt`, `Struct`, and arrays of scalar or Struct elements are observable. `$observe(...)` and `$observeOrAsk(...)` accept only these types, whether observed singly or in a group.
 
 Enum ordering comparisons use **ordinal position** within the declared values array. For `Enum(["cold", "lukewarm", "curious", "enthusiastic"])`, `interest >= "lukewarm"` is true when `interest` is `"lukewarm"` (index 1), `"curious"` (index 2), or `"enthusiastic"` (index 3). Equality and inequality compare the produced strings directly, so they do not require matching Enum declarations or membership of a literal operand.
 
@@ -197,11 +200,12 @@ Arc statically judges each cell or return write from the producer evidence avail
 
 #### Arrays
 
-`Array(elementCell)` declares an array cell whose inner value is an ordered list of one element shape. The element is either a constructed scalar observable cell — `Bool`, `Str`, `Enum`, or `Num`, including the `RangedInt(...)` shorthand — or zero-argument `Artifact()`. The element guarantee is declared once and applies to every stored member:
+`Array(elementCell)` declares an array cell whose inner value is an ordered list of one element shape. The element is a constructed scalar observable cell — `Bool`, `Str`, `Enum`, or `Num`, including the `RangedInt(...)` shorthand — a `Struct(...)`, or zero-argument `Artifact()`. The element guarantee is declared once and applies to every stored member:
 
 ```js
 let findings = Array(Str({ observing: `a finding ${user} mentioned` }));
 let scores = Array(Num({ observeAs: { kind: "integer", min: 1, max: 5 } }));
+let people = Array(Struct({ name: Str(), age: Num() }));
 let artifacts = Array(Artifact());
 ```
 
@@ -214,17 +218,55 @@ An array cell holds a whole list value and supports:
 - `items[index].$set(...)` as an existing-element cell write,
 - `items.length` as a non-negative-safe-integer read,
 - `items.isUnset()`,
-- observation as a whole collection or as one element, only when the element is scalar.
+- observation as a whole collection or as one element, only when the element is scalar or Struct.
 
-An action cell target is a lexical cell name followed by zero or more accesses into its inner value. A direct target such as `items` addresses the whole cell; `items[i]` addresses one element and evaluates `i` when the action reaches it. Only arrays support access paths in cell targets; object-field paths are invalid.
+An action cell target is a lexical cell name followed by zero or more accesses into its inner value. A direct target such as `items` addresses the whole cell; `items[i]` addresses one element and evaluates `i` when the action reaches it. Only arrays and Structs support access paths in cell targets.
 
-An element target must select an existing position. `$set(...)` replaces that element without changing its siblings. Observation is available only for scalar-element arrays; `$observe(items[i])` briefs and writes the element using its type and `observing` question. `$unset()` remains a whole-cell operation: `items[i].$unset()` is a parse error because array values are dense and have no unset element slots. An array literal contributes element evidence to its consuming context, as in `items.$set(["a", "b"])`, `artifacts.$set([Artifact("a.md")])`, or an equality expression; the destination or operation supplies the element guarantee, and each concrete element is validated against it before mutation.
+An element target must select an existing position. `$set(...)` replaces that element without changing its siblings. Observation is available only for scalar- and Struct-element arrays; `$observe(items[i])` briefs and writes the element using its type and `observing` question. `$unset()` remains a whole-cell operation: `items[i].$unset()` is a parse error because array values are dense and have no unset element slots. An array literal contributes element evidence to its consuming context, as in `items.$set(["a", "b"])`, `artifacts.$set([Artifact("a.md")])`, or an equality expression; the destination or operation supplies the element guarantee, and each concrete element is validated against it before mutation.
 
-Equality and inequality require one shared element authority, admit every concrete element under it, and then compare ordered element values structurally. Scalar arrays use their boolean, string, or number family; Enum elements participate as strings because equality does not apply Enum ordering domains. Artifact arrays use Artifact authority and compare members by admitted path, while two dynamic object arrays do not become Artifact arrays from shape alone. The shared unset-comparison rule applies unchanged (equality involving an unset array is `false`, inequality is `true`). Ordering, arithmetic, and boolean evaluation of a whole array are rejected. Template interpolation renders a primitive array by JavaScript array stringification — elements joined with commas, an empty array as the empty string. A whole Artifact array is not renderable; index it first to project one path in a value template or emit one structured Artifact part in semantic text.
+Equality and inequality require one shared element authority, admit every concrete element under it, and then compare ordered element values structurally. Scalar arrays use their boolean, string, or number family; Enum elements participate as strings because equality does not apply Enum ordering domains. Artifact arrays use Artifact authority and compare members by admitted path, while two dynamic object arrays do not become Artifact arrays from shape alone. Struct-element arrays compare their records by Struct equality. The shared unset-comparison rule applies unchanged (equality involving an unset array is `false`, inequality is `true`). Ordering, arithmetic, and boolean evaluation of a whole array are rejected. Template interpolation renders a primitive array by JavaScript array stringification — elements joined with commas, an empty array as the empty string. A whole Artifact or Struct array is not renderable; index an Artifact array first to project one path in a value template or emit one structured Artifact part in semantic text, and read a field of a Struct element.
 
 Indexing, targeting an element, or reading `length` on an unset array is a runtime error. An index must resolve to a non-negative safe integer and select an existing position; other values and positions outside the current array are runtime errors. Index expressions may use arithmetic over literals and locally available values, such as `items[i + 1]` and `items[i + 1].$set(value)`. They cannot contain a host call or another expression that requires host resolution.
 
 A whole-array write and an element write must match the array's element type and are validated before mutation. An element observation must also satisfy a scalar element's `observeAs`; a direct write does not.
+
+#### Structs
+
+`Struct(fields, config?)` declares a cell whose inner value is a record of named fields. Each field is declared with a constructed observable cell — `Bool`, `Str`, `Enum`, `Num`, `RangedInt(...)`, an observable `Array(...)`, or a nested `Struct(...)` — and may carry its own `observing` question. The config `observing` is the question for the whole record:
+
+```js
+let request = Struct(
+  {
+    destination: Str({ observing: `where ${user} wants to travel` }),
+    preferences: Struct({
+      seating: Str({ observing: `the seating ${user} prefers` }),
+      accessible: Bool(),
+    }),
+    tags: Array(Str()),
+  },
+  { observing: `${user}'s travel request` },
+);
+```
+
+A field name is an identifier or string key. `isUnset`, a `$`-prefixed name, an unsafe object key such as `__proto__`, a repeated name, a spread, and an Artifact, `Dialog.Cursor`, or Artifact-array field are parse errors.
+
+A Struct is set when it holds a complete record, in which every declared field holds a value, recursively; otherwise the whole Struct is unset. `request.isUnset()` reports whether the record is held. `isUnset()` applies to a whole cell, so `request.destination.isUnset()` is a parse error. An empty `Struct({})` holds `{}` when set and follows the ordinary cell lifecycle.
+
+`request.destination` and `request["destination"]` read a field. A member name is interpreted by the receiver's declaration, so a field named `state` or `length` reads that field, and a name the Struct does not declare is a parse error. A field of an unset Struct is unset, so `request.destination == "Tokyo"` is `false` while `request` is unset.
+
+Fields are also cell targets:
+
+- `request.$set({ ... })` replaces the whole record. The object must supply every declared field; a missing or undeclared field is rejected before mutation, statically for an object literal.
+- `request.preferences.$set({ ... })` and `request.destination.$set(value)` replace one subtree or field of a set record and preserve its siblings.
+- `$unset()` applies only to a whole cell, so `request.preferences.$unset()` is a parse error.
+
+Writing or observing a field of an unset Struct is a runtime error, raised before the value expression is evaluated or any brief is emitted.
+
+`$observe(request)` briefs the declared fields with their questions, and the held record when the Struct is set. A reported value is a complete record. A field target such as `$observe(request.preferences)` observes that subtree of a set record.
+
+Equality and inequality compare two Structs field by field, recursively, regardless of the order in which fields were declared or written. The two Structs must declare the same field names, and each pair of fields must be comparable for equality, so a `Str` field compares with an `Enum` field and a `Str` field does not compare with a `Num` field. An unset Struct follows the shared unset-comparison rule. Ordering and template interpolation of a whole Struct are rejected; read a field instead.
+
+An `Array(Struct(...))` element is a complete record. `people[0].name` and `span.item.name` read element fields, including nested fields. Whole-array writes, element writes such as `people[0].$set({ name: "Ada", age: 36 })`, and element-field writes such as `people[0].name.$set("Ada")` follow the Struct write rules. Observing a Struct-element array asks for a list of complete records, each field described by the element's declaration.
 
 #### Operators
 
@@ -276,12 +318,9 @@ Some action forms are statement-only. Others can also appear inside expressions.
 
 Statement forms:
 
-- `$observe(target)` — passive extraction from conversation using the target's `.observing` question text.
-- ``$observe(target, `override question`)`` — passive extraction with a specific observation question.
-- `$observeOrAsk(target)` — extraction with fallback to asking the user.
-- ``$observeOrAsk(target, `override question`)`` — extraction with a specific observation question, fallback to asking.
-- `$observe({ cellA, cellB })` — grouped extraction of several cells as one action. See [Grouped Observation](#grouped-observation).
-- `$observeOrAsk({ cellA, cellB })` — grouped extraction with fallback to asking the user.
+- `$observe(target, question?)` — extraction from the host context. See [Observations](#observations).
+- `$observeOrAsk(target, question?)` — extraction with fallback to asking a participant of the run.
+- `$observe({ cellA, cellB })` and `$observeOrAsk({ cellA, cellB })` — grouped extraction of several cells as one action.
 - `target.$set(value)` — typed direct-cell or existing-array-element write.
 - `cell.$unset()` — clear a cell's inner value.
 - `$instruct(text, { deflectWhen?, hostParams? })` — one-shot instruction.
@@ -297,12 +336,6 @@ Expression-capable forms:
 - Host calls through imported `host:*` modules — yields a host-provided value. See [Host Modules](#host-modules).
 
 `$observe()`, `target.$set(...)`, and `cell.$unset()` can also appear in hooks. Hooks can use expression-capable forms in their expressions. `this.catchDeflection` and `this.catchInterruption` hooks also allow `$observeOrAsk(...)`.
-
-##### Grouped Observation
-
-`$observe({ a, b })` and `$observeOrAsk({ a, b })` observe several cells as one resolved-once action. The object literal binds cells by same-name binding: each entry is a shorthand property naming an observable cell, and a renamed entry such as `{ x: age }`, a computed key, or a spread is a parse error. Each cell is observed with its own `.observing` question, so the grouped forms take no override question.
-
-The action is atomic. The host extracts the whole set in one inference and reports every field in one report; the runtime applies that report as a unit and holds no per-field progress. When the report resolves all fields, the action writes them together. A `$observe({ ... })` field the host returns as `unknown` is skipped and its cell left unchanged. A `$observeOrAsk({ ... })` report that leaves any field pending re-emits the whole group and writes nothing until one report resolves every field.
 
 #### Host Params
 
@@ -323,6 +356,64 @@ function Review() {
 The value may be any scalar literal or an array or object of scalar literals with non-computed keys. Numeric entries use direct unsigned literal syntax; signed numeric expressions are not part of the `hostParams` grammar. Template literals are also not valid inside `hostParams`.
 
 Arc never interprets these keys. Which ones are meaningful, and what they select — the agent that carries out the node's work, the dialog view the node evaluates under — belongs to the host the arc is deployed on; write them as that host documents them. Host params do not inherit: each node declares its own or supplies none.
+
+#### Observations
+
+An observation asks the host for a target's value and writes the reported value into the target. `$observe(...)` extracts the value from the host context. `$observeOrAsk(...)` extracts it the same way and falls back to asking a participant of the run. The observation's question determines who is asked.
+
+```js
+let topic = Str({ observing: `what topic ${user} has mentioned` });
+let depth = RangedInt(1, 5, { observing: `how deep ${user} wants to go` });
+
+$observe(topic);
+$observe(topic, `which topic ${user} raised most recently`);
+$observeOrAsk(depth);
+$observe({ topic, depth });
+```
+
+Each action has three forms:
+
+- `$observe(target)` and `$observeOrAsk(target)` observe one target with its declared question.
+- ``$observe(target, `question`)`` and ``$observeOrAsk(target, `question`)`` observe one target with a question for this call.
+- `$observe({ a, b })` and `$observeOrAsk({ a, b })` observe several cells as one action. See [Grouped Observation](#grouped-observation).
+
+A target is an observable cell or a position inside one: an array element such as `items[i]`, a Struct field such as `request.destination`, or an element field such as `people[0].name`. A position inside a cell requires that cell to be set. `args`, `returns`, and `span` are not observation targets.
+
+##### Observation Questions
+
+The question the host answers comes from the first of these that exists:
+
+1. The second argument of the call.
+2. The target's declared `observing`.
+3. The default text `observe <target>`, such as `observe request.destination`.
+
+Where a target declares its question depends on the target:
+
+| Target | Declared question |
+| --- | --- |
+| Scalar cell | `observing` in the declaration config, or a later `cell.observing = ...` assignment. |
+| Array cell or element | The element's `observing`, as in `Array(Str({ observing: ... }))`. For a whole array, it is the per-item question. |
+| Struct cell | `observing` in the Struct config, which asks for the whole record. Each field's own `observing` is briefed with it. |
+| Struct field | The field's own `observing`. |
+
+A second definition of a target's `observing` is a parse error. A question for one call replaces only the target's own question, so a Struct's field questions stay as declared.
+
+##### Observation Results
+
+`$observe(...)` leaves each named target holding a reported value or unchanged. `$observeOrAsk(...)` completes only when each named target holds a reported value. A named target is written as a whole, so a Struct or array receives a complete value or none.
+
+- `$observe(target)` writes a reported value. An `unknown` report consumes the action and preserves any existing value.
+- `$observeOrAsk(target)` writes only a reported value. Any other report writes nothing, and the observation resurfaces.
+
+A reported value must satisfy the target's type and `observeAs`. A report that fails this check writes nothing, and the observation is emitted again.
+
+The host receives the target's current value when it has one. A prior `$set(...)` supplies that value and does not resolve the observation.
+
+##### Grouped Observation
+
+`$observe({ a, b })` and `$observeOrAsk({ a, b })` observe several cells as one resolved-once action. The object literal binds cells by same-name binding: each entry is a shorthand property naming an observable cell, and a renamed entry such as `{ x: age }`, a computed key, or a spread is a parse error. Each cell is observed with its own declared question, so the grouped forms take no question argument.
+
+The action is atomic. The host extracts the whole set in one inference and reports every cell in one report, and the runtime applies that report as a unit and holds no per-cell progress. A `$observe({ ... })` report writes its resolved cells together and leaves each `unknown` cell unchanged. A `$observeOrAsk({ ... })` report that leaves any cell pending re-emits the whole group and writes nothing until one report resolves every cell.
 
 #### Instructions
 
@@ -442,8 +533,8 @@ The callback admits the same actions as an `invoke` body — control flow, `cell
 
 Results and length:
 
-- The receiver may be an array cell or a typed `args`/`returns` array channel; `$map` never writes it.
-- `results` is a bare array cell whose element type must match what the callback produces. The outputs commit to it in one write, in element order, when the whole `$map` resolves.
+- The receiver may be an array cell, a typed `args`/`returns` array channel, or an array field of a Struct cell or channel; `$map` never writes it.
+- `results` is a bare array cell or an array field of a Struct cell, such as `request.tags`, whose element type must match what the callback produces. The outputs commit to it in one write, in element order, when the whole `$map` resolves; a field commit writes only that field and requires its Struct to be set.
 - With `results` bound, every element must set `span.result`; an element that finishes without one is a runtime error. Referencing `span.result` in a forEach `$map` is a parse error.
 - `$map` preserves length: one output per input, no filtering. `results` may be the receiver itself, replacing it in one write.
 
@@ -457,9 +548,10 @@ Different actions and expressions resolve as follows:
 | --- | --- |
 | `cell.$set(value)` | Resolves after the value expression is available and the typed write succeeds. |
 | `cell.$unset()` | Resolves after clearing the inner value. |
-| `$observe(cell)` | Resolves after the host reports an observation result. A `resolved` result writes the reported value. An `unknown` result consumes the action and preserves any existing value. Prior `$set(...)` writes provide the observation's current value; they do not resolve the `$observe(...)` action. |
-| `$observeOrAsk(cell)` | Resolves after the host reports a concrete value. |
-| `$observe({ ... })` / `$observeOrAsk({ ... })` | Resolves after the host reports results for every field in one report. All `resolved` fields are written together; `unknown` fields are skipped. A grouped `$observeOrAsk` whose report leaves any field pending re-emits the whole group and writes nothing. See [Grouped Observation](#grouped-observation). |
+| `$observe(target)` | Resolves after the host reports a value or `unknown`. |
+| `$observeOrAsk(target)` | Resolves after the host reports a concrete value. |
+| `$observe({ ... })` | Resolves after one report addresses every cell. |
+| `$observeOrAsk({ ... })` | Resolves after one report resolves every cell. |
 | `$instruct(...)` | Resolves after its per-id application report unless its effective `deflectWhen` deflects first. |
 | `$instructLoop(...)` | Resolves when its `resolveWhen` evaluates true. While pending, the runtime checks reported `deflectWhen` evidence, `resolveWhen` evidence, and application reporting independently. |
 | `$enter(Target)` | Resolves when the target traversal reaches `State.COVERED` or `State.SKIPPED`. Covered targets commit staged `returns`; skipped targets resolve without committing staged `returns`. |
@@ -473,6 +565,7 @@ Different actions and expressions resolve as follows:
 Arc expressions are shared across value positions, including `if` tests, hook returns, `cell.$set(...)` values, template interpolations, and expression-position host calls. They support:
 
 - Value-bearing cell references — `interest`, `musicSurfaced`, `startedAt`
+- Array element and Struct field reads — `items[i]`, `request.destination`, `people[i].name`
 - Numeric arithmetic — `subtotal + tax`, `distance / duration`, `i + 1`, `-offset`
 - Numeric finiteness checks — `Num.isFinite(arith)`
 - Comparisons — `interest >= "lukewarm"`, `ready == true`
@@ -490,7 +583,7 @@ Comparison and logical composition evaluate by the rules in [Operators](#operato
 
 A template literal in a value position renders each interpolation to ordinary string text. Primitive values and primitive arrays use their existing string rendering, while an Artifact contributes its logical path. A whole Artifact array is rejected; indexing it first contributes the selected Artifact's path. The rendered result is an ordinary string regardless of which supported values contributed to it.
 
-A **boolean position** — an `if` test, the operands of `&&`, `||`, and `!`, a ternary test, and a `this.trigger`, `this.catchDeflection`, `this.catchInterruption`, `resolveWhen`, or `deflectWhen` return — accepts only a boolean value, without coercion. A comparison, `Num.isFinite(...)`, `&&` / `||` / `!`, `judge(...)`, a regex `.test(...)`, `.isUnset()`, `this.deflection.escaped(...)`, and a set `Bool` cell are booleans; a `Str`, `Num`, `Enum`, `Dialog.Cursor`, Artifact, or array value is not, and must be compared explicitly — `count > 0`, never `count`.
+A **boolean position** — an `if` test, the operands of `&&`, `||`, and `!`, a ternary test, and a `this.trigger`, `this.catchDeflection`, `this.catchInterruption`, `resolveWhen`, or `deflectWhen` return — accepts only a boolean value, without coercion. A comparison, `Num.isFinite(...)`, `&&` / `||` / `!`, `judge(...)`, a regex `.test(...)`, `.isUnset()`, `this.deflection.escaped(...)`, and a set `Bool` cell are booleans; a `Str`, `Num`, `Enum`, `Dialog.Cursor`, Artifact, array, or Struct value is not, and must be compared explicitly — `count > 0`, never `count`.
 
 A non-boolean value in a boolean position is rejected at parse time when its type is statically known, and poisons the traversal at runtime otherwise. An unset `Bool` used bare poisons the traversal too — its type passes the parse check, but there is no boolean to read — so either compare it (`== true` / `== false`, which are `false` on an unset cell) or ensure it is set before the bare read.
 
@@ -752,7 +845,6 @@ Processing rules:
 
 - `this.pendingState` exposes the outcome being finalized: `State.COVERED` or `State.DEFLECTED`. It is available only inside `this.effects`.
 - During deflected effects, `this.deflection.escaped(Target)` reports whether the deflection came through one of the node's own entries of `Target`. The `this.deflection` channel is unavailable during covered effects.
-- `$observe()` calls use the cell's declared `.observing`.
 - `cell.$set(value)` performs a type-checked write.
 - `cell.$unset()` clears the inner value.
 - Host calls used as actions prefix the operation name with `$`, as in `Memoir.facts.$apply(...)`, and use the same protocol and action-state semantics as calls in the main action graph.
@@ -930,7 +1022,7 @@ function Op(
 
 A node may declare `args`, `returns`, both, or neither; when both are present `args` precedes `returns`, and no other parameter name is admitted.
 
-Each channel key has a type. A key's type is `Bool()`, `Str()`, `Enum(...)`, `Num()`, `Artifact()`, `Dialog.Cursor()`, or `Array(elementSpec)`, with no observation config. `Array` accepts the same scalar element specs as a cell array or zero-argument `Artifact()`; nested channel arrays remain invalid. `Index()` is a channel-only non-negative-safe-integer refinement of `Num()` and cannot declare a cell or array element.
+Each channel key has a type. A key's type is `Bool()`, `Str()`, `Enum(...)`, `Num()`, `Artifact()`, `Dialog.Cursor()`, `Array(elementSpec)`, or `Struct({ ... })`, with no observation config. `Array` accepts the same element specs as a cell array; nested channel arrays remain invalid. `Struct` accepts the same field specs as a Struct cell. `Index()` is a channel-only non-negative-safe-integer refinement of `Num()` and cannot declare a cell or array element.
 
 `$enter(...)` and `$enterLoop(...)` bind caller cells to the target's keys:
 

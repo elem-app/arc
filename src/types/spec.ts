@@ -10,13 +10,19 @@ export type ScalarValueSpec =
 /** Guarantee declared by an Artifact cell or channel. */
 export type ArtifactSpec = { type: "artifact" };
 
-/** Immediate element guarantees supported by one-level Arc arrays. */
-export type ArrayElementSpec = ScalarValueSpec | ArtifactSpec;
+/**
+ * Immediate element guarantees supported by Arc arrays: a scalar, an Artifact,
+ * or a Struct whose every element is a complete record.
+ */
+export type ArrayElementSpec = ScalarValueSpec | ArtifactSpec | StructSpec;
 
-/** One-level array guarantee whose values may be semantically observed. */
+/** Element guarantee of an array whose values may be semantically observed. */
+export type ObservableElementSpec = ScalarValueSpec | StructSpec;
+
+/** Array guarantee whose values may be semantically observed. */
 export type ObservableArraySpec = {
   type: "array";
-  element: ScalarValueSpec;
+  element: ObservableElementSpec;
 };
 
 /** One-level stored Artifact-array guarantee. */
@@ -25,11 +31,29 @@ export type ArtifactArraySpec = {
   element: ArtifactSpec;
 };
 
-/** One-level authored array guarantee. */
+/** Authored array guarantee. */
 export type ArraySpec = ObservableArraySpec | ArtifactArraySpec;
 
-/** Guarantee declared by a semantically observable cell. */
-export type ObservableCellSpec = ScalarValueSpec | ObservableArraySpec;
+/**
+ * Named-field record guarantee whose fields are recursively observable. A
+ * value carries exactly the declared fields, each with a concrete value.
+ */
+export type StructSpec = {
+  type: "struct";
+  fields: Record<string, ObservableFieldSpec>;
+};
+
+/** Guarantee declared by one field of an observable Struct. */
+export type ObservableFieldSpec =
+  | ScalarValueSpec
+  | ObservableArraySpec
+  | StructSpec;
+
+/**
+ * Guarantee declared by a semantically observable cell. A cell and a Struct
+ * field admit the same observable guarantees.
+ */
+export type ObservableCellSpec = ObservableFieldSpec;
 
 /** Guarantee declared by a dialog-cursor cell or channel. */
 export type DialogCursorSpec = { type: "dialogCursor" };
@@ -46,7 +70,8 @@ export type ChannelSpec =
   | ArtifactSpec
   | DialogCursorSpec
   | { type: "index" }
-  | { type: "array"; element: ArrayElementSpec };
+  | { type: "array"; element: ArrayElementSpec }
+  | StructSpec;
 
 /** Value guarantee accepted by a supplied host-operation argument. */
 export type HostParameterValueSpec =
@@ -97,6 +122,22 @@ export function isObservableCellSpec(
   );
 }
 
+/** Whether a channel guarantee may declare a Struct field. */
+export function isObservableFieldSpec(
+  spec: ChannelSpec,
+): spec is ObservableFieldSpec {
+  switch (spec.type) {
+    case "artifact":
+    case "dialogCursor":
+    case "index":
+      return false;
+    case "array":
+      return spec.element.type !== "artifact";
+    default:
+      return true;
+  }
+}
+
 export function isSettableCellSpec(spec: CellSpec): boolean {
   return (
     isObservableCellSpec(spec) ||
@@ -132,12 +173,93 @@ export function cellSpecToChannelSpec(spec: CellSpec): ChannelSpec {
         type: "array",
         element: arrayElementSpecToChannelSpec(spec.element),
       };
+    case "struct":
+      return structSpecOf(spec);
+  }
+}
+
+/**
+ * A Struct shape whose fields belong to one field family `F`. A family is
+ * closed under nesting when each of its Struct members is itself a
+ * `StructShape<F>`, as for guarantees and for authored declarations.
+ */
+export type StructShape<F> = { type: "struct"; fields: Record<string, F> };
+
+/**
+ * Resolves the field a non-empty path names inside a Struct. `asStruct`
+ * exposes a field as a nested Struct of the same family, or returns
+ * `undefined` for a non-Struct field, so a field at any depth keeps the
+ * receiver's family.
+ */
+export function fieldAtPath<F>(
+  struct: StructShape<F>,
+  path: readonly string[],
+  asStruct: (field: F) => StructShape<F> | undefined,
+): F | undefined {
+  let fields = struct.fields;
+  let field: F | undefined;
+  for (const [depth, name] of path.entries()) {
+    if (depth > 0) {
+      const nested = asStruct(field!);
+      if (!nested) return undefined;
+      fields = nested.fields;
+    }
+    if (!Object.hasOwn(fields, name)) return undefined;
+    field = fields[name]!;
+  }
+  return field;
+}
+
+/** Resolves the guarantee of a non-empty field path inside a Struct. */
+export function fieldSpecAt(
+  spec: StructSpec,
+  path: readonly string[],
+): ObservableFieldSpec | undefined {
+  return fieldAtPath(spec, path, (field) =>
+    field.type === "struct" ? field : undefined,
+  );
+}
+
+/** Projects a Struct declaration into its bare recursive value guarantee. */
+export function structSpecOf(spec: StructSpec): StructSpec {
+  return {
+    type: "struct",
+    fields: Object.fromEntries(
+      Object.entries(spec.fields).map(([name, field]) => [
+        name,
+        fieldSpecOf(field),
+      ]),
+    ),
+  };
+}
+
+/** Projects one Struct field declaration into its bare value guarantee. */
+export function fieldSpecOf(spec: ObservableFieldSpec): ObservableFieldSpec {
+  switch (spec.type) {
+    case "struct":
+      return structSpecOf(spec);
+    case "array":
+      return { type: "array", element: observableElementSpecOf(spec.element) };
+    default:
+      return scalarSpecOf(spec);
   }
 }
 
 function arrayElementSpecToChannelSpec(
   spec: ArrayElementSpec,
 ): ArrayElementSpec {
+  return spec.type === "artifact"
+    ? { type: "artifact" }
+    : observableElementSpecOf(spec);
+}
+
+function observableElementSpecOf(
+  spec: ObservableElementSpec,
+): ObservableElementSpec {
+  return spec.type === "struct" ? structSpecOf(spec) : scalarSpecOf(spec);
+}
+
+function scalarSpecOf(spec: ScalarValueSpec): ScalarValueSpec {
   switch (spec.type) {
     case "boolean":
       return { type: "boolean" };
@@ -147,7 +269,5 @@ function arrayElementSpecToChannelSpec(
       return { type: "enum", values: spec.values };
     case "number":
       return { type: "number" };
-    case "artifact":
-      return { type: "artifact" };
   }
 }

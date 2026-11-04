@@ -401,7 +401,7 @@ type JudgmentBrief = {
 
 #### Observations and Observation Groups
 
-`ObservationBrief` represents a request by the runtime to extract a cell target's value — from an `$observe()` or `$observeOrAsk()` call. The target may be a whole cell or a concrete array element selected by the authored target expression. The host infers the value from conversation context using the provided question and the target leaf's type definition. When `mode` is `"observeOrAsk"`, the host may ask the user directly instead of inferring.
+`ObservationBrief` represents a request by the runtime to extract a cell target's value — from an `$observe()` or `$observeOrAsk()` call. The target may be a whole cell, a concrete array element, or a Struct field selected by the authored target expression. The host infers the value from conversation context using the provided question and the target leaf's type definition. When `mode` is `"observeOrAsk"`, the host may ask the user directly instead of inferring.
 
 ```typescript
 type ObservationBrief = {
@@ -419,13 +419,22 @@ type ObservationBrief = {
   mode: "observe" | "observeOrAsk";
   /** Rendered semantic observation question from arc source. */
   question: SemanticText;
-  /** Current target-leaf value, if any. */
-  currentValue?: PrimitiveValue | PrimitiveArrayValue;
+  /** Current target value, present only when the target is set. */
+  currentValue?: ObservedValue;
   /** Semantic metadata for this work item. */
   hostParams: PayloadValue;
-  /** Target-leaf type metadata for host-side validation/UI. */
-  meta: ObservationValueMeta;
+  /** Target type metadata for host-side validation/UI. */
+  meta: ObservationMeta;
 };
+
+type ObservedValue =
+  | PrimitiveValue
+  | PrimitiveArrayValue
+  | ObservedStructValue
+  | ObservedStructValue[];
+
+/** Struct record keyed by field name. */
+type ObservedStructValue = { [field: string]: ObservedValue };
 
 type ScalarObservationMeta =
   | { type: "boolean" }
@@ -434,38 +443,54 @@ type ScalarObservationMeta =
   | { type: "rangedInt"; min: number; max: number }
   | { type: "number"; min?: number; max?: number };
 
-type ObservationValueMeta =
+type ObservationMeta =
   | ScalarObservationMeta
-  | {
-      type: "array";
-      element: ScalarObservationMeta;
-    };
+  | ArrayObservationMeta
+  | StructObservationMeta;
+
+type ArrayObservationMeta = {
+  type: "array";
+  element: ScalarObservationMeta | StructObservationMeta;
+};
+
+type StructObservationMeta = {
+  type: "struct";
+  fields: Record<string, StructObservationField>;
+};
+
+type StructObservationField = {
+  /** Rendered semantic question from the field's `observing`. */
+  question: SemanticText;
+  /** Field type metadata. */
+  meta: ObservationMeta;
+};
 ```
+
+A Struct target describes its declared fields recursively with their questions and type metadata. The held record, when the Struct is set, is the top-level `currentValue`.
 
 The numeric observation metadata variants are:
 
 - `type: "number"` accepts a finite number within optional inclusive `min` and `max` bounds.
 - `type: "rangedInt"` accepts a JavaScript safe integer within the required inclusive `min` and `max` bounds.
 
-For either numeric variant, negative zero is accepted and subsequently represented as zero. These rules apply to scalar observations, every element of an array observation, array-element observations, and every numeric field of a grouped observation. An item whose value has the wrong type, is non-finite, or does not satisfy the integer shape is rejected as an `invalid-item` with `reasonCode: "observation-type"`. A numeric value outside the inclusive bounds is rejected as an `invalid-item` with `reasonCode: "observation-range"`. A rejected single item remains unresolved; a rejected grouped item writes nothing and re-emits as a group. `currentValue` is informational and may lie outside the metadata bounds; the bounds constrain the new report.
+For either numeric variant, negative zero is accepted and subsequently represented as zero. These rules apply to scalar observations, every element of an array observation, array-element observations, every numeric Struct field, and every numeric field of a grouped observation. An item whose value has the wrong type, is non-finite, or does not satisfy the integer shape is rejected as an `invalid-item` with `reasonCode: "observation-type"`. A numeric value outside the inclusive bounds is rejected as an `invalid-item` with `reasonCode: "observation-range"`. A rejected single item remains unresolved; a rejected grouped item writes nothing and re-emits as a group. `currentValue` is informational and may lie outside the metadata bounds; the bounds constrain the new report.
 
 The host reports the outcome as an `ObservationReport`:
 
 ```typescript
-type ObservationReport = {
+type ObservationReport =
+  /** A complete concrete value of the target's type. */
+  | { status: "resolved"; value: ObservedValue }
   /**
-   * "resolved" — value inferred, include `value`.
-   * "unknown" — could not determine. For `$observe()`, the action is consumed
-   *   without writing a new value. For `$observeOrAsk()`, the action resurfaces
-   *   next brief.
-   * "needs-user" — host wants the user to answer (observeOrAsk only), and the
-   *   action resurfaces next brief.
+   * "unknown" — could not determine; existing state is preserved.
+   * "needs-user" — a participant must be asked; `$observeOrAsk()` only.
    */
-  status: "resolved" | "unknown" | "needs-user";
-  /** The reported value. */
-  value?: PrimitiveValue | PrimitiveArrayValue;
-};
+  | { status: "unknown" | "needs-user"; value?: never };
 ```
+
+For `$observe()`, the runtime writes a `resolved` value or preserves existing state on `unknown`, and resolves the action; `needs-user` is an invalid item. For `$observeOrAsk()`, the runtime writes only a `resolved` value; otherwise it writes nothing and the observation resurfaces on the next brief.
+
+A `resolved` report carries a complete value. A Struct value supplies every declared field and no undeclared one, recursively, so `{}` is a valid value only for an empty Struct. An array value is the whole list, each Struct element a complete record. A `resolved` report without a value, an incomplete record, and any other status are invalid items.
 
 `ObservationGroupBrief` represents a request to extract several cells together — from an `$observe({ ... })` or `$observeOrAsk({ ... })` call. It shares the `observations` channel with `ObservationBrief`; the two are distinguished by `kind`. Sharing the channel means a host that iterates `observations` is forced to handle the group variant rather than silently leaving it unresolved (which would deadlock the arc). The host infers the whole set in one inference and reports every field in one report. The group is one resolved-once action: the runtime applies the report as a unit and keeps no per-field progress.
 
@@ -492,16 +517,16 @@ type ObservationGroupField = {
   cell: string;
   /** Rendered semantic observation question from the cell's `observing`. */
   question: SemanticText;
-  /** Current value, if any. */
-  currentValue?: PrimitiveValue | PrimitiveArrayValue;
+  /** Current value, present only when the member is set. */
+  currentValue?: ObservedValue;
   /** Cell type metadata for host-side validation/UI. */
-  meta: ObservationValueMeta;
+  meta: ObservationMeta;
 };
 ```
 
 The host reports the outcome as an `ObservationGroupReport`. It must carry an entry for every field in the brief; a report that omits a field is invalid, surfaces an `invalid-item` issue, writes nothing, and re-emits the group.
 
-Each entry is an `ObservationReport`, so an `Array` field reports its whole list exactly as a single array observation does. Reports carry no `kind`: read `ObservationGroupReport` apart from `ObservationReport` by the `fields` property, or by the `kind` of the brief the id came from.
+Each entry is an `ObservationReport`, so an `Array` field reports its whole list and a Struct field its whole record exactly as a single observation does. Reports carry no `kind`: read `ObservationGroupReport` apart from `ObservationReport` by the `fields` property, or by the `kind` of the brief the id came from.
 
 ```typescript
 type ObservationGroupReport = {
@@ -510,7 +535,7 @@ type ObservationGroupReport = {
 };
 ```
 
-When every field is `resolved` or `unknown`, the runtime writes all `resolved` values together and resolves the group. When any field is `needs-user`, the group re-emits and nothing is written.
+`$observe({ ... })` writes every `resolved` field together, preserves every `unknown` field, and resolves the group; any `needs-user` field re-emits the group and nothing is written. `$observeOrAsk({ ... })` writes only when every field is `resolved`; otherwise the group re-emits and nothing is written.
 
 #### Host Calls
 

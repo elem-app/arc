@@ -24,6 +24,8 @@ export type {
   LocalCellSpec,
   ObservableArraySpec,
   ObservableCellSpec,
+  ObservableFieldSpec,
   ScalarValueSpec,
+  StructSpec,
 } from "./spec.js";
 export * from "./value.js";

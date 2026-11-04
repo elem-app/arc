@@ -2196,6 +2196,24 @@ function Main() {
       ).toBe("override ask");
     });
 
+    it.each([
+      ["an array", "Array(Str())"],
+      ["a Struct", "Struct({ name: Str() })"],
+    ])("rejects an observing assignment on %s cell", (_label, declaration) => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let target = ${declaration};
+  target.observing = \`the target\`;
+  $observe(target);
+}
+`),
+      ).toThrow(
+        /target\.observing is only supported for scalar observable cells/,
+      );
+    });
+
     it("rejects this.observing and accepts cell.$set()", () => {
       expect(() =>
         parse(`
@@ -2955,7 +2973,7 @@ function Main() {
       ).toThrow(/CELL_TARGET_NON_CONTAINER/);
     });
 
-    it("keeps unset direct-only and keeps returns root assignment unsupported", () => {
+    it("keeps unset off array elements and keeps returns root assignment unsupported", () => {
       expect(() =>
         parse(`
 "arc";
@@ -3434,6 +3452,971 @@ function Main() {
           `"arc";\nfunction Main() { let note = Str(); let n = Num(); n.$set(note.length); }`,
         ),
       ).toThrow(/LENGTH_NON_ARRAY/);
+    });
+  });
+
+  describe("cell.struct", () => {
+    const REQUEST_SOURCE = `
+"arc";
+
+function Main() {
+  let request = Struct(
+    {
+      destination: Str({ observing: \`the requested destination\` }),
+      preferences: Struct({
+        seating: Str({ observing: \`the requested seating\` }),
+        accessible: Bool(),
+      }),
+      tags: Array(Str()),
+    },
+    { observing: \`the travel request\` },
+  );
+
+  $instruct(\`before \${request.isUnset()} \${request.destination == "Tokyo"}\`);
+  request.$set({
+    destination: "Tokyo",
+    preferences: { seating: "aisle", accessible: true },
+    tags: [],
+  });
+  request.preferences.seating.$set("window");
+  $instruct(\`after \${request.isUnset()} \${request.destination} \${request.preferences.seating}\`);
+}
+`;
+
+    function startStruct(source = REQUEST_SOURCE) {
+      const document = parse(source);
+      const runtime = new Runtime().add("struct-arc", document).init();
+      const seeded = runtime.newTraversal(arc("struct-arc", "Main"));
+      seeded.phase = "entered";
+      return { runtime, document, seeded };
+    }
+
+    it("struct.declaration parses nested observable fields and the whole-record question", () => {
+      const { document } = startStruct();
+      const cell = document.roots[0]!.cells[0]!;
+      expect(cell).toMatchObject({
+        name: "request",
+        type: "struct",
+        observing: { kind: "template-string" },
+        fields: {
+          destination: { type: "string", observing: {} },
+          preferences: {
+            type: "struct",
+            fields: {
+              seating: { type: "string" },
+              accessible: { type: "boolean" },
+            },
+          },
+          tags: { type: "array", element: { type: "string" } },
+        },
+      });
+    });
+
+    it.each([
+      [
+        "an Artifact field",
+        "Struct({ file: Artifact() })",
+        /request\.file must be an observable scalar/,
+      ],
+      [
+        "a Dialog.Cursor field",
+        "Struct({ at: Dialog.Cursor() })",
+        /request\.at must be an observable scalar/,
+      ],
+      [
+        "an Artifact-array field",
+        "Struct({ files: Array(Artifact()) })",
+        /request\.files cannot hold Artifact elements/,
+      ],
+      [
+        "an unsafe field name",
+        "Struct({ __proto__: Str() })",
+        /invalid field name "__proto__"/,
+      ],
+      [
+        "an isUnset field name",
+        "Struct({ isUnset: Str() })",
+        /invalid field name "isUnset"/,
+      ],
+      [
+        "a $-prefixed field name",
+        "Struct({ $set: Str() })",
+        /invalid field name "\$set"/,
+      ],
+      [
+        "a repeated field",
+        'Struct({ a: Str(), "a": Str() })',
+        /repeats field a/,
+      ],
+      ["a spread field", "Struct({ ...rest })", /fields do not support spread/],
+      [
+        "a non-object field map",
+        "Struct(Str())",
+        /fields must be an object literal/,
+      ],
+    ])("struct.declaration rejects %s", (_case, declaration, message) => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let request = ${declaration};
+}
+`),
+      ).toThrow(message);
+    });
+
+    it("struct.setness keeps a Struct unset until a complete record is written and then reads its fields", () => {
+      const { runtime, seeded } = startStruct();
+      const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+      expect(first.instructions.map((item) => item.text)).toEqual([
+        "before true false",
+      ]);
+      const second = progressBrief(runtime, first, {
+        move: "proceed",
+        instructions: appliedInstructions(first),
+      });
+      expect(rootTraversal(second).cells.request).toEqual({
+        destination: "Tokyo",
+        preferences: { seating: "window", accessible: true },
+        tags: [],
+      });
+      expect(second.instructions.map((item) => item.text)).toEqual([
+        "after false Tokyo window",
+      ]);
+    });
+
+    it("struct.access reads a field of an unset Struct as an unset read", () => {
+      const { runtime, seeded } = startStruct(`
+"arc";
+
+function Main() {
+  let request = Struct({ name: Str(), age: Num() });
+  let copied = Str();
+  copied.$set(request.name);
+}
+`);
+      const brief = actionTerminal(runtime.start([seeded], EMPTY_DIALOG));
+      expect(brief.outcome).toBe("poisoned");
+      expect(brief.issues).toContainEqual(
+        expect.objectContaining({
+          kind: "poisoned-traversal",
+          reasonCode: "invalid-cell-assignment",
+          reason: "copied.$set() requires a set value",
+        }),
+      );
+      expect(rootTraversal(brief).cells.copied).toBeUndefined();
+    });
+
+    it("struct.field-target rejects a field write into an unset Struct before evaluating its value", () => {
+      const { runtime, seeded } = startStruct(`
+"arc";
+
+function Main() {
+  let request = Struct({ name: Str(), approved: Bool() });
+  request.approved.$set(judge(\`whether the request is approved\`));
+}
+`);
+      const brief = actionTerminal(runtime.start([seeded], EMPTY_DIALOG));
+      expect(brief.outcome).toBe("poisoned");
+      expect(brief.issues).toContainEqual(
+        expect.objectContaining({
+          kind: "poisoned-traversal",
+          reasonCode: "unset-value",
+          reason: "Cannot access a field of unset Struct request",
+        }),
+      );
+      expect(rootTraversal(brief).cells.request).toBeUndefined();
+    });
+
+    it("struct.field-target rejects a field observation on an unset Struct before emitting a brief", () => {
+      const { runtime, seeded } = startStruct(`
+"arc";
+
+function Main() {
+  let request = Struct({ name: Str({ observing: \`the name\` }) });
+  $observe(request.name);
+}
+`);
+      const brief = actionTerminal(runtime.start([seeded], EMPTY_DIALOG));
+      expect(brief.outcome).toBe("poisoned");
+      expect(brief.issues).toContainEqual(
+        expect.objectContaining({
+          kind: "poisoned-traversal",
+          reasonCode: "unset-value",
+          reason: "Cannot access a field of unset Struct request",
+        }),
+      );
+    });
+
+    it("struct.validation rejects field $unset() and field isUnset() in authored source", () => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let request = Struct({ name: Str() });
+  request.name.$unset();
+}
+`),
+      ).toThrow(/\$unset\(\) requires a direct cell target/);
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let request = Struct({ name: Str() });
+  if (request.name.isUnset()) {}
+}
+`),
+      ).toThrow(/isUnset\(\) applies to a whole cell/);
+    });
+
+    it("struct.validation rejects field $unset() and field isUnset() in supplied Documents", () => {
+      const source = `
+"arc";
+function Main() {
+  let request = Struct({ name: Str() });
+  request.$unset();
+  if (request.isUnset()) {}
+}
+`;
+      const withFieldUnset = parse(source);
+      const unset = withFieldUnset.roots[0]!.statements[0]!;
+      if (unset.kind !== "unset")
+        throw new Error("expected an unset statement");
+      unset.target = ["request", { kind: "literal", value: "name" }];
+      expect(validate(withFieldUnset)).toContainEqual(
+        expect.objectContaining({ code: "NON_UNSETTABLE_CELL" }),
+      );
+      expect(() =>
+        new Runtime().add("field-unset", withFieldUnset).init(),
+      ).toThrow(/NON_UNSETTABLE_CELL/);
+
+      const withFieldIsUnset = parse(source);
+      const check = withFieldIsUnset.roots[0]!.statements[1]!;
+      if (check.kind !== "if") throw new Error("expected an if statement");
+      Object.assign(check, {
+        test: {
+          kind: "fieldIsUnset",
+          field: {
+            kind: "field",
+            receiver: { kind: "cell", name: "request" },
+            path: ["name"],
+          },
+        },
+      });
+      expect(validate(withFieldIsUnset)).toContainEqual(
+        expect.objectContaining({
+          code: "INVALID_EXPRESSION_STRATUM",
+          message: expect.stringMatching(/expected a recognized kind/),
+        }),
+      );
+      expect(() =>
+        new Runtime().add("field-is-unset", withFieldIsUnset).init(),
+      ).toThrow(/expected a recognized kind/);
+    });
+
+    it("struct.set replaces a whole Struct or subtree and rejects incomplete candidates without mutation", () => {
+      const { runtime, seeded } = startStruct(`
+"arc";
+
+function Main() {
+  let request = Struct({
+    destination: Str(),
+    preferences: Struct({ seating: Str(), accessible: Bool() }),
+  });
+  let missing = Str();
+  request.$set({
+    destination: "Tokyo",
+    preferences: { seating: "aisle", accessible: true },
+  });
+  request.preferences.$set({ seating: "window", accessible: false });
+  $instruct(\`seat \${request.preferences.seating}\`);
+  request.preferences.$set({ seating: missing, accessible: true });
+}
+`);
+      const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+      expect(first.instructions.map((item) => item.text)).toEqual([
+        "seat window",
+      ]);
+      expect(rootTraversal(first).cells.request).toEqual({
+        destination: "Tokyo",
+        preferences: { seating: "window", accessible: false },
+      });
+      const next = runtime.progress(
+        first,
+        { move: "proceed", instructions: appliedInstructions(first) },
+        EMPTY_DIALOG,
+      );
+      expect(next.issues).toContainEqual(
+        expect.objectContaining({
+          kind: "poisoned-traversal",
+          reasonCode: "invalid-cell-assignment",
+        }),
+      );
+      expect(rootTraversal(next).cells.request).toEqual({
+        destination: "Tokyo",
+        preferences: { seating: "window", accessible: false },
+      });
+    });
+
+    it("struct.set stores a deep copy independent of the cells its value was read from", () => {
+      const { runtime, seeded } = startStruct(`
+"arc";
+
+function Main() {
+  let city = Str();
+  let home = Struct({ city: Str() });
+  let person = Struct({ name: Str(), home: Struct({ city: Str() }) });
+  let people = Array(Struct({ name: Str(), home: Struct({ city: Str() }) }));
+  city.$set("Osaka");
+  home.$set({ city });
+  person.$set({ name: "Ada", home });
+  people.$set([person, person]);
+  person.name.$set("Bea");
+  people[0].$set(person);
+  city.$set("Kyoto");
+  home.city.$set("Nara");
+  person.name.$set("Cid");
+  person.home.city.$set("Kobe");
+  people[1].home.city.$set("Uji");
+  $instruct(\`done\`);
+}
+`);
+      const { cells } = rootTraversal(
+        startRun(runtime, [seeded], EMPTY_DIALOG),
+      );
+      expect(cells.city).toBe("Kyoto");
+      expect(cells.home).toEqual({ city: "Nara" });
+      expect(cells.person).toEqual({ name: "Cid", home: { city: "Kobe" } });
+      expect(cells.people).toEqual([
+        { name: "Bea", home: { city: "Osaka" } },
+        { name: "Ada", home: { city: "Uji" } },
+      ]);
+    });
+
+    it("struct.set rejects object literals with a missing or undeclared field statically", () => {
+      for (const literal of [
+        '{ destination: "Tokyo" }',
+        '{ destination: "Tokyo", seat: "aisle", extra: 1 }',
+        '{ destination: 1, seat: "aisle" }',
+      ]) {
+        expect(() =>
+          parse(`
+"arc";
+function Main() {
+  let request = Struct({ destination: Str(), seat: Str() });
+  request.$set(${literal});
+}
+`),
+        ).toThrow(/CELL_VALUE_TYPE/);
+      }
+    });
+
+    it("struct.empty follows the ordinary cell lifecycle", () => {
+      const { runtime, seeded } = startStruct(`
+"arc";
+
+function Main() {
+  let marker = Struct({});
+  let step = Num();
+  if (step.isUnset()) {
+    step.$set(1);
+    if (marker.isUnset()) {
+      marker.$set({});
+    }
+  }
+  if (!marker.isUnset()) {
+    $instruct(\`set\`);
+    marker.$unset();
+    $instruct(\`cleared \${marker.isUnset()}\`);
+  }
+}
+`);
+      const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+      expect(rootTraversal(first).cells.marker).toEqual({});
+      expect(first.instructions.map((item) => item.text)).toEqual(["set"]);
+      const second = progressBrief(runtime, first, {
+        move: "proceed",
+        instructions: appliedInstructions(first),
+      });
+      expect(rootTraversal(second).cells.marker).toBeUndefined();
+      expect(second.instructions.map((item) => item.text)).toEqual([
+        "cleared true",
+      ]);
+    });
+
+    it("struct.fields interprets state and length field names by the receiver's declared role", () => {
+      const document = parse(`
+"arc";
+
+function Main() {
+  let order = Struct({ state: Str(), length: Num(), items: Array(Str()) });
+  order.$set({ state: "open", length: 3, items: ["a", "b"] });
+  $instruct(\`\${order.state} \${order.length} \${order.items.length} \${order["items"][1]}\`);
+}
+`);
+      expect(document.roots[0]!.statements[1]).toMatchObject({
+        kind: "instruction",
+        template: {
+          parts: [
+            {
+              kind: "expression",
+              expression: { kind: "field", path: ["state"] },
+            },
+            { kind: "text" },
+            {
+              kind: "expression",
+              expression: { kind: "field", path: ["length"] },
+            },
+            { kind: "text" },
+            {
+              kind: "expression",
+              expression: {
+                kind: "arrayLength",
+                array: { kind: "field", path: ["items"] },
+              },
+            },
+            { kind: "text" },
+            {
+              kind: "expression",
+              expression: {
+                kind: "arrayElementRead",
+                array: { kind: "field", path: ["items"] },
+              },
+            },
+          ],
+        },
+      });
+      const runtime = new Runtime().add("struct-roles", document).init();
+      const seeded = runtime.newTraversal(arc("struct-roles", "Main"));
+      seeded.phase = "entered";
+      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      expect(brief.instructions.map((item) => item.text)).toEqual([
+        "open 3 2 b",
+      ]);
+    });
+
+    it.each([
+      ["an undeclared field read", "$instruct(`${request.missing}`);"],
+      ["an undeclared field target", 'request.missing.$set("x");'],
+      ["a whole-Struct interpolation", "$instruct(`${request}`);"],
+      ["a Struct ordering", "if (request > request) { $instruct(`x`); }"],
+      ["a scalar landing", 'request.$set("x");'],
+    ])("struct.validation rejects %s", (_case, statement) => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let request = Struct({ name: Str() });
+  ${statement}
+}
+`),
+      ).toThrow();
+    });
+
+    it("struct.equality compares complete Structs recursively regardless of field order", () => {
+      const { runtime, seeded } = startStruct(`
+"arc";
+
+function Main() {
+  let a = Struct({
+    name: Str(),
+    tags: Array(Str()),
+    prefs: Struct({ seat: Str(), tier: Enum(["a", "b"]) }),
+  });
+  let b = Struct({
+    prefs: Struct({ tier: Str(), seat: Str() }),
+    tags: Array(Str()),
+    name: Str(),
+  });
+  let other = Struct({
+    name: Str(),
+    tags: Array(Str()),
+    prefs: Struct({ seat: Str(), tier: Enum(["a", "b"]) }),
+  });
+  let missing = Struct({
+    name: Str(),
+    tags: Array(Str()),
+    prefs: Struct({ seat: Str(), tier: Enum(["a", "b"]) }),
+  });
+  let people = Array(Struct({ name: Str(), age: Num() }));
+  let copies = Array(Struct({ age: Num(), name: Str() }));
+  let result = Str();
+  a.$set({ name: "Ada", tags: ["x"], prefs: { seat: "aisle", tier: "a" } });
+  b.$set({ tags: ["x"], prefs: { tier: "a", seat: "aisle" }, name: "Ada" });
+  other.$set({ name: "Ada", tags: ["y"], prefs: { seat: "aisle", tier: "a" } });
+  people.$set([{ name: "Ada", age: 36 }]);
+  copies.$set([{ age: 36, name: "Ada" }]);
+  result.$set(
+    \`\${a == b} \${b == a} \${a == other} \${a != other} \${a == missing} \${a != missing} \${people == copies}\`,
+  );
+}
+`);
+      const terminal = actionTerminal(runtime.start([seeded], EMPTY_DIALOG));
+      expect(terminal.outcome).toBe("covered");
+      expect(rootTraversal(terminal).cells.result).toBe(
+        "true true false true false true true",
+      );
+    });
+
+    it.each([
+      [
+        "an ordering",
+        "let a = Struct({ x: Str() }); let b = Struct({ x: Str() }); if (a < b) {}",
+      ],
+      [
+        "a missing field",
+        "let a = Struct({ x: Str(), y: Str() }); let b = Struct({ x: Str() }); if (a == b) {}",
+      ],
+      [
+        "an incomparable field",
+        "let a = Struct({ x: Str() }); let b = Struct({ x: Num() }); if (a == b) {}",
+      ],
+      ["a scalar operand", 'let a = Struct({ x: Str() }); if (a == "x") {}'],
+      [
+        "differently shaped elements",
+        "let a = Array(Struct({ x: Str() })); let b = Array(Struct({ y: Str() })); if (a == b) {}",
+      ],
+    ])("struct.equality rejects %s at parse", (_case, body) => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  ${body}
+}
+`),
+      ).toThrow(/COMPARISON_VALUE_TYPE|ARRAY_ORDERING/);
+    });
+
+    it("struct.lint counts field writes and observations as reads of their Struct", () => {
+      const lint = (body: string) =>
+        analyzeDocument(
+          parse(`
+"arc";
+function Main() {
+  let s = Struct({ x: Str(), tags: Array(Str()) });
+  let items = Array(Str());
+  ${body}
+}
+`),
+        )
+          .lintIssues.filter((issue) => issue.code.startsWith("read-"))
+          .map(({ code, severity }) => ({ code, severity }));
+
+      const record = 's.$set({ x: "a", tags: [] });';
+      expect(
+        lint(`${record} s.x.$set("known"); $instruct(\`\${s.x}\`);`),
+      ).toEqual([]);
+      expect(lint('s.x.$set("known"); $instruct(`${s.x}`);')).toEqual([
+        { code: "read-without-assignment", severity: "error" },
+      ]);
+      expect(lint("$observe(s.x);")).toEqual([
+        { code: "read-without-assignment", severity: "error" },
+      ]);
+      expect(
+        lint(
+          `${record} items.$set(["a"]); items.$map(() => span.result.$set(span.item), s.tags); $instruct(\`\${s.tags}\`);`,
+        ),
+      ).toEqual([]);
+      expect(
+        lint(
+          'items.$set(["a"]); items.$map(() => span.result.$set(span.item), s.tags);',
+        ),
+      ).toEqual([{ code: "read-without-assignment", severity: "error" }]);
+      expect(lint("$instruct(`${s.x}`);")).toEqual([
+        expect.objectContaining({
+          code: "read-without-assignment",
+          severity: "error",
+        }),
+      ]);
+      expect(lint(`$instruct(\`\${s.x}\`); ${record}`)).toEqual([
+        expect.objectContaining({
+          code: "read-before-assignment",
+          severity: "notice",
+        }),
+      ]);
+    });
+
+    it("struct.declaration observing questions read fields of Structs declared in the same node", () => {
+      const { runtime, seeded } = startStruct(`
+"arc";
+
+function Main() {
+  let topic = Str({ observing: \`more about \${request.name}\` });
+  let request = Struct({
+    name: Str(),
+    detail: Str({ observing: \`details on \${request.name}\` }),
+  });
+  request.$set({ name: "Ada", detail: "none" });
+  $observe(topic);
+  $observe(request.detail);
+}
+`);
+      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const topic = singleObservations(brief)[0]!;
+      expect(renderSemanticTextForTest(topic.question)).toBe("more about Ada");
+      const next = progressBrief(runtime, brief, {
+        move: "proceed",
+        observations: { [topic.id]: { status: "resolved", value: "music" } },
+      });
+      const detail = singleObservations(next)[0]!;
+      expect(renderSemanticTextForTest(detail.question)).toBe("details on Ada");
+    });
+
+    it("struct.declaration validates cell references inside field observing questions", () => {
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let report = Artifact(\`reports/\${request.name}.md\`);
+  let request = Struct({ name: Str() });
+}
+`),
+      ).not.toThrow();
+      expect(() =>
+        parse(`
+"arc";
+function Main() {
+  let request = Struct({ name: Str({ observing: \`about \${missing}\` }) });
+}
+`),
+      ).toThrow(/UNKNOWN_CELL|missing/);
+    });
+
+    function setRequestBrief() {
+      const { runtime, seeded } = startStruct();
+      const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const brief = progressBrief(runtime, first, {
+        move: "proceed",
+        instructions: appliedInstructions(first),
+      });
+      return { runtime, brief };
+    }
+
+    it("struct.persistence round-trips a complete record", () => {
+      const { runtime, brief } = setRequestBrief();
+      const restored = JSON.parse(
+        JSON.stringify(brief.traversals),
+      ) as ArcTraversalSet;
+      const again = startRun(runtime, restored, EMPTY_DIALOG);
+      expect(rootTraversal(again).cells.request).toEqual({
+        destination: "Tokyo",
+        preferences: { seating: "window", accessible: true },
+        tags: [],
+      });
+    });
+
+    const COMPLETE_REQUEST = {
+      destination: "Tokyo",
+      preferences: { seating: "aisle", accessible: true },
+      tags: [],
+    };
+
+    it.each([
+      ["an undeclared field", { ...COMPLETE_REQUEST, extra: 1 }],
+      ["an invalid field value", { ...COMPLETE_REQUEST, destination: 1 }],
+      ["a missing field", { destination: "Tokyo", tags: [] }],
+      [
+        "a missing nested field",
+        { ...COMPLETE_REQUEST, preferences: { seating: "aisle" } },
+      ],
+      ["an empty record", {}],
+    ])("struct.persistence rejects restored state with %s", (_case, state) => {
+      const { runtime, brief } = setRequestBrief();
+      const restored = JSON.parse(
+        JSON.stringify(brief.traversals),
+      ) as ArcTraversalSet;
+      restored[0]!.cells.request = state;
+      expect(() => runtime.start(restored, EMPTY_DIALOG)).toThrow(
+        /Invalid persisted traversal state/,
+      );
+    });
+  });
+
+  describe("cell.struct-array", () => {
+    function startPeople(statements: string) {
+      const document = parse(`
+"arc";
+
+function Main() {
+  let people = Array(Struct({ name: Str({ observing: \`the name\` }), age: Num() }));
+  ${statements}
+}
+`);
+      const runtime = new Runtime().add("struct-array-arc", document).init();
+      const seeded = runtime.newTraversal(arc("struct-array-arc", "Main"));
+      seeded.phase = "entered";
+      return { runtime, document, seeded };
+    }
+
+    it("struct-array.declaration parses Struct elements for cells, Struct fields, and channels", () => {
+      const document = parse(`
+"arc";
+function Main() {
+  let people = Array(Struct({ name: Str() }, { observing: \`a person\` }));
+  let team = Struct({ crew: Array(Struct({ name: Str() })) });
+  function Child(args = { people: Array(Struct({ name: Str() })) }) {}
+}
+`);
+      const root = document.roots[0]!;
+      expect(root.cells[0]).toMatchObject({
+        type: "array",
+        element: {
+          type: "struct",
+          fields: { name: { type: "string" } },
+          observing: { kind: "template-string" },
+        },
+      });
+      expect(root.cells[1]).toMatchObject({
+        type: "struct",
+        fields: {
+          crew: {
+            type: "array",
+            element: { type: "struct", fields: { name: { type: "string" } } },
+          },
+        },
+      });
+      expect(root.children[0]!.signature!.args.people).toEqual({
+        type: "array",
+        element: { type: "struct", fields: { name: { type: "string" } } },
+      });
+    });
+
+    it("struct-array.set lands complete records and replaces element fields in place", () => {
+      const { runtime, seeded } = startPeople(`
+  people.$set([{ name: "Ann", age: 30 }, { name: "Bo", age: 4 }]);
+  people[0].name.$set("Ana");
+  people[1].$set({ name: "Bea", age: 5 });
+`);
+      const brief = startTerminal(runtime, [seeded], EMPTY_DIALOG);
+      expect(rootTraversal(brief).cells.people).toEqual([
+        { name: "Ana", age: 30 },
+        { name: "Bea", age: 5 },
+      ]);
+    });
+
+    it.each([
+      ["an incomplete record", `people.$set([{ name: "Ann" }]);`],
+      [
+        "an undeclared field",
+        `people.$set([{ name: "Ann", age: 1, extra: 1 }]);`,
+      ],
+      ["a scalar element", `people.$set(["Ann"]);`],
+    ])("struct-array.set rejects %s", (_case, statement) => {
+      expect(() => startPeople(statement)).toThrow(/CELL_VALUE_TYPE/);
+    });
+
+    it("struct-array.fields reads element fields by index, including nested arrays", () => {
+      const document = parse(`
+"arc";
+function Main() {
+  let team = Struct({ crew: Array(Struct({ name: Str(), tags: Array(Str()) })) });
+  let i = Num();
+  let name = Str();
+  let tag = Str();
+  let count = Num();
+  team.$set({ crew: [{ name: "Ann", tags: ["a"] }, { name: "Bo", tags: ["b", "c"] }] });
+  i.$set(1);
+  name.$set(team.crew[i].name);
+  tag.$set(team.crew[i].tags[1]);
+  count.$set(team.crew[0].tags.length);
+}
+`);
+      const runtime = new Runtime()
+        .add("struct-array-fields-arc", document)
+        .init();
+      const seeded = runtime.newTraversal(
+        arc("struct-array-fields-arc", "Main"),
+      );
+      seeded.phase = "entered";
+      const cells = rootTraversal(
+        startTerminal(runtime, [seeded], EMPTY_DIALOG),
+      ).cells;
+      expect([cells.name, cells.tag, cells.count]).toEqual(["Bo", "c", 1]);
+    });
+
+    it("struct-array.fields reads nested Struct fields through elements and span.item", () => {
+      const document = parse(`
+"arc";
+function Main() {
+  let team = Struct({
+    lead: Struct({ home: Struct({ city: Str() }) }),
+    crew: Array(Struct({ home: Struct({ city: Str() }), pets: Array(Struct({ name: Str() })) })),
+  });
+  let lead = Str();
+  let first = Str();
+  let pet = Str();
+  let cities = Array(Str());
+  team.$set({
+    lead: { home: { city: "Oslo" } },
+    crew: [{ home: { city: "Rome" }, pets: [{ name: "Rex" }, { name: "Tom" }] }],
+  });
+  lead.$set(team.lead.home.city);
+  first.$set(team.crew[0].home.city);
+  pet.$set(team.crew[0].pets[1].name);
+  team.crew.$map(() => span.result.$set(span.item.home.city), cities);
+}
+`);
+      const runtime = new Runtime()
+        .add("struct-array-nested-arc", document)
+        .init();
+      const seeded = runtime.newTraversal(
+        arc("struct-array-nested-arc", "Main"),
+      );
+      seeded.phase = "entered";
+      const cells = rootTraversal(
+        startTerminal(runtime, [seeded], EMPTY_DIALOG),
+      ).cells;
+      expect({
+        lead: cells.lead,
+        first: cells.first,
+        pet: cells.pet,
+        cities: cells.cities,
+      }).toEqual({
+        lead: "Oslo",
+        first: "Rome",
+        pet: "Tom",
+        cities: ["Rome"],
+      });
+    });
+
+    it.each([
+      ["a nested Struct field", `x.$set(people[0].home.missing);`],
+      [
+        "a span.item field",
+        `people.$map(() => { x.$set(span.item.missing); });`,
+      ],
+    ])(
+      "struct-array.fields rejects an undeclared %s at parse",
+      (_case, statement) => {
+        const document = `
+"arc";
+function Main() {
+  let people = Array(Struct({ home: Struct({ city: Str() }) }));
+  let x = Str();
+  ${statement}
+}
+`;
+        expect(() => parse(document)).toThrow(
+          /has no declared field "missing"/,
+        );
+      },
+    );
+
+    it("struct-array.fields rejects an undeclared element field at parse", () => {
+      expect(() =>
+        startPeople(`let x = Str(); x.$set(people[0].missing);`),
+      ).toThrow(/has no declared field "missing"/);
+    });
+
+    it("struct-array.unset rejects a field target inside an element", () => {
+      expect(() =>
+        startPeople(
+          `people.$set([{ name: "Ann", age: 1 }]); people[0].name.$unset();`,
+        ),
+      ).toThrow(/\$unset\(\) requires a direct cell target/);
+    });
+
+    it("struct-array.observe briefs element field questions and admits only complete records", () => {
+      const { runtime, seeded } = startPeople(`$observe(people);`);
+      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const observation = singleObservations(brief)[0]!;
+      expect(observation.meta).toEqual({
+        type: "array",
+        element: {
+          type: "struct",
+          fields: {
+            name: { question: "the name", meta: { type: "string" } },
+            age: { question: "observe people[].age", meta: { type: "number" } },
+          },
+        },
+      });
+
+      const rejected = progressBrief(runtime, brief, {
+        move: "proceed",
+        observations: {
+          [observation.id]: { status: "resolved", value: [{ name: "Ann" }] },
+        },
+      });
+      expect(rejected.issues).toContainEqual(
+        expect.objectContaining({ reasonCode: "observation-incomplete" }),
+      );
+
+      const done = progressTerminal(runtime, rejected, {
+        move: "proceed",
+        observations: {
+          [singleObservations(rejected)[0]!.id]: {
+            status: "resolved",
+            value: [{ name: "Ann", age: 30 }],
+          },
+        },
+      });
+      expect(rootTraversal(done).cells.people).toEqual([
+        { name: "Ann", age: 30 },
+      ]);
+    });
+
+    it("struct-array.observe targets one element and one element field with whole current values", () => {
+      const { runtime, seeded } = startPeople(`
+  people.$set([{ name: "Ann", age: 30 }]);
+  $observe(people[0]);
+  $observe(people[0].name);
+`);
+      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const element = singleObservations(brief)[0]!;
+      expect(element).toMatchObject({
+        cell: "people[0]",
+        currentValue: { name: "Ann", age: 30 },
+        meta: {
+          type: "struct",
+          fields: {
+            name: { question: "the name", meta: { type: "string" } },
+            age: { meta: { type: "number" } },
+          },
+        },
+      });
+      expect(element.meta).toEqual({
+        type: "struct",
+        fields: {
+          name: { question: "the name", meta: { type: "string" } },
+          age: { question: "observe people[0].age", meta: { type: "number" } },
+        },
+      });
+
+      const next = progressBrief(runtime, brief, {
+        move: "proceed",
+        observations: {
+          [element.id]: { status: "resolved", value: { name: "Bea", age: 30 } },
+        },
+      });
+      const field = singleObservations(next)[0]!;
+      expect(field).toMatchObject({
+        cell: "people[0].name",
+        question: "the name",
+        currentValue: "Bea",
+      });
+
+      const done = progressTerminal(runtime, next, {
+        move: "proceed",
+        observations: { [field.id]: { status: "resolved", value: "Cy" } },
+      });
+      expect(rootTraversal(done).cells.people).toEqual([
+        { name: "Cy", age: 30 },
+      ]);
+    });
+
+    it("struct-array.persistence rejects an incomplete restored element", () => {
+      const { runtime, seeded } = startPeople(
+        `people.$set([{ name: "Ann", age: 1 }]); $instruct(\`wait\`);`,
+      );
+      const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const restored = JSON.parse(
+        JSON.stringify(brief.traversals),
+      ) as ArcTraversalSet;
+      expect(() => runtime.start(restored, EMPTY_DIALOG)).not.toThrow();
+      restored[0]!.cells.people = [{ name: "Ann" }];
+      expect(() => runtime.start(restored, EMPTY_DIALOG)).toThrow(
+        /Invalid persisted traversal state/,
+      );
     });
   });
 });
