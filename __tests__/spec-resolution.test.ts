@@ -36,6 +36,11 @@ const context: ProducerContext = {
     { name: "numbers", type: "array", element: { type: "number" } },
     { name: "strings", type: "array", element: { type: "string" } },
     { name: "artifacts", type: "array", element: { type: "artifact" } },
+    {
+      name: "records",
+      type: "array",
+      element: { type: "struct", fields: { path: { type: "string" } } },
+    },
   ],
 };
 
@@ -154,21 +159,36 @@ describe("shared operation rules", () => {
       name: "otherChoice",
     };
 
-    expect(
-      comparisonRule.checkProducers("==", choice, literal("outside"), context),
-    ).toMatchObject({ judgment: { kind: "compatible" }, mode: "string" });
-    expect(
-      comparisonRule.checkProducers("!=", choice, otherChoice, context),
-    ).toMatchObject({ judgment: { kind: "compatible" }, mode: "string" });
+    const outside = comparisonRule.checkProducers(
+      "==",
+      choice,
+      literal("outside"),
+      context,
+    );
+    expect(outside.judgment.kind).toBe("compatible");
+    expect(comparisonRule.mayBeEqual(outside)).toBe(false);
+    const overlapping = comparisonRule.checkProducers(
+      "!=",
+      choice,
+      otherChoice,
+      context,
+    );
+    expect(overlapping.judgment.kind).toBe("compatible");
+    expect(comparisonRule.mayBeEqual(overlapping)).toBe(true);
   });
 
-  it("preserves and strictly admits the shared array element family", () => {
+  it("admits any array pair for equality and reports disjoint element types as never equal", () => {
     const numbers: ValueExpression = { kind: "cell", name: "numbers" };
     const strings: ValueExpression = { kind: "cell", name: "strings" };
 
-    expect(
-      comparisonRule.checkProducers("==", numbers, strings, context),
-    ).toMatchObject({ judgment: { kind: "incompatible" }, mode: "array" });
+    const disjoint = comparisonRule.checkProducers(
+      "==",
+      numbers,
+      strings,
+      context,
+    );
+    expect(disjoint.judgment.kind).toBe("compatible");
+    expect(comparisonRule.mayBeEqual(disjoint)).toBe(false);
 
     const dynamicDecision = comparisonRule.checkProducers(
       "==",
@@ -176,65 +196,36 @@ describe("shared operation rules", () => {
       dynamic(),
       context,
     );
-    expect(dynamicDecision).toMatchObject({
-      judgment: { kind: "unknown" },
-      mode: "array",
-      arrayElementFamily: "number",
-    });
+    expect(comparisonRule.mayBeEqual(dynamicDecision)).toBe(true);
+    for (const value of [[2], ["1"], [{ path: "x" }]]) {
+      expect(
+        comparisonRule.admitValues("==", dynamicDecision, [1], value).admitted,
+      ).toBe(true);
+    }
     expect(
-      comparisonRule.admitValues("==", dynamicDecision, [1], [2]).admitted,
-    ).toBe(true);
-    expect(
-      comparisonRule.admitValues("==", dynamicDecision, [1], ["1"]).admitted,
-    ).toBe(false);
-    expect(
-      comparisonRule.admitValues("==", dynamicDecision, [1], [{ path: "x" }])
-        .admitted,
+      comparisonRule.admitValues("==", dynamicDecision, ["1"], [1]).admitted,
     ).toBe(false);
   });
 
-  it("selects Artifact authority for array equality without inferring it from object shape", () => {
+  it("admits Artifact arrays against records and rejects an invalid Artifact element", () => {
     const artifacts: ValueExpression = { kind: "cell", name: "artifacts" };
-    const decision = comparisonRule.checkProducers(
-      "==",
-      artifacts,
-      dynamic(),
-      context,
-    );
-    expect(decision).toMatchObject({
-      judgment: { kind: "unknown" },
-      mode: "array",
-      arrayElementFamily: "artifact",
-    });
+    const records: ValueExpression = { kind: "cell", name: "records" };
+    const artifact = createArtifactValue("one.md");
+
     expect(
       comparisonRule.admitValues(
         "==",
-        decision,
-        [createArtifactValue("one.md")],
-        [createArtifactValue("one.md")],
+        comparisonRule.checkProducers("==", artifacts, records, context),
+        [artifact],
+        [{ path: "one.md" }],
       ).admitted,
     ).toBe(true);
     expect(
       comparisonRule.admitValues(
         "==",
-        decision,
-        [{ path: "one.md" }],
-        [{ path: "/invalid.md" }],
-      ).admitted,
-    ).toBe(false);
-
-    const shapeOnly = comparisonRule.checkProducers(
-      "==",
-      dynamic("leftArtifacts"),
-      dynamic("rightArtifacts"),
-      context,
-    );
-    expect(
-      comparisonRule.admitValues(
-        "==",
-        shapeOnly,
-        [{ path: "one.md" }],
-        [{ path: "one.md" }],
+        comparisonRule.checkProducers("==", artifacts, dynamic(), context),
+        [{ $path: "/invalid.md" }],
+        [artifact],
       ).admitted,
     ).toBe(false);
   });
@@ -353,7 +344,7 @@ describe("Union comparison rules", () => {
   };
   const cell = (name: string): ValueExpression => ({ kind: "cell", name });
 
-  it("union.comparison requires one declaration to cover both incompatible alternatives", () => {
+  it("union.comparison admits any held value and reports operands with no shared member", () => {
     const member = comparisonRule.checkProducers(
       "!=",
       cell("hour"),
@@ -370,27 +361,33 @@ describe("Union comparison rules", () => {
       cell("text"),
       unionContext,
     );
-    expect(broad.judgment.kind).toBe("unknown");
+    expect(broad.judgment.kind).toBe("compatible");
+    expect(comparisonRule.mayBeEqual(broad)).toBe(true);
     expect(
       comparisonRule.admitValues("!=", broad, 9, "no_preference").admitted,
-    ).toBe(false);
+    ).toBe(true);
     const unrelated = comparisonRule.checkProducers(
       "==",
       cell("left"),
       cell("right"),
       unionContext,
     );
-    expect(unrelated.judgment.kind).toBe("unknown");
+    expect(unrelated.judgment.kind).toBe("compatible");
+    expect(comparisonRule.mayBeEqual(unrelated)).toBe(true);
     expect(
       comparisonRule.admitValues("==", unrelated, 9, "text").admitted,
-    ).toBe(false);
+    ).toBe(true);
     expect(comparisonRule.admitValues("==", unrelated, 9, true).admitted).toBe(
       true,
     );
-    expect(
-      comparisonRule.checkProducers("!=", literal(1), literal(""), unionContext)
-        .judgment.kind,
-    ).toBe("incompatible");
+    const standalone = comparisonRule.checkProducers(
+      "!=",
+      literal(1),
+      literal(""),
+      unionContext,
+    );
+    expect(standalone.judgment.kind).toBe("compatible");
+    expect(comparisonRule.mayBeEqual(standalone)).toBe(false);
   });
 
   it("union.comparison selects the first admitting Enum and excludes shadowed ordering authority", () => {
@@ -426,7 +423,7 @@ describe("Union comparison rules", () => {
     expect(shadowed.judgment.kind).toBe("incompatible");
   });
 
-  it("union.comparison rejects malformed concrete values before applying equality relaxation", () => {
+  it("union.comparison rejects malformed concrete values before equality", () => {
     const selected = comparisonRule.checkProducers(
       "==",
       cell("hour"),

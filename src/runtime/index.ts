@@ -54,6 +54,7 @@ import {
   firstNonFiniteNumberPath,
   isArtifactValue,
   isRenderedSemanticText,
+  pathOfArtifactValue,
   type CellValue,
   type Dialog,
 } from "../types/value.js";
@@ -1363,4 +1364,4 @@ export type {
   SemanticTextPart,
   StructValue,
 } from "../types/value.js";
-export { createArtifactValue, isArtifactValue };
+export { createArtifactValue, isArtifactValue, pathOfArtifactValue };

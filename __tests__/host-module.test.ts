@@ -789,7 +789,7 @@ ${body}
       "if (Typed.string()) {}",
       "let n = Num(); n.$set(Typed.string() + 1);",
       "let a = Artifact(); a.$set(Artifact(Typed.boolean()));",
-      'let b = Bool(); b.$set(Typed.artifact() == "x.md");',
+      "let b = Bool(); b.$set(Typed.artifact() < 1);",
     ];
     for (const [index, body] of incompatibleBodies.entries()) {
       expect(() =>
@@ -819,6 +819,29 @@ function Main() {
 `),
       ),
     ).not.toThrow();
+  });
+
+  it("runtime add admits and lints equality between a declared result and another type", () => {
+    const hostModules = new Map([
+      ["typed", hmd.define({ artifact: () => hmd.Artifact() })],
+    ]);
+    const document = parse(`
+"arc";
+import Typed from "host:typed";
+function Main() {
+  let b = Bool();
+  b.$set(Typed.artifact() == "x.md");
+}
+`);
+
+    expect(() =>
+      new Runtime({ hostModules }).add("typed-equality", document),
+    ).not.toThrow();
+    expect(
+      analyzeDocument(document, { hostModules }).lintIssues,
+    ).toContainEqual(
+      expect.objectContaining({ code: "comparison-never-equal" }),
+    );
   });
 
   it("runtime init retains its separate cross document compatibility responsibility", () => {

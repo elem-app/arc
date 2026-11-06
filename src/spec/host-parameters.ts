@@ -9,6 +9,7 @@ import type {
 export function isHostStructFieldName(name: string): boolean {
   return (
     name.length > 0 &&
+    !name.startsWith("$") &&
     name !== "__proto__" &&
     name !== "prototype" &&
     name !== "constructor"

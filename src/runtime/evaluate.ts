@@ -87,6 +87,7 @@ import {
   firstNonFiniteNumberPath,
   isArtifactValue,
   isPlainRecord,
+  pathOfArtifactValue,
   type ArrayElementValue,
   type ArrayValue,
   type ArtifactValue,
@@ -1200,18 +1201,8 @@ function computeCompoundValueExpression(
       accum,
     );
     if (right.status === "blocked") return right;
-    const isOrdering =
-      expression.op === ">" ||
-      expression.op === ">=" ||
-      expression.op === "<" ||
-      expression.op === "<=";
     if (left.value === undefined || right.value === undefined) {
-      return {
-        status: "resolved",
-        value:
-          expression.op === "!=" &&
-          (left.value === undefined || right.value === undefined),
-      };
+      return { status: "resolved", value: expression.op === "!=" };
     }
     const admitted = comparisonRule.admitValues(
       expression.op,
@@ -1223,7 +1214,7 @@ function computeCompoundValueExpression(
       throw runtimeError(admitted.violation.code, admitted.violation.detail);
     }
     const selected = admitted.value.decision;
-    if (selected.mode === "struct") {
+    if (selected.mode === "equality") {
       const equal = payloadValuesEqual(
         admitted.value.left,
         admitted.value.right,
@@ -1233,23 +1224,21 @@ function computeCompoundValueExpression(
         value: expression.op === "==" ? equal : !equal,
       };
     }
-    if (isOrdering && selected.mode === "enum") {
+    if (selected.mode === "enum") {
       const enumValues = selected.enumValues ?? [];
       const li = enumValues.indexOf(admitted.value.left as string);
       const ri = enumValues.indexOf(admitted.value.right as string);
       return {
         status: "resolved",
-        value: evaluateBinary(expression.op, li, ri, false, false),
+        value: evaluateOrdering(expression.op, li, ri),
       };
     }
     return {
       status: "resolved",
-      value: evaluateBinary(
+      value: evaluateOrdering(
         expression.op,
         admitted.value.left,
         admitted.value.right,
-        selected.mode === "artifact",
-        selected.mode === "artifact",
       ),
     };
   }
@@ -2409,7 +2398,7 @@ function computeSemanticText(
           `Invalid Artifact value: ${describeArtifactValueIssue(issue ?? "not-plain-object")}`,
         );
       }
-      parts.push({ kind: "artifact", path: value.value.path });
+      parts.push({ kind: "artifact", path: pathOfArtifactValue(value.value) });
       deferred = true;
       continue;
     }
@@ -2483,16 +2472,6 @@ export function truthy(value: unknown): boolean {
     );
   }
   return admission.value;
-}
-
-/** Structural equality of two ordered arrays by element value. */
-function arraysStructurallyEqual(left: unknown[], right: unknown[]): boolean {
-  return (
-    left.length === right.length &&
-    left.every((element, index) =>
-      cellValuesEqual(element as CellValue, right[index] as CellValue),
-    )
-  );
 }
 
 function runtimeKind(value: unknown): string {
@@ -2583,68 +2562,19 @@ function assertPayloadConsumer(
   );
 }
 
-function evaluateBinary(
+function evaluateOrdering(
   op: ComparisonOperator,
   left: unknown,
   right: unknown,
-  leftHasArtifactType: boolean,
-  rightHasArtifactType: boolean,
 ): boolean {
-  const artifactOperand = leftHasArtifactType || rightHasArtifactType;
-  const artifactsEqual =
-    leftHasArtifactType &&
-    rightHasArtifactType &&
-    isArtifactValue(left) &&
-    isArtifactValue(right) &&
-    left.path === right.path;
-  const arrayOperand = Array.isArray(left) || Array.isArray(right);
-  switch (op) {
-    case "==":
-      if (left === undefined || right === undefined) return false;
-      if (artifactOperand) return artifactsEqual;
-      if (arrayOperand) {
-        return (
-          Array.isArray(left) &&
-          Array.isArray(right) &&
-          arraysStructurallyEqual(left, right)
-        );
-      }
-      return left === right;
-    case "!=":
-      if (left === undefined || right === undefined) return true;
-      if (artifactOperand) return !artifactsEqual;
-      if (arrayOperand) {
-        return !(
-          Array.isArray(left) &&
-          Array.isArray(right) &&
-          arraysStructurallyEqual(left, right)
-        );
-      }
-      return left !== right;
-    case ">":
-    case ">=":
-    case "<":
-    case "<=":
-      if (artifactOperand) {
-        throw runtimeError(
-          "invalid-artifact-operation",
-          `Artifacts cannot be used with ordering operator ${op}`,
-        );
-      }
-      if (arrayOperand) {
-        throw runtimeError(
-          "invalid-array-operation",
-          "Arrays cannot be ordered",
-        );
-      }
-      return op === ">"
-        ? compareValues(left, right) > 0
-        : op === ">="
-          ? compareValues(left, right) >= 0
-          : op === "<"
-            ? compareValues(left, right) < 0
-            : compareValues(left, right) <= 0;
-  }
+  const order = compareValues(left, right);
+  return op === ">"
+    ? order > 0
+    : op === ">="
+      ? order >= 0
+      : op === "<"
+        ? order < 0
+        : order <= 0;
 }
 
 function compareValues(left: unknown, right: unknown): number {

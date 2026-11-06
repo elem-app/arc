@@ -154,7 +154,7 @@ const recordsModule = hmd.define({
 
 Here, the caller may omit `context` entirely. When it supplies `context`, it must include `instruction` and may omit `attachment`.
 
-Field names must be nonempty and cannot be `__proto__`, `prototype`, or `constructor`.
+Field names must be nonempty, cannot begin with `$`, and cannot be `__proto__`, `prototype`, or `constructor`.
 
 ## Declaration errors and call validation
 

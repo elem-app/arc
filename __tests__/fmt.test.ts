@@ -165,7 +165,7 @@ describe("value formatting", () => {
     expect(
       fmtRule.projectValue(
         alternatives,
-        { tag: 0, file: { path: "a.md" } },
+        { tag: 0, file: { $path: "a.md" } },
         {},
       ),
     ).toEqual({ admitted: true, value: '{"tag":0,"file":"a.md"}' });
@@ -469,23 +469,36 @@ describe("value formatting", () => {
     ).toEqual({ admitted: true, value: '{"path":"a.md","user":1,"self":2}' });
   });
 
-  it.each([
-    'fmt(true ? Artifact("a.md") : { path: "a.md" })',
-    'fmt(true ? [Artifact("a.md")] : [{ path: "a.md" }])',
-    'fmt({ file: true ? Artifact("a.md") : { path: "a.md" } })',
-    'fmt(true ? { file: Artifact("a.md") } : { file: { path: "a.md" } })',
-    "fmt(Dialog.cursor)",
-    "fmt(null)",
-  ])("fmt.authority rejects incompatible operand %s", (expression) => {
-    expect(() =>
-      parse(
-        `"arc"; function Main() { let text = Str(); text.$set(${expression}); }`,
-      ),
-    ).toThrow(/INVALID_FMT_OPERAND/);
-  });
+  it.each(["fmt(Dialog.cursor)", "fmt(null)"])(
+    "fmt.authority rejects incompatible operand %s",
+    (expression) => {
+      expect(() =>
+        parse(
+          `"arc"; function Main() { let text = Str(); text.$set(${expression}); }`,
+        ),
+      ).toThrow(/INVALID_FMT_OPERAND/);
+    },
+  );
 
   it("fmt.authority accepts disjoint and identical conditional interpretations", () => {
     expect(result('fmt(true ? Artifact("a.md") : { path: 3 })')).toBe("a.md");
+    expect(result('fmt(true ? Artifact("a.md") : { path: "a.md" })')).toBe(
+      "a.md",
+    );
+    expect(result('fmt(false ? Artifact("a.md") : { path: "a.md" })')).toBe(
+      '{"path":"a.md"}',
+    );
+    expect(result('fmt(true ? [Artifact("a.md")] : [{ path: "a.md" }])')).toBe(
+      "a.md",
+    );
+    expect(
+      result('fmt({ file: true ? Artifact("a.md") : { path: "a.md" } })'),
+    ).toBe('{"file":"a.md"}');
+    expect(
+      result(
+        'fmt(true ? { file: Artifact("a.md") } : { file: { path: "a.md" } })',
+      ),
+    ).toBe('{"file":"a.md"}');
     expect(result('fmt(true ? Artifact("a.md") : Artifact("b.md"))')).toBe(
       "a.md",
     );
@@ -667,12 +680,12 @@ describe("value formatting", () => {
       fact: { kind: "provenance", provenance: "artifact" },
     };
     expect(
-      fmtRule.projectValue(artifact, { path: "../bad" }, {}),
+      fmtRule.projectValue(artifact, { $path: "../bad" }, {}),
     ).toMatchObject({ admitted: false });
     expect(
       fmtRule.projectValue(
         { kind: "alternatives", alternatives: [artifact, dynamic] },
-        { path: "a.md" },
+        { $path: "a.md" },
         {},
       ),
     ).toMatchObject({

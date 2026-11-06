@@ -8,12 +8,10 @@ import { isHostStructFieldName } from "./host-parameters.js";
 
 /**
  * Field names admitted by authored Struct declarations: safe record names that
- * do not collide with the `isUnset()` check or `$`-prefixed actions.
+ * do not collide with the `isUnset()` check.
  */
 export function isStructFieldName(name: string): boolean {
-  return (
-    isHostStructFieldName(name) && !name.startsWith("$") && name !== "isUnset"
-  );
+  return isHostStructFieldName(name) && name !== "isUnset";
 }
 
 /**

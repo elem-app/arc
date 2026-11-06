@@ -368,7 +368,7 @@ function Main(
         EMPTY_DIALOG,
       ),
     );
-    (supplied[0] as { path: string }).path = "mutated.md";
+    (supplied[0] as { $path: string }).$path = "mutated.md";
 
     expect(rootTraversal(terminalBrief).cells.childOutput).toEqual([
       createArtifactValue("input.md"),
@@ -378,7 +378,7 @@ function Main(
     ]);
     expect(() =>
       runtime.enterArc(arc("artifact-array-channels", "Main"), EMPTY_DIALOG, {
-        args: { input: [{ path: "/invalid.md" }] },
+        args: { input: [{ $path: "/invalid.md" }] },
       }),
     ).toThrow(/\$\[0\]/);
   });
@@ -579,7 +579,7 @@ function Main() {
     const root = restored.find(
       (traversal) => traversal.enteredBy === undefined,
     )!;
-    root.cells.values = [{ path: "/invalid.md" }];
+    root.cells.values = [{ $path: "/invalid.md" }];
 
     expect(() => runtime.start(restored, EMPTY_DIALOG)).toThrow(
       /Invalid persisted traversal state.*\$\[0\]/,
@@ -726,7 +726,7 @@ function Main() {
       hostCalls: {
         [invalidCall.hostCalls[0]!.id]: {
           status: "resolved",
-          value: [{ path: "/bad.md" }],
+          value: [{ $path: "/bad.md" }],
         },
       },
     });

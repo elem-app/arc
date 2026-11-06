@@ -240,19 +240,13 @@ let hours = Array(Union([Num(), Enum(["no_preference"])]));
 let request = Struct({ hour: Union([Num(), Enum(["no_preference"])]) });
 ```
 
-A set union holds the concrete scalar admitted by at least one member. Overlapping, redundant, and shadowed members are valid. The **preceding spec** is the first admitting member in authored order. Each destination uses its own declaration. An operation follows that preceding spec without falling back to later members when it fails. Member order can affect Enum ordering, but the value carries no member index or tag. Struct and array schemas remain fixed when a union leaf changes value.
+A set union holds the concrete scalar admitted by at least one member. Overlapping, redundant, and shadowed members are valid. Each destination uses its own declaration. The value carries no member index or tag. Struct and array schemas remain fixed when a union leaf changes value.
 
 One-time writes admit the actual value: a numeric `meetingHour` can be written to a Num destination, while `"no_preference"` cannot. A write that can never succeed is rejected before the script runs, and any other write is checked against the runtime value. Bindings require every provider value to fit the receiver. A union of Num and an Enum answer cannot provide a Num argument, but can receive a Num return. Receiver members may collectively cover an Enum provider. These rules recurse through fixed containers.
 
-Union observation asks for one value. Its question belongs to the whole union; member constructors cannot declare `observing`. Members may carry `observeAs`. A report is accepted when any member accepts it, including that member's `observeAs`. `observeAs` does not affect later writes or which member is the preceding spec. An explicit Enum answer is never inferred from an unknown outcome.
+Union observation asks for one value. Its question belongs to the whole union; member constructors cannot declare `observing`. Members may carry `observeAs`. A report is accepted when any member accepts it, including that member's `observeAs`. `observeAs` does not affect later writes or how the value is ordered. An explicit Enum answer is never inferred from an unknown outcome.
 
-Operations use each union operand's preceding spec. Equality compares values normally when their specs are compatible, including `Enum` and `Str`.
-
-`==` and `!=` also allow otherwise incompatible types when one operand has a union declaration that accepts both sides. A union operand is checked using its preceding spec; another typed operand is checked using its declared spec. The union must accept every value those specs allow. For a literal, it only needs to accept that literal's value. When these checks pass, the incompatible types compare unequal. For example, `meetingHour != "no_preference"` is true when `meetingHour` holds a number. The same comparison against a `Str` cell holding `"no_preference"` fails: `Str` allows strings outside the union. A `Num` cell is allowed because every number fits the union.
-
-Standalone `1 != ""` is incompatible because neither side declares a union. Sharing a member is also insufficient: a `Union([Num(), Bool()])` holding `9` cannot be compared with a `Union([Str(), Bool()])` holding `"text"`, because neither union accepts both selected types.
-
-These equality rules also apply to union fields and array elements; the surrounding structs and arrays must still meet their structural comparison rules. Unset operands follow the shared unset-comparison rule. Ordering requires compatible preceding specs and does not permit the cross-type comparisons described above.
+Equality compares the value a union holds like any other value, so `meetingHour != "no_preference"` is true when `meetingHour` holds a number.
 
 ```js
 if (!meetingHour.isUnset() && meetingHour != "no_preference") {
@@ -261,6 +255,8 @@ if (!meetingHour.isUnset() && meetingHour != "no_preference") {
 ```
 
 A guard controls execution but does not narrow the declared type. Arithmetic, boolean positions, `Num.isFinite(...)`, and regex tests check the actual value at runtime. Scalar formatting and primitive-array interpolation apply to the actual value.
+
+Ordering also uses the held value. A string orders by the first member that admits it: by declared position when that member is an `Enum`, and lexicographically when it is a `Str`. Ordering does not fall back to a later member, so a `Union([Enum(["low", "high"]), Str()])` holding `"low"` cannot be ordered against `"outside"`. Member order therefore matters only for a string that more than one member admits.
 
 Channels accept unions without observation config. Index is eligible as a standalone channel and cannot be a union member. Host parameters and returns accept the same flat unions, authored through `hmd.Union`.
 
@@ -288,9 +284,9 @@ An array cell holds a whole list value and supports:
 
 An action cell target is a lexical cell name followed by zero or more accesses into its inner value. A direct target such as `items` addresses the whole cell; `items[i]` addresses one element and evaluates `i` when the action reaches it. Only arrays and structs support access paths in cell targets.
 
-An element target must select an existing position. `$set(...)` replaces that element without changing its siblings. Observation is available for arrays whose elements are scalar, union, or struct; `$observe(items[i])` briefs and writes the element using its type and `observing` question. `$unset()` remains a whole-cell operation: `items[i].$unset()` is a parse error because array values are dense and have no unset element slots. An array literal takes its element type from where it is used, as in `items.$set(["a", "b"])`, `artifacts.$set([Artifact("a.md")])`, or an equality expression, and each element is validated against that type before mutation.
+An element target must select an existing position. `$set(...)` replaces that element without changing its siblings. Observation is available for arrays whose elements are scalar, union, or struct; `$observe(items[i])` briefs and writes the element using its type and `observing` question. `$unset()` remains a whole-cell operation: `items[i].$unset()` is a parse error because array values are dense and have no unset element slots. An array literal takes its element type from the write that uses it, as in `items.$set(["a", "b"])` or `artifacts.$set([Artifact("a.md")])`, and each element is validated against that type before mutation.
 
-Equality and inequality compare arrays element by element, in order. Both arrays must hold one kind of element: boolean, string, number, Artifact, or struct. Enum elements compare as strings, Artifact elements by logical path, and struct elements by struct equality. Union-element arrays apply the union comparison rules to each aligned pair of values. The shared unset-comparison rule applies (equality involving an unset array is `false`, inequality is `true`). Ordering, arithmetic, and boolean evaluation of a whole array are rejected.
+Equality and inequality compare arrays element by element, in order, and each pair of elements compares like any other two values. The shared unset-comparison rule applies (equality involving an unset array is `false`, inequality is `true`). Ordering, arithmetic, and boolean evaluation of a whole array are rejected.
 
 Indexing, targeting an element, or reading `length` on an unset array is a runtime error. An index must resolve to a non-negative safe integer and select an existing position; other values and positions outside the current array are runtime errors. Index expressions may use arithmetic over literals and locally available values, such as `items[i + 1]` and `items[i + 1].$set(value)`. They cannot contain a host call or another expression that requires host resolution.
 
@@ -330,7 +326,7 @@ Writing or observing a field of an unset struct is a runtime error, raised befor
 
 `$observe(request)` briefs the declared fields with their questions, and the held record when the struct is set. A reported value is a complete record. A field target such as `$observe(request.preferences)` observes that subtree of a set record.
 
-Equality and inequality compare two structs field by field, recursively, regardless of the order in which fields were declared or written. The two structs must declare the same field names, and each pair of fields must be comparable for equality, so a `Str` field compares with an `Enum` field and a `Str` field does not compare with a `Num` field. An unset struct follows the shared unset-comparison rule. Ordering and direct template interpolation of a whole struct are rejected; use `fmt(value, config?)` for its textual representation or read a field.
+Equality and inequality compare two structs field by field, recursively, regardless of the order in which fields were declared or written. Structs with different field names are unequal. An unset struct follows the shared unset-comparison rule. Ordering and direct template interpolation of a whole struct are rejected; use `fmt(value, config?)` for its textual representation or read a field.
 
 An `Array(Struct(...))` element is a complete record. `people[0].name` and `span.item.name` read element fields, including nested fields. Whole-array writes, element writes such as `people[0].$set({ name: "Ada", age: 36 })`, and element-field writes such as `people[0].name.$set("Ada")` follow the struct write rules. Observing a struct-element array asks for a list of complete records, each field described by the element's declaration.
 
@@ -347,7 +343,7 @@ Arc expressions are shared across value positions, including `if` tests, hook re
 - Semantic checks — ``judge(`semantic question`)``
 - Host calls — `Dice.roll(20)`, `Store.flags.enabled()`
 - Artifact construction — `Artifact("report.md")`, ``Artifact(`reports/${slug}.md`)``
-- Value formatting — `fmt(request)`, `fmt(people, { array: { style: "json" } })` (see [Formatting values](#formatting-values)).
+- Value formatting — `fmt(request)`, `fmt(people, { array: { style: "json" } })`
 - Regex tests — `/pattern/flags.test(target)` (e.g., `/music|band/i.test(Dialog.lastUserMessage)`)
 - Cursor turn differences — `Dialog.cursor.userTurnsSince(startedAt)`, `endedAt.totalTurnsSince(startedAt)`
 - Unset checks — `topic.isUnset()`, `startedAt.isUnset()`
@@ -385,7 +381,7 @@ To guard against such poisoning, use `Num.isFinite(expr)` as a precheck. It retu
 
 Comparison operators pair two values and produce a boolean:
 
-- Equality — `==` and `!=` — compares by value. Numeric equality is exact, with no rounding tolerance. Scalars are otherwise equal when their values are identical, Artifacts are equal when their logical paths are equal, arrays are equal when they hold the same elements in the same order (see [Arrays](#arrays)), and structs are equal when their fields are equal (see [Structs](#structs)). When either operand is an unset cell, `==` is `false` and `!=` is `true`.
+- Equality — `==` and `!=` — compares by value and accepts any two values except `Dialog.Cursor`s, which cannot be compared. Values of different types are unequal, without coercion, so `1 == "1"` is `false`. A comparison that can never be equal is legal, and Arc reports it as a lint warning. Numeric equality is exact, with no rounding tolerance. Scalars are otherwise equal when their values are identical, Artifacts are equal when their logical paths are equal, arrays are equal when they hold the same elements in the same order (see [Arrays](#arrays)), and structs are equal when their fields are equal (see [Structs](#structs)). When either operand is an unset cell, `==` is `false` and `!=` is `true`.
 - Ordering — `>`, `>=`, `<`, and `<=` — compares magnitude. Numbers order numerically, strings order lexicographically, and `Enum` values order by declared position. When one operand is an `Enum`, the other must be a member literal, an `Enum` with the same values in the same order, or a value that is a member at runtime; a `Str` cell is rejected. When either operand is an unset cell, all four are `false`. Artifacts, arrays, and structs have no ordering.
 
 `&&` and `||` are logical conjunction and disjunction over boolean operands, producing a boolean. Each short-circuits: `&&` evaluates its right operand only when its left is `true`, and `||` only when its left is `false`, so a blocking or effectful right operand runs only where the left has not already decided the result.
@@ -403,7 +399,6 @@ A template literal in a value position renders each interpolation to text and pr
 ```js
 $instruct(`explain ${fmt(people, { array: { parentheses: "[]" } })}`);
 summary.$set(fmt(request));
-encoded.$set(fmt(fmt(request), { str: "json" }));
 ```
 
 Formatting reads the input at its evaluation site and returns text without changing it. The result can be used wherever an ordinary string-valued expression is accepted. In a semantic template, the input cannot require host work. In other value positions, host work in the input completes before formatting. A position that accepts only local expressions, such as an array index, applies that limit to the input.
@@ -434,7 +429,7 @@ Calls compose through nesting: each outer call formats the inner call's string v
 
 Strings and Enum values use `str`; booleans and finite numbers use their ordinary textual values. Arrays and structs format recursively. An Artifact formats as its logical path, using the `str` setting or an enclosing JSON style. A value with a declared type is validated against that declaration before rendering, including its exact fields and nested types. `Dialog.Cursor`, `null`, malformed payloads, unset values, and non-finite numbers fail formatting. These failures produce no formatted result for a consuming write or host emission.
 
-When using conditionals as the first argument of `fmt()`, every branch must produce a value that `fmt()` supports. If Arc reports ambiguous formatting, call `fmt()` within each branch instead: `condition ? fmt(a) : fmt(b)`.
+When using conditionals as the first argument of `fmt()`, every branch must produce a value that `fmt()` supports.
 
 `fmt` is reserved for the built-in and cannot name a node, cell, or import binding. Struct fields, channel names, and imported host operations may use the name `fmt`.
 
@@ -764,7 +759,7 @@ Records.$record({
 });
 ```
 
-Object arguments use static named data properties. Field names must be nonempty and cannot be `__proto__`, `prototype`, or `constructor`. Duplicate keys, accessors, methods, computed keys, and spread are invalid.
+Object arguments use static named data properties. Field names must be nonempty, cannot begin with `$`, and cannot be `__proto__`, `prototype`, or `constructor`. Duplicate keys, accessors, methods, computed keys, and spread are invalid.
 
 For template literals, the host module's declaration determines whether the use site is a value use site or a semantic-text use site. The template literal must conform to that use.
 

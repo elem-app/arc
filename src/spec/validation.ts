@@ -294,7 +294,7 @@ function validateHostParameterSpec(
           hostSpecIssue(
             issues,
             fieldPath,
-            "Struct field names must be nonempty and cannot be __proto__, prototype, or constructor",
+            "Struct field names must be nonempty, cannot begin with $, and cannot be __proto__, prototype, or constructor",
           );
           continue;
         }

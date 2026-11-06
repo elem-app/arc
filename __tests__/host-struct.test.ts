@@ -153,7 +153,7 @@ describe("Struct host parameters", () => {
       expect(() =>
         hmd.define({ call: (_value = hmd.Struct(fields as never)) => {} }),
       ).toThrow(/Invalid host module declaration/);
-    for (const name of ["", "__proto__", "prototype", "constructor"])
+    for (const name of ["", "$path", "__proto__", "prototype", "constructor"])
       expect(() =>
         hmd.define({
           call: (
@@ -232,7 +232,7 @@ describe("Struct host parameters", () => {
         Object.defineProperty({}, "hidden", { value: { type: "string" } }),
         { name: null },
       ].map((fields) => ({ type: "struct", fields })),
-      ...["", "__proto__", "prototype", "constructor"].map((name) => ({
+      ...["", "$path", "__proto__", "prototype", "constructor"].map((name) => ({
         type: "struct",
         fields: Object.fromEntries([[name, { type: "string" }]]),
       })),
@@ -322,6 +322,7 @@ describe("Struct host parameters", () => {
       '{ title: "a", title: "b" }',
       '{ "": 1 }',
       '{ __proto__: "x" }',
+      '{ $path: "x" }',
       '{ prototype: "x" }',
       '{ constructor: "x" }',
       '{ ["title"]: "x" }',
@@ -369,7 +370,7 @@ describe("Struct host parameters", () => {
           title: { kind: "value", value: { kind: "literal", value: [] } },
         },
       },
-      ...["", "__proto__", "prototype", "constructor"].map((name) => ({
+      ...["", "$path", "__proto__", "prototype", "constructor"].map((name) => ({
         kind: "object",
         value: Object.fromEntries([[name, field]]),
       })),
@@ -552,7 +553,7 @@ describe("Struct host parameters", () => {
         .arguments,
     ).toEqual([
       {
-        rows: [{ pair: [0, { path: "notes/a.md" }] }],
+        rows: [{ pair: [0, { $path: "notes/a.md" }] }],
         tuple: [{ flag: true }, [2, 3]],
         context: {
           text: [
@@ -649,7 +650,7 @@ describe("Struct host parameters", () => {
       ],
       [
         '{ file: Artifact("notes/a.md") }',
-        { file: { path: "../escape" } },
+        { file: { $path: "../escape" } },
         { type: "struct", fields: { file: { type: "artifact" } } },
         '$["file"]',
       ],
@@ -670,23 +671,21 @@ describe("Struct host parameters", () => {
       });
   });
 
-  it("struct.authority rejects identical-carrier Struct and Artifact substitutions recursively", () => {
+  it("struct.authority rejects Struct and Artifact substitutions recursively", () => {
     const struct: HostParameterValueSpec = {
       type: "struct",
       fields: { path: { type: "string" } },
     };
     const artifact: HostParameterValueSpec = { type: "artifact" };
     for (const nested of [false, true])
-      for (const [source, ownSpec, otherSpec] of [
-        ['{ path: "notes/a.md" }', struct, artifact],
-        ['Artifact("notes/a.md")', artifact, struct],
+      for (const [source, value, ownSpec, otherSpec] of [
+        ['{ path: "notes/a.md" }', { path: "notes/a.md" }, struct, artifact],
+        ['Artifact("notes/a.md")', { $path: "notes/a.md" }, artifact, struct],
       ] as const) {
         const wrapSource = nested ? `{ item: ${source} }` : source;
         const wrap = (spec: HostParameterValueSpec): HostParameterValueSpec =>
           nested ? { type: "struct", fields: { item: spec } } : spec;
-        const rendered = nested
-          ? { item: { path: "notes/a.md" } }
-          : { path: "notes/a.md" };
+        const rendered = nested ? { item: value } : value;
         expect(
           registrationIssues(
             normalized(wrap(otherSpec)) as HostModuleSpec,

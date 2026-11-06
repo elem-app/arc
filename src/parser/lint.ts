@@ -58,6 +58,11 @@ const LINT_RULES = {
     message:
       "Bool cell is set to both true and false in this arc; action-graph $set() actions resolve and are remembered, so toggles and resets should be modeled deliberately.",
   },
+  "comparison-never-equal": {
+    severity: "warning",
+    message:
+      "Comparison operands share no possible value, so == is always false and != is always true; Arc does not coerce between types. Compare values of the same type, or check for a misspelled Enum value.",
+  },
   "bare-cell-boolean": {
     severity: "warning",
     message:
@@ -140,6 +145,14 @@ export function lintNodeBareCellBooleans(
       emitLintIssue(lintIssues, "bare-cell-boolean", cell.loc);
     }
   }
+}
+
+/** Warn about an equality whose operands can never hold equal values. */
+export function lintNeverEqualComparison(
+  lintIssues: LintIssue[],
+  loc: SourceRange | undefined,
+): void {
+  emitLintIssue(lintIssues, "comparison-never-equal", loc);
 }
 
 /** Literal true/false write locations for one boolean cell. */

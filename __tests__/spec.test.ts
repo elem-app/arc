@@ -15,6 +15,23 @@ import { createArtifactValue } from "../src/types/value.js";
 
 const kind = (judgment: CoherenceJudgment) => judgment.kind;
 
+describe("Artifact carriers", () => {
+  it("artifact.carrier keeps Artifact and Struct admission disjoint", () => {
+    const record = {
+      type: "struct",
+      fields: { path: { type: "string" } },
+    } as const;
+    const artifact = { type: "artifact" } as const;
+
+    expect(admitValue(artifact, { $path: "a.md" }).admitted).toBe(true);
+    expect(admitValue(artifact, { path: "a.md" }).admitted).toBe(false);
+    expect(admitValue(record, { path: "a.md" }).admitted).toBe(true);
+    expect(admitValue(record, createArtifactValue("a.md")).admitted).toBe(
+      false,
+    );
+  });
+});
+
 describe("spec judgments", () => {
   it("validates semantic invariants outside the TypeScript representation", () => {
     expect(validateSpec({ type: "enum", values: [] })?.code).toBe("empty-enum");
@@ -53,7 +70,7 @@ describe("spec judgments", () => {
     expect(
       admitValue(
         { type: "artifact" },
-        { path: "result.md", extra: "not-an-artifact-carrier" },
+        { $path: "result.md", extra: "not-an-artifact-carrier" },
       ).admitted,
     ).toBe(false);
     expect(
@@ -68,11 +85,11 @@ describe("spec judgments", () => {
       element: { type: "artifact" },
     } as const;
     const customPrototype = Object.create({ inherited: true }) as {
-      path: string;
+      $path: string;
     };
-    customPrototype.path = "one.md";
-    const accessor = {} as { path: string };
-    Object.defineProperty(accessor, "path", {
+    customPrototype.$path = "one.md";
+    const accessor = {} as { $path: string };
+    Object.defineProperty(accessor, "$path", {
       enumerable: true,
       get: () => "one.md",
     });
@@ -85,7 +102,7 @@ describe("spec judgments", () => {
     expect(admitValue(artifactArray, []).admitted).toBe(true);
     expect(admitValue(artifactArray, ["one.md"]).admitted).toBe(false);
     expect(
-      admitValue(artifactArray, [{ path: "one.md", extra: true }]),
+      admitValue(artifactArray, [{ $path: "one.md", extra: true }]),
     ).toMatchObject({
       admitted: false,
       violation: { code: "invalid-artifact", path: "$[0]" },
@@ -110,12 +127,12 @@ describe("spec judgments", () => {
       admitted: false,
       violation: { code: "invalid-artifact", path: "$[0]" },
     });
-    expect(admitValue(artifactArray, [{ path: "/absolute.md" }])).toMatchObject(
-      {
-        admitted: false,
-        violation: { code: "invalid-artifact", path: "$[0]" },
-      },
-    );
+    expect(
+      admitValue(artifactArray, [{ $path: "/absolute.md" }]),
+    ).toMatchObject({
+      admitted: false,
+      violation: { code: "invalid-artifact", path: "$[0]" },
+    });
   });
 
   it("distinguishes an unset value from null during concrete admission", () => {

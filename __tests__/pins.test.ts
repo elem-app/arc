@@ -150,7 +150,7 @@ function Main() {
         },
       });
       expect(rootTraversal(terminal).cells.artifact).toEqual({
-        path: "docs/current.md",
+        $path: "docs/current.md",
       });
       expect("hostCalls" in terminal).toBe(false);
     });

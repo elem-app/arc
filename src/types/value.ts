@@ -32,11 +32,12 @@ export function isPrimitiveArrayValue(
 }
 
 /**
- * Exact `{ path }` carrier used under Artifact authority. Shape alone does not
- * select that authority.
+ * Exact `{ $path }` carrier used under Artifact authority. Shape alone does not
+ * select that authority, but no declared Struct can share it because `$` cannot
+ * begin a field name.
  */
 export type ArtifactValue = {
-  readonly path: string;
+  readonly $path: string;
 };
 
 /** Concrete invariant violated by an Artifact path. */
@@ -82,8 +83,8 @@ function classifyArtifactValueShape(
 ): ArtifactValueIssue | undefined {
   if (!isPlainRecord(value)) return "not-plain-object";
   const keys = Reflect.ownKeys(value);
-  if (keys.length !== 1 || !keys.includes("path")) return "invalid-keys";
-  const path = Object.getOwnPropertyDescriptor(value, "path");
+  if (keys.length !== 1 || !keys.includes("$path")) return "invalid-keys";
+  const path = Object.getOwnPropertyDescriptor(value, "$path");
   if (!path || !("value" in path) || !path.enumerable) {
     return "invalid-properties";
   }
@@ -104,7 +105,12 @@ export function createArtifactValue(path: string): ArtifactValue {
       { reasonCode: "invalid-artifact-path" },
     );
   }
-  return { path };
+  return { $path: path };
+}
+
+/** Reads the logical path of an Artifact carrier. */
+export function pathOfArtifactValue(value: ArtifactValue): string {
+  return value.$path;
 }
 
 /** Renders one Artifact path issue for a boundary-specific diagnostic. */
@@ -127,9 +133,9 @@ export function describeArtifactValueIssue(issue: ArtifactValueIssue): string {
     case "not-plain-object":
       return "value must be a plain object";
     case "invalid-keys":
-      return "value must contain exactly path";
+      return "value must contain exactly $path";
     case "invalid-properties":
-      return "path must be an enumerable data property";
+      return "$path must be an enumerable data property";
     default:
       return describeArtifactPathIssue(issue);
   }

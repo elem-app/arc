@@ -343,7 +343,7 @@ function structToken<
     if (typeof name !== "string" || !isHostStructFieldName(name)) {
       declarationError(
         path,
-        "Struct field names must be nonempty strings and cannot be __proto__, prototype, or constructor",
+        "Struct field names must be nonempty strings, cannot begin with $, and cannot be __proto__, prototype, or constructor",
       );
     }
     const fieldPath = propertyPath(path, name);

@@ -48,4 +48,5 @@ export {
   isDialogCursorValue,
   isPrimitiveArrayValue,
   isPrimitiveValue,
+  pathOfArtifactValue,
 } from "./value.js";

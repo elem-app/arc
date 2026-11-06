@@ -89,9 +89,9 @@ type StructValue = {
 };
 ```
 
-A top-level payload may be a string, number, boolean, `undefined`, an Artifact value, or an array or object recursively composed from payload values. Nested values must be defined; arrays must be dense ordinary data arrays without accessors or extra properties; objects must be plain or null-prototype data objects without accessors or symbols. String keys, including `$`-prefixed keys, are admitted.
+A top-level payload may be a string, number, boolean, `undefined`, an Artifact value, or an array or object recursively composed from payload values. Nested values must be defined; arrays must be dense ordinary data arrays without accessors or extra properties; objects must be plain or null-prototype data objects without accessors or symbols. A typed position admits only what its spec declares, and no Struct spec can declare a `$`-prefixed field.
 
-An Artifact value has the exact transport shape `{ path: string }`. Use `createArtifactValue(path)` to validate and construct one, and `isArtifactValue(value)` to validate an unknown value when the surrounding operation or declaration already requires an Artifact. The shape carries no global runtime tag: an unconstrained `{ path: "x" }` payload remains an ordinary struct. Artifact cells, channels, constructors, and interpolations require that exact shape. The registered document spec remains authoritative for persisted cell values.
+An Artifact value has the exact transport shape `{ $path: string }`. Use `createArtifactValue(path)` to validate and construct one, `isArtifactValue(value)` to validate an unknown value when the surrounding operation or declaration already requires an Artifact, and `pathOfArtifactValue(value)` to read its logical path. The shape carries no global runtime tag: an unconstrained `{ $path: "x" }` payload remains ordinary data. Artifact cells, channels, constructors, and interpolations require that exact shape. The registered document spec remains authoritative for persisted cell values.
 
 ## Traversal State
 
@@ -150,16 +150,14 @@ The stable causes for runtime-initiated poison are:
 | `invalid-array-literal` | An array literal element is not a valid value. |
 | `invalid-struct-literal` | A struct literal field does not hold a valid value. |
 | `invalid-field-read` | A field read names a field the struct does not declare. Validated documents should normally prevent this. |
-| `invalid-artifact-value` | A value used under Artifact authority does not have the exact valid `{ path: string }` shape; nested array failures include the first invalid member path. |
+| `invalid-artifact-value` | A value used under Artifact authority does not have the exact valid `{ $path: string }` shape; nested array failures include the first invalid member path. |
 | `invalid-artifact-operation` | Runtime evaluation receives an Artifact in ordering, regex, or another unsupported operation. Artifact equality and inequality are supported. |
 | `non-numeric-arithmetic-operand` | A dynamically supplied arithmetic operand is not a number. The reason identifies the operator, operand position, and runtime value kind. |
 | `non-numeric-is-finite-argument` | A dynamically supplied `Num.isFinite(...)` argument is not a number. |
 | `non-finite-number` | Authored execution tries to use `NaN` or an infinity where a finite number is required. |
-| `invalid-comparison-operands` | The operands of a comparison cannot be compared, such as a union comparison that no declared union covers. |
+| `invalid-comparison-operands` | The operands of a comparison cannot be compared, such as an ordering between a number and a string, or an equality operand that is not a valid value. |
 | `invalid-numeric-comparison` | A numeric comparison receives a non-number. |
 | `invalid-string-comparison` | A string comparison receives a non-string. |
-| `invalid-boolean-comparison` | A boolean equality receives a non-boolean. |
-| `invalid-struct-comparison` | A struct equality receives a value that is not a record. |
 | `non-boolean-value` | A boolean position receives a value that is not a boolean. |
 | `invalid-string` | A position that requires a string receives another value. |
 | `span-outside-map` | `span` is read outside a `$map` callback. Validated documents should normally prevent this. |

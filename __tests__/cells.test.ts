@@ -1566,12 +1566,12 @@ function Main(args = { input: Artifact() }) {
       const brief = actionProgress(
         runtime.enterArc(arc("artifact-cell-set", "Main"), EMPTY_DIALOG, {
           args: {
-            input: { path: "assigned.md" },
+            input: { $path: "assigned.md" },
           },
         }),
       );
 
-      expect(rootTraversal(brief).cells.note).toEqual({ path: "assigned.md" });
+      expect(rootTraversal(brief).cells.note).toEqual({ $path: "assigned.md" });
       expect(brief.instructions[0]?.text).toEqual([
         { kind: "text", value: "Use " },
         { kind: "artifact", path: "assigned.md" },
@@ -1694,16 +1694,57 @@ function Main(args = { same: Artifact(), different: Artifact() }) {
         unsetEqual: false,
         unsetUnequal: true,
       });
-      expect(() =>
-        parse(`
+    });
+
+    it("artifact.equality keeps Artifacts distinct from path strings and path records", () => {
+      const runtime = new Runtime()
+        .add(
+          "artifact-cross-type-equality",
+          parse(`
 "arc";
 function Main() {
   let note = Artifact("same.md");
-  let equal = Bool();
-  equal.$set(note == "same.md");
+  let text = Str();
+  let record = Struct({ path: Str() });
+  let notes = Array(Artifact());
+  let records = Array(Struct({ path: Str() }));
+  let noNotes = Array(Artifact());
+  let noRecords = Array(Struct({ path: Str() }));
+  let againstText = Bool();
+  let againstRecord = Bool();
+  let againstLiteral = Bool();
+  let againstRecords = Bool();
+  let againstNoRecords = Bool();
+
+  text.$set("same.md");
+  record.$set({ path: "same.md" });
+  notes.$set([note]);
+  records.$set([{ path: "same.md" }]);
+  noNotes.$set([]);
+  noRecords.$set([]);
+  againstText.$set(note == text);
+  againstRecord.$set(note == record);
+  againstLiteral.$set(note != { path: "same.md" });
+  againstRecords.$set(notes == records);
+  againstNoRecords.$set(noNotes == noRecords);
 }
 `),
-      ).toThrow(/COMPARISON_VALUE_TYPE/);
+        )
+        .init();
+
+      const brief = actionTerminal(
+        runtime.enterArc(
+          arc("artifact-cross-type-equality", "Main"),
+          EMPTY_DIALOG,
+        ),
+      );
+      expect(rootTraversal(brief).cells).toMatchObject({
+        againstText: false,
+        againstRecord: false,
+        againstLiteral: true,
+        againstRecords: false,
+        againstNoRecords: true,
+      });
     });
 
     it("artifact.direct-operations reject ordering, arithmetic, regex, and property access", () => {
@@ -2038,7 +2079,7 @@ function Main() {
       const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
       expect(rootTraversal(brief).cells.slug).toBe("changed");
       expect(rootTraversal(brief).cells.note).toEqual({
-        path: "notes/initial.md",
+        $path: "notes/initial.md",
       });
       expect(brief.instructions[0]?.text).toEqual([
         { kind: "text", value: "Use " },
@@ -3277,18 +3318,32 @@ function Main() {
       expect(cells.neqReordered).toBe(true);
     });
 
-    it("rejects equality between arrays with incompatible element guarantees", () => {
-      expect(() =>
-        parse(`
+    it("compares arrays with different element types by value", () => {
+      const document = parse(`
 "arc";
 function Main() {
   let numbers = Array(Num());
   let strings = Array(Str());
-  let same = Bool();
-  same.$set(numbers == strings);
+  let filled = Bool();
+  let empty = Bool();
+  numbers.$set([1]);
+  strings.$set(["1"]);
+  filled.$set(numbers == strings);
+  numbers.$set([]);
+  strings.$set([]);
+  empty.$set(numbers == strings);
 }
-`),
-      ).toThrow(/COMPARISON_VALUE_TYPE/);
+`);
+      const runtime = new Runtime()
+        .add("array-cross-type-equality", document)
+        .init();
+      const seeded = runtime.newTraversal(
+        arc("array-cross-type-equality", "Main"),
+      );
+      seeded.phase = "entered";
+      expect(
+        rootTraversal(startTerminal(runtime, [seeded], EMPTY_DIALOG)).cells,
+      ).toMatchObject({ filled: false, empty: true });
     });
 
     it.each([
@@ -4000,33 +4055,58 @@ function Main() {
       );
     });
 
-    it.each([
-      [
-        "an ordering",
-        "let a = Struct({ x: Str() }); let b = Struct({ x: Str() }); if (a < b) {}",
-      ],
-      [
-        "a missing field",
-        "let a = Struct({ x: Str(), y: Str() }); let b = Struct({ x: Str() }); if (a == b) {}",
-      ],
-      [
-        "an incomparable field",
-        "let a = Struct({ x: Str() }); let b = Struct({ x: Num() }); if (a == b) {}",
-      ],
-      ["a scalar operand", 'let a = Struct({ x: Str() }); if (a == "x") {}'],
-      [
-        "differently shaped elements",
-        "let a = Array(Struct({ x: Str() })); let b = Array(Struct({ y: Str() })); if (a == b) {}",
-      ],
-    ])("struct.equality rejects %s at parse", (_case, body) => {
+    it("struct.equality rejects an ordering at parse", () => {
       expect(() =>
         parse(`
 "arc";
 function Main() {
-  ${body}
+  let a = Struct({ x: Str() });
+  let b = Struct({ x: Str() });
+  if (a < b) {}
 }
 `),
-      ).toThrow(/COMPARISON_VALUE_TYPE|ARRAY_ORDERING/);
+      ).toThrow(/COMPARISON_VALUE_TYPE/);
+    });
+
+    it.each([
+      [
+        "a missing field",
+        'let a = Struct({ x: Str(), y: Str() }); let b = Struct({ x: Str() }); a.$set({ x: "1", y: "2" }); b.$set({ x: "1" });',
+      ],
+      [
+        "a differently typed field",
+        'let a = Struct({ x: Str() }); let b = Struct({ x: Num() }); a.$set({ x: "1" }); b.$set({ x: 1 });',
+      ],
+      [
+        "a scalar operand",
+        'let a = Struct({ x: Str() }); let b = Str(); a.$set({ x: "1" }); b.$set("1");',
+      ],
+      [
+        "differently shaped elements",
+        'let a = Array(Struct({ x: Str() })); let b = Array(Struct({ y: Str() })); a.$set([{ x: "1" }]); b.$set([{ y: "1" }]);',
+      ],
+    ])("struct.equality compares %s as unequal", (caseName, setup) => {
+      const source = `struct-unequal-${caseName}`;
+      const runtime = new Runtime()
+        .add(
+          source,
+          parse(`
+"arc";
+function Main() {
+  ${setup}
+  let same = Bool();
+  let different = Bool();
+  same.$set(a == b);
+  different.$set(a != b);
+}
+`),
+        )
+        .init();
+      const seeded = runtime.newTraversal(arc(source, "Main"));
+      seeded.phase = "entered";
+      expect(
+        rootTraversal(startTerminal(runtime, [seeded], EMPTY_DIALOG)).cells,
+      ).toMatchObject({ same: false, different: true });
     });
 
     it("struct.lint counts field writes and observations as reads of their Struct", () => {

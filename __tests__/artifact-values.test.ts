@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { parse, validate } from "../src/parser/index.js";
-import { Runtime } from "../src/runtime/index.js";
+import { pathOfArtifactValue, Runtime } from "../src/runtime/index.js";
 import { cellValuesEqual } from "../src/runtime/state.js";
 import type { ArtifactValue, PayloadValue } from "../src/types/index.js";
 import {
@@ -13,15 +13,23 @@ import {
 } from "../src/types/value.js";
 
 describe("Artifact values", () => {
+  it("artifact.value.path reads the logical path of a created or restored value", () => {
+    const created = createArtifactValue("incoming/source.md");
+    const restored = JSON.parse(JSON.stringify(created)) as ArtifactValue;
+
+    expect(pathOfArtifactValue(created)).toBe("incoming/source.md");
+    expect(pathOfArtifactValue(restored)).toBe("incoming/source.md");
+  });
+
   it("artifact.value.factory creates a JSON-stable value without factory provenance", () => {
     const created = createArtifactValue("incoming/source.md");
     const restored = JSON.parse(JSON.stringify(created)) as unknown;
-    const forged = { path: "incoming/forged.md" };
+    const forged = { $path: "incoming/forged.md" };
     const nullPrototype = Object.assign(Object.create(null), {
-      path: "incoming/null-prototype.md",
+      $path: "incoming/null-prototype.md",
     });
 
-    expect(created).toEqual({ path: "incoming/source.md" });
+    expect(created).toEqual({ $path: "incoming/source.md" });
     expect(isArtifactValue(created)).toBe(true);
     expect(isArtifactValue(restored)).toBe(true);
     expect(isArtifactValue(forged)).toBe(true);
@@ -38,27 +46,28 @@ describe("Artifact values", () => {
     const accessor = Object.defineProperties(
       {},
       {
-        path: { enumerable: true, get: () => "accessor.md" },
+        $path: { enumerable: true, get: () => "accessor.md" },
       },
     );
     const symbol = Symbol("extra");
     const nonEnumerable = Object.defineProperties(
       {},
       {
-        path: { enumerable: false, value: "hidden.md" },
+        $path: { enumerable: false, value: "hidden.md" },
       },
     );
     const malformed: unknown[] = [
       null,
       [],
       new (class ArtifactLike {
-        path = "class.md";
+        $path = "class.md";
       })(),
       {},
-      { path: "ok.md", extra: true },
-      { path: "ok.md", [symbol]: true },
-      { path: 1 },
-      { path: "/absolute.md" },
+      { path: "ok.md" },
+      { $path: "ok.md", extra: true },
+      { $path: "ok.md", [symbol]: true },
+      { $path: 1 },
+      { $path: "/absolute.md" },
       accessor,
       nonEnumerable,
       new Proxy(
@@ -88,7 +97,7 @@ describe("Artifact values", () => {
 
     for (const [path, issue] of invalidCases) {
       expect(classifyArtifactPath(path)).toBe(issue);
-      expect(isArtifactValue({ path })).toBe(false);
+      expect(isArtifactValue({ $path: path })).toBe(false);
       try {
         createArtifactValue(path as string);
         throw new Error("expected createArtifactValue to reject");
@@ -122,7 +131,7 @@ describe("Artifact values", () => {
       semanticPart: { kind: string; path: string };
     };
 
-    (artifact as { path: string }).path = "mutated.md";
+    (artifact as { $path: string }).$path = "mutated.md";
     expect(cloned.nested[0]).toEqual(createArtifactValue("nested/value.md"));
     expect(cloned.semanticPart).toEqual({
       kind: "artifact",
@@ -185,12 +194,12 @@ function Main() {
   it("artifact.payload rejects malformed values before Runtime.add cloning", () => {
     const symbol = Symbol("extra");
     const malformed = [
-      { path: "valid.md", [symbol]: true },
-      Object.defineProperty({ path: "valid.md" }, "extra", { value: true }),
+      { $path: "valid.md", [symbol]: true },
+      Object.defineProperty({ $path: "valid.md" }, "extra", { value: true }),
       Object.defineProperties(
         {},
         {
-          path: { enumerable: true, get: () => "valid.md" },
+          $path: { enumerable: true, get: () => "valid.md" },
         },
       ),
       Object.defineProperty({}, "$private", { value: true }),
@@ -209,10 +218,10 @@ function Main() {
     const artifact = createArtifactValue("chosen.md");
     expect(mergeAndClonePayload({ keep: true }, artifact)).toEqual({
       keep: true,
-      path: "chosen.md",
+      $path: "chosen.md",
     });
     expect(mergeAndClonePayload(artifact, { replace: true })).toEqual({
-      path: "chosen.md",
+      $path: "chosen.md",
       replace: true,
     });
     expect(mergeAndClonePayload(artifact, undefined)).toEqual(artifact);

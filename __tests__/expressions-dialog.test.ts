@@ -1081,6 +1081,167 @@ function Main() {
   });
 });
 
+describe("Equality across types", () => {
+  const lints = (body: string) =>
+    analyzeDocument(parse(`"arc"; function Main() { ${body} }`)).lintIssues.map(
+      (issue) => issue.code,
+    );
+
+  it("expr.equality compares values of different types as unequal without coercion", () => {
+    const source = "cross-type-equality";
+    const runtime = new Runtime()
+      .add(
+        source,
+        parse(`"arc"; function Main() {
+          let number = Num(); let text = Str(); let flag = Bool();
+          let digits = Bool(); let flagged = Bool(); let literals = Bool();
+          let arrays = Bool(); let same = Bool();
+          number.$set(1); text.$set("1"); flag.$set(true);
+          digits.$set(number == text);
+          flagged.$set(flag != number);
+          literals.$set(1 == "1");
+          arrays.$set([1] == ["1"]);
+          same.$set(number == 1);
+        }`),
+      )
+      .init();
+    const seeded = runtime.newTraversal(arc(source, "Main"));
+    seeded.phase = "entered";
+    expect(
+      rootTraversal(startTerminal(runtime, [seeded], EMPTY_DIALOG)).cells,
+    ).toMatchObject({
+      digits: false,
+      flagged: true,
+      literals: false,
+      arrays: false,
+      same: true,
+    });
+  });
+
+  it.each([
+    [
+      "a cell",
+      "let at = Dialog.Cursor(); let other = Dialog.Cursor(); if (at == other) {}",
+    ],
+    ["a live cursor", "let at = Dialog.Cursor(); if (at != Dialog.cursor) {}"],
+    ["a scalar", "let at = Dialog.Cursor(); if (at == 1) {}"],
+    ["an array element", "let at = Dialog.Cursor(); if ([at] == []) {}"],
+    [
+      "a conditional branch",
+      "let at = Dialog.Cursor(); let flag = Bool(); if ((flag ? at : 1) == 1) {}",
+    ],
+  ])(
+    "expr.equality keeps Dialog.Cursor out when compared with %s",
+    (_case, body) => {
+      expect(() => parse(`"arc"; function Main() { ${body} }`)).toThrow(
+        /COMPARISON_VALUE_TYPE/,
+      );
+    },
+  );
+
+  it.each([
+    ["a number and a string", 'let a = Num(); a.$set(1); if (a == "1") {}'],
+    ["a boolean and a number", "let a = Bool(); a.$set(true); if (a != 1) {}"],
+    ["an Artifact and a path", 'let a = Artifact("x.md"); if (a == "x.md") {}'],
+    [
+      "a misspelled Enum literal",
+      'let a = Enum(["cold", "warm"]); a.$set("cold"); if (a == "wram") {}',
+    ],
+    [
+      "Enums without a shared value",
+      'let a = Enum(["x"]); let b = Enum(["y"]); a.$set("x"); b.$set("y"); if (a == b) {}',
+    ],
+    [
+      "arrays with disjoint element types",
+      "let a = Array(Num()); let b = Array(Str()); a.$set([]); b.$set([]); if (a == b) {}",
+    ],
+    [
+      "structs with different fields",
+      'let a = Struct({ x: Str() }); let b = Struct({ y: Str() }); a.$set({ x: "1" }); b.$set({ y: "1" }); if (a == b) {}',
+    ],
+    [
+      "a union with no matching member",
+      'let a = Union([Num(), Enum(["none"])]); a.$set(1); if (a == true) {}',
+    ],
+    [
+      "a misaligned literal array position",
+      'let a = Num(); a.$set(1); if ([a, "x"] == ["x", a]) {}',
+    ],
+  ])("expr.equality lint flags %s", (_case, body) => {
+    expect(lints(body)).toContain("comparison-never-equal");
+  });
+
+  it.each([
+    ["two numbers", "let a = Num(); a.$set(1); if (a == 2) {}"],
+    [
+      "an Enum member literal",
+      'let a = Enum(["cold", "warm"]); a.$set("cold"); if (a == "warm") {}',
+    ],
+    [
+      "an Enum and a Str",
+      'let a = Enum(["x"]); let b = Str(); a.$set("x"); b.$set("x"); if (a == b) {}',
+    ],
+    [
+      "a union and a Str that may match",
+      'let a = Union([Num(), Enum(["none"])]); let b = Str(); a.$set(1); b.$set("x"); if (a == b) {}',
+    ],
+    [
+      "a union and a member literal",
+      'let a = Union([Num(), Enum(["none"])]); a.$set(1); if (a != "none") {}',
+    ],
+    [
+      "an empty array literal",
+      "let a = Array(Num()); a.$set([]); if (a == []) {}",
+    ],
+    [
+      "a node state",
+      "$enter(Child); if (Child.state == State.COVERED) {} function Child() {}",
+    ],
+    ["an ordering", "let a = Num(); a.$set(1); if (a > 2) {}"],
+  ])("expr.equality lint accepts %s", (_case, body) => {
+    expect(lints(body)).not.toContain("comparison-never-equal");
+  });
+
+  it("expr.equality lint reports the enclosing statement across hooks and $map callbacks", () => {
+    const lines = analyzeDocument(
+      parse(`"arc";
+function Main() {
+  let count = Num();
+  let items = Array(Num());
+  this.trigger = () => {
+    return count == "a";
+  };
+  this.guard = () => {
+    if (count == "b") return State.SKIPPED;
+  };
+  this.catchDeflection = () => {
+    return count == "c";
+  };
+  this.effects = () => {
+    if (count == "d") {
+      count.$set(1);
+    }
+  };
+  $instructLoop(\`go\`, {
+    resolveWhen: () => count == "e",
+  });
+  items.$set([1]);
+  items.$map(() => {
+    if (span.item == "f") {
+      $instruct(\`item\`);
+    }
+  });
+  $instruct(\`\${count == "g"}\`);
+}
+`),
+    )
+      .lintIssues.filter((issue) => issue.code === "comparison-never-equal")
+      .map((issue) => issue.loc?.start.line)
+      .sort((left, right) => left! - right!);
+    expect(lines).toEqual([6, 9, 12, 15, 20, 24, 28]);
+  });
+});
+
 describe("Union operations", () => {
   function run(body: string) {
     const source = "union-operations";
@@ -1142,16 +1303,34 @@ describe("Union operations", () => {
     expect(rootTraversal(terminal).cells.result).toBeUndefined();
   });
 
-  it("union.runtime unrelated declarations sharing one member do not authorize the selected incompatible pair", () => {
+  it("union.runtime compares unrelated declarations by held value", () => {
     const { runtime, seeded } = run(`
       let left = Union([Num(), Bool()]); let right = Union([Str(), Bool()]);
-      let result = Bool(); left.$set(9); right.$set("text"); result.$set(left == right);
+      let different = Bool(); let same = Bool();
+      left.$set(9); right.$set("text"); different.$set(left == right);
+      left.$set(true); right.$set(true); same.$set(left == right);
     `);
-    const terminal = startTerminal(runtime, [seeded], EMPTY_DIALOG);
-    expect(terminal.issues).toContainEqual(
-      expect.objectContaining({ reasonCode: "invalid-comparison-operands" }),
-    );
-    expect(rootTraversal(terminal).cells.result).toBeUndefined();
+    const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+    expect(rootTraversal(brief).cells).toMatchObject({
+      different: false,
+      same: true,
+    });
+    expect(brief.issues).toEqual([]);
+  });
+
+  it("union.runtime compares a held number with a broader Str as unequal", () => {
+    const { runtime, seeded } = run(`
+      let hour = Union([Num(), Enum(["no_preference"])]);
+      let text = Str(); let same = Bool(); let different = Bool();
+      text.$set("no_preference"); hour.$set(9);
+      same.$set(hour == text); different.$set(hour != text);
+    `);
+    const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+    expect(rootTraversal(brief).cells).toMatchObject({
+      same: false,
+      different: true,
+    });
+    expect(brief.issues).toEqual([]);
   });
 
   it("union.runtime recursively compares fixed containers using their Union fields and elements", () => {
@@ -1185,12 +1364,14 @@ describe("Union operations", () => {
     const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
     expect(rootTraversal(brief).cells.same).toBe(true);
     expect(brief.issues).toEqual([]);
-    expect(() =>
-      run(`
-        let hour = Union([Num(), Enum(["no_preference"])]); let same = Bool();
-        same.$set([hour, 1] == [1, "no_preference"]);
-      `),
-    ).toThrow(/COMPARISON_VALUE_TYPE/);
+    const swapped = run(`
+      let hour = Union([Num(), Enum(["no_preference"])]); let same = Bool();
+      hour.$set("no_preference"); same.$set([hour, 1] == [1, "no_preference"]);
+    `);
+    expect(
+      rootTraversal(startRun(swapped.runtime, [swapped.seeded], EMPTY_DIALOG))
+        .cells.same,
+    ).toBe(false);
   });
 
   it("union.runtime guards admit actual numeric boolean and regex operands without narrowing declarations", () => {

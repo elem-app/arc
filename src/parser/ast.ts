@@ -1405,7 +1405,7 @@ export function parseHostCallArgument(
       }
       if (!isHostStructFieldName(key)) {
         throw new Error(
-          "Host call object keys cannot be __proto__, prototype, or constructor",
+          "Host call object keys cannot begin with $ or be __proto__, prototype, or constructor",
         );
       }
       if (Object.hasOwn(value, key)) {

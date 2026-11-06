@@ -1,10 +1,11 @@
 import type { FmtConfig } from "../types/ir.js";
 import type { CellSpec, ChannelSpec } from "../types/spec.js";
 import {
-  classifyArtifactPath,
   firstInvalidPayloadValue,
   firstNonFiniteNumberPath,
   isPlainRecord,
+  pathOfArtifactValue,
+  type ArtifactValue,
   type PrimitiveValue,
 } from "../types/value.js";
 import type {
@@ -210,145 +211,6 @@ function evidenceShape(evidence: ProducerEvidence): Shape {
   }
 }
 
-type Overlap = { overlaps: boolean; ambiguous: boolean };
-const disjoint: Overlap = { overlaps: false, ambiguous: false };
-const same: Overlap = { overlaps: true, ambiguous: false };
-
-function scalarFamily(shape: Extract<Shape, { kind: "scalar" }>): string {
-  return shape.spec.type === "enum"
-    ? "string"
-    : shape.spec.type === "index"
-      ? "number"
-      : shape.spec.type;
-}
-
-function exactScalars(
-  shape: Extract<Shape, { kind: "scalar" }>,
-): readonly PrimitiveValue[] | undefined {
-  return shape.literal !== undefined
-    ? [shape.literal]
-    : shape.spec.type === "enum"
-      ? shape.spec.values
-      : undefined;
-}
-
-function scalarContains(
-  shape: Extract<Shape, { kind: "scalar" }>,
-  value: PrimitiveValue,
-): boolean {
-  if (shape.literal !== undefined && value !== shape.literal) return false;
-  if (shape.spec.type === "enum")
-    return typeof value === "string" && shape.spec.values.includes(value);
-  if (shape.spec.type === "index")
-    return (
-      typeof value === "number" && Number.isSafeInteger(value) && value >= 0
-    );
-  return typeof value === shape.spec.type;
-}
-
-function artifactPathOverlap(shape: Shape): Overlap {
-  if (shape.kind === "dynamic") return same;
-  if (shape.kind === "alternatives") {
-    const children = shape.alternatives.map(artifactPathOverlap);
-    return {
-      overlaps: children.some((child) => child.overlaps),
-      ambiguous: children.some((child) => child.ambiguous),
-    };
-  }
-  if (shape.kind !== "scalar" || scalarFamily(shape) !== "string")
-    return disjoint;
-  const values = exactScalars(shape);
-  return values &&
-    !values.some(
-      (value) =>
-        typeof value === "string" && classifyArtifactPath(value) === undefined,
-    )
-    ? disjoint
-    : { overlaps: true, ambiguous: true };
-}
-
-/** Checks overlapping carriers whose nominal projections could disagree. */
-function overlap(left: Shape, right: Shape): Overlap {
-  if (left.kind === "alternatives" || right.kind === "alternatives") {
-    const pairs = (
-      left.kind === "alternatives" ? left.alternatives : [left]
-    ).flatMap((a) =>
-      (right.kind === "alternatives" ? right.alternatives : [right]).map((b) =>
-        overlap(a, b),
-      ),
-    );
-    return {
-      overlaps: pairs.some((p) => p.overlaps),
-      ambiguous: pairs.some((p) => p.ambiguous),
-    };
-  }
-  if (left.kind === "unusable" || right.kind === "unusable") return disjoint;
-  if (left.kind === "dynamic" || right.kind === "dynamic") return same;
-  if (left.kind === "artifact" || right.kind === "artifact") {
-    if (left.kind === "artifact" && right.kind === "artifact") return same;
-    const other = left.kind === "artifact" ? right : left;
-    if (other.kind !== "struct") return disjoint;
-    if (!other.fields) return same;
-    const keys = Object.keys(other.fields);
-    if (keys.length !== 1 || keys[0] !== "path") return disjoint;
-    return artifactPathOverlap(other.fields.path!);
-  }
-  if (left.kind === "scalar" || right.kind === "scalar") {
-    if (
-      left.kind !== "scalar" ||
-      right.kind !== "scalar" ||
-      scalarFamily(left) !== scalarFamily(right)
-    )
-      return disjoint;
-    const a = exactScalars(left),
-      b = exactScalars(right);
-    if (a && !a.some((value) => scalarContains(right, value))) return disjoint;
-    if (b && !b.some((value) => scalarContains(left, value))) return disjoint;
-    return same;
-  }
-  if (left.kind === "struct" || right.kind === "struct") {
-    if (left.kind !== "struct" || right.kind !== "struct") return disjoint;
-    if (!left.fields || !right.fields) return same;
-    const keys = Object.keys(left.fields);
-    if (
-      keys.length !== Object.keys(right.fields).length ||
-      keys.some((key) => !Object.hasOwn(right.fields!, key))
-    )
-      return disjoint;
-    const children = keys.map((key) =>
-      overlap(left.fields![key]!, right.fields![key]!),
-    );
-    return children.some((p) => !p.overlaps)
-      ? disjoint
-      : { overlaps: true, ambiguous: children.some((p) => p.ambiguous) };
-  }
-  if (left.kind === "list" && right.kind === "list") {
-    const child = overlap(left.element, right.element);
-    return { overlaps: true, ambiguous: child.ambiguous };
-  }
-  if (
-    left.kind === "array" &&
-    right.kind === "array" &&
-    left.elements.length !== right.elements.length
-  )
-    return disjoint;
-  const count =
-    left.kind === "array"
-      ? left.elements.length
-      : right.kind === "array"
-        ? right.elements.length
-        : 0;
-  const children = Array.from({ length: count }, (_, i) =>
-    overlap(
-      left.kind === "array" ? left.elements[i]! : left.element,
-      right.kind === "array" ? right.elements[i]! : right.element,
-    ),
-  );
-  return children.some((p) => !p.overlaps)
-    ? disjoint
-    : { overlaps: true, ambiguous: children.some((p) => p.ambiguous) };
-}
-
 function judgeShape(shape: Shape): CoherenceJudgment {
   if (shape.kind === "unusable") return { kind: "incompatible" };
   if (shape.kind === "dynamic" || (shape.kind === "struct" && !shape.fields))
@@ -367,17 +229,10 @@ function judgeShape(shape: Shape): CoherenceJudgment {
   if (judgments.some((j) => j.kind === "incompatible"))
     return { kind: "incompatible" };
   if (judgments.some((j) => j.kind === "unknown")) return { kind: "unknown" };
-  if (
-    shape.kind === "alternatives" &&
-    children.some((a, i) =>
-      children.slice(i + 1).some((b) => overlap(a, b).ambiguous),
-    )
-  )
-    return { kind: "incompatible" };
   return { kind: "compatible" };
 }
 
-/** Judges supported formatting operands and ambiguous nominal alternatives. */
+/** Judges supported formatting operands. */
 export function checkFmtEvidence(
   evidence: ProducerEvidence,
 ): CoherenceJudgment {
@@ -449,7 +304,10 @@ function project(
   if (shape.kind === "artifact") {
     const admission = admit({ type: "artifact" }, value, path);
     return admission.admitted
-      ? { admitted: true, value: (value as { path: string }).path }
+      ? {
+          admitted: true,
+          value: pathOfArtifactValue(value as ArtifactValue),
+        }
       : fail(admission.violation.detail, path);
   }
   if (shape.kind === "array" || shape.kind === "list") {

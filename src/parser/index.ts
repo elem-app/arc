@@ -137,6 +137,7 @@ import {
 } from "./document-grammar.js";
 import {
   lintArcCellReads,
+  lintNeverEqualComparison,
   lintNodeBareCellBooleans,
   lintNodeReadBeforeSet,
   lintNodeStatements,
@@ -463,6 +464,18 @@ let mapContextStack: MapValidationContext[] = [];
 
 /** The per-SEG read-sets collected for the node currently being validated. */
 let activeSegReadSets: Map<SegKey, NodeReadSet> | undefined;
+
+/**
+ * Where an expression-level lint lands. Expressions carry no source location,
+ * so each one reports at the declaration or statement being validated.
+ */
+let activeLintSite:
+  | { issues: LintIssue[]; loc: SourceRange | undefined }
+  | undefined;
+
+function noteLintLoc(loc: SourceRange | undefined): void {
+  if (activeLintSite) activeLintSite.loc = loc;
+}
 
 function recordCellRead(name: string): void {
   activeReadSet?.cells.add(name);
@@ -4689,6 +4702,7 @@ function validateNode(
   const segReadSets = new Map<SegKey, NodeReadSet>();
   activeReadSet = builder;
   activeSegReadSets = segReadSets;
+  activeLintSite = { issues: context.lintIssues, loc: node.loc };
   try {
     if (node.guidance !== undefined)
       validateSemanticString(
@@ -4699,6 +4713,7 @@ function validateNode(
         baseOptions,
       );
     for (const cell of node.cells) {
+      noteLintLoc(cell.loc);
       const questions = isObservableCell(cell) ? observingQuestions(cell) : [];
       for (const question of questions) {
         validateSemanticString(
@@ -4811,6 +4826,7 @@ function validateNode(
   } finally {
     activeReadSet = previousReadSet;
     activeSegReadSets = previousSegReadSets;
+    activeLintSite = undefined;
   }
   segReadSets.set(nodeSegKey("body"), finalizeReadSet(builder));
   context.bySeg.set(node, segReadSets);
@@ -4841,6 +4857,7 @@ function validateStatement(
   labels: string[] = [],
   options: ValidationOptions = {},
 ): void {
+  noteLintLoc(statement.loc);
   if (statement.kind === "if") {
     validateExpression(statement.test, cells, nodes, issues, options);
     checkBooleanValue(
@@ -5476,6 +5493,7 @@ function validateTriggerStatement(
   labels: string[] = [],
   options: ValidationOptions = {},
 ): void {
+  noteLintLoc(statement.loc);
   if (statement.kind === "if") {
     validateExpression(statement.test, cells, nodes, issues, options);
     checkBooleanValue(
@@ -5583,6 +5601,7 @@ function validateGuardStatement(
   labels: string[] = [],
   options: ValidationOptions = {},
 ): void {
+  noteLintLoc(statement.loc);
   if (statement.kind === "if") {
     validateExpression(statement.test, cells, nodes, issues, options);
     checkBooleanValue(
@@ -5746,6 +5765,7 @@ function validateCatchDeflectionStatement(
   labels: string[] = [],
   options: ValidationOptions = {},
 ): void {
+  noteLintLoc(statement.loc);
   if (statement.kind === "if") {
     validateExpression(statement.test, cells, nodes, issues, options);
     checkBooleanValue(
@@ -5869,6 +5889,7 @@ function validateEffectStatement(
   labels: string[] = [],
   options: ValidationOptions = {},
 ): void {
+  noteLintLoc(statement.loc);
   if (statement.kind === "if") {
     validateExpression(statement.test, cells, nodes, issues, options);
     checkBooleanValue(
@@ -6629,6 +6650,12 @@ function validateExpression(
                 ? "A whole array cannot be used in an ordering comparison"
                 : "Comparison operands do not have a coherent shared domain",
         });
+      } else if (
+        !isOrdering &&
+        activeLintSite &&
+        !comparisonRule.mayBeEqual(decision)
+      ) {
+        lintNeverEqualComparison(activeLintSite.issues, activeLintSite.loc);
       }
       return;
     }

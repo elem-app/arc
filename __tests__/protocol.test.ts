@@ -1330,7 +1330,7 @@ function Main() {
         move: "proceed",
         hostCalls: { [callId]: { status: "resolved", value: hostValue } },
       });
-      (hostValue as { path: string }).path = "mutated.md";
+      (hostValue as { $path: string }).$path = "mutated.md";
       expect(instruction.instructions[0]?.text).toEqual([
         { kind: "text", value: "Use " },
         { kind: "artifact", path: "host.md" },

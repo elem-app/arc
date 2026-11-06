@@ -266,7 +266,7 @@ function Main(
       ],
       [
         "note",
-        { path: "note.md", extra: true },
+        { $path: "note.md", extra: true },
         /Invalid persisted traversal state.*artifact guarantee/,
       ],
       [
@@ -389,7 +389,7 @@ function Transform(
         args: { input, slug: "summary" },
       }),
     );
-    (input as { path: string }).path = "mutated-after-entry.md";
+    (input as { $path: string }).$path = "mutated-after-entry.md";
 
     expect(first.instructions[0]?.text).toEqual([
       { kind: "text", value: "Read " },
@@ -433,18 +433,18 @@ function Main(args = { input: Artifact() }) {}
       "incoming.md",
       { kind: "artifact", path: "incoming.md" },
       {},
-      { path: "incoming.md", extra: true },
-      Object.assign(Object.create({}), { path: "incoming.md" }),
+      { $path: "incoming.md", extra: true },
+      Object.assign(Object.create({}), { $path: "incoming.md" }),
       Object.defineProperties(
         {},
         {
-          path: { enumerable: true, get: () => "incoming.md" },
+          $path: { enumerable: true, get: () => "incoming.md" },
         },
       ),
-      { path: 1 },
-      { path: "" },
-      { path: "/absolute.md" },
-      { path: "a/../escape.md" },
+      { $path: 1 },
+      { $path: "" },
+      { $path: "/absolute.md" },
+      { $path: "a/../escape.md" },
     ];
 
     for (const value of invalidValues) {
