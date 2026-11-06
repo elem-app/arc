@@ -27,7 +27,7 @@ import type {
   HostCallBrief,
   PayloadValue,
 } from "../src/types/index.js";
-import { mergeAndClonePayload } from "../src/value-utils.js";
+import { mergeAndClonePayload } from "../src/types/value.js";
 import {
   actionProgress,
   appliedInstructions,

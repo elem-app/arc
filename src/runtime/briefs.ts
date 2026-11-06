@@ -1,25 +1,24 @@
 import type {
   ActionBrief,
+  ActionMove,
   ActionReport,
   InstructionBrief,
   InstructionReport,
+  NodeTransition,
+  RuntimeIssue,
   TerminalBrief,
   TriggerBrief,
   TriggerReport,
 } from "../types/host-interaction.js";
 import type {
-  ActionMove,
   ArcRef,
   ArcTraversal,
   ArcTraversalSet,
   BriefId,
   NodeRef,
-  NodeTransition,
-  RuntimeIssue,
 } from "../types/runtime.js";
 import { catchSegKey, hookSegKey, nodeSegKey } from "../types/runtime.js";
-import type { Dialog } from "../types/value.js";
-import { clonePayloadValue } from "../value-utils.js";
+import { clonePayloadValue, type Dialog } from "../types/value.js";
 import {
   clearInvokeStateCrossedByDeflection,
   continueArc,

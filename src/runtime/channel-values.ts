@@ -1,5 +1,5 @@
 import { admitValue } from "../spec/resolution.js";
-import type { ChannelNamespace } from "../types/parser.js";
+import type { ChannelNamespace } from "../types/ir.js";
 import type { ChannelSpec } from "../types/spec.js";
 import type { CellValue } from "../types/value.js";
 import { runtimeError } from "./report-validation.js";

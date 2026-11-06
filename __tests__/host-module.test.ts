@@ -19,6 +19,7 @@ import {
 
 import {
   actionProgress,
+  actionTerminal,
   EMPTY_DIALOG,
   progressBrief,
   resolvedHostCalls,
@@ -295,6 +296,7 @@ describe("host module declarations", () => {
       "Str",
       "Enum",
       "Num",
+      "Union",
       "Index",
       "Artifact",
       "Dialog",
@@ -1478,5 +1480,319 @@ function Main() {
     expect(replayed.issues).not.toContainEqual(
       expect.objectContaining({ reasonCode: "invalid-comparison-operands" }),
     );
+  });
+});
+
+const preference = () => hmd.Union([hmd.Num(), hmd.Enum(["no_preference"])]);
+const preferenceSpec = {
+  type: "union" as const,
+  members: [
+    { type: "number" as const },
+    { type: "enum" as const, values: ["no_preference"] },
+  ],
+};
+
+describe("shared Union host declarations", () => {
+  it("union.hmd captures ordered alternatives in parameters returns and composite positions", () => {
+    const declaration = hmd.define({
+      choose: (
+        _value = hmd.Union([hmd.Enum(["no_preference"]), hmd.Str(), hmd.Str()]),
+        _nested = hmd.Array(hmd.Array(preference())),
+        _tuple = hmd.Tuple([hmd.Bool(), preference()]),
+        _record = hmd.Struct({ hour: hmd.Omittable(preference()) }),
+        _optional = hmd.Omittable(preference()),
+      ) => hmd.Struct({ hours: hmd.Array(preference()) }),
+    });
+    expect(declaration.members.choose).toEqual({
+      kind: "operation",
+      parameters: [
+        {
+          type: "union",
+          members: [
+            { type: "enum", values: ["no_preference"] },
+            { type: "string" },
+            { type: "string" },
+          ],
+        },
+        { type: "array", element: { type: "array", element: preferenceSpec } },
+        { type: "tuple", elements: [{ type: "boolean" }, preferenceSpec] },
+        {
+          type: "struct",
+          fields: { hour: { type: "omittable", spec: preferenceSpec } },
+        },
+        { type: "omittable", spec: preferenceSpec },
+      ],
+      returns: {
+        type: "struct",
+        fields: { hours: { type: "array", element: preferenceSpec } },
+      },
+    });
+    expect(validateHostModuleSpec(declaration)).toEqual([]);
+    expect(
+      hmd.define({ choose: (_value = preference()) => preference() }).members
+        .choose,
+    ).toEqual({
+      kind: "operation",
+      parameters: [preferenceSpec],
+      returns: preferenceSpec,
+    });
+  });
+
+  it("union.hmd rejects ineligible member types arity and reused capture markers", () => {
+    const invalid = [
+      () => hmd.define({ call: () => hmd.Union([]) }),
+      () => hmd.define({ call: () => hmd.Union([hmd.Num()]) }),
+      () =>
+        hmd.define({
+          call: () => {
+            // @ts-expect-error Index is not a Union member.
+            return hmd.Union([hmd.Num(), hmd.Index()]);
+          },
+        }),
+      () =>
+        hmd.define({
+          call: () => {
+            // @ts-expect-error Nested Unions are not members.
+            return hmd.Union([hmd.Num(), preference()]);
+          },
+        }),
+      () =>
+        hmd.define({
+          call: () => {
+            // @ts-expect-error Containers are not Union members.
+            return hmd.Union([hmd.Num(), hmd.Array(hmd.Num())]);
+          },
+        }),
+      () =>
+        hmd.define({
+          call: () => {
+            // @ts-expect-error Structs are not Union members.
+            return hmd.Union([hmd.Num(), hmd.Struct({})]);
+          },
+        }),
+      () =>
+        hmd.define({
+          call: () => {
+            // @ts-expect-error Local-only markers are not Union members.
+            return hmd.Union([hmd.Num(), hmd.Artifact()]);
+          },
+        }),
+      () =>
+        hmd.define({
+          call: () => {
+            // @ts-expect-error SemanticText is not a Union member.
+            return hmd.Union([hmd.Num(), hmd.SemanticText()]);
+          },
+        }),
+      () =>
+        hmd.define({
+          call: () => {
+            // @ts-expect-error Omittable wraps a parameter or field, not a member.
+            return hmd.Union([hmd.Num(), hmd.Omittable(hmd.Str())]);
+          },
+        }),
+      () =>
+        hmd.define({
+          call: () => {
+            const member = hmd.Str();
+            return hmd.Union([member, member]);
+          },
+        }),
+    ];
+    for (const declare of invalid) {
+      expect(declare).toThrow(
+        expect.objectContaining({
+          code: "HOST_MODULE_DECLARATION",
+          path: '$["call"]',
+        }),
+      );
+    }
+  });
+
+  it("union.normalized rejects nested Index and malformed members in parameters and results", () => {
+    const cyclic: { type: string; members: unknown[] } = {
+      type: "union",
+      members: [],
+    };
+    cyclic.members.push({ type: "number" }, cyclic);
+    const invalid = [
+      { type: "union", members: [] },
+      { type: "union", members: [{ type: "number" }] },
+      { type: "union", members: [{ type: "number" }, { type: "index" }] },
+      { type: "union", members: [{ type: "number" }, preferenceSpec] },
+      {
+        type: "union",
+        members: [
+          { type: "number" },
+          { type: "array", element: { type: "string" } },
+        ],
+      },
+      {
+        type: "union",
+        members: [{ type: "number" }, { type: "enum", values: [] }],
+      },
+      { type: "union", members: [{ type: "number" }, , { type: "string" }] },
+      {
+        type: "union",
+        members: [{ type: "number", observing: "invalid" }, { type: "string" }],
+      },
+      { ...preferenceSpec, extra: true },
+      cyclic,
+    ];
+    for (const spec of invalid) {
+      for (const operation of [
+        { parameters: [spec] },
+        { parameters: [{ type: "array", element: spec }] },
+        { parameters: [{ type: "struct", fields: { hour: spec } }] },
+        { parameters: [], returns: spec },
+        { parameters: [], returns: { type: "array", element: spec } },
+      ]) {
+        expect(
+          validateHostModuleSpec({
+            kind: "namespace",
+            members: { choose: { kind: "operation", ...operation } },
+          }).length,
+        ).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it("union.host arguments preserve scalar choices inside arrays tuples fields and semantic strings", () => {
+    const declaration = hmd.define({
+      choose: (
+        _value = preference(),
+        _array = hmd.Array(preference()),
+        _tuple = hmd.Tuple([hmd.Bool(), preference()]),
+        _record = hmd.Struct({
+          hour: preference(),
+          omitted: hmd.Omittable(preference()),
+        }),
+        _text = preference(),
+      ) => {},
+    });
+    const runtime = new Runtime({ hostModules: hostModules(declaration) })
+      .add(
+        "union-arguments",
+        parse(`
+      "arc"; import Store from "host:store";
+      function Main() {
+        let hour = Union([Num(), Enum(["no_preference"])]);
+        hour.$set(9);
+        Store.$choose(hour, [9, "no_preference"], [true, "no_preference"], { hour: hour }, \`no_preference\`);
+      }
+    `),
+      )
+      .init();
+    const brief = actionProgress(
+      runtime.enterArc(toArcRef("union-arguments", "Main"), EMPTY_DIALOG),
+    );
+    expect(brief.hostCalls[0]?.arguments).toEqual([
+      9,
+      [9, "no_preference"],
+      [true, "no_preference"],
+      { hour: 9 },
+      "no_preference",
+    ]);
+    expect(brief.issues).toEqual([]);
+  });
+
+  it("union.host arguments defer partial producer coverage and reject inadmissible values before emission", () => {
+    const declaration = hmd.define({ choose: (_value = preference()) => {} });
+    for (const [index, value] of [9, "no_preference", true].entries()) {
+      const source = `union-value-${index}`;
+      const runtime = new Runtime({ hostModules: hostModules(declaration) })
+        .add(
+          source,
+          parse(`
+        "arc"; import Store from "host:store";
+        function Main() {
+          let value = Union([Num(), Enum(["no_preference"]), Bool()]);
+          value.$set(${JSON.stringify(value)});
+          Store.$choose(value);
+        }
+      `),
+        )
+        .init();
+      if (value === true) {
+        const terminal = actionTerminal(
+          runtime.enterArc(toArcRef(source, "Main"), EMPTY_DIALOG),
+        );
+        expect(terminal.issues).toContainEqual(
+          expect.objectContaining({ reasonCode: "invalid-host-argument" }),
+        );
+        expect("hostCalls" in terminal).toBe(false);
+      } else {
+        const brief = actionProgress(
+          runtime.enterArc(toArcRef(source, "Main"), EMPTY_DIALOG),
+        );
+        expect(brief.hostCalls[0]?.arguments).toEqual([value]);
+      }
+    }
+    const issues = registrationIssues(
+      new Runtime({ hostModules: hostModules(declaration) }),
+      "union-impossible-argument",
+      parse(`
+      "arc"; import Store from "host:store"; function Main() { Store.$choose(false); }
+    `),
+    );
+    expect(issues).toContainEqual(
+      expect.objectContaining({ code: "HOST_ARGUMENT_TYPE" }),
+    );
+  });
+
+  it("union.host registry owns alternatives and admits return values before pinning", () => {
+    const declaration = hmd.define({
+      choose: (_value = preference()) => preference(),
+    });
+    const runtime = new Runtime({ hostModules: hostModules(declaration) });
+    const operation = declaration.members.choose!;
+    if (
+      operation.kind !== "operation" ||
+      operation.parameters[0]?.type !== "union" ||
+      operation.returns?.type !== "union"
+    )
+      throw new Error("Expected Union operation");
+    const parameter = operation.parameters[0].members[1]!;
+    const result = operation.returns.members[1]!;
+    if (parameter.type !== "enum" || result.type !== "enum")
+      throw new Error("Expected Enum member");
+    parameter.values[0] = "changed";
+    result.values[0] = "changed";
+    operation.parameters[0].members.reverse();
+    operation.returns.members.splice(0, 2);
+    runtime
+      .add(
+        "union-result",
+        parse(`
+      "arc"; import Store from "host:store";
+      function Main() {
+        let value = Union([Num(), Enum(["no_preference"])]);
+        let ready = Bool({ observing: \`ready\` });
+        value.$set(Store.choose("no_preference"));
+        $observe(ready);
+      }
+    `),
+      )
+      .init();
+    const first = actionProgress(
+      runtime.enterArc(toArcRef("union-result", "Main"), EMPTY_DIALOG),
+    );
+    expect(first.hostCalls[0]?.arguments).toEqual(["no_preference"]);
+    const id = first.hostCalls[0]!.id;
+    const retry = progressBrief(runtime, first, {
+      move: "proceed",
+      hostCalls: { [id]: { status: "resolved", value: false } },
+    });
+    expect(retry.hostCalls.map((call) => call.id)).toEqual([id]);
+    expect(retry.issues).toContainEqual(
+      expect.objectContaining({ reasonCode: "host-call-result-type" }),
+    );
+    const accepted = progressBrief(runtime, retry, {
+      move: "proceed",
+      hostCalls: { [id]: { status: "resolved", value: "no_preference" } },
+    });
+    expect(accepted.hostCalls).toHaveLength(0);
+    expect(accepted.observations).toHaveLength(1);
+    expect(accepted.traversals[0]?.cells.value).toBe("no_preference");
   });
 });

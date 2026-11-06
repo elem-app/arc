@@ -1,9 +1,10 @@
-import type {
-  HostModuleSpecIssue,
-  HostParameterSpec,
-  SpecViolation,
+import {
+  isUnionMemberSpec,
+  type HostModuleSpecIssue,
+  type HostParameterSpec,
+  type SpecViolation,
 } from "../types/spec.js";
-import { isPlainRecord } from "../value-utils.js";
+import { isPlainRecord } from "../types/value.js";
 import { isHostStructFieldName } from "./host-parameters.js";
 import { isStructFieldName } from "./struct.js";
 
@@ -155,6 +156,38 @@ function validateHostParameterSpec(
       hostSpecIssue(issues, `${path}.type`, "spec type must be a string");
       return;
     }
+    if (type === "union") {
+      if (!exactHostSpecKeys(object, ["type", "members"], path, issues)) return;
+      const members = inspectHostSpecArray(
+        object.members,
+        `${path}.members`,
+        issues,
+      );
+      if (!members) return;
+      if (members.length < 2)
+        hostSpecIssue(issues, path, "Union requires at least two members");
+      members.forEach((member, index) => {
+        const memberPath = `${path}.members[${index}]`;
+        const entry = inspectHostSpecObject(member, memberPath, issues);
+        if (!entry) return;
+        if (!isUnionMemberSpec(entry)) {
+          hostSpecIssue(
+            issues,
+            memberPath,
+            "Union member must be an eligible scalar Arc spec",
+          );
+          return;
+        }
+        validateHostParameterSpec(
+          member,
+          memberPath,
+          "argument",
+          issues,
+          state,
+        );
+      });
+      return;
+    }
     if (type === "omittable") {
       if (context !== "parameter" && context !== "field") {
         hostSpecIssue(
@@ -190,6 +223,7 @@ function validateHostParameterSpec(
           element.type !== "string" &&
           element.type !== "enum" &&
           element.type !== "number" &&
+          element.type !== "union" &&
           element.type !== "artifact" &&
           element.type !== "struct"
         ) {
@@ -315,9 +349,9 @@ function validateHostParameterSpec(
 }
 
 /**
- * Validates a Struct result: every field is an observable Arc field — a
- * scalar, an array of scalars or Structs, or a nested Struct — so a complete
- * result can land on an observable Struct cell.
+ * Validates a struct result: every field is an observable Arc field — a
+ * scalar, a union, an array of these or of structs, or a nested struct — so a
+ * complete result can land on an observable struct cell.
  */
 function validateHostStructResultSpec(
   object: Record<string, unknown>,
@@ -349,7 +383,7 @@ function validateHostStructResultSpec(
       hostSpecIssue(
         issues,
         fieldPath,
-        "Struct result fields must be observable scalars, observable arrays, or Structs",
+        "Struct result fields must be observable scalars, Unions, observable arrays, or Structs",
       );
       continue;
     }
@@ -492,14 +526,52 @@ function hostSpecIssue(
 }
 
 /** Validates invariants the representational TypeScript union cannot express. */
-export function validateSpec(spec: unknown): SpecViolation | undefined {
+export function validateSpec(
+  spec: unknown,
+  visiting = new WeakSet<object>(),
+): SpecViolation | undefined {
   if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
     return {
       code: "invalid-spec-shape",
       detail: "Spec must be an object",
     };
   }
-  const object = spec as Record<string, unknown>;
+  if (visiting.has(spec))
+    return {
+      code: "invalid-spec-shape",
+      detail: "Spec cannot contain a cycle",
+    };
+  visiting.add(spec);
+  try {
+    return validateSpecRecord(spec as Record<string, unknown>, visiting);
+  } finally {
+    visiting.delete(spec);
+  }
+}
+
+function validateSpecRecord(
+  object: Record<string, unknown>,
+  visiting: WeakSet<object>,
+): SpecViolation | undefined {
+  if (object.type === "union") {
+    if (!Array.isArray(object.members) || object.members.length < 2) {
+      return {
+        code: "invalid-spec-shape",
+        detail: "Union requires at least two scalar members",
+      };
+    }
+    for (const member of object.members) {
+      const violation = validateSpec(member, visiting);
+      if (violation) return violation;
+      if (!isUnionMemberSpec(member as Record<string, unknown>)) {
+        return {
+          code: "invalid-spec-shape",
+          detail: "Union members must be scalar specs",
+        };
+      }
+    }
+    return undefined;
+  }
   if (object.type === "array") {
     if (!("element" in object)) {
       return {
@@ -507,7 +579,7 @@ export function validateSpec(spec: unknown): SpecViolation | undefined {
         detail: "Array spec requires an element spec",
       };
     }
-    const elementViolation = validateSpec(object.element);
+    const elementViolation = validateSpec(object.element, visiting);
     if (elementViolation) return elementViolation;
     const elementType = (object.element as Record<string, unknown>).type;
     if (
@@ -515,6 +587,7 @@ export function validateSpec(spec: unknown): SpecViolation | undefined {
       elementType !== "string" &&
       elementType !== "enum" &&
       elementType !== "number" &&
+      elementType !== "union" &&
       elementType !== "artifact" &&
       elementType !== "struct"
     ) {
@@ -526,7 +599,7 @@ export function validateSpec(spec: unknown): SpecViolation | undefined {
     return undefined;
   }
   if (object.type === "struct") {
-    return validateStructSpec(object);
+    return validateStructSpec(object, visiting);
   }
   if (object.type === "enum") {
     if (
@@ -570,11 +643,12 @@ export function validateSpec(spec: unknown): SpecViolation | undefined {
 }
 
 /**
- * Validates a Struct spec: safe field names, each field an observable scalar,
- * an observable array of scalars or Structs, or a nested Struct.
+ * Validates a struct spec: safe field names, each field an observable scalar,
+ * a union, an observable array of these or of structs, or a nested struct.
  */
 function validateStructSpec(
   object: Record<string, unknown>,
+  visiting: WeakSet<object>,
 ): SpecViolation | undefined {
   const fields = object.fields;
   if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
@@ -590,7 +664,7 @@ function validateStructSpec(
         detail: `Invalid Struct field name ${JSON.stringify(name)}`,
       };
     }
-    const violation = validateSpec(field);
+    const violation = validateSpec(field, visiting);
     if (violation) return violation;
     if (!isPlainRecord(field)) continue;
     const elementType =

@@ -1,23 +1,55 @@
 /** Arc spec type vocabulary, basic guards, and structural conversions. */
 
+import { fieldAtPath, type StructShape, type UnionShape } from "./shape.js";
+
+/** Numeric constraints applied only when accepting an observation result. */
+export type NumberObserveAsConstraint =
+  | { kind: "number"; min?: number; max?: number }
+  | { kind: "integer"; min?: number; max?: number };
+
 /** Scalar constraints shared by cell and channel guarantees. */
-export type ScalarValueSpec =
+export type ScalarSpec =
   | { type: "boolean" }
   | { type: "string" }
   | { type: "enum"; values: string[] }
-  | { type: "number" };
+  | { type: "number"; observeAs?: NumberObserveAsConstraint };
+
+/** Ordered scalar alternatives eligible at an observable value position. */
+export type UnionSpec = UnionShape<ScalarSpec>;
+
+/** Whether a spec may be a union member. */
+export function isUnionMemberSpec(spec: {
+  type?: unknown;
+}): spec is ScalarSpec {
+  return (
+    spec.type === "boolean" ||
+    spec.type === "string" ||
+    spec.type === "enum" ||
+    spec.type === "number"
+  );
+}
 
 /** Guarantee declared by an Artifact cell or channel. */
 export type ArtifactSpec = { type: "artifact" };
 
+/** Non-negative integer guarantee declared by an `Index()` channel. */
+export type IndexSpec = { type: "index" };
+
+/** Guarantee declared by a dialog-cursor cell or channel. */
+export type DialogCursorSpec = { type: "dialogCursor" };
+
 /**
- * Immediate element guarantees supported by Arc arrays: a scalar, an Artifact,
- * or a Struct whose every element is a complete record.
+ * Immediate element guarantees supported by Arc arrays: scalar, union, Artifact,
+ * or struct. Every struct element is a complete record.
  */
-export type ArrayElementSpec = ScalarValueSpec | ArtifactSpec | StructSpec;
+export type ArrayElementSpec =
+  | ScalarSpec
+  | UnionSpec
+  | ArtifactSpec
+  | StructSpec;
 
 /** Element guarantee of an array whose values may be semantically observed. */
-export type ObservableElementSpec = ScalarValueSpec | StructSpec;
+export type ObservableElementSpec = ScalarSpec | UnionSpec | StructSpec;
 
 /** Array guarantee whose values may be semantically observed. */
 export type ObservableArraySpec = {
@@ -32,31 +64,31 @@ export type ArtifactArraySpec = {
 };
 
 /** Authored array guarantee. */
-export type ArraySpec = ObservableArraySpec | ArtifactArraySpec;
+export type ArraySpec = {
+  type: "array";
+  element: ArrayElementSpec;
+};
 
 /**
  * Named-field record guarantee whose fields are recursively observable. A
  * value carries exactly the declared fields, each with a concrete value.
  */
-export type StructSpec = {
-  type: "struct";
-  fields: Record<string, ObservableFieldSpec>;
-};
+export type StructSpec = StructShape<ObservableFieldSpec>;
 
-/** Guarantee declared by one field of an observable Struct. */
-export type ObservableFieldSpec =
-  | ScalarValueSpec
+/**
+ * Guarantee declared by a semantically observable cell.
+ */
+export type ObservableCellSpec =
+  | ScalarSpec
+  | UnionSpec
   | ObservableArraySpec
   | StructSpec;
 
 /**
- * Guarantee declared by a semantically observable cell. A cell and a Struct
+ * Guarantee declared by one field of an observable struct. A cell and a struct
  * field admit the same observable guarantees.
  */
-export type ObservableCellSpec = ObservableFieldSpec;
-
-/** Guarantee declared by a dialog-cursor cell or channel. */
-export type DialogCursorSpec = { type: "dialogCursor" };
+export type ObservableFieldSpec = ObservableCellSpec;
 
 /** Guarantee declared by a local-only cell. */
 export type LocalCellSpec = DialogCursorSpec | ArtifactSpec;
@@ -66,25 +98,27 @@ export type CellSpec = ObservableCellSpec | ArtifactArraySpec | LocalCellSpec;
 
 /** Read/write guarantee declared by an Arc channel. */
 export type ChannelSpec =
-  | ScalarValueSpec
+  | ScalarSpec
+  | UnionSpec
   | ArtifactSpec
   | DialogCursorSpec
-  | { type: "index" }
-  | { type: "array"; element: ArrayElementSpec }
+  | IndexSpec
+  | ArraySpec
   | StructSpec;
 
 /** Value guarantee accepted by a supplied host-operation argument. */
 export type HostParameterValueSpec =
-  | ScalarValueSpec
+  | ScalarSpec
+  | UnionSpec
   | ArtifactSpec
   | DialogCursorSpec
-  | { type: "index" }
+  | IndexSpec
   | { type: "array"; element: HostParameterValueSpec }
   | { type: "tuple"; elements: HostParameterValueSpec[] }
-  | { type: "struct"; fields: Record<string, HostParameterSpec> }
+  | StructShape<HostParameterSpec>
   | { type: "semanticText" };
 
-/** Required or omittable host parameter or named Struct field. */
+/** Required or omittable host parameter or named struct field. */
 export type HostParameterSpec =
   | HostParameterValueSpec
   | { type: "omittable"; spec: HostParameterValueSpec };
@@ -112,6 +146,12 @@ export type HostModuleSpecIssue = {
   detail: string;
 };
 
+/** Semantic spec-shape violation not excluded by the TypeScript union. */
+export type SpecViolation = {
+  code: "invalid-spec-shape" | "empty-enum" | "duplicate-enum-value";
+  detail: string;
+};
+
 export function isObservableCellSpec(
   spec: CellSpec,
 ): spec is ObservableCellSpec {
@@ -122,7 +162,7 @@ export function isObservableCellSpec(
   );
 }
 
-/** Whether a channel guarantee may declare a Struct field. */
+/** Whether a channel guarantee may declare a struct field. */
 export function isObservableFieldSpec(
   spec: ChannelSpec,
 ): spec is ObservableFieldSpec {
@@ -147,15 +187,11 @@ export function isSettableCellSpec(spec: CellSpec): boolean {
   );
 }
 
-/** Semantic spec-shape violation not excluded by the TypeScript union. */
-export type SpecViolation = {
-  code: "invalid-spec-shape" | "empty-enum" | "duplicate-enum-value";
-  detail: string;
-};
-
 /** Projects a cell guarantee into the corresponding channel-shaped guarantee. */
 export function cellSpecToChannelSpec(spec: CellSpec): ChannelSpec {
   switch (spec.type) {
+    case "union":
+      return unionSpecOf(spec);
     case "boolean":
       return { type: "boolean" };
     case "string":
@@ -178,39 +214,7 @@ export function cellSpecToChannelSpec(spec: CellSpec): ChannelSpec {
   }
 }
 
-/**
- * A Struct shape whose fields belong to one field family `F`. A family is
- * closed under nesting when each of its Struct members is itself a
- * `StructShape<F>`, as for guarantees and for authored declarations.
- */
-export type StructShape<F> = { type: "struct"; fields: Record<string, F> };
-
-/**
- * Resolves the field a non-empty path names inside a Struct. `asStruct`
- * exposes a field as a nested Struct of the same family, or returns
- * `undefined` for a non-Struct field, so a field at any depth keeps the
- * receiver's family.
- */
-export function fieldAtPath<F>(
-  struct: StructShape<F>,
-  path: readonly string[],
-  asStruct: (field: F) => StructShape<F> | undefined,
-): F | undefined {
-  let fields = struct.fields;
-  let field: F | undefined;
-  for (const [depth, name] of path.entries()) {
-    if (depth > 0) {
-      const nested = asStruct(field!);
-      if (!nested) return undefined;
-      fields = nested.fields;
-    }
-    if (!Object.hasOwn(fields, name)) return undefined;
-    field = fields[name]!;
-  }
-  return field;
-}
-
-/** Resolves the guarantee of a non-empty field path inside a Struct. */
+/** Resolves the guarantee of a non-empty field path inside a struct. */
 export function fieldSpecAt(
   spec: StructSpec,
   path: readonly string[],
@@ -220,7 +224,7 @@ export function fieldSpecAt(
   );
 }
 
-/** Projects a Struct declaration into its bare recursive value guarantee. */
+/** Projects a struct declaration into its bare recursive value guarantee. */
 export function structSpecOf(spec: StructSpec): StructSpec {
   return {
     type: "struct",
@@ -233,9 +237,11 @@ export function structSpecOf(spec: StructSpec): StructSpec {
   };
 }
 
-/** Projects one Struct field declaration into its bare value guarantee. */
+/** Projects one struct field declaration into its bare value guarantee. */
 export function fieldSpecOf(spec: ObservableFieldSpec): ObservableFieldSpec {
   switch (spec.type) {
+    case "union":
+      return unionSpecOf(spec);
     case "struct":
       return structSpecOf(spec);
     case "array":
@@ -256,10 +262,18 @@ function arrayElementSpecToChannelSpec(
 function observableElementSpecOf(
   spec: ObservableElementSpec,
 ): ObservableElementSpec {
-  return spec.type === "struct" ? structSpecOf(spec) : scalarSpecOf(spec);
+  return spec.type === "struct"
+    ? structSpecOf(spec)
+    : spec.type === "union"
+      ? unionSpecOf(spec)
+      : scalarSpecOf(spec);
 }
 
-function scalarSpecOf(spec: ScalarValueSpec): ScalarValueSpec {
+function unionSpecOf(spec: UnionSpec): UnionSpec {
+  return { type: "union", members: spec.members.map(scalarSpecOf) };
+}
+
+function scalarSpecOf(spec: ScalarSpec): ScalarSpec {
   switch (spec.type) {
     case "boolean":
       return { type: "boolean" };

@@ -6,7 +6,7 @@ The runtime executes parsed Arc scripts together with a **host**. It traverses a
 
 Arc execution is a conversation between the runtime and the host. The runtime walks the graph and knows what work needs doing. The host knows how to do that work. They communicate through ephemeral **briefs** (runtime → host) and **reports** (host → runtime).
 
-One walk of an arc proceeds in two stages:
+An arc runs in two stages:
 
 1. **Trigger stage** — the runtime evaluates dormant arcs' triggers to decide which arc becomes active. Triggers may contain semantic checks that require host resolution, so this stage follows the brief/report exchange.
 
@@ -15,6 +15,61 @@ One walk of an arc proceeds in two stages:
 There is only one active arc being traversed at a time.
 
 After the action graph resolves, the node's `this.effects` finalization graph runs. It uses the same actions and host-call protocol as the main graph and may require additional resolution rounds before the node settles.
+
+## Host Integration Example
+
+A host first constructs a `Runtime` and registers its documents (see [Registration](#registration)). A typical host turn then runs:
+
+1. Build Dialog from session history.
+
+2. Trigger stage:
+   1. `startTrigger(traversals, dialog)` → trigger brief.
+   1. Persist `brief.traversals`.
+   1. While `brief.matched` is not set:
+      1. Resolve judgments/observations/hostCalls and optional `preferredMatch`.
+      1. `progressTrigger(brief, report, latestDialog)` → new trigger brief.
+      1. Persist `brief.traversals`.
+   1. Once `brief.matched` is set, proceed to action stage.
+
+3. Action stage (if an arc is active):
+   1. `start(traversals, dialog)` → `ActionBrief | TerminalBrief`.
+   1. Persist `brief.traversals`.
+   1. While `brief.canProgress`, inspect its instructions, pending work, and `allowedMoves`; choose when to hand control back; resolve available items; and call `progress(brief, { move, instructions, judgments, observations, hostCalls }, latestDialog)`. Unresolved or unreported work re-surfaces on later `ActionBrief`s under the same ids. When `brief.deflection` is present, prepare the handoff and report only `{ move: "deflect" }`. On other frontiers, report `move: "poison"` if the host cannot accept the frontier contract or fails a resolution fatally. Persist each returned `brief.traversals`.
+   1. When `canProgress` is false, settle from `brief.root`, `brief.outcome`, `brief.returns`, and `brief.issues`.
+
+## Registration
+
+Runtime construction accepts the complete host-module declaration environment and has a collecting phase followed by an initialized phase:
+
+```typescript
+type RuntimeOptions = {
+  hostModules?: ReadonlyMap<string, HostModuleSpec>;
+};
+
+const runtime = new Runtime({ hostModules });
+```
+
+`HostModuleSpec` is normalized data. Host developers may construct it with [`hmd.define()`](../docs/host-module-declarations.md) from the `arc/host-utils` entry point. The runtime validates and privately clones the registry at construction. Omitting `hostModules` means an empty registry.
+
+Documents may be added in any Arc import order while collecting. Execution APIs require successful initialization; successful initialization seals the runtime against further additions.
+
+Expected document and registry incoherence is reported through `RuntimeRegistrationError`. The error's `operation` is `"add"` or `"init"`, and its `issues` contains every independently discoverable structured registration issue from that call. Its message includes every issue code and message for ordinary logging; callers that present or classify failures should consume `issues` rather than parse the message. Caller misuse and impossible internal invariants remain ordinary immediate errors.
+
+**`add(source, document)`** — validate and collect one document. `source` is the filename stem (e.g. `"heavy-metal"`). The runtime keeps a private copy, so the caller's object is not mutated and later caller mutation does not change runtime behavior. Hand-built IR may omit element IDs.
+
+`add()` performs every document-local and host-module check: document grammar, semantic validity, every imported host module and action path, exact operation arity, compatible parameter operands, and satisfaction of each consumer's result demand. An action consumer creates no result demand. It does not require imported Arc documents to have been added yet.
+
+`add()` is atomic. A failed call, including a duplicate source or Arc ref, collects nothing. A document that fails grammar or semantic validation is not checked against host modules, so fixing it may reveal further issues.
+
+**`init()`** — resolve and validate the complete prospective registry. Initialization resolves every import and imported node-entry endpoint, then walks imported bindings with the caller's lexical cells, current node signature, and enclosing `$map` receiver/result element specs. Args bindings are checked provider-to-receiver; returns bindings are checked declared-return-to-local-receiver. It collects unresolved imports and every independently checkable undeclared, unresolved, or incompatible binding. A binding dependent on an unresolved import is skipped rather than reported as a cascade. Issues are returned in canonical source/position/binding order, independent of document-add order, and one `RuntimeRegistrationError` reports the complete result.
+
+Initialization commits atomically. A failed `init()` leaves the runtime collecting and retryable, so the caller may add a missing document and call `init()` again. A successful call commits the resolved registry, enables execution, and rejects later `add()` calls. Calling `init()` again on an initialized runtime returns that runtime unchanged.
+
+**`has(arc)`** — check whether an arc is registered.
+
+**`newTraversalSet()`** — create an empty traversal set for a fresh trigger or action session.
+
+**`newTraversal(arc)`** — after initialization, create a fresh arc traversal in the `"dormant"` phase with `enterCount = 0`.
 
 ## Payload Values
 
@@ -89,14 +144,26 @@ The stable causes for runtime-initiated poison are:
 | `invalid-enum-value` | A value written to `Enum` is not one of its declared values. |
 | `unknown-cell` | Runtime evaluation cannot resolve the cell targeted by `$set()`, `$unset()`, `$observe()`, or an internal write. Validated documents should normally prevent this. |
 | `invalid-observation-target` | Runtime evaluation reaches `$observe()`, `$observeOrAsk()`, or a grouped `$observe({ ... })` field with a non-observable cell such as `Dialog.Cursor`. Validated documents should normally prevent this. |
-| `unknown-channel-key` | An `args.*` or `returns.*` key is read or written but the caller's `$enter()` did not wire that key. |
+| `unknown-channel-key` | An `args.*` or `returns.*` key is read or written that the node does not declare. A declared key the caller leaves unbound is legal. |
 | `invalid-channel-binding` | A wired channel points to a caller cell or owner traversal that no longer exists. |
 | `invalid-return-value` | A `returns.*.$set()` value has the wrong value shape, or violates an `Index()` channel's non-negative-safe-integer refinement. |
+| `invalid-array-literal` | An array literal element is not a valid value. |
+| `invalid-struct-literal` | A struct literal field does not hold a valid value. |
+| `invalid-field-read` | A field read names a field the struct does not declare. Validated documents should normally prevent this. |
 | `invalid-artifact-value` | A value used under Artifact authority does not have the exact valid `{ path: string }` shape; nested array failures include the first invalid member path. |
 | `invalid-artifact-operation` | Runtime evaluation receives an Artifact in ordering, regex, or another unsupported operation. Artifact equality and inequality are supported. |
 | `non-numeric-arithmetic-operand` | A dynamically supplied arithmetic operand is not a number. The reason identifies the operator, operand position, and runtime value kind. |
 | `non-numeric-is-finite-argument` | A dynamically supplied `Num.isFinite(...)` argument is not a number. |
 | `non-finite-number` | Authored execution tries to use `NaN` or an infinity where a finite number is required. |
+| `invalid-comparison-operands` | The operands of a comparison cannot be compared, such as a union comparison that no declared union covers. |
+| `invalid-numeric-comparison` | A numeric comparison receives a non-number. |
+| `invalid-string-comparison` | A string comparison receives a non-string. |
+| `invalid-boolean-comparison` | A boolean equality receives a non-boolean. |
+| `invalid-struct-comparison` | A struct equality receives a value that is not a record. |
+| `non-boolean-value` | A boolean position receives a value that is not a boolean. |
+| `invalid-string` | A position that requires a string receives another value. |
+| `span-outside-map` | `span` is read outside a `$map` callback. Validated documents should normally prevent this. |
+| `invalid-host-argument` | A host-call argument does not satisfy the operation's declaration. No call is emitted. |
 | `invalid-template-interpolation` | A value or semantic template attempts to interpolate an unset or unsupported value. |
 | `unset-value` | An unset value is used where a concrete value is required. Comparisons may consume ordinary unset values without poisoning: equality and ordering return `false`, except inequality returns `true`, whenever either operand is unset. |
 | `invalid-artifact-path` | An Artifact initializer or factory receives an empty or absolute path or one containing a `.` or `..` segment. |
@@ -107,21 +174,11 @@ The stable causes for runtime-initiated poison are:
 
 Invalid judgment or observation results supplied in a report do not poison the traversal. They surface as `invalid-item` issues with their own validation reason codes. A grouped observation report that omits a field, or supplies a field value failing its cell's type, is invalid the same way: the group writes nothing and re-emits.
 
-### Node State vs. Node Frame
+### Node State
 
-Two pieces of traversal state that serve distinct purposes:
-
-**Node state** is the outcome — what happened to the node as a whole. It is `COVERED` after actions and effects complete, `DEFLECTED` after deflection finalization, `SKIPPED` when a guard bypasses the entry, `INTERRUPTED` when an interruption leaves work pending, or unset before an outcome is recorded. The parent's action graph reads it through `ReferenceName.state` to decide whether to re-enter or move on. `forgetful(ReferenceName)` explicitly clears the prior canonical node state and starts a new entry whose eventual outcome becomes the new `ReferenceName.state`.
+Node state is the outcome of a node as a whole. It is `COVERED` after actions and effects complete, `DEFLECTED` after deflection finalization, `SKIPPED` when a guard bypasses the entry, `INTERRUPTED` when an interruption leaves work pending, or unset before an outcome is recorded. The parent's action graph reads it through `ReferenceName.state` to decide whether to re-enter or move on. `forgetful(ReferenceName)` explicitly clears the prior canonical node state and starts a new entry whose eventual outcome becomes the new `ReferenceName.state`.
 
 Canonical node state is addressable from Arc source through `ReferenceName.state`. Blank anonymous copies created through `newcopy(ReferenceName)` are not addressable from Arc source and do not change the meaning of `ReferenceName.state`. Forgetful entries created through `forgetful(ReferenceName)` remain addressable and replace the prior canonical outcome with the new entry's outcome.
-
-An `invoke(() => { ... })` body runs inline in its enclosing node, so a brief emitted from inside one carries the enclosing node's ref. Match reports to briefs by id rather than interpreting the ref.
-
-An `arr.$map(callback, results?)` callback runs inline the same way: work a member emits directly carries the enclosing node's ref, while an `$enter(newcopy(...))` inside the callback briefs under the entered copy. Members run one at a time, so at most one member's work reaches any brief, and each member's brief ids are qualified by its index. The pending map state deep-clones its stored values and persists with the traversal set, so a blocked member resumes across brief/report rounds and across a process restart.
-
-**Node frame** is the internal resolution map — which individual actions within the node have been resolved. When a `$` action resolves, the frame records it so subsequent runs of the node bypass it. The frame is bookkeeping that the action graph author never sees directly.
-
-On re-entry with `this.forgetfulEntry = true`, or on entry via `forgetful(ReferenceName)`, the frame is discarded — resolved actions are forgotten and the new entry's walk starts from an empty frame. Cell values and child traversal state are preserved. The new entry replaces the node's own prior outcome through ordinary entry semantics. Forgetfulness applies only at the entry boundary: during the entry, resolved actions remain remembered normally.
 
 ## Brief/Report Protocol
 
@@ -142,7 +199,7 @@ Briefs and reports are ephemeral — they are valid only for the runtime call th
 
 A brief is emitted when the current walk reaches a frontier that requires host coordination.
 
-An **execution walk** is one top-down pass through the active arc's action graph. Each `start()` call performs one planning walk. Each `progress()` call first applies the report, then performs a new planning walk to produce the next brief.
+A **walk** is one pass through the active arc's action graph. `start()` performs one walk. `progress()` first applies the report, then performs a new walk to produce the next brief.
 
 The runtime emits briefs under these conditions:
 
@@ -150,18 +207,11 @@ The runtime emits briefs under these conditions:
 - **Action brief** — action traversal encounters unresolved `judge()`, `$observe()`, `$observeOrAsk()`, host calls, or instructions.
 - **Transition brief** — the walk's position moved between nodes and evaluation is about to continue at the new position (see Transitions below). A transition brief carries no other work.
 
-Batching:
-
-- Semantic work may batch when multiple unresolved items are reachable before a blocking action at the same frontier.
-- Instruction actions batch only within the **currently executing node body**.
-- Instruction actions batch only when their effective merged `hostParams`, mode, `resolveWhen`, and `deflectWhen` match.
-- Entering a child with `$enter(ReferenceName)`, returning to a caller, or beginning `this.effects` ends an instruction batch.
-- An action brief never mixes instructions from different node bodies.
-- The protocol does not promise whether separately reachable instruction actions share a brief. Hosts must handle every presented item without depending on a particular instruction batch size.
+A brief may carry several reachable work items, including several instructions. Hosts must handle every presented item without depending on how many share a brief.
 
 Resume:
 
-- After a brief/report round, traversal seeks the suspended frontier: it lands back on the frontier without re-asking work answered earlier in the same walk.
+- After a brief/report round, answered work is not asked again.
 - Pending instructions continue to surface in follow-up `ActionBrief`s while they remain unresolved; a repeated instruction brief may carry the same instruction text with a different instruction `phase` and a different `postcheck` frontier as resolution work progresses.
 
 ### `TriggerBrief` and `TriggerReport`
@@ -214,7 +264,7 @@ type TriggerReport = {
 
 ### `ActionBrief`
 
-`ActionBrief` is the reportable frontier the runtime yields during the action stage. Action-stage entrypoints return `ActionBrief | TerminalBrief`, without naming that union, and hosts narrow the output through `canProgress`. Its `allowedMoves` determines which control moves the host may submit at the current frontier.
+`ActionBrief` is the reportable frontier the runtime yields during the action stage. Action-stage entrypoints return `ActionBrief | TerminalBrief`, and hosts narrow the output through `canProgress`. Its `allowedMoves` determines which control moves the host may submit at the current frontier.
 
 ```typescript
 type ActionBrief = {
@@ -279,6 +329,8 @@ type TerminalBrief = {
 `ActionReport` is what the host sends back after inspecting an action brief. It includes itemized results and a move that tells the runtime what to do next.
 
 ```typescript
+type ActionMove = "proceed" | "deflect" | "interrupt" | "poison";
+
 type ActionReport = {
   /**
    * "proceed" — host submits this report and requests traversal progression.
@@ -319,11 +371,54 @@ type ActionReport = {
 };
 ```
 
-Nodes that complete all reachable actions and effects become covered automatically. Nodes bypassed by explicit guard logic become skipped. Poison is a host-initiated contract failure for a malformed or unusable frontier.
+Nodes that complete all reachable actions and effects become covered automatically. Nodes bypassed by explicit guard logic become skipped. A `poison` move reports a malformed or unusable frontier.
+
+### Issues
+
+Every brief carries the `RuntimeIssue`s surfaced while advancing from the previous yield.
+
+```typescript
+type RuntimeIssue =
+  | {
+      kind: "poisoned-traversal";
+      arc: ArcRef;
+      active: NodeRef;
+      source?: SourceRange;
+      reasonCode?: string;
+      reason?: string;
+    }
+  | { kind: "invalid-report"; reasonCode?: string; reason?: string }
+  | {
+      kind: "invalid-item";
+      briefId: BriefId;
+      reasonCode?: string;
+      reason?: string;
+    }
+  | {
+      kind: "ambiguous-match";
+      matchableArcs: ArcRef[];
+      reasonCode?: string;
+      reason?: string;
+    };
+```
+
+- `poisoned-traversal` — a traversal poisoned. See [Poisoning](#poisoning).
+- `invalid-report` — the whole report was rejected.
+- `invalid-item` — one reported item was rejected, and valid items were applied.
+- `ambiguous-match` — several arcs matched and no `preferredMatch` selected one.
 
 ### Deflections
 
 Every new deflection starts with an accepted host `deflect` report. A host may choose deflection on an ordinary eligible frontier. When a guard or an instruction's `deflectWhen` requires deflection, the runtime instead yields an exclusive `ActionBrief` carrying `deflection: { origin }` whose `allowedMoves` is exactly `["deflect"]`. The host identifies this boundary by inspecting `brief.deflection`. The field is absent on ordinary work, transitions, and applied catch frontiers.
+
+```typescript
+type DeflectionContext = {
+  /** The node where the deflection originated. Preserved while it propagates. */
+  origin: NodeRef;
+  /** The `$enter`/`$enterLoop` target it last propagated through. Unset at the origin. */
+  from?: NodeRef;
+};
+```
 
 The host persists the returned traversals and prepares the handoff before reporting `{ move: "deflect" }` with the dialog for the current position. Catch handling, effects, propagation, and deflection-driven abandonment begin after acknowledgement.
 
@@ -350,7 +445,7 @@ type NodeTransition = {
 
 One transition describes one stretch of position changes with no intervening authored evaluation. A guarded child or a branch condition between hops forces a per-hop transition — that evaluation is precisely what needs the new view — while guard-less enter chains and uncaught deflections through hookless, effect-less ancestors coalesce into one multi-element transition.
 
-A transition brief is **exclusive**: it carries no judgments, observations, host calls, or instructions. Any work that could ride along would have been produced under the old view, so it surfaces only after acknowledgment, posed under the fresh projection — which may also change what is posed. The runtime enforces this; a transition brief with work is a runtime defect, not a host concern. The resulting invariant is that reports are **view-pure**: a work report answers work under the current view (same view, possibly newer content), and a transition proceed changes the view and answers nothing.
+A transition brief is **exclusive**: it carries no judgments, observations, host calls, or instructions. Any work that could ride along would have been produced under the old view, so it surfaces only after acknowledgment, posed under the fresh projection — which may also change what is posed. The resulting invariant is that reports are **view-pure**: a work report answers work under the current view (same view, possibly newer content), and a transition proceed changes the view and answers nothing.
 
 `allowedMoves` for a transition brief is `["poison", "proceed"]`. The host may rely on exclusivity without checking: when `transition` is present the work arrays are empty, and the report is the bare move — no judgment, observation, host-call, or instruction entries, since there is nothing they could answer, and the runtime applies no itemized results when acknowledging a transition. The proceed's significance is the dialog argument that accompanies it, which the host projects for `position` — the runtime interprets no host params, so `hostParams` hands the host whatever its own projection rule reads. A host that cannot produce the projection fails the same way it fails a host call: it poisons the frontier rather than letting the walk continue on a wrong view. An unacknowledged transition persists with the traversal set and re-yields after a restart, and a rejected report re-carries it.
 
@@ -358,7 +453,7 @@ Transitions surface only during the action stage; trigger probing evaluates agai
 
 ### Work Items
 
-Each work item identifies its request with `id` and its source node with `sourceRef`. Alongside work-specific inputs, it carries `hostParams`. Action-stage work also carries optional `guidance?: SemanticText` rendered from that node's `this.guidance`; trigger work neither evaluates nor carries guidance. The host applies guidance as standing context; observation groups share it across their fields. Undeclared guidance is absent, and an explicitly empty string is preserved.
+Each work item identifies its request with `id` and its source node with `sourceRef`. Work from an `invoke(() => { ... })` body or an `arr.$map(callback, results?)` callback carries the enclosing node's ref, while an `$enter(newcopy(...))` inside a callback briefs under the entered copy. Match reports to briefs by id rather than interpreting the ref. Alongside work-specific inputs, it carries `hostParams`. Action-stage work also carries optional `guidance?: SemanticText` rendered from that node's `this.guidance`; trigger work neither evaluates nor carries guidance. The host applies guidance as standing context; observation groups share it across their fields. Undeclared guidance is absent, and an explicitly empty string is preserved.
 
 #### Semantic Text
 
@@ -401,7 +496,7 @@ type JudgmentBrief = {
 
 #### Observations and Observation Groups
 
-`ObservationBrief` represents a request by the runtime to extract a cell target's value — from an `$observe()` or `$observeOrAsk()` call. The target may be a whole cell, a concrete array element, or a Struct field selected by the authored target expression. The host infers the value from conversation context using the provided question and the target leaf's type definition. When `mode` is `"observeOrAsk"`, the host may ask the user directly instead of inferring.
+`ObservationBrief` asks the host to extract a value for a whole cell, array element, or struct field selected by `$observe()` or `$observeOrAsk()`. The host uses the question and target metadata to interpret conversation context. With `mode: "observeOrAsk"`, it may ask the user directly.
 
 ```typescript
 type ObservationBrief = {
@@ -426,56 +521,11 @@ type ObservationBrief = {
   /** Target type metadata for host-side validation/UI. */
   meta: ObservationMeta;
 };
-
-type ObservedValue =
-  | PrimitiveValue
-  | PrimitiveArrayValue
-  | ObservedStructValue
-  | ObservedStructValue[];
-
-/** Struct record keyed by field name. */
-type ObservedStructValue = { [field: string]: ObservedValue };
-
-type ScalarObservationMeta =
-  | { type: "boolean" }
-  | { type: "string" }
-  | { type: "enum"; values: string[] }
-  | { type: "rangedInt"; min: number; max: number }
-  | { type: "number"; min?: number; max?: number };
-
-type ObservationMeta =
-  | ScalarObservationMeta
-  | ArrayObservationMeta
-  | StructObservationMeta;
-
-type ArrayObservationMeta = {
-  type: "array";
-  element: ScalarObservationMeta | StructObservationMeta;
-};
-
-type StructObservationMeta = {
-  type: "struct";
-  fields: Record<string, StructObservationField>;
-};
-
-type StructObservationField = {
-  /** Rendered semantic question from the field's `observing`. */
-  question: SemanticText;
-  /** Field type metadata. */
-  meta: ObservationMeta;
-};
 ```
 
-A Struct target describes its declared fields recursively with their questions and type metadata. The held record, when the Struct is set, is the top-level `currentValue`.
+`ObservedValue` and `ObservationMeta` are exported by `arc/runtime`. Metadata describes the target's scalar constraints, union members, array element spec, or struct fields. Struct fields carry their own questions; a union has one question for the whole target. `currentValue` is informational and may lie outside the constraints for a new observation.
 
-The numeric observation metadata variants are:
-
-- `type: "number"` accepts a finite number within optional inclusive `min` and `max` bounds.
-- `type: "rangedInt"` accepts a JavaScript safe integer within the required inclusive `min` and `max` bounds.
-
-For either numeric variant, negative zero is accepted and subsequently represented as zero. These rules apply to scalar observations, every element of an array observation, array-element observations, every numeric Struct field, and every numeric field of a grouped observation. An item whose value has the wrong type, is non-finite, or does not satisfy the integer shape is rejected as an `invalid-item` with `reasonCode: "observation-type"`. A numeric value outside the inclusive bounds is rejected as an `invalid-item` with `reasonCode: "observation-range"`. A rejected single item remains unresolved; a rejected grouped item writes nothing and re-emits as a group. `currentValue` is informational and may lie outside the metadata bounds; the bounds constrain the new report.
-
-The host reports the outcome as an `ObservationReport`:
+The host reports one outcome:
 
 ```typescript
 type ObservationReport =
@@ -488,11 +538,13 @@ type ObservationReport =
   | { status: "unknown" | "needs-user"; value?: never };
 ```
 
-For `$observe()`, the runtime writes a `resolved` value or preserves existing state on `unknown`, and resolves the action; `needs-user` is an invalid item. For `$observeOrAsk()`, the runtime writes only a `resolved` value; otherwise it writes nothing and the observation resurfaces on the next brief.
+A resolved value must satisfy the target metadata. Arrays carry complete lists, and structs carry exactly their declared fields, recursively. A union accepts one value satisfying any member, including when several members match. Its report carries that value directly. An explicit Enum answer requires evidence and is never inferred from an unknown outcome.
 
-A `resolved` report carries a complete value. A Struct value supplies every declared field and no undeclared one, recursively, so `{}` is a valid value only for an empty Struct. An array value is the whole list, each Struct element a complete record. A `resolved` report without a value, an incomplete record, and any other status are invalid items.
+Numeric values must be finite and satisfy inclusive bounds when present; `rangedInt` also requires a safe integer. Negative zero is represented as zero. For numeric targets, a wrong type or integer shape produces `invalid-item` with `reasonCode: "observation-type"`; a numeric bound violation uses `"observation-range"`. For a union target, a value matching the primitive type of exactly one member reports that member's fault; any other inadmissible value uses `"observation-type"`. Invalid outcomes write nothing and leave the observation pending.
 
-`ObservationGroupBrief` represents a request to extract several cells together — from an `$observe({ ... })` or `$observeOrAsk({ ... })` call. It shares the `observations` channel with `ObservationBrief`; the two are distinguished by `kind`. Sharing the channel means a host that iterates `observations` is forced to handle the group variant rather than silently leaving it unresolved (which would deadlock the arc). The host infers the whole set in one inference and reports every field in one report. The group is one resolved-once action: the runtime applies the report as a unit and keeps no per-field progress.
+For `$observe()`, a resolved value is written, `unknown` preserves existing state, and either outcome completes the action; `needs-user` is invalid. For `$observeOrAsk()`, only a resolved value completes the action. `unknown` and `needs-user` write nothing and the observation reappears on the next brief.
+
+`ObservationGroupBrief` asks the host to extract several targets together, from `$observe({ ... })` or `$observeOrAsk({ ... })`. It shares the `observations` channel with single observations; hosts distinguish them by `kind`.
 
 ```typescript
 type ObservationGroupBrief = {
@@ -524,9 +576,7 @@ type ObservationGroupField = {
 };
 ```
 
-The host reports the outcome as an `ObservationGroupReport`. It must carry an entry for every field in the brief; a report that omits a field is invalid, surfaces an `invalid-item` issue, writes nothing, and re-emits the group.
-
-Each entry is an `ObservationReport`, so an `Array` field reports its whole list and a Struct field its whole record exactly as a single observation does. Reports carry no `kind`: read `ObservationGroupReport` apart from `ObservationReport` by the `fields` property, or by the `kind` of the brief the id came from.
+The host returns every requested field in one report, keyed by its `cell` label:
 
 ```typescript
 type ObservationGroupReport = {
@@ -535,7 +585,9 @@ type ObservationGroupReport = {
 };
 ```
 
-`$observe({ ... })` writes every `resolved` field together, preserves every `unknown` field, and resolves the group; any `needs-user` field re-emits the group and nothing is written. `$observeOrAsk({ ... })` writes only when every field is `resolved`; otherwise the group re-emits and nothing is written.
+Each field follows the same value constraints as a single observation. Missing fields or invalid outcomes reject the group, write nothing, and leave it pending. Reports carry no `kind`; hosts identify the report shape from the originating brief or the presence of `fields`.
+
+Grouped `$observe()` writes all resolved fields together, preserves unknown fields, and completes; a `needs-user` field leaves the whole group pending without writes. Grouped `$observeOrAsk()` writes only when every field resolves in the same report. The runtime keeps no per-field progress between reports.
 
 #### Host Calls
 
@@ -564,11 +616,11 @@ type HostCallBrief = {
 
 The runtime resolves the call's `module + target + operation` path through its injected host-module registry and checks every argument, including nested fields and elements, against the operation's declaration before emitting the brief. If argument admission fails, the traversal poisons with `invalid-host-argument` and emits no invalid call. Nested host calls remain unavailable as arguments because arguments must be renderable without additional host work.
 
-`HostCallBrief.arguments` contains exactly the arguments supplied by the authored call, preserving their positions and count, including the supplied fields of nested Structs. Omittable arguments and fields left out of the call remain absent; the runtime inserts no values or defaults. Every supplied value must be set and satisfy the payload rules.
+`HostCallBrief.arguments` contains exactly the arguments supplied by the authored call, preserving their positions and count, including the supplied fields of nested structs. Omittable arguments and fields left out of the call remain absent; the runtime inserts no values or defaults. Every supplied value must be set and satisfy the payload rules.
 
-The consumer decides whether a result is required. An expression consumer requires the operation to declare a result compatible with the demanded spec. An action consumer imposes no result requirement; it accepts an operation with or without a declared result and discards any value the host reports. There is no consumer marker in the brief. The `$` sigil is consumed by parsing, and `operation` is always unsigiled.
+The consumer decides whether a result is required. An expression consumer requires the operation to declare a result compatible with the demanded spec. An action consumer imposes no result requirement; it accepts an operation with or without a declared result and discards any value the host reports. The brief does not identify the consumer, and `operation` is always unsigiled.
 
-The host must not infer the originating consumer from a `HostCallBrief`. `ActionBrief.allowedMoves` is authoritative for control: a call awaiting action resolution withholds `"deflect"`, while a call awaiting an expression value does not by itself withhold it. The runtime derives this distinction from the consumer while building the brief.
+The host must not infer the originating consumer from a `HostCallBrief`. `ActionBrief.allowedMoves` is authoritative for control: a call awaiting action resolution withholds `"deflect"`, while a call awaiting an expression value does not by itself withhold it.
 
 Every host-call report has an explicit resolution envelope:
 
@@ -586,7 +638,7 @@ Report values first pass transport sanitation. Every nested value must satisfy t
 
 A host call used as an action follows resolved-once action-state lifetime. On first reach, the runtime captures its admitted arguments, `hostParams`, and rendered `guidance` and suspends at that action. It re-emits the captured invocation under the same brief id without reevaluating its inputs until it receives `{ status: "resolved" }` or the host poisons the frontier. Once resolved, the action slot stays resolved through ordinary retries and re-entry. A new `invoke(...)` run, a different `$map(...)` member, or a forgetful entry clears the applicable action state, so the call executes again when reached.
 
-Persisted action state includes pending captured invocations. Restoration validates pending and resolved state shapes, call identity, captured argument admission, captured `hostParams`, and the semantic-text shape of captured `guidance` before traversal resumes. Captured arguments must preserve the authored argument count, supplied Struct fields, and authored array lengths at every nesting depth.
+Persisted action state includes pending captured invocations. Restoration validates pending and resolved state shapes, call identity, captured argument admission, captured `hostParams`, and the semantic-text shape of captured `guidance` before traversal resumes. Captured arguments must preserve the authored argument count, supplied struct fields, and authored array lengths at every nesting depth.
 
 #### Instructions
 
@@ -635,7 +687,7 @@ type InstructionPostcheck = {
 
 `postcheck` is not the full authored resolution logic. It includes only the check ids that are currently pending in this brief. Later briefs for the same instruction may expose a different `postcheck` frontier. An answered check does not re-pose within the same decision cycle: a hook that settles while the other hook is still open keeps its answers, so follow-up briefs carry only the open hook's checks until the instruction resolves, deflects, or returns to `apply` for a fresh cycle.
 
-After an instruction is applied, the host should report back:
+After applying an instruction, the host reports it:
 
 ```typescript
 type InstructionReport = {
@@ -643,30 +695,21 @@ type InstructionReport = {
 };
 ```
 
-Instruction handback is intentionally different from value-style actions. For value-style actions, the host reports values and runtime advances from those values.
+The host reports each `apply`-phase instruction it performed as `instructions[id]: { status: "applied" }`. Omitted ids stay in `apply`, so a brief with several instructions may be acknowledged partially. A `postcheck` instruction has already been applied for its current cycle and must not be reported applied again. How the host establishes application is outside the runtime's concern.
 
-For instructions, the host should:
+A `once` instruction, from `$instruct()`, resolves only after it is reported applied. A `persistent` instruction, from `$instructLoop()`, stays pending until its `resolveWhen` resolves true.
 
-1. Respect instruction `mode` in host logic.
-   - `once`: the runtime resolves the instruction only after the host reports that instruction id as `status: "applied"`. How the host establishes application is outside the runtime's concern. Set for `$instruct()`s.
-   - `persistent`: the instruction remains pending until its authored `resolveWhen` resolves true. Set for `$instructLoop()`s.
-2. Respect instruction `phase` in the current brief.
-   - `apply`: treat the instruction as guidance currently in effect.
-   - `postcheck`: the instruction is still pending, but this brief is focused on resolving follow-up checks rather than treating it as a fresh instruction presentation.
-   - Typical progression is: first reach emits `phase: "apply"`; follow-up briefs while primarily checking conditions emit `phase: "postcheck"`; after a non-terminal check cycle the same instruction may return to `phase: "apply"`.
-3. For each `phase: "apply"` instruction actually performed, report `instructions[id]: { status: "applied" }`. Omitted ids remain unconfirmed and stay in `apply`; when a brief contains multiple instructions, it may therefore be acknowledged partially. A `postcheck` instruction has already been applied for its current cycle and must not be reported applied again.
-4. Independently report any available values for `postcheck` ids in the same brief (`judgments` / `observations` / `hostCalls`). Application and postcheck evidence may arrive separately or in the same report.
-5. A pending instruction suppresses `move: "deflect"` in both phases. The runtime evaluates reported `deflectWhen` evidence independently of application. True deflect evidence yields the exclusive required-deflection frontier even when the instruction has not been reported applied; acknowledge that subsequent frontier with `{ move: "deflect" }`.
+A first reach emits `phase: "apply"`. Follow-up briefs while checks are open emit `phase: "postcheck"`, and after a non-terminal check cycle the same instruction may return to `phase: "apply"`.
 
-Runtime then derives instruction outcome from authored conditions. Each `$instruct`, and each `$instructLoop` iteration, is one lap collecting two evidences, each banked once settled: the deflect evidence (`deflectWhen`) and the finished evidence (application for a one-shot, `resolveWhen` for a loop).
+Application and postcheck values are separate report channels with no ordering. A host may report application first, values for the `postcheck` ids first, or both together.
+
+A pending instruction suppresses `move: "deflect"` in both phases. True deflect evidence yields the exclusive required-deflection frontier even when the instruction has not been reported applied; acknowledge that frontier with `{ move: "deflect" }`.
+
+Each `$instruct`, and each `$instructLoop` iteration, is one lap collecting two evidences, each banked once settled and not posed again: the deflect evidence (`deflectWhen`) and the finished evidence (application for a one-shot, `resolveWhen` for a loop).
 
 1. A deflect evidence that settles true decides the lap and yields the required acknowledgement, honoring the finished evidence collected up to the same handback: a finished lap stays resolved through the deflection, an unfinished one retains its evidence until acknowledgement and re-presents after the deflection is handled.
 2. With both evidences in and no deflection, a finished lap resolves — for a loop, a true `resolveWhen` resolves the whole action and a false one starts a fresh lap with fresh evidence.
 3. Else the lap waits for its open evidence. An unapplied instruction stays in `apply`; an applied instruction with unresolved checks stays in `postcheck`.
-
-The two report channels impose no ordering. A host may report application first, postcheck evidence first, or both together; each settled evidence banks for the lap and its checks do not re-pose.
-
-If values are still missing, runtime returns the next action brief directly. That brief may include the same instruction again with `phase: "postcheck"`, or with `phase: "apply"` if the instruction has come back into effect after a non-terminal check cycle.
 
 ## Runtime API
 
@@ -720,49 +763,9 @@ The host must uphold these invariants within each scoped `Dialog`:
 - **Scope consistency**: `lastTurns`, `cursor`, and `view` describe the same scoped visible dialog.
 - **Visible-turn projection**: `lastTurns` and `cursor` are based only on Arc-visible `user` and `self` turns, using the same projection rules.
 - **Exact deltas**: for any earlier and later cursors from the same view, `later.user - earlier.user` must equal exactly the number of visible `user` turns added between those cursors, and `later.self - earlier.self` must equal exactly the number of visible `self` turns added between those cursors. These deltas are therefore never negative.
-- **Same-view comparison only**: a cursor is a coordinate in one projection; two views count different subsets of the conversation, so a cross-view difference measures nothing. Comparing cursors with different views poisons the traversal with `reasonCode: "cross-view-comparison"`, and the issue reason names both views. Cursors stored before views existed carry no stamp and read as the default view.
+- **Same-view comparison only**: a cursor is a coordinate in one projection; two views count different subsets of the conversation, so a cross-view difference measures nothing. Comparing cursors with different views poisons the traversal with `reasonCode: "cross-view-comparison"`, and the issue reason names both views. A cursor with no stamp reads as the default view.
 
 If the host windows `lastTurns`, it must still compute `cursor` from the full scoped visible dialog, or from another durable per-view coordinate source, so cursor deltas remain exact when older turns drop out of `lastTurns`. The runtime errors if the current cursor is earlier than a stored cursor of the same view.
-
-### Registration
-
-Runtime construction accepts the complete host-module declaration environment and has a collecting phase followed by an initialized phase:
-
-```typescript
-type RuntimeOptions = {
-  hostModules?: ReadonlyMap<string, HostModuleSpec>;
-};
-
-const runtime = new Runtime({ hostModules });
-```
-
-`HostModuleSpec` is normalized data. Host developers may construct it with [`hmd.define()`](../docs/host-module-declarations.md) from the `arc/host-utils` entry point. The runtime receives only the normalized registry, validates and privately clones the supplied registry at construction; omitting `hostModules` means an empty definitive registry.
-
-Documents may be added in any Arc import order while collecting. Execution APIs require successful initialization; successful initialization seals the runtime against further additions.
-
-Expected document and registry incoherence is reported through `RuntimeRegistrationError`. The error's `operation` is `"add"` or `"init"`, and its `issues` contains every independently discoverable structured registration issue from that call. Its message includes every issue code and message for ordinary logging; callers that present or classify failures should consume `issues` rather than parse the message. Caller misuse and impossible internal invariants remain ordinary immediate errors.
-
-**`add(source, document)`** — validate, privately snapshot, and collect one document. `source` is the filename stem (e.g. `"heavy-metal"`). Collection does not mutate the caller's object, and later caller mutation does not change runtime behavior.
-
-Document intake uses this exact order:
-
-1. Analyze the raw caller graph before cloning: establish graph safety, then the complete Document grammar, then semantic validity. Malformed records and misplaced variants produce structured issues before typed traversal. Graph-safety failures uniformly use `INVALID_PUBLIC_IR`; payload diagnostics apply to safe carriers at actual payload positions. Only `ELEMENT_ID` issues are provisionally ignored; every other issue rejects the add.
-2. Clone the accepted graph while preserving numeric values exactly, including the sign of zero.
-3. Stamp canonical element IDs on the private clone, so valid hand-built IR may omit them without mutating the caller's graph.
-4. Analyze the stamped private clone again under the runtime's definitive host-module registry and reject every issue. The runtime retains this analysis's rewalk plan.
-5. Canonicalize negative zero in the private clone only after the second analysis succeeds, then collect every root atomically.
-
-If raw analysis finds issues, `add()` reports all non-`ELEMENT_ID` issues discovered by that stage together and does not clone. Environment-free analysis treats a host call without declaration evidence as dynamic; this preserves raw public-IR validation without guessing a host environment. If the stamped private analysis finds issues, it reports all of them together and does not collect. The definitive pass requires every imported host module and action path, exact operation arity, compatible parameter operands, and satisfaction of each consumer's result demand. An action consumer creates no result demand. The second pass runs only after raw validation succeeds because malformed descriptors, cycles, and other invalid graph shapes cannot safely cross the clone boundary. Duplicate sources, duplicate Arc refs, and validation failures collect nothing from that call. `add()` performs every document-local and host-environment check, but it does not require imported Arc documents to have been added yet.
-
-**`init()`** — resolve and validate the complete prospective registry. Initialization resolves every import and imported node-entry endpoint, then walks imported bindings with the caller's lexical cells, current node signature, and enclosing `$map` receiver/result element specs. Args bindings are checked provider-to-receiver; returns bindings are checked declared-return-to-local-receiver. It collects unresolved imports and every independently checkable undeclared, unresolved, or incompatible binding. A binding dependent on an unresolved import is skipped rather than reported as a cascade. Issues are returned in canonical source/position/binding order, independent of document-add order, and one `RuntimeRegistrationError` reports the complete result.
-
-Initialization commits atomically. A failed `init()` leaves the runtime collecting and retryable, so the caller may add a missing document and call `init()` again. A successful call commits the resolved registry, enables execution, and rejects later `add()` calls. Calling `init()` again on an initialized runtime returns that runtime unchanged.
-
-**`has(arc)`** — check whether an arc is registered.
-
-**`newTraversalSet()`** — create an empty traversal set for a fresh trigger or action session.
-
-**`newTraversal(arc)`** — after initialization, create a fresh arc traversal in the `"dormant"` phase with `enterCount = 0`.
 
 ### Trigger Stage
 
@@ -822,26 +825,6 @@ When report validation fails, `progress(...)` returns an `ActionBrief` with `iss
 | --------- | --------------------- | ---------------------------------- |
 | `ArcRef`  | opaque runtime string | Identifies a registered arc.       |
 | `NodeRef` | opaque runtime string | Identifies a node (source + path). |
+| `BriefId` | opaque runtime string | Identifies a work item in a brief. |
 
 Construct and destructure refs through the helpers exported by `arc/runtime` (`toArcRef`, `toArcRefParts`, `toNodeRef`, `toNodeRefParts`). Callers should not assume a specific string layout.
-
-## Host Integration Example
-
-A typical host turn:
-
-1. Build Dialog from session history.
-
-2. Trigger stage:
-   1. `startTrigger(traversals, dialog)` → trigger brief.
-   1. Persist `brief.traversals`.
-   1. While `brief.matched` is not set:
-      1. Resolve judgments/observations/hostCalls and optional `preferredMatch`.
-      1. `progressTrigger(brief, report, latestDialog)` → new trigger brief.
-      1. Persist `brief.traversals`.
-   1. Once `brief.matched` is set, proceed to action stage.
-
-3. Action stage (if an arc is active):
-   1. `start(traversals, dialog)` → `ActionBrief | TerminalBrief`.
-   1. Persist `brief.traversals`.
-   1. While `brief.canProgress`, inspect its instructions, pending work, and `allowedMoves`; choose when to hand control back; resolve available items; and call `progress(brief, { move, instructions, judgments, observations, hostCalls }, latestDialog)`. Unresolved or unreported work re-surfaces on later `ActionBrief`s under the same ids. When `brief.deflection` is present, prepare the handoff and report only `{ move: "deflect" }`. On other frontiers, report `move: "poison"` if the host cannot accept the frontier contract or fails a resolution fatally. Persist each returned `brief.traversals`.
-   1. When `canProgress` is false, settle from `brief.root`, `brief.outcome`, `brief.returns`, and `brief.issues`.

@@ -3,13 +3,16 @@ import {
   isHostStructFieldName,
 } from "../spec/host-parameters.js";
 import { validateHostModuleSpec, validateSpec } from "../spec/validation.js";
-import type {
-  ChannelSpec,
-  HostModuleSpec,
-  HostNamespaceSpec,
-  HostOperationSpec,
-  HostParameterSpec,
-  HostParameterValueSpec,
+import {
+  isUnionMemberSpec,
+  type ChannelSpec,
+  type HostModuleSpec,
+  type HostNamespaceSpec,
+  type HostOperationSpec,
+  type HostParameterSpec,
+  type HostParameterValueSpec,
+  type ScalarSpec,
+  type UnionSpec,
 } from "../types/spec.js";
 
 declare const tokenType: unique symbol;
@@ -22,7 +25,7 @@ type DeclarationToken<Spec extends HostParameterSpec = HostParameterSpec> = {
 type TokenSpec<Token> =
   Token extends DeclarationToken<infer Spec> ? Spec : never;
 
-/** The Struct spec `hmd.Struct(fields)` captures, field by field. */
+/** The struct spec `hmd.Struct(fields)` captures, field by field. */
 type StructTokenSpec<
   Fields extends Readonly<Record<string, DeclarationToken>>,
 > = {
@@ -267,6 +270,26 @@ function enumToken(values: readonly string[]): DeclarationToken<{
   return createToken(spec);
 }
 
+/** Captures one flat ordered list of scalar alternatives. */
+function unionToken(
+  members: readonly DeclarationToken<ScalarSpec>[],
+): DeclarationToken<UnionSpec> {
+  const path = activeCapture?.path ?? "$";
+  const children = inspectTokenArray(members, path, "Union");
+  if (children.length < 2) {
+    declarationError(path, "Union requires at least two scalar members");
+  }
+  const specs = children.map((child): ScalarSpec => {
+    const spec = valueTokenSpec(child, path, "Union");
+    if (isUnionMemberSpec(spec)) return spec;
+    declarationError(
+      path,
+      "Union members must be Bool, Str, Enum, or Num markers",
+    );
+  });
+  return createToken({ type: "union", members: specs }, children);
+}
+
 function arrayToken<Spec extends HostParameterValueSpec>(
   element: DeclarationToken<Spec>,
 ): DeclarationToken<{ type: "array"; element: Spec }> {
@@ -459,6 +482,7 @@ function isChannelSpec(spec: HostParameterSpec): spec is ChannelSpec {
     case "index":
     case "artifact":
     case "dialogCursor":
+    case "union":
       return true;
     case "array":
       return (
@@ -479,8 +503,8 @@ function isChannelSpec(spec: HostParameterSpec): spec is ChannelSpec {
 }
 
 /**
- * Whether a Struct result field is an observable Arc field: a scalar, an array
- * of scalars or Structs, or a nested Struct of such fields.
+ * Whether a struct result field is an observable Arc field: a scalar, a union,
+ * an array of such values or structs, or a nested struct of such fields.
  */
 function isObservableFieldSpec(spec: HostParameterSpec): boolean {
   switch (spec.type) {
@@ -488,6 +512,7 @@ function isObservableFieldSpec(spec: HostParameterSpec): boolean {
     case "string":
     case "enum":
     case "number":
+    case "union":
       return true;
     case "array":
       return (
@@ -531,6 +556,7 @@ export const hmd = Object.freeze({
   Str: () => scalarToken({ type: "string" }),
   Enum: enumToken,
   Num: () => scalarToken({ type: "number" }),
+  Union: unionToken,
   Index: () => scalarToken({ type: "index" }),
   Artifact: () => scalarToken({ type: "artifact" }),
   Dialog: Object.freeze({

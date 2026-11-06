@@ -1,14 +1,9 @@
 /**
- * Persisted traversal state and the runtime identities, transitions, issues,
- * and moves shared with Arc's host-interaction protocol.
+ * Persisted traversal state with its identities and guards, and the issues
+ * surfaced by runtime registration.
  */
 
-import type {
-  ActionStatement,
-  ElementId,
-  SegKey,
-  SourceRange,
-} from "./parser.js";
+import type { ActionStatement, ElementId, SegKey, SourceRange } from "./ir.js";
 import type {
   ArrayElementValue,
   ArrayValue,
@@ -26,6 +21,51 @@ export type ArcRef = `arc:${string}`;
  * Canonical reference to one root or owned nested node inside a document.
  */
 export type NodeRef = `node:${string}`;
+
+export function toArcRef(source: string, identifier: string): ArcRef {
+  return `arc:${encodeURIComponent(source)}:${encodeURIComponent(identifier)}`;
+}
+
+export function toNodeRef(source: string, path: string[]): NodeRef {
+  return `node:${encodeURIComponent(source)}:${path.map(encodeURIComponent).join(".")}`;
+}
+
+export function toArcRefParts(ref: ArcRef): {
+  source: string;
+  identifier: string;
+} {
+  const [, source, id] = ref.split(":");
+  if (source === undefined || id === undefined)
+    throw new Error(`Invalid ArcRef: ${ref}`);
+  return {
+    source: decodeURIComponent(source),
+    identifier: decodeURIComponent(id),
+  };
+}
+
+export function toNodeRefParts(ref: NodeRef): {
+  source: string;
+  path: string[];
+} {
+  const [, source, encodedPath] = ref.split(":");
+  if (source === undefined || encodedPath === undefined)
+    throw new Error(`Invalid NodeRef: ${ref}`);
+  return {
+    source: decodeURIComponent(source),
+    path: encodedPath.split(".").map(decodeURIComponent),
+  };
+}
+
+/**
+ * Whether a ref string is an arc ref (vs a node ref). Accepts any `string` so it
+ * serves both as a discriminator over a known `ArcRef | NodeRef` and as a
+ * validator for untrusted input (e.g. a ref carried in a host report), keeping
+ * arc's `arc:` ref-format convention owned here rather than reimplemented by
+ * callers.
+ */
+export function isArcRef(ref: string): ref is ArcRef {
+  return ref.startsWith("arc:");
+}
 
 /**
  * Observable runtime state of a node, corresponding directly to `State.*` inside
@@ -250,6 +290,9 @@ type SubtreeBracket = {
   preSnapshot?: StateSnapshot;
 };
 
+/** Host-facing phase of a pending instruction. */
+export type InstructionPhase = "apply" | "postcheck";
+
 /**
  * Persisted continuation for a pending instruction: the host-facing phase plus
  * the current lap's banked hook evidence. A lap — one `$instruct` pendency or
@@ -259,7 +302,7 @@ type SubtreeBracket = {
  * banked evidence.
  */
 type InstructionContinuation = {
-  instructionPhase: "apply" | "postcheck";
+  instructionPhase: InstructionPhase;
   deflectWhenOutcome?: boolean;
   resolveWhenOutcome?: boolean;
 };
@@ -322,6 +365,10 @@ export type ActionState =
       >;
       status: ActionStatus;
     };
+
+export function isResolvedActionState(state: ActionState | undefined): boolean {
+  return state?.status === "resolved";
+}
 
 /**
  * The `ActionState` variant that holds state for one action kind. Selects by
@@ -562,6 +609,40 @@ export type ArcTraversal = TraversalBase<ArcRef> & {
  */
 export type Traversal = ArcTraversal | NodeTraversal;
 
+export function isArcTraversal(
+  traversal: Traversal,
+): traversal is Extract<Traversal, { ref: ArcRef }> {
+  return isArcRef(traversal.ref);
+}
+
+export function isStopped(traversal: ArcTraversal): boolean {
+  return (
+    traversal.phase === "completed" ||
+    traversal.phase === "suspended" ||
+    traversal.phase === "poisoned"
+  );
+}
+
+export function isEnteredTraversal(traversal: Traversal): boolean {
+  return isArcTraversal(traversal)
+    ? traversal.phase === "entered" &&
+        (traversal.state === undefined || traversal.state === "interrupted")
+    : traversal.state === undefined || traversal.state === "interrupted";
+}
+
+export function isSuspendedArcTraversal(traversal: Traversal): boolean {
+  return isArcTraversal(traversal) && traversal.phase === "suspended";
+}
+
+/** Whether a prior copy ended its attempt and may be replaced by a fresh copy. */
+export function isTerminalNodeTraversal(traversal: NodeTraversal): boolean {
+  return (
+    traversal.state === "covered" ||
+    traversal.state === "skipped" ||
+    traversal.state === "deflected"
+  );
+}
+
 /**
  * The full persisted runtime state for action progression.
  *
@@ -570,58 +651,6 @@ export type Traversal = ArcTraversal | NodeTraversal;
  * continuation state.
  */
 export type ArcTraversalSet = ArcTraversal[];
-
-/**
- * The walk's position moved from one node to another.
- *
- * `position` is the node the walk now stands at: evaluation continues there,
- * and the next dialog must be projected for it. `exited`
- * and `entered` tell how the walk got there — the nodes it left (innermost
- * first) and the nodes it newly opened (outermost first). Both are arrays
- * because one transition covers a whole stretch of moves with no authored
- * evaluation in between: a guard-less enter chain opens several nodes at once,
- * and a deflection can unwind several. On a pure entry, `position` is the
- * innermost entered node; on an exit, it is the caller returned to, which
- * appears in neither array because it was already open.
- *
- * `hostParams` is the position node's authored `hostParams` (`undefined` when
- * it declares none), carried so the host can decide how to project without a
- * document lookup. A transition-bearing brief carries no other work: the host
- * answers `proceed`, and the point of that report is the dialog supplied with
- * it, freshly projected for `position`.
- */
-export type NodeTransition = TransitionStretch & {
-  position: NodeRef;
-  hostParams: PayloadValue;
-};
-
-/** Host-visible runtime issue surfaced while advancing from the previous yield. */
-export type RuntimeIssue =
-  | {
-      kind: "poisoned-traversal";
-      arc: ArcRef;
-      active: NodeRef;
-      source?: SourceRange;
-      reasonCode?: string;
-      reason?: string;
-    }
-  | {
-      kind: "invalid-report";
-      reasonCode?: string;
-      reason?: string;
-    }
-  | {
-      kind: "invalid-item";
-      briefId: BriefId;
-      reasonCode?: string;
-      reason?: string;
-    }
-  | {
-      kind: "ambiguous-match";
-      matchableArcs: ArcRef[];
-      reasonCode?: string;
-      reason?: string;
-    };
 
 /** One document-local issue found while `Runtime.add()` validates an input. */
 export type RuntimeDocumentIssue = {
@@ -664,14 +693,3 @@ export type RuntimeRegistryIssue =
 export type RuntimeRegistrationIssue =
   | RuntimeDocumentIssue
   | RuntimeRegistryIssue;
-
-/**
- * High-level moves offered by the current action brief through `allowedMoves`.
- *
- * - `proceed`: report semantic results and continue traversal
- * - `deflect`: initiate or acknowledge deflection at the active node.
- * - `interrupt`: interrupt pending work without acknowledging it.
- * - `poison`: mark the active arc as unusable because the host cannot execute
- *   the current frontier contract.
- */
-export type ActionMove = "proceed" | "deflect" | "interrupt" | "poison";

@@ -3,12 +3,13 @@ import type {
   Cell,
   ComparisonOperator,
   FieldReceiver,
+  FmtConfig,
   HostCall,
   HostCallArgument,
   NodeSignature,
   SemanticString,
   ValueExpression,
-} from "../types/parser.js";
+} from "../types/ir.js";
 import {
   cellSpecToChannelSpec,
   fieldSpecAt,
@@ -21,26 +22,26 @@ import {
   type HostOperationSpec,
   type HostParameterValueSpec,
   type StructSpec,
+  type UnionSpec,
 } from "../types/spec.js";
 import {
   classifyArtifactPath,
   classifyArtifactValue,
-  isArtifactValue,
-  isDialogCursorValue,
-  isPrimitiveArrayValue,
-  isPrimitiveValue,
-  type CellValue,
-  type PayloadValue,
-  type PrimitiveValue,
-  type SemanticText,
-} from "../types/value.js";
-import {
   describeArtifactPathIssue,
   describeArtifactValueIssue,
   firstInvalidPayloadValue,
   firstNonFiniteNumberPath,
+  isArtifactValue,
+  isDialogCursorValue,
   isPlainRecord,
-} from "../value-utils.js";
+  isPrimitiveArrayValue,
+  isPrimitiveValue,
+  isRenderedSemanticText,
+  type CellValue,
+  type PayloadValue,
+  type PrimitiveValue,
+} from "../types/value.js";
+import { checkFmtEvidence, fmtValue } from "./fmt.js";
 import { hostParameterValueSpec } from "./host-parameters.js";
 
 type HostActionPath = {
@@ -93,7 +94,8 @@ export type AdmissionViolation = {
     | "invalid-array"
     | "invalid-artifact"
     | "invalid-dialog-cursor"
-    | "invalid-struct";
+    | "invalid-struct"
+    | "invalid-union";
   detail: string;
   path: string;
 };
@@ -113,6 +115,19 @@ export function admitValue(
     return violation("unset", "A set value is required", path);
   }
   switch (spec.type) {
+    case "union": {
+      for (const member of spec.members) {
+        const result = admitValue(member, value, path);
+        if (result.admitted) return result;
+      }
+      const sameCarrier = spec.members.filter(
+        (member) =>
+          typeof value === (member.type === "enum" ? "string" : member.type),
+      );
+      return sameCarrier.length === 1
+        ? admitValue(sameCarrier[0]!, value, path)
+        : violation("invalid-union", "Value must satisfy a Union member", path);
+    }
     case "boolean":
       return typeof value === "boolean"
         ? admitted(value)
@@ -179,7 +194,7 @@ export function admitValue(
 }
 
 /**
- * Admits one complete concrete Struct value: a plain data record carrying
+ * Admits one complete concrete struct value: a plain data record carrying
  * exactly the declared fields, each with an admitted concrete value.
  */
 function admitStructValue(
@@ -224,6 +239,18 @@ function admitted(value: CellValue): Admission {
   return { admitted: true, value };
 }
 
+/** Resolves the first admitting scalar member in authored order. */
+export function precedingSpec(
+  spec: CellSpec | ChannelSpec,
+  value: unknown,
+): Exclude<ChannelSpec, { type: "union" }> | undefined {
+  if (spec.type !== "union") return spec;
+  for (const member of spec.members) {
+    if (admitValue(member, value).admitted) return member;
+  }
+  return undefined;
+}
+
 function violation(
   code: AdmissionViolation["code"],
   detail: string,
@@ -257,6 +284,20 @@ export function judgeOneTimeLanding(
   destination: CellSpec | ChannelSpec,
 ): CoherenceJudgment {
   if (!source) return UNKNOWN;
+  if (
+    destination.type === "union" &&
+    source.kind !== "site" &&
+    source.kind !== "literal"
+  ) {
+    const judgments = destination.members.map((member) =>
+      judgeOneTimeLanding(source, member),
+    );
+    if (judgments.some((judgment) => judgment.kind === "compatible"))
+      return COMPATIBLE;
+    return judgments.every((judgment) => judgment.kind === "incompatible")
+      ? INCOMPATIBLE
+      : UNKNOWN;
+  }
   switch (source.kind) {
     case "site":
       return judgeSpecLanding(source.spec, destination);
@@ -312,11 +353,44 @@ export function reduceAlternativeJudgments(
   return COMPATIBLE;
 }
 
+/** Reduces the judgments of one union's members; disagreement defers to the value. */
+function reduceUnionJudgments(
+  judgments: readonly CoherenceJudgment[],
+): CoherenceJudgment {
+  if (judgments.every((judgment) => judgment.kind === "compatible"))
+    return COMPATIBLE;
+  if (judgments.every((judgment) => judgment.kind === "incompatible"))
+    return INCOMPATIBLE;
+  return UNKNOWN;
+}
+
+function reduceOverUnion(
+  union: UnionSpec,
+  judge: (member: ProducerEvidence) => CoherenceJudgment,
+): CoherenceJudgment {
+  return reduceUnionJudgments(
+    union.members.map((spec) => judge(resolvedFact({ kind: "site", spec }))),
+  );
+}
+
 /** Whether every provider value is admitted by the receiver guarantee. */
 export function reusableSpecCompatible(
   provider: CellSpec | ChannelSpec,
   receiver: CellSpec | ChannelSpec,
 ): boolean {
+  if (provider.type === "union")
+    return provider.members.every((member) =>
+      reusableSpecCompatible(member, receiver),
+    );
+  if (receiver.type === "union") {
+    if (provider.type === "enum")
+      return provider.values.every(
+        (value) => admitValue(receiver, value).admitted,
+      );
+    return receiver.members.some((member) =>
+      reusableSpecCompatible(provider, member),
+    );
+  }
   if (provider.type === "index" && receiver.type === "number") return true;
   if (provider.type === "enum" && receiver.type === "string") return true;
   if (provider.type !== receiver.type) return false;
@@ -353,6 +427,17 @@ function judgeSpecLanding(
   destination: CellSpec | ChannelSpec,
 ): CoherenceJudgment {
   if (reusableSpecCompatible(source, destination)) return COMPATIBLE;
+  if (source.type === "union")
+    return reduceUnionJudgments(
+      source.members.map((member) => judgeSpecLanding(member, destination)),
+    );
+  if (destination.type === "union") {
+    return destination.members.every(
+      (member) => judgeSpecLanding(source, member).kind === "incompatible",
+    )
+      ? INCOMPATIBLE
+      : UNKNOWN;
+  }
   if (source.type === "number" && destination.type === "index") return UNKNOWN;
   if (source.type === "string" && destination.type === "enum") return UNKNOWN;
   if (source.type === "enum" && destination.type === "enum") {
@@ -473,6 +558,8 @@ export function resolveProducer(
       };
     case "template-string":
       return resolvedFact(interpolationRule.result);
+    case "fmt":
+      return resolvedFact(fmtRule.result);
     case "scope":
     case "interruptionId":
     case "interruptionReason":
@@ -593,7 +680,11 @@ export function judgeHostArgument(
   }
   if (argument.kind === "semantic") {
     if (destination.type === "semanticText") return { kind: "compatible" };
-    if (destination.type !== "string" && destination.type !== "enum") {
+    if (
+      destination.type !== "string" &&
+      destination.type !== "enum" &&
+      destination.type !== "union"
+    ) {
       return { kind: "incompatible" };
     }
     return judgeSemanticArgument(argument.value, destination, context);
@@ -617,8 +708,8 @@ export function judgeHostArgument(
 }
 
 /**
- * Judges a value producer landing on a host Struct parameter. A complete Arc
- * Struct supplies every field it declares, so each of its fields must be
+ * Judges a value producer landing on a host struct parameter. A complete Arc
+ * struct supplies every field it declares, so each of its fields must be
  * declared by the parameter and every required parameter field must be
  * supplied.
  */
@@ -674,7 +765,7 @@ function judgeHostStructValue(
 }
 
 /**
- * Admits a rendered complete Struct value under a host Struct parameter: a
+ * Admits a rendered complete struct value under a host struct parameter: a
  * plain record whose fields are declared, which supplies every required field,
  * and whose field values satisfy their parameter specs.
  */
@@ -863,7 +954,7 @@ export function admitHostArgument(
   }
   if (destination.type === "struct") {
     // An Artifact constructor carries `{ path }` under Artifact authority, so
-    // its carrier never stands in for a Struct with the same shape.
+    // its carrier never stands in for a struct with the same shape.
     if (argument.kind === "value" && argument.value.kind === "artifact") {
       return hostArgumentViolation(
         "An Artifact value cannot satisfy a Struct parameter",
@@ -883,59 +974,6 @@ export function admitHostArgument(
         admission.violation.detail,
         admission.violation.path,
       );
-}
-
-/** Validates the carrier shape of rendered host-facing semantic text. */
-export function isRenderedSemanticText(value: unknown): value is SemanticText {
-  if (typeof value === "string") return true;
-  if (!Array.isArray(value)) return false;
-  return value.every((part) => {
-    if (!part || typeof part !== "object" || Array.isArray(part)) return false;
-    const record = part as Record<string, unknown>;
-    switch (record.kind) {
-      case "text":
-        return (
-          hasExactKeys(record, ["kind", "value"]) &&
-          typeof record.value === "string"
-        );
-      case "entity":
-        return (
-          hasExactKeys(record, ["kind", "name"]) &&
-          (record.name === "user" || record.name === "self")
-        );
-      case "artifact":
-        return (
-          hasExactKeys(record, ["kind", "path"]) &&
-          typeof record.path === "string" &&
-          classifyArtifactPath(record.path) === undefined
-        );
-      case "hostVar":
-        return (
-          hasExactKeys(record, ["kind", "module", "path"]) &&
-          typeof record.module === "string" &&
-          record.module.length > 0 &&
-          Array.isArray(record.path) &&
-          record.path.length > 0 &&
-          record.path.every(
-            (segment: unknown) =>
-              typeof segment === "string" && segment.length > 0,
-          )
-        );
-      default:
-        return false;
-    }
-  });
-}
-
-function hasExactKeys(
-  value: Record<string, unknown>,
-  keys: readonly string[],
-): boolean {
-  const actual = Object.keys(value);
-  return (
-    actual.length === keys.length &&
-    keys.every((key) => Object.hasOwn(value, key))
-  );
 }
 
 /** Applies the generic one-time landing relation to producer evidence. */
@@ -969,7 +1007,7 @@ export function judgeProducerLanding(
 }
 
 /**
- * Judges an authored object landing on a Struct guarantee: the object must name
+ * Judges an authored object landing on a struct guarantee: the object must name
  * exactly the declared fields, and each field producer must land on its field.
  */
 function judgeStructEvidenceLanding(
@@ -1120,6 +1158,23 @@ export const artifactPathRule = {
   } satisfies SourceFact,
 };
 
+export const fmtRule = {
+  checkProducer(
+    operand: ValueExpression,
+    context: ProducerContext,
+  ): CoherenceJudgment {
+    return checkFmtEvidence(resolveProducer(operand, context));
+  },
+  projectValue(
+    evidence: ProducerEvidence,
+    value: unknown,
+    config: FmtConfig,
+  ): OperationAdmission<string> {
+    return fmtValue(evidence, value, config, admitValue);
+  },
+  result: { kind: "carrier", carrier: "string" } satisfies SourceFact,
+};
+
 export const interpolationRule = {
   checkProducer(
     operand: ValueExpression,
@@ -1176,7 +1231,8 @@ export const interpolationRule = {
   result: { kind: "carrier", carrier: "string" } satisfies SourceFact,
 };
 
-export type ComparisonDecision = {
+/** The comparison evaluation applies to admitted operands. */
+export type SelectedComparison = {
   judgment: CoherenceJudgment;
   mode:
     | "enum"
@@ -1186,10 +1242,20 @@ export type ComparisonDecision = {
     | "artifact"
     | "array"
     | "struct"
+    | "cross-type"
     | "dynamic";
   enumValues?: readonly string[];
   arrayElementFamily?: ArrayComparisonFamily;
 };
+
+/** A selected comparison, or operands whose union declarations select one per value. */
+export type ComparisonDecision =
+  | SelectedComparison
+  | {
+      judgment: CoherenceJudgment;
+      mode: "by-value";
+      operands: { left: ProducerEvidence; right: ProducerEvidence };
+    };
 
 export const comparisonRule = {
   checkProducers(
@@ -1210,113 +1276,592 @@ export const comparisonRule = {
     decision: ComparisonDecision,
     left: unknown,
     right: unknown,
-  ): OperationAdmission<{ left: unknown; right: unknown }> {
-    switch (decision.mode) {
-      case "enum": {
-        const spec: ChannelSpec = {
-          type: "enum",
-          values: [...(decision.enumValues ?? [])],
-        };
-        const admittedLeft = admitValue(spec, left);
-        const admittedRight = admitValue(spec, right);
-        if (!admittedLeft.admitted || !admittedRight.admitted) {
-          return operationViolation(
-            "invalid-enum-value",
-            "Enum comparison requires values in the selected Enum domain",
-          );
-        }
-        return operationAdmitted({ left, right });
-      }
-      case "number": {
-        const admittedLeft = admitValue({ type: "number" }, left);
-        const admittedRight = admitValue({ type: "number" }, right);
-        if (!admittedLeft.admitted || !admittedRight.admitted) {
-          const nonFinite =
-            (typeof left === "number" && !Number.isFinite(left)) ||
-            (typeof right === "number" && !Number.isFinite(right));
-          return operationViolation(
-            nonFinite ? "non-finite-number" : "invalid-numeric-comparison",
-            nonFinite
-              ? "Numeric value must be finite before numeric comparison"
-              : "Numeric comparison requires finite numeric operands",
-          );
-        }
-        return operationAdmitted({ left, right });
-      }
-      case "string":
-        return typeof left === "string" && typeof right === "string"
-          ? operationAdmitted({ left, right })
-          : operationViolation(
-              "invalid-string-comparison",
-              "String comparison requires string operands",
-            );
-      case "boolean":
-        return typeof left === "boolean" && typeof right === "boolean"
-          ? operationAdmitted({ left, right })
-          : operationViolation(
-              "invalid-boolean-comparison",
-              "Boolean equality requires boolean operands",
-            );
-      case "artifact":
-        return isArtifactValue(left) && isArtifactValue(right)
-          ? operationAdmitted({ left, right })
-          : operationViolation(
-              "invalid-artifact-value",
-              "Artifact equality requires valid Artifact values",
-            );
-      case "array":
-        return admitArrayComparisonValues(
-          decision.arrayElementFamily,
+  ): OperationAdmission<AdmittedComparison> {
+    return decision.mode === "by-value"
+      ? admitUnionComparisonValues(
+          op,
+          decision.operands.left,
+          decision.operands.right,
           left,
           right,
-        );
-      case "struct":
-        return isPlainRecord(left) && isPlainRecord(right)
-          ? operationAdmitted({ left, right })
-          : operationViolation(
-              "invalid-struct-comparison",
-              "Struct equality requires Struct operands",
-            );
-      case "dynamic":
-        if (Array.isArray(left) || Array.isArray(right)) {
-          return admitArrayComparisonValues(undefined, left, right);
-        }
-        if (typeof left === "number" || typeof right === "number") {
-          const admittedLeft = admitValue({ type: "number" }, left);
-          const admittedRight = admitValue({ type: "number" }, right);
-          if (admittedLeft.admitted && admittedRight.admitted) {
-            return operationAdmitted({ left, right });
-          }
-          const nonFinite =
-            (typeof left === "number" && !Number.isFinite(left)) ||
-            (typeof right === "number" && !Number.isFinite(right));
-          return operationViolation(
-            nonFinite ? "non-finite-number" : "invalid-numeric-comparison",
-            nonFinite
-              ? "Numeric value must be finite before numeric comparison"
-              : "Numeric comparison requires finite numeric operands",
-          );
-        }
-        if (op !== "==" && op !== "!=") {
-          return typeof left === "string" && typeof right === "string"
-            ? operationAdmitted({ left, right })
-            : operationViolation(
-                "invalid-comparison-operands",
-                "Ordering requires two finite numbers or two strings",
-              );
-        }
-        return operationAdmitted({ left, right });
-    }
+        )
+      : admitSelectedComparison(op, decision, left, right);
   },
 
   result: { kind: "carrier", carrier: "boolean" } satisfies SourceFact,
 };
+
+function incoherentComparison(): OperationAdmission<never> {
+  return operationViolation(
+    "invalid-comparison-operands",
+    "Comparison operands do not have a coherent shared domain",
+  );
+}
+
+function admitSelectedComparison(
+  op: ComparisonOperator,
+  selected: SelectedComparison,
+  left: unknown,
+  right: unknown,
+): OperationAdmission<AdmittedComparison> {
+  if (selected.judgment.kind === "incompatible") return incoherentComparison();
+  const admitted = admitComparisonOperands(op, selected, left, right);
+  return admitted.admitted
+    ? operationAdmitted({ left, right, decision: selected })
+    : admitted;
+}
+
+function admitComparisonOperands(
+  op: ComparisonOperator,
+  selected: SelectedComparison,
+  left: unknown,
+  right: unknown,
+): OperationAdmission<{ left: unknown; right: unknown }> {
+  switch (selected.mode) {
+    case "cross-type":
+      return operationAdmitted({ left, right });
+    case "enum": {
+      const spec: ChannelSpec = {
+        type: "enum",
+        values: [...(selected.enumValues ?? [])],
+      };
+      const admittedLeft = admitValue(spec, left);
+      const admittedRight = admitValue(spec, right);
+      if (!admittedLeft.admitted || !admittedRight.admitted) {
+        return operationViolation(
+          "invalid-enum-value",
+          "Enum comparison requires values in the selected Enum domain",
+        );
+      }
+      return operationAdmitted({ left, right });
+    }
+    case "number": {
+      const admittedLeft = admitValue({ type: "number" }, left);
+      const admittedRight = admitValue({ type: "number" }, right);
+      if (!admittedLeft.admitted || !admittedRight.admitted) {
+        const nonFinite =
+          (typeof left === "number" && !Number.isFinite(left)) ||
+          (typeof right === "number" && !Number.isFinite(right));
+        return operationViolation(
+          nonFinite ? "non-finite-number" : "invalid-numeric-comparison",
+          nonFinite
+            ? "Numeric value must be finite before numeric comparison"
+            : "Numeric comparison requires finite numeric operands",
+        );
+      }
+      return operationAdmitted({ left, right });
+    }
+    case "string":
+      return typeof left === "string" && typeof right === "string"
+        ? operationAdmitted({ left, right })
+        : operationViolation(
+            "invalid-string-comparison",
+            "String comparison requires string operands",
+          );
+    case "boolean":
+      return typeof left === "boolean" && typeof right === "boolean"
+        ? operationAdmitted({ left, right })
+        : operationViolation(
+            "invalid-boolean-comparison",
+            "Boolean equality requires boolean operands",
+          );
+    case "artifact":
+      return isArtifactValue(left) && isArtifactValue(right)
+        ? operationAdmitted({ left, right })
+        : operationViolation(
+            "invalid-artifact-value",
+            "Artifact equality requires valid Artifact values",
+          );
+    case "array":
+      return admitArrayComparisonValues(
+        selected.arrayElementFamily,
+        left,
+        right,
+      );
+    case "struct":
+      return isPlainRecord(left) && isPlainRecord(right)
+        ? operationAdmitted({ left, right })
+        : operationViolation(
+            "invalid-struct-comparison",
+            "Struct equality requires Struct operands",
+          );
+    case "dynamic":
+      if (Array.isArray(left) || Array.isArray(right)) {
+        return admitArrayComparisonValues(undefined, left, right);
+      }
+      if (typeof left === "number" || typeof right === "number") {
+        const admittedLeft = admitValue({ type: "number" }, left);
+        const admittedRight = admitValue({ type: "number" }, right);
+        if (admittedLeft.admitted && admittedRight.admitted) {
+          return operationAdmitted({ left, right });
+        }
+        const nonFinite =
+          (typeof left === "number" && !Number.isFinite(left)) ||
+          (typeof right === "number" && !Number.isFinite(right));
+        return operationViolation(
+          nonFinite ? "non-finite-number" : "invalid-numeric-comparison",
+          nonFinite
+            ? "Numeric value must be finite before numeric comparison"
+            : "Numeric comparison requires finite numeric operands",
+        );
+      }
+      if (op !== "==" && op !== "!=") {
+        return typeof left === "string" && typeof right === "string"
+          ? operationAdmitted({ left, right })
+          : operationViolation(
+              "invalid-comparison-operands",
+              "Ordering requires two finite numbers or two strings",
+            );
+      }
+      return operationAdmitted({ left, right });
+  }
+}
+
+/** Whether a producer carries a union declaration at a compared position. */
+function hasUnionEvidence(evidence: ProducerEvidence): boolean {
+  switch (evidence.kind) {
+    case "fact":
+      return evidence.fact.kind === "site"
+        ? hasUnionSpec(evidence.fact.spec)
+        : evidence.fact.kind === "array" &&
+            evidence.fact.elements.some((fact) =>
+              hasUnionEvidence(resolvedFact(fact)),
+            );
+    case "alternatives":
+      return evidence.alternatives.some(hasUnionEvidence);
+    case "array":
+      return evidence.elements.some(hasUnionEvidence);
+    case "struct":
+      return Object.values(evidence.fields ?? {}).some(hasUnionEvidence);
+    default:
+      return false;
+  }
+}
+
+function hasUnionSpec(spec: CellSpec | ChannelSpec): boolean {
+  return (
+    spec.type === "union" ||
+    (spec.type === "array" && hasUnionSpec(spec.element)) ||
+    (spec.type === "struct" && Object.values(spec.fields).some(hasUnionSpec))
+  );
+}
+
+function declaredUnion(evidence: ProducerEvidence): UnionSpec | undefined {
+  return evidence.kind === "fact" &&
+    evidence.fact.kind === "site" &&
+    evidence.fact.spec.type === "union"
+    ? evidence.fact.spec
+    : undefined;
+}
+
+/** Shadowed members remain declared, but cannot govern an operation. */
+function precedingAlternatives(spec: UnionSpec): ProducerEvidence[] {
+  return spec.members.flatMap((member, index) => {
+    const earlier = spec.members.slice(0, index);
+    const shadowed =
+      member.type === "enum"
+        ? member.values.every((value) =>
+            earlier.some((prior) => admitValue(prior, value).admitted),
+          )
+        : earlier.some((prior) => reusableSpecCompatible(member, prior));
+    return shadowed ? [] : [resolvedFact({ kind: "site", spec: member })];
+  });
+}
+
+/** Exact literals and complete guarantees can establish same-union coverage. */
+function coveredByUnion(evidence: ProducerEvidence, union: UnionSpec): boolean {
+  if (evidence.kind !== "fact") return false;
+  const fact = evidence.fact;
+  if (fact.kind === "literal") return admitValue(union, fact.value).admitted;
+  if (fact.kind === "site") return reusableSpecCompatible(fact.spec, union);
+  if (fact.kind === "carrier")
+    return reusableSpecCompatible({ type: fact.carrier }, union);
+  return (
+    fact.kind === "provenance" &&
+    fact.provenance === "index" &&
+    reusableSpecCompatible({ type: "index" }, union)
+  );
+}
+
+function sameUnionPair(
+  left: ProducerEvidence,
+  right: ProducerEvidence,
+  unions: readonly UnionSpec[],
+): boolean {
+  return unions.some(
+    (union) => coveredByUnion(left, union) && coveredByUnion(right, union),
+  );
+}
 
 function decideComparison(
   op: ComparisonOperator,
   left: ProducerEvidence,
   right: ProducerEvidence,
 ): ComparisonDecision {
+  if (!hasUnionEvidence(left) && !hasUnionEvidence(right))
+    return decideOrdinaryComparison(op, left, right);
+  return {
+    judgment: judgeUnionComparison(op, left, right),
+    mode: "by-value",
+    operands: { left, right },
+  };
+}
+
+/** The ordinary rule for one selected pair, widened by same-union equality. */
+function decideUnionPair(
+  op: ComparisonOperator,
+  left: ProducerEvidence,
+  right: ProducerEvidence,
+  unions: readonly UnionSpec[],
+): SelectedComparison {
+  const ordinary = decideOrdinaryComparison(op, left, right);
+  return ordinary.judgment.kind === "incompatible" &&
+    (op === "==" || op === "!=") &&
+    sameUnionPair(left, right, unions)
+    ? decision("compatible", "cross-type")
+    : ordinary;
+}
+
+function declaredUnions(
+  left: ProducerEvidence,
+  right: ProducerEvidence,
+): UnionSpec[] {
+  return [declaredUnion(left), declaredUnion(right)].filter(
+    (spec): spec is UnionSpec => spec !== undefined,
+  );
+}
+
+/** Judges a comparison that reaches a union declaration at any depth. */
+function judgeUnionComparison(
+  op: ComparisonOperator,
+  left: ProducerEvidence,
+  right: ProducerEvidence,
+): CoherenceJudgment {
+  if (left.kind === "alternatives") {
+    return reduceAlternativeJudgments(
+      left.alternatives.map(
+        (alternative) => decideComparison(op, alternative, right).judgment,
+      ),
+    );
+  }
+  if (right.kind === "alternatives") {
+    return reduceAlternativeJudgments(
+      right.alternatives.map(
+        (alternative) => decideComparison(op, left, alternative).judgment,
+      ),
+    );
+  }
+  const unions = declaredUnions(left, right);
+  if (unions.length > 0) {
+    const leftUnion = declaredUnion(left);
+    const rightUnion = declaredUnion(right);
+    return reduceUnionJudgments(
+      (leftUnion ? precedingAlternatives(leftUnion) : [left]).flatMap((lhs) =>
+        (rightUnion ? precedingAlternatives(rightUnion) : [right]).map(
+          (rhs) => decideUnionPair(op, lhs, rhs, unions).judgment,
+        ),
+      ),
+    );
+  }
+  const leftFamily = stableFamily(left);
+  const rightFamily = stableFamily(right);
+  if (leftFamily === "array" || rightFamily === "array") {
+    if (op !== "==" && op !== "!=") return INCOMPATIBLE;
+    if (leftFamily === "dynamic" || rightFamily === "dynamic") return UNKNOWN;
+    if (leftFamily !== "array" || rightFamily !== "array") return INCOMPATIBLE;
+    return reduceAlternativeJudgments(
+      alignedElementEvidence(left, right).map(
+        ([lhs, rhs]) => decideComparison(op, lhs, rhs).judgment,
+      ),
+    );
+  }
+  if (leftFamily === "struct" || rightFamily === "struct") {
+    return op === "==" || op === "!="
+      ? judgeStructEquality(left, right)
+      : INCOMPATIBLE;
+  }
+  return decideOrdinaryComparison(op, left, right).judgment;
+}
+
+type AdmittedComparison = {
+  left: unknown;
+  right: unknown;
+  decision: SelectedComparison;
+};
+
+/** Checks a replayed value against its original producer, without adding type tags. */
+function evidenceAdmitsValue(
+  evidence: ProducerEvidence,
+  value: unknown,
+): boolean {
+  switch (evidence.kind) {
+    case "dynamic":
+      return true;
+    case "unusable":
+      return false;
+    case "alternatives":
+      return evidence.alternatives.some((alternative) =>
+        evidenceAdmitsValue(alternative, value),
+      );
+    case "array":
+      return (
+        Array.isArray(value) &&
+        value.length === evidence.elements.length &&
+        evidence.elements.every((element, index) =>
+          evidenceAdmitsValue(element, value[index]),
+        )
+      );
+    case "struct":
+      return (
+        isPlainRecord(value) &&
+        (evidence.fields === undefined ||
+          (sameFieldNames(evidence.fields, value) &&
+            Object.entries(evidence.fields).every(([name, field]) =>
+              evidenceAdmitsValue(field, value[name]),
+            )))
+      );
+    case "fact": {
+      const fact = evidence.fact;
+      switch (fact.kind) {
+        case "site":
+          return admitValue(fact.spec, value).admitted;
+        case "literal":
+          return value === fact.value;
+        case "carrier":
+          return typeof value === fact.carrier;
+        case "empty-array":
+          return Array.isArray(value) && value.length === 0;
+        case "array":
+          return evidenceAdmitsValue(
+            { kind: "array", elements: fact.elements.map(resolvedFact) },
+            value,
+          );
+        case "provenance":
+          return admitValue(
+            {
+              type:
+                fact.provenance === "dialog-cursor"
+                  ? "dialogCursor"
+                  : fact.provenance,
+            },
+            value,
+          ).admitted;
+      }
+    }
+  }
+}
+
+function elementEvidenceAt(
+  evidence: ProducerEvidence,
+  index: number,
+): ProducerEvidence {
+  if (evidence.kind === "array")
+    return evidence.elements[index] ?? { kind: "unusable" };
+  if (evidence.kind === "fact") {
+    if (evidence.fact.kind === "site" && evidence.fact.spec.type === "array")
+      return resolvedFact({ kind: "site", spec: evidence.fact.spec.element });
+    if (evidence.fact.kind === "array")
+      return evidence.fact.elements[index]
+        ? resolvedFact(evidence.fact.elements[index]!)
+        : { kind: "unusable" };
+  }
+  return { kind: "dynamic" };
+}
+
+/** The element pairs equality compares: by position for literal arrays. */
+function alignedElementEvidence(
+  left: ProducerEvidence,
+  right: ProducerEvidence,
+): [ProducerEvidence, ProducerEvidence][] {
+  const lengths = [left, right].flatMap((evidence) => {
+    const length = literalArrayLength(evidence);
+    return length === undefined ? [] : [length];
+  });
+  const count = lengths.length > 0 ? Math.min(...lengths) : 1;
+  return Array.from({ length: count }, (_, index) => [
+    elementEvidenceAt(left, index),
+    elementEvidenceAt(right, index),
+  ]);
+}
+
+function literalArrayLength(evidence: ProducerEvidence): number | undefined {
+  if (evidence.kind === "array") return evidence.elements.length;
+  if (evidence.kind !== "fact") return undefined;
+  if (evidence.fact.kind === "array") return evidence.fact.elements.length;
+  return evidence.fact.kind === "empty-array" ? 0 : undefined;
+}
+
+/** Validates both values once, then selects the comparison they establish. */
+function admitUnionComparisonValues(
+  op: ComparisonOperator,
+  leftEvidence: ProducerEvidence,
+  rightEvidence: ProducerEvidence,
+  left: unknown,
+  right: unknown,
+): OperationAdmission<AdmittedComparison> {
+  const nonFinite =
+    firstNonFiniteNumberPath(left) ?? firstNonFiniteNumberPath(right);
+  if (nonFinite !== undefined)
+    return operationViolation(
+      "non-finite-number",
+      `Numeric value must be finite before numeric comparison at ${nonFinite}`,
+    );
+  if (
+    firstInvalidPayloadValue(left) ||
+    firstInvalidPayloadValue(right) ||
+    !evidenceAdmitsValue(leftEvidence, left) ||
+    !evidenceAdmitsValue(rightEvidence, right)
+  )
+    return incoherentComparison();
+  return selectUnionComparison(op, leftEvidence, rightEvidence, left, right);
+}
+
+/** Resolves each union from its validated value, then applies the pair rule. */
+function selectUnionComparison(
+  op: ComparisonOperator,
+  leftEvidence: ProducerEvidence,
+  rightEvidence: ProducerEvidence,
+  left: unknown,
+  right: unknown,
+): OperationAdmission<AdmittedComparison> {
+  if (
+    leftEvidence.kind === "alternatives" ||
+    rightEvidence.kind === "alternatives"
+  ) {
+    const leftAlternatives =
+      leftEvidence.kind === "alternatives"
+        ? leftEvidence.alternatives.filter((evidence) =>
+            evidenceAdmitsValue(evidence, left),
+          )
+        : [leftEvidence];
+    const rightAlternatives =
+      rightEvidence.kind === "alternatives"
+        ? rightEvidence.alternatives.filter((evidence) =>
+            evidenceAdmitsValue(evidence, right),
+          )
+        : [rightEvidence];
+    let selected: AdmittedComparison | undefined;
+    for (const lhs of leftAlternatives)
+      for (const rhs of rightAlternatives) {
+        const result = selectUnionComparison(op, lhs, rhs, left, right);
+        if (!result.admitted) return result;
+        if (
+          selected &&
+          (selected.decision.mode !== result.value.decision.mode ||
+            !sameEnumDomain(
+              selected.decision.enumValues ?? [],
+              result.value.decision.enumValues ?? [],
+            ))
+        ) {
+          return operationViolation(
+            "invalid-comparison-operands",
+            "Conditional alternatives do not establish one unambiguous comparison domain",
+          );
+        }
+        selected = result.value;
+      }
+    return selected ? operationAdmitted(selected) : incoherentComparison();
+  }
+
+  const unions = declaredUnions(leftEvidence, rightEvidence);
+  if (unions.length > 0) {
+    const leftUnion = declaredUnion(leftEvidence);
+    const rightUnion = declaredUnion(rightEvidence);
+    const lhs = leftUnion
+      ? resolvedFact({ kind: "site", spec: precedingSpec(leftUnion, left)! })
+      : leftEvidence;
+    const rhs = rightUnion
+      ? resolvedFact({ kind: "site", spec: precedingSpec(rightUnion, right)! })
+      : rightEvidence;
+    return admitSelectedComparison(
+      op,
+      decideUnionPair(op, lhs, rhs, unions),
+      left,
+      right,
+    );
+  }
+
+  if (
+    (hasUnionEvidence(leftEvidence) || hasUnionEvidence(rightEvidence)) &&
+    (Array.isArray(left) || Array.isArray(right))
+  ) {
+    if (
+      !Array.isArray(left) ||
+      !Array.isArray(right) ||
+      (op !== "==" && op !== "!=")
+    )
+      return incoherentComparison();
+    for (
+      let index = 0;
+      index < Math.min(left.length, right.length);
+      index += 1
+    ) {
+      const admitted = selectUnionComparison(
+        "==",
+        elementEvidenceAt(leftEvidence, index),
+        elementEvidenceAt(rightEvidence, index),
+        left[index],
+        right[index],
+      );
+      if (!admitted.admitted) return admitted;
+    }
+    return operationAdmitted({
+      left,
+      right,
+      decision: decision("compatible", "array"),
+    });
+  }
+  if (
+    (hasUnionEvidence(leftEvidence) || hasUnionEvidence(rightEvidence)) &&
+    (isPlainRecord(left) || isPlainRecord(right))
+  ) {
+    if (
+      !isPlainRecord(left) ||
+      !isPlainRecord(right) ||
+      !sameFieldNames(left, right) ||
+      (op !== "==" && op !== "!=")
+    )
+      return incoherentComparison();
+    const leftFields = structOperandFields(leftEvidence);
+    const rightFields = structOperandFields(rightEvidence);
+    if (!leftFields || !rightFields) return incoherentComparison();
+    for (const name of Object.keys(left)) {
+      const lhs =
+        leftFields === "dynamic"
+          ? ({ kind: "dynamic" } as const)
+          : leftFields[name]!;
+      const rhs =
+        rightFields === "dynamic"
+          ? ({ kind: "dynamic" } as const)
+          : rightFields[name]!;
+      const admitted = selectUnionComparison(
+        "==",
+        lhs,
+        rhs,
+        left[name],
+        right[name],
+      );
+      if (!admitted.admitted) return admitted;
+    }
+    return operationAdmitted({
+      left,
+      right,
+      decision: decision("compatible", "struct"),
+    });
+  }
+  return admitSelectedComparison(
+    op,
+    decideOrdinaryComparison(op, leftEvidence, rightEvidence),
+    left,
+    right,
+  );
+}
+
+function decideOrdinaryComparison(
+  op: ComparisonOperator,
+  left: ProducerEvidence,
+  right: ProducerEvidence,
+): SelectedComparison {
   const ordering = op !== "==" && op !== "!=";
   const leftEnum = provenEnumDomain(left);
   const rightEnum = provenEnumDomain(right);
@@ -1406,13 +1951,13 @@ function decideComparison(
 
 function decision(
   kind: CoherenceJudgment["kind"],
-  mode: ComparisonDecision["mode"],
-): ComparisonDecision {
+  mode: SelectedComparison["mode"],
+): SelectedComparison {
   return { judgment: { kind }, mode };
 }
 
 /**
- * Judges equality of two Struct operands: they must declare the same field
+ * Judges equality of two struct operands: they must declare the same field
  * names, and each pair of fields must be comparable for equality, recursively.
  * Field order is irrelevant.
  */
@@ -1456,8 +2001,8 @@ function judgeStructEquality(
 }
 
 /**
- * The field producers of a Struct operand, `"dynamic"` when its fields are
- * known only at runtime, or `undefined` when the operand is not a Struct.
+ * The field producers of a struct operand, `"dynamic"` when its fields are
+ * known only at runtime, or `undefined` when the operand is not a struct.
  */
 function structOperandFields(
   evidence: Exclude<ProducerEvidence, { kind: "alternatives" }>,
@@ -1484,7 +2029,7 @@ function structOperandFields(
 }
 
 /**
- * Judges equality of two Struct-element arrays: every element producer on
+ * Judges equality of two struct-element arrays: every element producer on
  * either side must be equality-comparable with the others.
  */
 function judgeStructArrayEquality(
@@ -1602,6 +2147,14 @@ function stableFamily(evidence: ProducerEvidence): StableFamily {
           return "array";
         case "struct":
           return "struct";
+        case "union": {
+          const families = fact.spec.members.map((spec) =>
+            stableFamily(resolvedFact({ kind: "site", spec })),
+          );
+          return families.every((family) => family === families[0])
+            ? families[0]!
+            : "dynamic";
+        }
       }
     }
   }
@@ -1731,7 +2284,7 @@ function judgeScalarComparisonEvidence(
 
 /** The stable family of an array element declaration. */
 function arrayElementFamily(spec: ArrayElementSpec): StableFamily {
-  return spec.type === "enum" ? "string" : spec.type;
+  return stableFamily({ kind: "fact", fact: { kind: "site", spec } });
 }
 
 function isArrayComparisonFamily(
@@ -1750,6 +2303,9 @@ function judgeFamily(
   evidence: ProducerEvidence,
   family: "boolean" | "string" | "number" | "artifact" | "array",
 ): CoherenceJudgment {
+  const union = declaredUnion(evidence);
+  if (union)
+    return reduceOverUnion(union, (member) => judgeFamily(member, family));
   switch (evidence.kind) {
     case "dynamic":
       return { kind: "unknown" };
@@ -1950,6 +2506,8 @@ function judgeStringEvidence(evidence: ProducerEvidence): CoherenceJudgment {
 function judgeInterpolationEvidence(
   evidence: ProducerEvidence,
 ): CoherenceJudgment {
+  const union = declaredUnion(evidence);
+  if (union) return reduceOverUnion(union, judgeInterpolationEvidence);
   switch (evidence.kind) {
     case "dynamic":
       return { kind: "unknown" };
@@ -1998,6 +2556,9 @@ function judgeInterpolationEvidence(
 function judgePrimitiveArrayElementInterpolation(
   evidence: ProducerEvidence,
 ): CoherenceJudgment {
+  const union = declaredUnion(evidence);
+  if (union)
+    return reduceOverUnion(union, judgePrimitiveArrayElementInterpolation);
   switch (evidence.kind) {
     case "dynamic":
       return { kind: "unknown" };
@@ -2026,6 +2587,8 @@ function operationViolation<T = never>(
 }
 
 function judgeNumericEvidence(evidence: ProducerEvidence): CoherenceJudgment {
+  const union = declaredUnion(evidence);
+  if (union) return reduceOverUnion(union, judgeNumericEvidence);
   switch (evidence.kind) {
     case "dynamic":
       return { kind: "unknown" };
@@ -2085,6 +2648,8 @@ function hostParameterChannelSpec(
       return { type: spec.type };
     case "enum":
       return { type: "enum", values: spec.values };
+    case "union":
+      return spec;
     case "array": {
       const element = spec.element;
       if (
@@ -2092,16 +2657,14 @@ function hostParameterChannelSpec(
         element.type !== "string" &&
         element.type !== "enum" &&
         element.type !== "number" &&
+        element.type !== "union" &&
         element.type !== "artifact"
       ) {
         return undefined;
       }
       return {
         type: "array",
-        element:
-          element.type === "enum"
-            ? { type: "enum", values: element.values }
-            : { type: element.type },
+        element,
       };
     }
     case "tuple":
@@ -2113,7 +2676,7 @@ function hostParameterChannelSpec(
 
 function judgeSemanticArgument(
   semantic: SemanticString,
-  destination: Extract<ChannelSpec, { type: "string" | "enum" }>,
+  destination: Extract<ChannelSpec, { type: "string" | "enum" | "union" }>,
   context: ProducerContext,
 ): CoherenceJudgment {
   if (semantic.kind === "literal") {
@@ -2134,8 +2697,15 @@ function judgeSemanticArgument(
     }
     if (producerMayProduceArtifact(evidence)) dynamic = true;
   }
-  if (destination.type === "enum") return { kind: "unknown" };
-  return dynamic ? { kind: "unknown" } : { kind: "compatible" };
+  const landing = judgeOneTimeLanding(
+    { kind: "carrier", carrier: "string" },
+    destination,
+  );
+  return landing.kind === "incompatible"
+    ? landing
+    : dynamic
+      ? UNKNOWN
+      : landing;
 }
 
 function producerMayProduceArtifact(evidence: ProducerEvidence): boolean {
@@ -2175,7 +2745,7 @@ function resolveArrayElementSpec(
 }
 
 /**
- * Resolves the declared value guarantee of a cell, channel, or Struct field
+ * Resolves the declared value guarantee of a cell, channel, or struct field
  * reference, projected to its bare channel-shaped spec.
  */
 export function resolveReferenceSpec(

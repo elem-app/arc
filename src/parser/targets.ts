@@ -1,6 +1,6 @@
 import type * as acorn from "acorn";
 
-import type { EnterTarget } from "../types/parser.js";
+import type { EnterTarget } from "../types/ir.js";
 
 export type TargetParseMode = "enter" | "enterLoop" | "deflectionEscaped";
 

@@ -3,8 +3,8 @@
  * produced by document analysis.
  */
 
+import { fieldAtPath, type StructShape, type UnionShape } from "./shape.js";
 import {
-  fieldAtPath,
   isObservableCellSpec,
   isSettableCellSpec,
   type ArtifactArraySpec,
@@ -12,6 +12,7 @@ import {
   type ChannelSpec,
   type DialogCursorSpec,
   type HostModuleSpec,
+  type ScalarSpec,
 } from "./spec.js";
 import type { PayloadValue, PrimitiveValue } from "./value.js";
 
@@ -150,12 +151,6 @@ export interface NumericUnaryExpression<TExpression> {
   argument: TExpression;
 }
 
-/** The boolean predicate produced by authored `Num.isFinite(...)`. */
-export type NumIsFiniteExpression = {
-  kind: "numIsFinite";
-  argument: ValueExpression;
-};
-
 /** A literal value written in an expression position. */
 export type LiteralExpression = {
   kind: "literal";
@@ -173,19 +168,19 @@ export type SlotReference =
   | { kind: "cell"; name: string }
   | { kind: "channel"; namespace: ChannelNamespace; key: string };
 
-/** Read of one element of an array-valued cell, channel, or Struct field. */
+/** `span.item`: the element the current `$map` member maps. */
+export type SpanItemReference = { kind: "span"; owner: "map"; key: "item" };
+
+/** Read of one element of an array-valued cell, channel, or struct field. */
 export type ArrayElementRead = {
   kind: "arrayElementRead";
   array: ArrayReference;
   index: LocalExpression;
 };
 
-/** `span.item`: the element the current `$map` member maps. */
-export type SpanItemReference = { kind: "span"; owner: "map"; key: "item" };
-
 /**
  * Struct-valued receiver a field reference selects from: a declared cell or
- * channel, one element of a Struct array, or the current `$map` element.
+ * channel, one element of a struct array, or the current `$map` element.
  */
 export type FieldReceiver =
   | SlotReference
@@ -193,7 +188,7 @@ export type FieldReceiver =
   | SpanItemReference;
 
 /**
- * Reference to one declared field inside a Struct receiver. `path` names the
+ * Reference to one declared field inside a struct receiver. `path` names the
  * field at each level, outermost first, and resolves against the receiver's
  * declaration.
  */
@@ -204,23 +199,40 @@ export type FieldReference = {
 };
 
 /**
- * Reference to the array-valued cell, channel, or Struct field an element or
+ * Reference to the array-valued cell, channel, or struct field an element or
  * length read targets.
  */
 export type ArrayReference = SlotReference | FieldReference;
 
 /**
  * Output array a `$map` commits: an array cell name, or an array field of a
- * Struct cell.
+ * struct cell.
  */
 export type MapResultsTarget = string | FieldReference;
+
+/**
+ * The cell a `$map` results target writes, or `undefined` for a field whose
+ * receiver is not a cell.
+ */
+export function mapResultsCell(target: MapResultsTarget): string | undefined {
+  if (typeof target === "string") return target;
+  return target.receiver.kind === "cell" ? target.receiver.name : undefined;
+}
+
+/**
+ * Canonical label of a `$map` results target: the cell name followed by each
+ * field name, dot-separated.
+ */
+export function mapResultsLabel(target: MapResultsTarget): string {
+  if (typeof target === "string") return target;
+  return [mapResultsCell(target) ?? "", ...target.path].join(".");
+}
 
 /** Expressions the runtime resolves locally. */
 export type LocalExpression =
   | LiteralExpression
-  | { kind: "cell"; name: string }
+  | SlotReference
   | { kind: "isUnset"; cell: string }
-  | { kind: "channel"; namespace: ChannelNamespace; key: string }
   | { kind: "channelIsUnset"; namespace: ChannelNamespace; key: string }
   | FieldReference
   | ArrayElementRead
@@ -310,6 +322,41 @@ export type ArtifactConstructExpression = {
   path: ValueExpression;
 };
 
+/** Static rendering choices for a value and its descendants. */
+export type FmtConfig = {
+  array?:
+    | {
+        style?: never;
+        separator?: string;
+        parentheses?: "" | "[]" | "()" | "{}";
+      }
+    | { style: "json"; separator?: never; parentheses?: never };
+  struct?: { style?: "json" };
+  str?: "bare" | "json";
+};
+
+/** Formats a value into an ordinary string using static rendering choices. */
+export type FmtExpression = {
+  kind: "fmt";
+  value: ValueExpression;
+  config: FmtConfig;
+};
+
+/** The boolean predicate produced by authored `Num.isFinite(...)`. */
+export type NumIsFiniteExpression = {
+  kind: "numIsFinite";
+  argument: ValueExpression;
+};
+
+/**
+ * Constructs one complete struct value from named field expressions. The
+ * landing struct declaration decides which fields are required.
+ */
+export type StructLiteralExpression = {
+  kind: "structLiteral";
+  fields: Record<string, ValueExpression>;
+};
+
 /**
  * Full recursive expression grammar for Arc value positions.
  *
@@ -322,6 +369,7 @@ export type ValueExpression =
   | JudgeExpression
   | HostCall
   | ArtifactConstructExpression
+  | FmtExpression
   | ValueString
   | { kind: "arrayLiteral"; elements: ValueExpression[] }
   | StructLiteralExpression
@@ -354,66 +402,45 @@ export type ValueExpression =
     }
   | { kind: "unary"; op: "!"; argument: ValueExpression };
 
-/**
- * Constructs one complete Struct value from named field expressions. The
- * landing Struct declaration decides which fields are required.
- */
-export type StructLiteralExpression = {
-  kind: "structLiteral";
-  fields: Record<string, ValueExpression>;
-};
-
-/** Numeric constraints applied only when accepting an observation result. */
-export type NumericObserveAs =
-  | { kind: "number"; min?: number; max?: number }
-  | { kind: "integer"; min?: number; max?: number };
-
-/** Spec and observation fields shared by scalar cells and array elements. */
-export type ObservableScalar =
-  | { type: "boolean"; observing?: SemanticString }
-  | { type: "string"; observing?: SemanticString }
-  | { type: "enum"; values: string[]; observing?: SemanticString }
-  | {
-      type: "number";
-      observing?: SemanticString;
-      observeAs?: NumericObserveAs;
-    };
-
-type CellBase = {
-  name: string;
-  loc?: SourceRange;
-};
-
-/**
- * Observable array declaration with one scalar or Struct element guarantee.
- * Every element of a Struct array is a complete record.
- */
-export type ObservableArray = {
-  type: "array";
-  element: ObservableScalar | ObservableStruct;
-};
-
-/**
- * Observable Struct declaration: named fields, each recursively observable.
- * `observing` is the whole-record question; each field keeps its own.
- */
-export type ObservableStruct = {
-  type: "struct";
-  fields: Record<string, ObservableField>;
+/** Scalar declaration with its own observation question. */
+export type ObservableScalar = ScalarSpec & {
   observing?: SemanticString;
 };
 
-/** Declaration of one field inside an observable Struct. */
-export type ObservableField =
+/** A union declaration with ordered members and one observation question. */
+export type ObservableUnion = UnionShape<ScalarSpec> & {
+  observing?: SemanticString;
+};
+
+/**
+ * Observable array declaration with one scalar, union, or struct element guarantee.
+ * Every element of a struct array is a complete record.
+ */
+export type ObservableArray = {
+  type: "array";
+  element: ObservableScalar | ObservableUnion | ObservableStruct;
+};
+
+/**
+ * Observable struct declaration: named fields, each recursively observable.
+ * `observing` is the whole-record question; each field keeps its own.
+ */
+export type ObservableStruct = StructShape<Observable> & {
+  observing?: SemanticString;
+};
+
+/** Declaration of a cell, struct field, or array element that can be observed. */
+export type Observable =
   | ObservableScalar
+  | ObservableUnion
   | ObservableArray
   | ObservableStruct;
 
-/** Resolves the authored declaration of a non-empty field path in a Struct. */
+/** Resolves the authored declaration of a non-empty field path in a struct. */
 export function fieldDeclarationAt(
   struct: ObservableStruct,
   path: readonly string[],
-): ObservableField | undefined {
+): Observable | undefined {
   return fieldAtPath(struct, path, (field) =>
     field.type === "struct" ? field : undefined,
   );
@@ -421,11 +448,9 @@ export function fieldDeclarationAt(
 
 /**
  * Every authored observation question of an observable declaration: its own,
- * its array element's, and each Struct field's, recursively.
+ * its array element's, and each struct field's, recursively.
  */
-export function observingQuestions(
-  declaration: ObservableScalar | ObservableArray | ObservableStruct,
-): SemanticString[] {
+export function observingQuestions(declaration: Observable): SemanticString[] {
   switch (declaration.type) {
     case "array":
       return observingQuestions(declaration.element);
@@ -439,28 +464,36 @@ export function observingQuestions(
   }
 }
 
-/** Scalar observable cell declaration visible in the lexical scope of a node. */
-export type ScalarObservableCell = ObservableScalar & CellBase;
+type CellBase = {
+  name: string;
+  loc?: SourceRange;
+};
+
+/** Observable scalar cell declaration visible in the lexical scope of a node. */
+export type ScalarCell = ObservableScalar & CellBase;
 
 /**
- * Observable array declaration: an ordered collection with one scalar or Struct
- * element guarantee.
+ * Observable array cell declaration with one scalar, union, or struct element guarantee.
  */
 export type ObservableArrayCell = ObservableArray & CellBase;
 
-/** Observable Struct cell declaration with owned nested field state. */
+/** Observable union cell declaration with one value admitted by its members. */
+export type UnionCell = ObservableUnion & CellBase;
+
+/** Observable struct cell declaration with owned nested field state. */
 export type StructCell = ObservableStruct & CellBase;
 
 /** Observable cell declaration visible in the lexical scope of a node. */
 export type ObservableCell =
-  | ScalarObservableCell
+  | ScalarCell
+  | UnionCell
   | ObservableArrayCell
   | StructCell;
 
 /** Stored, readable, and settable Artifact-array declaration. */
 export type ArtifactArrayCell = ArtifactArraySpec & CellBase;
 
-/** Array declaration with scalar, Struct, or Artifact elements. */
+/** Array declaration with scalar, union, struct, or Artifact elements. */
 export type ArrayCell = ObservableArrayCell | ArtifactArrayCell;
 
 /** Dialog-cursor cell declaration: a stored coordinate into the visible dialog. */
@@ -487,30 +520,13 @@ export function isArrayCell(cell: Cell): cell is ArrayCell {
 }
 
 /** An observable declaration whose spec and metadata are scalar-shaped. */
-export function isScalarObservableCell(
-  cell: Cell,
-): cell is ScalarObservableCell {
+export function isScalarCell(cell: Cell): cell is ScalarCell {
   return (
-    isObservableCell(cell) && cell.type !== "array" && cell.type !== "struct"
+    isObservableCell(cell) &&
+    cell.type !== "union" &&
+    cell.type !== "array" &&
+    cell.type !== "struct"
   );
-}
-
-/**
- * The cell a `$map` results target writes, or `undefined` for a field whose
- * receiver is not a cell.
- */
-export function mapResultsCell(target: MapResultsTarget): string | undefined {
-  if (typeof target === "string") return target;
-  return target.receiver.kind === "cell" ? target.receiver.name : undefined;
-}
-
-/**
- * Canonical label of a `$map` results target: the cell name followed by each
- * field name, dot-separated.
- */
-export function mapResultsLabel(target: MapResultsTarget): string {
-  if (typeof target === "string") return target;
-  return [mapResultsCell(target) ?? "", ...target.path].join(".");
 }
 
 export function isArtifactCell(cell: Cell): cell is ArtifactCell {
@@ -709,15 +725,9 @@ export type CatchInterruptionStatement = CatchDeflectionStatement;
  */
 export type EffectStatement = HookStatement<SetReturnAction | HostCall>;
 
-/**
- * Enter a child node or imported arc from the current action graph.
- *
- * `target.identifier` is a structural reference name resolved from a local
- * declaration or import binding, and is distinct from a display label.
- */
-export type EnterNodeAction = {
+/** Fields shared by every enter action. */
+type EnterActionBase = {
   id: ElementId;
-  kind: "enter-node";
   target: EnterTarget;
   /**
    * Args channel bindings.
@@ -734,25 +744,18 @@ export type EnterNodeAction = {
   loc?: SourceRange;
 };
 
+/**
+ * Enter a child node or imported arc from the current action graph.
+ *
+ * `target.identifier` is a structural reference name resolved from a local
+ * declaration or import binding, and is distinct from a display label.
+ */
+export type EnterNodeAction = EnterActionBase & { kind: "enter-node" };
+
 /** Repeated enter action with caller-authored loop resolution. */
-export type EnterLoopAction = {
-  id: ElementId;
+export type EnterLoopAction = EnterActionBase & {
   kind: "enter-loop";
-  target: EnterTarget;
   resolveWhen: ResolutionStatement[];
-  /**
-   * Args channel bindings.
-   * key: child-side args channel key (`args.<key>`).
-   * value: the `EnterChannelBindingSource` the key binds to.
-   */
-  args?: EnterChannelBindings;
-  /**
-   * Returns channel bindings.
-   * key: child-side returns channel key (`returns.<key>.$set(...)`).
-   * value: the `EnterChannelBindingSource` the key binds to.
-   */
-  returns?: EnterChannelBindings;
-  loc?: SourceRange;
 };
 
 /** Authored instruction emitted from the action graph. */
@@ -804,7 +807,7 @@ export type InvokeAction = {
  *
  * `receiver` is the input array — a lexical array cell, a typed read-only
  * array channel, or an array field of either. `results` is the output array
- * when present: an array cell name, or an array field of a Struct cell; omitting
+ * when present: an array cell name, or an array field of a struct cell; omitting
  * it is the forEach shape (members run for their effects, no output, and
  * `span.result` is unbound). `body` is the callback statement graph, run under
  * the invoke dialect, its element ids stamped under this action's id.

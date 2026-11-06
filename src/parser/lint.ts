@@ -15,13 +15,13 @@ import type {
   Statement,
   TriggerStatement,
   ValueExpression,
-} from "../types/parser.js";
+} from "../types/ir.js";
 import {
   isObservableCell,
   isValueExpressionCell,
   mapResultsCell,
   observingQuestions,
-} from "../types/parser.js";
+} from "../types/ir.js";
 
 type LintRule = {
   severity: LintIssue["severity"];
@@ -420,6 +420,16 @@ function expressionContainsBareCellBoolean(
           part.kind === "expression" &&
           expressionContainsBareCellBoolean(part.expression, false),
       );
+    case "fmt":
+      return expressionContainsBareCellBoolean(expression.value, false);
+    case "arrayLiteral":
+      return expression.elements.some((element) =>
+        expressionContainsBareCellBoolean(element, false),
+      );
+    case "structLiteral":
+      return Object.values(expression.fields).some((field) =>
+        expressionContainsBareCellBoolean(field, false),
+      );
     case "artifact":
       return expressionContainsBareCellBoolean(expression.path, false);
     case "judge":
@@ -692,6 +702,12 @@ function collectExpressionReads(
           collectExpressionReads(part.expression, into);
         }
       }
+      return;
+    case "fmt":
+      collectExpressionReads(expression.value, into);
+      return;
+    case "judge":
+      collectSemanticStringReads(expression.question, into);
       return;
     case "artifact":
       collectExpressionReads(expression.path, into);

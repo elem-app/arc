@@ -11,6 +11,7 @@ import {
   artifactPathRule,
   booleanRule,
   comparisonRule,
+  fmtRule,
   interpolationRule,
   judgeHostArgument,
   judgeProducerLanding,
@@ -53,10 +54,10 @@ import type {
   Node,
   NodeReadSet,
   NodeSignature,
-  NumericObserveAs,
-  ObservableField,
+  Observable,
   ObservableScalar,
   ObservableStruct,
+  ObservableUnion,
   ObserveAction,
   ObserveGroupAction,
   ObserveOrAskAction,
@@ -75,17 +76,17 @@ import type {
   ValidationIssue,
   ValueExpression,
   WriteDiffMode,
-} from "../types/parser.js";
+} from "../types/ir.js";
 import {
   isArrayCell,
   isObservableCell,
-  isScalarObservableCell,
+  isScalarCell,
   isValueExpressionCell,
   mapResultsCell,
   mapResultsLabel,
   observingQuestions,
   UNSTAMPED_ID,
-} from "../types/parser.js";
+} from "../types/ir.js";
 import { invokeSegKey, nodeSegKey } from "../types/runtime.js";
 import type {
   ArrayElementSpec,
@@ -93,6 +94,7 @@ import type {
   CellSpec,
   ChannelSpec,
   HostModuleSpec,
+  NumberObserveAsConstraint,
   ObservableFieldSpec,
   StructSpec,
 } from "../types/spec.js";
@@ -102,6 +104,7 @@ import {
   isObservableCellSpec,
   isObservableFieldSpec,
   isSettableCellSpec,
+  isUnionMemberSpec,
 } from "../types/spec.js";
 import type { PayloadValue, StructValue } from "../types/value.js";
 import {
@@ -161,7 +164,10 @@ const ARC_RESERVED_IMPORT_ALIAS_NAMES: ReadonlySet<string> = new Set([
   "RangedInt",
   "State",
   "Str",
+  "Struct",
+  "Union",
   "args",
+  "fmt",
   "forgetful",
   "invoke",
   "judge",
@@ -553,8 +559,8 @@ function parseNode(
   if (!fn.id?.name) {
     throw new Error("Node declarations must be named");
   }
-  if (fn.id.name === "invoke") {
-    throw new Error("invoke is a reserved name and cannot name a node");
+  if (fn.id.name === "invoke" || fn.id.name === "fmt") {
+    throw new Error(`${fn.id.name} is a reserved name and cannot name a node`);
   }
 
   const signature = parseNodeSignature(fn.params);
@@ -799,9 +805,9 @@ function parseNodeBody(
           `Unknown cell for observing assignment: ${member.object}`,
         );
       }
-      if (!isScalarObservableCell(cell)) {
+      if (cell.type !== "union" && !isScalarCell(cell)) {
         throw new Error(
-          `${member.object}.observing is only supported for scalar observable cells`,
+          `${member.object}.observing is only supported for scalar observable cells and Union cells`,
         );
       }
       if (cell.observing !== undefined) {
@@ -1018,6 +1024,21 @@ function parseChannelSpec(
     throw new Error(`${owner} must be a channel spec constructor`);
   }
   const name = callee.name;
+  if (name === "Union") {
+    if (expression.arguments.length !== 1) {
+      throw new Error(`${owner} Union() channel spec takes one member array`);
+    }
+    const members = unionMemberCalls(expression.arguments[0], owner).map(
+      (member, index) => {
+        const spec = parseChannelSpec(member, `${owner} member ${index}`);
+        if (!isUnionMemberSpec(spec)) {
+          throw new Error(`${owner} Union members must be scalar specs`);
+        }
+        return spec;
+      },
+    );
+    return { type: "union", members };
+  }
   if (name === "Artifact") {
     if (expression.arguments.length !== 0) {
       throw new Error(`${owner} Artifact() channel spec takes no arguments`);
@@ -1096,7 +1117,7 @@ function parseChannelSpec(
     }
     if (element.type === "index" || element.type === "dialogCursor") {
       throw new Error(
-        `${owner} Array() element must be a scalar, Artifact, or Struct channel type`,
+        `${owner} Array() element must be a scalar, Union, Artifact, or Struct channel type`,
       );
     }
     return { type: "array", element };
@@ -1106,7 +1127,7 @@ function parseChannelSpec(
 
 /**
  * Parses a `Struct({ ... })` channel spec. Fields use bare channel constructors
- * for observable scalars, observable arrays, and nested Structs.
+ * for scalars, unions, observable arrays, and nested structs.
  */
 function parseStructChannelSpec(
   expression: acorn.CallExpression,
@@ -1148,7 +1169,7 @@ function parseStructChannelSpec(
     const field = parseChannelSpec(property.value, `${owner}.${name}`);
     if (!isObservableFieldSpec(field)) {
       throw new Error(
-        `${owner}.${name} must be an observable scalar, observable array, or Struct`,
+        `${owner}.${name} must be a scalar, Union, observable array, or Struct`,
       );
     }
     fields[name] = field;
@@ -1401,6 +1422,13 @@ function applyExpressionIds(
         }
       }
       return;
+    case "fmt":
+      applyExpressionIds(expression.value, nextExpressionId, verify);
+      return;
+    case "structLiteral":
+      for (const field of Object.values(expression.fields))
+        applyExpressionIds(field, nextExpressionId, verify);
+      return;
     case "artifact":
       applyExpressionIds(expression.path, nextExpressionId, verify);
       return;
@@ -1493,8 +1521,8 @@ function parseCellDeclarations(
     ) {
       continue;
     }
-    if (id.name === "invoke") {
-      throw new Error("invoke is a reserved name and cannot name a cell");
+    if (id.name === "invoke" || id.name === "fmt") {
+      throw new Error(`${id.name} is a reserved name and cannot name a cell`);
     }
 
     const callee = declaration.init.callee;
@@ -1561,6 +1589,15 @@ function parseCellDeclarations(
       );
     }
 
+    if (callee.name === "Union") {
+      cells.push({
+        name: id.name,
+        ...parseUnionDeclaration(declaration.init, id.name, context),
+        loc: locOf(id),
+      });
+      continue;
+    }
+
     if (callee.name === "Struct") {
       cells.push({
         name: id.name,
@@ -1608,9 +1645,9 @@ function parseCellDeclarations(
 }
 
 /**
- * Parses `Struct({ field: Constructor(...), ... }, config?)`. Each field is an
- * observable scalar, an observable array of scalars or Structs, or a nested
- * Struct; `config.observing` is the whole-record question.
+ * Parses `Struct({ field: Constructor(...), ... }, config?)`. Each field is a
+ * scalar, union, observable array, or nested struct; `config.observing` is the
+ * whole-record question.
  */
 function parseStructDeclaration(
   call: acorn.CallExpression,
@@ -1626,7 +1663,7 @@ function parseStructDeclaration(
   if (!fieldsArg || fieldsArg.type !== "ObjectExpression") {
     throw new Error(`Struct ${owner} fields must be an object literal`);
   }
-  const fields: Record<string, ObservableField> = {};
+  const fields: Record<string, Observable> = {};
   for (const property of fieldsArg.properties) {
     if (property.type === "SpreadElement") {
       throw new Error(`Struct ${owner} fields do not support spread`);
@@ -1665,13 +1702,16 @@ function parseStructFieldDeclaration(
   expression: acorn.Expression | acorn.Pattern,
   owner: string,
   context: DeclarationParseContext,
-): ObservableField {
+): Observable {
   if (expression.type !== "CallExpression") {
     throw new Error(
       `Struct field ${owner} must be a constructed observable field, e.g. Str()`,
     );
   }
   const callee = expression.callee;
+  if (callee.type === "Identifier" && callee.name === "Union") {
+    return parseUnionDeclaration(expression, owner, context);
+  }
   if (callee.type === "Identifier" && callee.name === "Struct") {
     return parseStructDeclaration(expression, owner, context);
   }
@@ -1687,10 +1727,47 @@ function parseStructFieldDeclaration(
   const scalar = parseScalarConstructorSpec(expression, owner, context);
   if (!scalar) {
     throw new Error(
-      `Struct field ${owner} must be an observable scalar, observable array, or Struct constructor`,
+      `Struct field ${owner} must be a scalar, Union, observable Array, or Struct constructor`,
     );
   }
   return scalar;
+}
+
+/** Parses one flat ordered union declaration and its observation config. */
+function parseUnionDeclaration(
+  call: acorn.CallExpression,
+  owner: string,
+  context: DeclarationParseContext,
+): ObservableUnion {
+  if (call.arguments.length > 2) {
+    throw new Error(
+      `Union cell ${owner} takes a member array and optional config`,
+    );
+  }
+  const members = unionMemberCalls(call.arguments[0], owner).map(
+    (member, index) => {
+      const scalar = parseScalarConstructorSpec(
+        member,
+        `${owner} member ${index}`,
+        context,
+      );
+      if (!scalar)
+        throw new Error(
+          `Union cell ${owner} members must be scalar constructors`,
+        );
+      if (scalar.observing !== undefined) {
+        throw new Error(
+          `Union cell ${owner} members cannot declare observing; put the question on the Union`,
+        );
+      }
+      return scalar;
+    },
+  );
+  return {
+    type: "union",
+    members,
+    ...parseCellConfig(owner, "Union", call.arguments[1], context),
+  };
 }
 
 /**
@@ -1699,7 +1776,7 @@ function parseStructFieldDeclaration(
  * `RangedInt(min, max, config?)` — and
  * returns its element spec. Returns `undefined` when the callee is not a scalar
  * constructor. Shared by top-level scalar cell declarations, array element
- * declarations, and (in Phase 2) typed channel specs; `owner` names the owning
+ * declarations, struct fields, and union members; `owner` names the owning
  * construct in error messages.
  */
 function parseScalarConstructorSpec(
@@ -1787,9 +1864,29 @@ function parseScalarConstructorSpec(
   return undefined;
 }
 
+/** Requires at least two constructed alternatives, preserving authored order. */
+function unionMemberCalls(
+  argument: acorn.Expression | acorn.SpreadElement | undefined,
+  owner: string,
+): acorn.CallExpression[] {
+  if (argument?.type !== "ArrayExpression" || argument.elements.length < 2) {
+    throw new Error(
+      `Union ${owner} requires an array of at least two member constructors`,
+    );
+  }
+  return argument.elements.map((member) => {
+    if (member?.type !== "CallExpression") {
+      throw new Error(
+        `Union ${owner} members must be constructed scalar specs`,
+      );
+    }
+    return member;
+  });
+}
+
 /**
  * Parses the single element constructor of an `Array(elementCell)` declaration
- * into a scalar, Artifact, or Struct element. The element must be a constructed
+ * into a scalar, union, Artifact, or struct element. The element must be a constructed
  * cell: a bare constructor (`Array(Str)`), a nested array, extra arguments, or
  * any other constructor are all rejected.
  */
@@ -1797,7 +1894,7 @@ function parseArrayElementSpec(
   cellName: string,
   args: readonly (acorn.Expression | acorn.SpreadElement)[],
   context: DeclarationParseContext,
-): ObservableScalar | ObservableStruct | ArtifactSpec {
+): ObservableScalar | ObservableUnion | ObservableStruct | ArtifactSpec {
   const arg = args[0];
   if (args.length !== 1 || !arg || arg.type === "SpreadElement") {
     throw new Error(
@@ -1806,7 +1903,7 @@ function parseArrayElementSpec(
   }
   if (arg.type !== "CallExpression") {
     throw new Error(
-      `Array cell ${cellName} element must be a constructed scalar cell, e.g. Array(Str())`,
+      `Array cell ${cellName} element must be a constructed declaration, e.g. Array(Str())`,
     );
   }
   if (arg.callee.type === "Identifier" && arg.callee.name === "Array") {
@@ -1820,13 +1917,16 @@ function parseArrayElementSpec(
     }
     return { type: "artifact" };
   }
+  if (arg.callee.type === "Identifier" && arg.callee.name === "Union") {
+    return parseUnionDeclaration(arg, `${cellName}[]`, context);
+  }
   if (arg.callee.type === "Identifier" && arg.callee.name === "Struct") {
     return parseStructDeclaration(arg, `${cellName}[]`, context);
   }
   const element = parseScalarConstructorSpec(arg, cellName, context);
   if (!element) {
     throw new Error(
-      `Array cell ${cellName} element must be a scalar, Artifact, or Struct cell constructor`,
+      `Array cell ${cellName} element must be a scalar, Union, Artifact, or Struct cell constructor`,
     );
   }
   return element;
@@ -1884,15 +1984,17 @@ function parseNumericCellConfig(
   typeName: string,
   arg: acorn.Expression | acorn.SpreadElement | undefined,
   context: DeclarationParseContext,
-): { observing?: SemanticString; observeAs?: NumericObserveAs } {
+): { observing?: SemanticString; observeAs?: NumberObserveAsConstraint } {
   if (!arg) return {};
   if (arg.type === "SpreadElement" || arg.type !== "ObjectExpression") {
     throw new Error(
       `${typeName} cell ${cellName} config must be an object literal`,
     );
   }
-  const config: { observing?: SemanticString; observeAs?: NumericObserveAs } =
-    {};
+  const config: {
+    observing?: SemanticString;
+    observeAs?: NumberObserveAsConstraint;
+  } = {};
   for (const property of arg.properties) {
     if (property.type === "SpreadElement" || property.computed) {
       throw new Error(
@@ -1926,7 +2028,10 @@ function parseNumericCellConfig(
           `Duplicate cell config assignment: ${cellName}.observeAs`,
         );
       }
-      config.observeAs = parseNumericObserveAs(property.value, cellName);
+      config.observeAs = parseNumberObserveAsConstraint(
+        property.value,
+        cellName,
+      );
       continue;
     }
     throw new Error(
@@ -1936,14 +2041,14 @@ function parseNumericCellConfig(
   return config;
 }
 
-function parseNumericObserveAs(
+function parseNumberObserveAsConstraint(
   expression: acorn.Expression | acorn.Pattern,
   cellName: string,
-): NumericObserveAs {
+): NumberObserveAsConstraint {
   if (expression.type !== "ObjectExpression") {
     throw new Error(`Num cell ${cellName} observeAs must be an object literal`);
   }
-  let kind: NumericObserveAs["kind"] | undefined;
+  let kind: NumberObserveAsConstraint["kind"] | undefined;
   let min: number | undefined;
   let max: number | undefined;
   const seen = new Set<string>();
@@ -2381,9 +2486,9 @@ function parseSetSpanCall(
 
 /**
  * Parses `receiver.$map(callback, results?)` into a `MapAction`. The receiver is
- * an array cell, a typed array channel, or a Struct field of either; the
+ * an array cell, a typed array channel, or a struct field of either; the
  * callback is a zero-arg arrow parsed under the invoke dialect in the enclosing
- * node's scope; `results`, when present, is an output array cell or a Struct
+ * node's scope; `results`, when present, is an output array cell or a struct
  * cell field.
  */
 function parseMapCall(
@@ -2499,7 +2604,7 @@ function parseMapCallback(
 
 /**
  * Parses a `$map` results argument: a bare array cell, or a declared field of a
- * Struct cell.
+ * struct cell.
  */
 function parseMapResults(
   node: acorn.Expression | acorn.SpreadElement,
@@ -3081,9 +3186,11 @@ function parseEnterChannelMap(
   return mapping;
 }
 
+type ObserveMethod = "observe" | "observeOrAsk";
+
 function parseObserveCall(
   expression: acorn.CallExpression,
-  method: "observe" | "observeOrAsk",
+  method: ObserveMethod,
 
   availableHostModules: ReadonlyMap<string, string> = new Map(),
   expressionContext?: ExpressionParseContext,
@@ -3136,7 +3243,7 @@ function parseObserveCall(
  */
 function parseObserveGroupCall(
   expression: acorn.CallExpression,
-  method: "observe" | "observeOrAsk",
+  method: ObserveMethod,
   objectArg: acorn.ObjectExpression,
 ): ObserveGroupAction | ObserveOrAskGroupAction {
   if (expression.arguments.length !== 1) {
@@ -4107,19 +4214,19 @@ function validateNodeShape(
   documentImportNames: ReadonlySet<string>,
   issues: ValidationIssue[],
 ): void {
-  if (node.identifier === "invoke") {
+  if (node.identifier === "invoke" || node.identifier === "fmt") {
     issues.push({
       code: "RESERVED_NAME",
-      message: "invoke is a reserved name and cannot name a node",
+      message: `${node.identifier} is a reserved name and cannot name a node`,
       loc: node.loc,
     });
   }
   const cells = new Set<string>();
   for (const cell of node.cells) {
-    if (cell.name === "invoke") {
+    if (cell.name === "invoke" || cell.name === "fmt") {
       issues.push({
         code: "RESERVED_NAME",
-        message: "invoke is a reserved name and cannot name a cell",
+        message: `${cell.name} is a reserved name and cannot name a cell`,
         loc: cell.loc,
       });
     }
@@ -4265,7 +4372,7 @@ function validateDeflectionTarget(
 
 /**
  * The declaration a cell target selects: the root cell itself, a declared
- * Struct field or subtree, or an array element.
+ * struct field or subtree, or an array element.
  */
 type ResolvedCellTargetSpec =
   | { kind: "direct"; spec: CellSpec }
@@ -4292,7 +4399,7 @@ function formatCellTarget(target: CellTarget): string {
 }
 
 /**
- * Walks target accessors through the root declaration. A Struct accessor must
+ * Walks target accessors through the root declaration. A struct accessor must
  * be a literal string naming a declared field; an array accessor selects one
  * element; any other receiver is not a container.
  */
@@ -5153,7 +5260,7 @@ function validateMapStatement(
 
 /**
  * Validates a `$map` `results` target: an array cell, or a declared array field
- * of a Struct cell.
+ * of a struct cell.
  */
 function validateMapResults(
   results: MapResultsTarget,
@@ -5172,7 +5279,7 @@ function validateMapResults(
     });
     return;
   }
-  // Committing one field reads the current Struct before replacing the field.
+  // Committing one field reads the current struct before replacing the field.
   if (typeof results !== "string") recordCellRead(root);
   const spec =
     typeof results === "string"
@@ -5217,7 +5324,7 @@ function mapReceiverPath(
     : undefined;
 }
 
-/** The cell and Struct field path a `$map` receiver reads. */
+/** The cell and struct field path a `$map` receiver reads. */
 type MapReceiverPath = { cell: string; path: readonly string[] };
 
 function formatMapReceiver(receiver: MapReceiverPath): string {
@@ -6065,6 +6172,14 @@ function briefableExpressionLoc(
         }
       }
       return undefined;
+    case "fmt":
+      return briefableExpressionLoc(expression.value);
+    case "structLiteral":
+      for (const field of Object.values(expression.fields)) {
+        const loc = briefableExpressionLoc(field);
+        if (loc) return loc;
+      }
+      return undefined;
     case "artifact":
       return briefableExpressionLoc(expression.path);
     case "arrayElementRead":
@@ -6165,7 +6280,7 @@ function checkBooleanValue(
 
 /** Validates an array element / length read receiver and records its read. */
 /**
- * Validates a Struct field reference against its receiver's declaration and
+ * Validates a struct field reference against its receiver's declaration and
  * records the receiver read. Returns the selected field's declaration.
  */
 function validateFieldReference(
@@ -6599,6 +6714,22 @@ function validateExpression(
         }
       }
       return;
+    case "fmt":
+      validateExpression(expression.value, cells, nodes, issues, options);
+      if (
+        fmtRule.checkProducer(
+          expression.value,
+          producerContext(cells, signature, options),
+        ).kind === "incompatible"
+      ) {
+        issues.push({
+          code: "INVALID_FMT_OPERAND",
+          message:
+            "Formatting requires a supported value with unambiguous authority",
+          loc: briefableExpressionLoc(expression.value),
+        });
+      }
+      return;
     case "artifact":
       validateExpression(expression.path, cells, nodes, issues, options);
       {
@@ -6626,5 +6757,6 @@ function validateExpression(
   }
 }
 
-export type * from "../types/parser.js";
+export type * from "../types/ir.js";
+export type { NumberObserveAsConstraint } from "../types/spec.js";
 export type { PayloadValue } from "../types/value.js";

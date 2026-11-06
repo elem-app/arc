@@ -2768,3 +2768,58 @@ function Main() {
     });
   });
 });
+
+describe("Union channel bindings", () => {
+  it("union.binding enforces opposite args and returns directions without narrowing from current values", () => {
+    const union = 'Union([Num(), Enum(["none"])])';
+    for (const [source, target, direction, valid] of [
+      [union, "Num()", "args", false],
+      ["Num()", union, "args", true],
+      [union, "Num()", "returns", true],
+      ["Num()", union, "returns", false],
+      ['Enum(["a", "b"])', 'Union([Enum(["a"]), Enum(["b"])])', "args", true],
+      ["Array(Num())", "Array(Union([Num(), Str()]))", "args", true],
+      ["Array(Union([Num(), Str()]))", "Array(Num())", "args", false],
+    ] as const) {
+      const document = `"arc"; function Main() { let value = ${source}; $enter(Op, { ${direction}: { value: value } }); function Op(${direction} = { value: ${target} }) {} }`;
+      if (valid) expect(() => parse(document)).not.toThrow();
+      else expect(() => parse(document)).toThrow(/ENTER_CHANNEL_INCOMPATIBLE/);
+    }
+    const caller = parse(
+      `"arc"; import { Op } from "union-provider"; function Main() { let value = ${union}; value.$set(9); $enter(Op, { args: { value: value } }); }`,
+    );
+    const provider = parse('"arc"; function Op(args = { value: Num() }) {}');
+    for (const order of [true, false]) {
+      const runtime = new Runtime();
+      if (order)
+        runtime.add("union-caller", caller).add("union-provider", provider);
+      else runtime.add("union-provider", provider).add("union-caller", caller);
+      expect(() => runtime.init()).toThrow(/ENTER_CHANNEL_INCOMPATIBLE/);
+    }
+  });
+
+  it("union.binding caller arguments and staged returns cross fixed container guarantees", () => {
+    const source = "union-channel-execution";
+    const runtime = new Runtime()
+      .add(
+        source,
+        parse(`
+      "arc"; function Main() {
+        let input = Struct({ hour: Num() }); let output = Union([Num(), Enum(["none"])]);
+        input.$set({ hour: 9 });
+        $enter(Op, { args: { input: input }, returns: { output: output } });
+        $instruct(\`done\`);
+        function Op(args = { input: Struct({ hour: Union([Num(), Enum(["none"])]) }) }, returns = { output: Num() }) {
+          this.effects = () => { returns.output.$set(args.input.hour); };
+        }
+      }
+    `),
+      )
+      .init();
+    const seeded = runtime.newTraversal(arc(source, "Main"));
+    seeded.phase = "entered";
+    expect(
+      rootTraversal(startRun(runtime, [seeded], EMPTY_DIALOG)).cells.output,
+    ).toBe(9);
+  });
+});

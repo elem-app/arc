@@ -11,8 +11,8 @@ import {
   stringOperandRule,
   type ProducerContext,
 } from "../src/spec/resolution.js";
-import type { ElementId, ValueExpression } from "../src/types/parser.js";
-import { createArtifactValue } from "../src/value-utils.js";
+import type { ElementId, ValueExpression } from "../src/types/ir.js";
+import { createArtifactValue } from "../src/types/value.js";
 
 const literal = (value: string | number | boolean | null): ValueExpression => ({
   kind: "literal",
@@ -300,5 +300,184 @@ describe("shared operation rules", () => {
         createArtifactValue("one.md"),
       ),
     ).toEqual({ admitted: true, value: "one.md" });
+  });
+});
+
+describe("Union comparison rules", () => {
+  const unionContext: ProducerContext = {
+    cells: [
+      {
+        name: "hour",
+        type: "union",
+        members: [
+          { type: "number" },
+          { type: "enum", values: ["no_preference"] },
+        ],
+      },
+      { name: "text", type: "string" },
+      {
+        name: "left",
+        type: "union",
+        members: [{ type: "number" }, { type: "boolean" }],
+      },
+      {
+        name: "right",
+        type: "union",
+        members: [{ type: "string" }, { type: "boolean" }],
+      },
+      {
+        name: "ordered",
+        type: "union",
+        members: [
+          { type: "enum", values: ["low", "high"] },
+          { type: "enum", values: ["high", "low"] },
+        ],
+      },
+      {
+        name: "reverse",
+        type: "union",
+        members: [
+          { type: "enum", values: ["high", "low"] },
+          { type: "number" },
+        ],
+      },
+      {
+        name: "shadowed",
+        type: "union",
+        members: [
+          { type: "string" },
+          { type: "enum", values: ["low", "high"] },
+        ],
+      },
+    ],
+  };
+  const cell = (name: string): ValueExpression => ({ kind: "cell", name });
+
+  it("union.comparison requires one declaration to cover both incompatible alternatives", () => {
+    const member = comparisonRule.checkProducers(
+      "!=",
+      cell("hour"),
+      literal("no_preference"),
+      unionContext,
+    );
+    expect(member.judgment.kind).toBe("compatible");
+    expect(
+      comparisonRule.admitValues("!=", member, 9, "no_preference").admitted,
+    ).toBe(true);
+    const broad = comparisonRule.checkProducers(
+      "!=",
+      cell("hour"),
+      cell("text"),
+      unionContext,
+    );
+    expect(broad.judgment.kind).toBe("unknown");
+    expect(
+      comparisonRule.admitValues("!=", broad, 9, "no_preference").admitted,
+    ).toBe(false);
+    const unrelated = comparisonRule.checkProducers(
+      "==",
+      cell("left"),
+      cell("right"),
+      unionContext,
+    );
+    expect(unrelated.judgment.kind).toBe("unknown");
+    expect(
+      comparisonRule.admitValues("==", unrelated, 9, "text").admitted,
+    ).toBe(false);
+    expect(comparisonRule.admitValues("==", unrelated, 9, true).admitted).toBe(
+      true,
+    );
+    expect(
+      comparisonRule.checkProducers("!=", literal(1), literal(""), unionContext)
+        .judgment.kind,
+    ).toBe("incompatible");
+  });
+
+  it("union.comparison selects the first admitting Enum and excludes shadowed ordering authority", () => {
+    const ordered = comparisonRule.checkProducers(
+      "<",
+      cell("ordered"),
+      literal("high"),
+      unionContext,
+    );
+    expect(ordered.judgment.kind).toBe("compatible");
+    expect(
+      comparisonRule.admitValues("<", ordered, "low", "high"),
+    ).toMatchObject({
+      admitted: true,
+      value: { decision: { mode: "enum", enumValues: ["low", "high"] } },
+    });
+    const conflict = comparisonRule.checkProducers(
+      "<",
+      cell("ordered"),
+      cell("reverse"),
+      unionContext,
+    );
+    expect(conflict.judgment.kind).toBe("incompatible");
+    expect(
+      comparisonRule.admitValues("<", conflict, "low", "high").admitted,
+    ).toBe(false);
+    const shadowed = comparisonRule.checkProducers(
+      "<",
+      cell("shadowed"),
+      cell("ordered"),
+      unionContext,
+    );
+    expect(shadowed.judgment.kind).toBe("incompatible");
+  });
+
+  it("union.comparison rejects malformed concrete values before applying equality relaxation", () => {
+    const selected = comparisonRule.checkProducers(
+      "==",
+      cell("hour"),
+      literal("no_preference"),
+      unionContext,
+    );
+    for (const value of [null, true, "outside", {}, [], undefined]) {
+      expect(
+        comparisonRule.admitValues("==", selected, value, "no_preference")
+          .admitted,
+      ).toBe(false);
+    }
+    expect(
+      comparisonRule.admitValues("==", selected, Infinity, "no_preference"),
+    ).toMatchObject({
+      admitted: false,
+      violation: { code: "non-finite-number" },
+    });
+  });
+
+  it("union.comparison retains strict conditional evidence and refuses ambiguous Enum interpretation", () => {
+    const conditional: ValueExpression = {
+      kind: "conditional",
+      test: literal(true),
+      consequent: cell("ordered"),
+      alternate: cell("reverse"),
+    };
+    const selected = comparisonRule.checkProducers(
+      "<",
+      conditional,
+      literal("high"),
+      unionContext,
+    );
+    expect(selected.judgment.kind).toBe("unknown");
+    expect(
+      comparisonRule.admitValues("<", selected, "low", "high"),
+    ).toMatchObject({
+      admitted: false,
+      violation: { code: "invalid-comparison-operands" },
+    });
+    const invalid: ValueExpression = {
+      kind: "conditional",
+      test: literal(true),
+      consequent: cell("hour"),
+      alternate: literal(false),
+    };
+    expect(arithmeticRule.checkProducer(invalid, unionContext).kind).toBe(
+      "incompatible",
+    );
+    expect(arithmeticRule.checkProducer(cell("hour"), unionContext).kind).toBe(
+      "unknown",
+    );
   });
 });

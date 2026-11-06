@@ -20,7 +20,7 @@ import type {
   HostModuleSpec,
   PrimitiveArrayValue,
 } from "../src/types/index.js";
-import { createArtifactValue } from "../src/value-utils.js";
+import { createArtifactValue } from "../src/types/value.js";
 
 import {
   actionProgress,
@@ -93,10 +93,10 @@ function Main(
     ).toThrow(/cannot nest arrays/);
     expect(() =>
       parse(`"arc"; function Main() { let values = Array(Dialog.Cursor()); }`),
-    ).toThrow(/scalar, Artifact, or Struct cell constructor/);
+    ).toThrow(/scalar, Union, Artifact, or Struct cell constructor/);
     expect(() =>
       parse(`"arc"; function Main() { let values = Array(Index()); }`),
-    ).toThrow(/scalar, Artifact, or Struct cell constructor/);
+    ).toThrow(/scalar, Union, Artifact, or Struct cell constructor/);
   });
 
   it("artifact-array.public-ir rejects declaration metadata on Artifact elements through validate and Runtime.add", () => {

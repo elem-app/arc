@@ -12,14 +12,21 @@ import type {
   Cell,
   ChannelSpec,
   Document,
+  FmtConfig,
+  FmtExpression,
   HostCallArgument,
   Statement,
   TriggerStatement,
   ValidationIssue,
   ValueExpression,
 } from "../src/types/index.js";
-import { UNSTAMPED_ID } from "../src/types/parser.js";
-import { EMPTY_DIALOG, startRun } from "./helpers.js";
+import { UNSTAMPED_ID } from "../src/types/ir.js";
+import {
+  EMPTY_DIALOG,
+  rootTraversal,
+  startRun,
+  startTerminal,
+} from "./helpers.js";
 
 type Path = (string | number)[];
 const rootPath: Path = ["roots", 0];
@@ -173,6 +180,7 @@ const expressions = {
   judge: { id: UNSTAMPED_ID, kind: "judge", question: text },
   "host-call": { ...call, target: [], arguments: [] },
   artifact: { kind: "artifact", path: { kind: "literal", value: "file.md" } },
+  fmt: { kind: "fmt", value: text, config: {} },
   "template-string": {
     kind: "template-string",
     parts: [
@@ -452,6 +460,7 @@ const specs = {
   string: { type: "string" },
   enum: { type: "enum", values: ["a", "b"] },
   number: { type: "number" },
+  union: { type: "union", members: [{ type: "number" }, { type: "string" }] },
   artifact: { type: "artifact" },
   dialogCursor: { type: "dialogCursor" },
   index: { type: "index" },
@@ -509,6 +518,116 @@ for (const [type, spec] of Object.entries(specs)) {
 }
 
 describe("public Document grammar", () => {
+  it("fmt.public-ir enforces local strata and config data-property grammar", () => {
+    const source = "fmt-public-document";
+    const base = parse(
+      '"arc"; function Main() { let text = Str(); text.$set(fmt("a")); }',
+    );
+    for (const config of [
+      { str: undefined },
+      { array: undefined },
+      { array: { style: undefined } },
+      { struct: { style: undefined } },
+      [],
+    ]) {
+      const document = JSON.parse(JSON.stringify(base)) as Document;
+      const statement = document.roots[0]!.statements[0]!;
+      if (statement.kind !== "set" || statement.value.kind !== "fmt")
+        throw new Error("expected formatting");
+      statement.value.config = config as FmtConfig;
+      expect(validate(document)).toContainEqual(
+        expect.objectContaining({ code: "INVALID_FMT_CONFIG" }),
+      );
+      expect(() => new Runtime().add(source, document)).toThrow();
+    }
+    let called = false;
+    const getter = Object.defineProperty({}, "str", {
+      enumerable: true,
+      get() {
+        called = true;
+        return "bare";
+      },
+    });
+    const statement = base.roots[0]!.statements[0]!;
+    if (statement.kind !== "set" || statement.value.kind !== "fmt")
+      throw new Error("expected formatting");
+    statement.value.config = getter;
+    expect(() => new Runtime().add(source, base)).toThrow();
+    expect(called).toBe(false);
+    const local = parse(
+      '"arc"; function Main() { let items = Array(Str()); items.$set(["x"]); items[0].$set("y"); }',
+    );
+    const write = local.roots[0]!.statements[1]!;
+    if (write.kind !== "set") throw new Error("expected element write");
+    Reflect.set(write.target, "1", {
+      kind: "fmt",
+      value: { kind: "literal", value: 0 },
+      config: {},
+    });
+    for (const document of [
+      local,
+      JSON.parse(JSON.stringify(local)) as Document,
+    ]) {
+      expect(validate(document)).toContainEqual(
+        expect.objectContaining({ code: "INVALID_EXPRESSION_STRATUM" }),
+      );
+      expect(() => new Runtime().add(source, document)).toThrow();
+    }
+  });
+
+  it("fmt.public-ir validates raw and deserialized expressions atomically", () => {
+    const source = "fmt-public-document";
+    const base = parse(
+      '"arc"; function Main() { let text = Str(); text.$set(fmt("a")); }',
+    );
+    const cases: unknown[] = [
+      { kind: "fmt", value: { kind: "literal", value: "a" } },
+      { kind: "fmt", config: {} },
+      {
+        kind: "fmt",
+        value: { kind: "literal", value: "a" },
+        config: {},
+        extra: 1,
+      },
+      {
+        kind: "fmt",
+        value: { kind: "literal", value: "a" },
+        config: { str: "bad" },
+      },
+      {
+        kind: "fmt",
+        value: { kind: "literal", value: "a" },
+        config: { array: { style: "json", parentheses: "[]" } },
+      },
+      { kind: "fmt", value: { kind: "dialogCursor" }, config: {} },
+      { kind: "fmt", value: { kind: "invalid" }, config: {} },
+    ];
+    for (const expression of cases) {
+      const document = JSON.parse(JSON.stringify(base)) as Document;
+      const statement = document.roots[0]!.statements[0]!;
+      if (statement.kind !== "set") throw new Error("expected set");
+      statement.value = expression as FmtExpression;
+      for (const raw of [
+        document,
+        JSON.parse(JSON.stringify(document)) as Document,
+      ]) {
+        expect(validate(raw).length).toBeGreaterThan(0);
+        const runtime = new Runtime();
+        expect(() => runtime.add(source, raw)).toThrow();
+        expect(runtime.has(toArcRef(source, "Main"))).toBe(false);
+        expect(() => runtime.add(source, base).init()).not.toThrow();
+      }
+    }
+    const valid = JSON.parse(JSON.stringify(base)) as Document;
+    expect(validate(valid)).toEqual([]);
+    const runtime = new Runtime().add(source, valid).init();
+    const seeded = runtime.newTraversal(toArcRef(source, "Main"));
+    seeded.phase = "entered";
+    expect(
+      rootTraversal(startTerminal(runtime, [seeded], EMPTY_DIALOG)).cells.text,
+    ).toBe("a");
+  });
+
   it.each([
     [
       "unknown enter binding",
@@ -1063,7 +1182,7 @@ describe("Document roles and shared entry points", () => {
     };
     document.roots[0]!.hostParams = {
       kind: "host-call",
-      type: "rangedInt",
+      type: "number",
       value: { kind: "object", value: { malformed: true } },
       observeAs: "ordinary data",
       hostParams: { kind: "judge", id: "" },
@@ -1338,5 +1457,119 @@ describe("Document import records", () => {
       0,
       "importedName",
     ]);
+  });
+});
+
+describe("Union declaration grammar", () => {
+  it("union.grammar preserves ordered flat members a Union question and refinements at eligible positions", () => {
+    const document = parse(`
+      "arc";
+      function Main(args = { input: Union([Num(), Str()]), index: Index() }, returns = { output: Array(Union([Num(), Str()])) }) {
+        let choice = Union([Enum(["none"]), Str(), Str(), RangedInt(1, 5)], { observing: \`choice\` });
+        let rows = Array(Union([Num(), Str()]));
+        let record = Struct({ nested: Struct({ choice: Union([Bool(), Num()]) }) });
+      }
+    `);
+    expect(validate(document)).toEqual([]);
+    expect(document.roots[0]?.cells[0]).toMatchObject({
+      type: "union",
+      observing: {
+        kind: "template-string",
+        parts: [{ kind: "text", value: "choice" }],
+      },
+      members: [
+        { type: "enum", values: ["none"] },
+        { type: "string" },
+        { type: "string" },
+        {
+          type: "number",
+          observeAs: { kind: "integer", min: 1, max: 5 },
+        },
+      ],
+    });
+    expect(validate(JSON.parse(JSON.stringify(document)) as Document)).toEqual(
+      [],
+    );
+  });
+
+  it("union.grammar rejects nested Unions Index container members and malformed source lists", () => {
+    const invalidMembers = [
+      "Union([Num(), Str()])",
+      "Index()",
+      "Array(Num())",
+      "Struct({})",
+      "Artifact()",
+      "Dialog.Cursor()",
+      'Bool({ observing: "member" })',
+      'Str({ observing: "member" })',
+      'Enum(["none"], { observing: "member" })',
+      'Num({ observing: "member" })',
+      'RangedInt(1, 5, { observing: "member" })',
+    ];
+    for (const member of invalidMembers) {
+      for (const declaration of [
+        `function Main() { let value = Union([Num(), ${member}]); }`,
+        `function Main() { let values = Array(Union([Num(), ${member}])); }`,
+        `function Main() { let record = Struct({ choice: Union([Num(), ${member}]) }); }`,
+        `function Main(args = { value: Union([Num(), ${member}]) }) {}`,
+      ])
+        expect(() => parse(`"arc"; ${declaration}`)).toThrow();
+    }
+    for (const members of [
+      "[]",
+      "[Num()]",
+      "[Num, Str()]",
+      "[Num(), , Str()]",
+      "[...members, Num()]",
+    ]) {
+      expect(() =>
+        parse(`"arc"; function Main() { let value = Union(${members}); }`),
+      ).toThrow();
+    }
+    expect(() =>
+      parse(
+        '"arc"; function Main(args = { value: Union([Num(), Str()], { observing: `invalid` }) }) {}',
+      ),
+    ).toThrow();
+    expect(() =>
+      parse('"arc"; import Union from "host:service"; function Main() {}'),
+    ).toThrow(/reserved/);
+  });
+
+  it("union.public-ir enforces the same member boundary in cells fields elements and channels", () => {
+    const base =
+      parse(`"arc"; function Main(args = { input: Union([Num(), Str()]) }, returns = { output: Union([Num(), Str()]) }) {
+      let choice = Union([Num(), Str()]); let rows = Array(Union([Num(), Str()])); let record = Struct({ choice: Union([Num(), Str()]) });
+    }`);
+    const paths: Path[] = [
+      ["roots", 0, "cells", 0],
+      ["roots", 0, "cells", 1, "element"],
+      ["roots", 0, "cells", 2, "fields", "choice"],
+      ["roots", 0, "signature", "args", "input"],
+      ["roots", 0, "signature", "returns", "output"],
+    ];
+    for (const path of paths)
+      for (const members of [
+        [],
+        [{ type: "number" }],
+        [{ type: "number" }, { type: "index" }],
+        [
+          { type: "number" },
+          { type: "union", members: [{ type: "boolean" }, { type: "string" }] },
+        ],
+        [{ type: "number" }, { type: "struct", fields: {} }],
+        [{ type: "number" }, { type: "boolean", extra: true }],
+        [
+          { type: "number" },
+          { type: "string", observing: { kind: "literal", value: "member" } },
+        ],
+      ]) {
+        const document = clone(base);
+        put(document, [...path, "members"], members);
+        expect(structure(document).length).toBeGreaterThan(0);
+        expect(() => new Runtime().add("invalid-union", document)).toThrow(
+          RuntimeRegistrationError,
+        );
+      }
   });
 });

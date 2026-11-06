@@ -10,13 +10,16 @@ import { describe, expect, it } from "vitest";
 
 import { parse, validate } from "../src/parser/index.js";
 import {
+  actionProgress,
   appliedInstructions,
   arc,
   EMPTY_DIALOG,
   node,
   progressBrief,
+  progressTerminal,
   rootTraversal,
   TestRuntime as Runtime,
+  settleTransitions,
   startRun,
   startTerminal,
   startTrigger,
@@ -551,56 +554,98 @@ function Main() {
   });
 
   describe("flow.unreached-branch", () => {
-    it("preserves resolved branch actions across later unreachable and reachable passes", () => {
+    it("flow.unreached-branch retains completed and pending actions when the same branch becomes reachable again", () => {
       const document = parse(`
 "arc";
-
 function Main() {
   let enabled = Bool();
-
+  let pendingValue = Str();
+  let tailValue = Str();
   enabled.$set(true);
+  this.catchDeflection = () => {
+    $observe(enabled);
+    return true;
+  };
   if (enabled == true) {
-    $instruct(\`first enabled pass\`);
+    $instruct("once");
+    $observeOrAsk(pendingValue);
   }
-
-  enabled.$set(false);
-  if (enabled == false) {
-    $instruct(\`disabled pass\`);
-  }
-
-  enabled.$set(true);
-  if (enabled == true) {
-    $instruct(\`second enabled pass\`);
-  }
+  $observeOrAsk(tailValue);
 }
 `);
       const runtime = new Runtime()
         .add("unreached-branch-arc", document)
         .init();
-      const seeded = runtime.newTraversal(arc("unreached-branch-arc", "Main"));
-      seeded.phase = "entered";
-
-      const first = startRun(runtime, [seeded], EMPTY_DIALOG);
-      expect(first.instructions.map((item) => item.text)).toEqual([
-        "first enabled pass",
-      ]);
-
-      const disabled = progressBrief(runtime, first, {
+      const first = actionProgress(
+        settleTransitions(
+          runtime,
+          runtime.enterArc(arc("unreached-branch-arc", "Main"), EMPTY_DIALOG),
+          EMPTY_DIALOG,
+        ),
+      );
+      expect(first.instructions.map((item) => item.text)).toEqual(["once"]);
+      const pending = progressBrief(runtime, first, {
         move: "proceed",
         instructions: appliedInstructions(first),
       });
-      expect(disabled.instructions.map((item) => item.text)).toEqual([
-        "disabled pass",
-      ]);
-
-      const enabledAgain = progressBrief(runtime, disabled, {
+      expect(pending.observations).toHaveLength(1);
+      expect(pending.observations[0]).toMatchObject({ cell: "pendingValue" });
+      const hide = progressBrief(runtime, pending, { move: "deflect" });
+      expect(hide.observations).toHaveLength(1);
+      expect(hide.observations[0]).toMatchObject({ cell: "enabled" });
+      const hidden = progressBrief(runtime, hide, {
         move: "proceed",
-        instructions: appliedInstructions(disabled),
+        observations: {
+          [hide.observations[0]!.id]: { status: "resolved", value: false },
+        },
       });
-      expect(enabledAgain.instructions.map((item) => item.text)).toEqual([
-        "second enabled pass",
-      ]);
+      expect(hidden.instructions).toEqual([]);
+      expect(hidden.observations).toHaveLength(1);
+      expect(hidden.observations[0]).toMatchObject({ cell: "tailValue" });
+      expect(rootTraversal(hidden).cells.enabled).toBe(false);
+      const show = progressBrief(runtime, hidden, { move: "deflect" });
+      expect(show.observations).toHaveLength(1);
+      expect(show.observations[0]).toMatchObject({ cell: "enabled" });
+      const enabledAgain = progressBrief(runtime, show, {
+        move: "proceed",
+        observations: {
+          [show.observations[0]!.id]: { status: "resolved", value: true },
+        },
+      });
+      expect(enabledAgain.instructions).toEqual([]);
+      expect(enabledAgain.observations).toHaveLength(1);
+      expect(enabledAgain.observations[0]).toMatchObject({
+        cell: "pendingValue",
+        id: pending.observations[0]!.id,
+      });
       expect(rootTraversal(enabledAgain).cells.enabled).toBe(true);
+      const tail = progressBrief(runtime, enabledAgain, {
+        move: "proceed",
+        observations: {
+          [enabledAgain.observations[0]!.id]: {
+            status: "resolved",
+            value: "retained",
+          },
+        },
+      });
+      expect(tail.instructions).toEqual([]);
+      expect(tail.observations).toHaveLength(1);
+      expect(tail.observations[0]).toMatchObject({
+        cell: "tailValue",
+        id: hidden.observations[0]!.id,
+      });
+      const done = progressTerminal(runtime, tail, {
+        move: "proceed",
+        observations: {
+          [tail.observations[0]!.id]: { status: "resolved", value: "finished" },
+        },
+      });
+      expect(done).toMatchObject({ outcome: "covered", issues: [] });
+      expect(rootTraversal(done).cells).toMatchObject({
+        enabled: true,
+        pendingValue: "retained",
+        tailValue: "finished",
+      });
     });
   });
 });

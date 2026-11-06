@@ -10,14 +10,18 @@ import type {
   Node,
   NodeSignature,
   Statement,
-} from "../types/parser.js";
-import type { ArcRef, RuntimeRegistryIssue } from "../types/runtime.js";
+} from "../types/ir.js";
+import {
+  toArcRef,
+  toArcRefParts,
+  type ArcRef,
+  type RuntimeRegistryIssue,
+} from "../types/runtime.js";
 import {
   cellSpecToChannelSpec,
   type ArrayElementSpec,
   type ChannelSpec,
 } from "../types/spec.js";
-import { toArcRef, toArcRefParts } from "./refs.js";
 import type { RegistryEntry } from "./state.js";
 
 type MapBindingContext = {

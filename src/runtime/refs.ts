@@ -1,63 +1,18 @@
-import type { ElementId, Node } from "../types/parser.js";
-import type {
-  ArcRef,
-  ArcTraversalSet,
-  NodeRef,
-  Traversal,
+import type { ElementId, Node } from "../types/ir.js";
+import {
+  isArcRef,
+  isArcTraversal,
+  toArcRef,
+  toArcRefParts,
+  toNodeRef,
+  toNodeRefParts,
+  type ArcRef,
+  type ArcTraversalSet,
+  type NodeRef,
+  type Traversal,
 } from "../types/runtime.js";
 
 import type { RegistryEntry } from "./state.js";
-
-export function toArcRef(source: string, identifier: string): ArcRef {
-  return `arc:${encodeURIComponent(source)}:${encodeURIComponent(identifier)}`;
-}
-
-export function toNodeRef(source: string, path: string[]): NodeRef {
-  return `node:${encodeURIComponent(source)}:${path.map(encodeURIComponent).join(".")}`;
-}
-
-export function toArcRefParts(ref: ArcRef): {
-  source: string;
-  identifier: string;
-} {
-  const [, source, id] = ref.split(":");
-  if (source === undefined || id === undefined)
-    throw new Error(`Invalid ArcRef: ${ref}`);
-  return {
-    source: decodeURIComponent(source),
-    identifier: decodeURIComponent(id),
-  };
-}
-
-export function toNodeRefParts(ref: NodeRef): {
-  source: string;
-  path: string[];
-} {
-  const [, source, encodedPath] = ref.split(":");
-  if (source === undefined || encodedPath === undefined)
-    throw new Error(`Invalid NodeRef: ${ref}`);
-  return {
-    source: decodeURIComponent(source),
-    path: encodedPath.split(".").map(decodeURIComponent),
-  };
-}
-
-/**
- * Whether a ref string is an arc ref (vs a node ref). Accepts any `string` so it
- * serves both as a discriminator over a known `ArcRef | NodeRef` and as a
- * validator for untrusted input (e.g. a ref carried in a host report), keeping
- * arc's `arc:` ref-format convention owned here rather than reimplemented by
- * callers.
- */
-export function isArcRef(ref: string): ref is ArcRef {
-  return ref.startsWith("arc:");
-}
-
-export function isArcTraversal(
-  traversal: Traversal,
-): traversal is Extract<Traversal, { ref: ArcRef }> {
-  return isArcRef(traversal.ref);
-}
 
 export function rootRefOf(ref: ArcRef | NodeRef): ArcRef {
   if (isArcRef(ref)) return ref;

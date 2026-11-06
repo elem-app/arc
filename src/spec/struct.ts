@@ -3,8 +3,7 @@
  * holds a complete record of its declared fields, or is unset.
  */
 
-import type { PayloadValue } from "../types/value.js";
-import { isPlainRecord } from "../value-utils.js";
+import { isPlainRecord, type PayloadValue } from "../types/value.js";
 import { isHostStructFieldName } from "./host-parameters.js";
 
 /**

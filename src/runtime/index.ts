@@ -6,7 +6,6 @@ import {
 import {
   admitHostArgument,
   admitValue,
-  isRenderedSemanticText,
   resolveHostOperation,
   resolveReferenceSpec,
 } from "../spec/resolution.js";
@@ -30,33 +29,34 @@ import type {
   NodeReadSet,
   Statement,
   ValidationIssue,
-} from "../types/parser.js";
-import { mapResultsLabel } from "../types/parser.js";
-import type {
-  ActionState,
-  ArcRef,
-  ArcTraversal,
-  ArcTraversalSet,
-  NodeRef,
-  PinEntry,
-  RuntimeDocumentIssue,
-  RuntimeRegistrationIssue,
-  RuntimeRegistryIssue,
-  StateSnapshot,
-  Traversal,
+} from "../types/ir.js";
+import { mapResultsLabel } from "../types/ir.js";
+import {
+  isArcRef,
+  toArcRef,
+  type ActionState,
+  type ArcRef,
+  type ArcTraversal,
+  type ArcTraversalSet,
+  type NodeRef,
+  type PinEntry,
+  type RuntimeDocumentIssue,
+  type RuntimeRegistrationIssue,
+  type RuntimeRegistryIssue,
+  type StateSnapshot,
+  type Traversal,
 } from "../types/runtime.js";
 import type { CellSpec, ChannelSpec, HostModuleSpec } from "../types/spec.js";
-import {
-  isArtifactValue,
-  type CellValue,
-  type Dialog,
-} from "../types/value.js";
 import {
   cloneWithCanonicalNumbers,
   createArtifactValue,
   firstInvalidPayloadValue,
   firstNonFiniteNumberPath,
-} from "../value-utils.js";
+  isArtifactValue,
+  isRenderedSemanticText,
+  type CellValue,
+  type Dialog,
+} from "../types/value.js";
 import {
   acceptActionReport,
   acceptDeflectionReport,
@@ -83,11 +83,9 @@ import {
   formatRef,
   getEntryForRef,
   getNodeForRef,
-  isArcRef,
   lexicalParentRef,
   resolveLexicalRef,
   toAnonymousCopyRef,
-  toArcRef,
   traversalToNodeRef,
 } from "./refs.js";
 import { admitHostCallResults } from "./report-validation.js";
@@ -102,14 +100,14 @@ import {
   type TriggerBriefState,
 } from "./state.js";
 
-export { validateActionReport, validateTriggerReport } from "./briefs.js";
 export {
   isArcRef,
   toArcRef,
   toArcRefParts,
   toNodeRef,
   toNodeRefParts,
-} from "./refs.js";
+} from "../types/runtime.js";
+export { validateActionReport, validateTriggerReport } from "./briefs.js";
 export { findActiveRoot } from "./state.js";
 
 export type RuntimeOptions = {
@@ -1307,6 +1305,7 @@ function invalidPersistedState(detail: string): Error {
 
 export type {
   ActionBrief,
+  ActionMove,
   ActionPoisonReason,
   ActionReport,
   ArrayObservationMeta,
@@ -1316,31 +1315,32 @@ export type {
   InstructionPostcheck,
   InstructionReport,
   JudgmentBrief,
+  NodeTransition,
   ObservationBrief,
   ObservationGroupBrief,
   ObservationGroupField,
   ObservationGroupReport,
   ObservationMeta,
   ObservationReport,
+  RuntimeIssue,
   ScalarObservationMeta,
   StructObservationField,
   StructObservationMeta,
   TerminalBrief,
   TriggerBrief,
   TriggerReport,
+  UnionObservationMeta,
 } from "../types/host-interaction.js";
-export type { WriteDiffMode } from "../types/parser.js";
+export type { WriteDiffMode } from "../types/ir.js";
 export type {
-  ActionMove,
   ArcRef,
   ArcTraversal,
   ArcTraversalSet,
   BriefId,
+  DeflectionContext,
   NodeRef,
   NodeState,
-  NodeTransition,
   RuntimeDocumentIssue,
-  RuntimeIssue,
   RuntimeRegistrationIssue,
   RuntimeRegistryIssue,
   TransitionStretch,

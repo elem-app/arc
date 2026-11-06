@@ -1,11 +1,13 @@
-import type { ElementId, Node, NodeReadSet, SegKey } from "../types/parser.js";
-import type {
-  NodeRef,
-  NodeState,
-  StateSnapshot,
-  Traversal,
+import type { ElementId, Node, NodeReadSet, SegKey } from "../types/ir.js";
+import {
+  invokeSegKey,
+  isArcRef,
+  type NodeRef,
+  nodeSegKey,
+  type NodeState,
+  type StateSnapshot,
+  type Traversal,
 } from "../types/runtime.js";
-import { invokeSegKey, nodeSegKey } from "../types/runtime.js";
 import type { CellValue } from "../types/value.js";
 import {
   channelIsDeclared,
@@ -13,7 +15,7 @@ import {
   readChannelValue,
   resolveRefInTraversal,
 } from "./evaluate.js";
-import { arcToNodeRef, getEntryForRef, isArcRef } from "./refs.js";
+import { arcToNodeRef, getEntryForRef } from "./refs.js";
 import { type LeafStep, writeDiffStep } from "./seg.js";
 import { type Accumulator, cellValuesEqual, childState } from "./state.js";
 

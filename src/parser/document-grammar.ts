@@ -1,13 +1,19 @@
+import { validateFmtConfig } from "../spec/fmt.js";
 import { isHostStructFieldName } from "../spec/host-parameters.js";
 import { isStructFieldName } from "../spec/struct.js";
 import { validateSpec } from "../spec/validation.js";
-import type * as IR from "../types/parser.js";
-import type { ArrayElementSpec, ChannelSpec } from "../types/spec.js";
-import { classifyArtifactPath } from "../types/value.js";
+import type * as IR from "../types/ir.js";
 import {
+  isUnionMemberSpec,
+  type ArrayElementSpec,
+  type ChannelSpec,
+  type NumberObserveAsConstraint,
+} from "../types/spec.js";
+import {
+  classifyArtifactPath,
   describeArtifactPathIssue,
   firstInvalidPayloadValue,
-} from "../value-utils.js";
+} from "../types/value.js";
 
 type Rule = (
   value: unknown,
@@ -231,7 +237,7 @@ const arrayReference = variants("kind", {
   ...slotReferenceRules,
   field: fieldReference,
 } satisfies Record<IR.ArrayReference["kind"], Rule>);
-/** A `$map` results target: an array cell name or a field of a Struct cell. */
+/** A `$map` results target: an array cell name or a field of a struct cell. */
 const mapResults: Rule = (value, path, issues) => {
   if (typeof value === "string") {
     name(value, path, issues);
@@ -395,6 +401,15 @@ const expressionRules = {
             "INVALID_ARTIFACT_PATH",
           );
       }
+    },
+  }),
+  fmt: expr<"fmt">({
+    kind: oneOf("fmt"),
+    value: valueChild,
+    config: (value, path, issues) => {
+      const invalid = validateFmtConfig(value, path);
+      if (invalid)
+        issue(issues, invalid.path, invalid.detail, "INVALID_FMT_CONFIG");
     },
   }),
   "template-string": expr<"template-string">({
@@ -585,13 +600,13 @@ const hostArgument: Rule = coded(
 
 const observeAs: Rule = coded((value, path, issues) => {
   const before = issues.length;
-  record<IR.NumericObserveAs>({
+  record<NumberObserveAsConstraint>({
     kind: oneOf("number", "integer"),
     min: optional(number),
     max: optional(number),
   })(value, path, issues);
   if (issues.length !== before) return;
-  const bounds = value as IR.NumericObserveAs;
+  const bounds = value as NumberObserveAsConstraint;
   if (
     bounds.min !== undefined &&
     bounds.max !== undefined &&
@@ -614,12 +629,15 @@ type SpecRole =
   | "cell-element"
   | "channel-element"
   | "cell-field"
-  | "channel-field";
+  | "channel-field"
+  | "cell-union-member"
+  | "channel-union-member";
 const specTypes = {
   boolean: true,
   string: true,
   enum: true,
   number: true,
+  union: true,
   artifact: true,
   dialogCursor: true,
   index: true,
@@ -635,20 +653,12 @@ function spec(role: SpecRole): Rule {
       issue(issues, path, "expected a spec record", "INVALID_SPEC");
       return;
     }
-    if (value.type === "rangedInt") {
-      issue(
-        issues,
-        path,
-        'Source / IR numeric spec must use type "number"; found "rangedInt"',
-        "NON_CANONICAL_NUMERIC_SPEC",
-      );
-      return;
-    }
     const type = value.type;
     if (
       typeof type !== "string" ||
       !Object.hasOwn(specTypes, type) ||
-      (role === "cell" && type === "index") ||
+      (role.startsWith("cell") && type === "index") ||
+      (role.endsWith("member") && !isUnionMemberSpec({ type })) ||
       (role.endsWith("element") &&
         ["array", "index", "dialogCursor"].includes(type)) ||
       (role.endsWith("field") &&
@@ -666,8 +676,13 @@ function spec(role: SpecRole): Rule {
     if (role === "cell")
       Object.assign(fields, { name, loc: optional(location) });
     if (type === "enum") fields.values = array(string);
-    const cellRole =
-      role === "cell" || role === "cell-element" || role === "cell-field";
+    const cellRole = role.startsWith("cell");
+    if (type === "union") {
+      fields.members = array(
+        spec(cellRole ? "cell-union-member" : "channel-union-member"),
+        2,
+      );
+    }
     if (type === "array")
       fields.element = role.endsWith("field")
         ? refine(
@@ -691,8 +706,10 @@ function spec(role: SpecRole): Rule {
       if (cellRole) fields.observing = optional(semanticChild);
     }
     const observable =
-      cellRole && ["boolean", "string", "enum", "number"].includes(type);
-    if (observable) fields.observing = optional(semanticChild);
+      cellRole &&
+      ["boolean", "string", "enum", "number", "union"].includes(type);
+    if (observable && role !== "cell-union-member")
+      fields.observing = optional(semanticChild);
     if (observable && type === "number") fields.observeAs = optional(observeAs);
     if (role === "cell" && type === "artifact")
       fields.initializer = optional(

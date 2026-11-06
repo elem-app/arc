@@ -2,17 +2,17 @@
  * Host-facing brief and report types exchanged across Arc's runtime protocol.
  */
 
-import type { InstructionAction } from "./parser.js";
+import type { InstructionAction, SourceRange } from "./ir.js";
 import type {
-  ActionMove,
   ArcRef,
   ArcTraversalSet,
   BriefId,
   DeflectionContext,
+  InstructionPhase,
   NodeRef,
-  NodeTransition,
-  RuntimeIssue,
+  TransitionStretch,
 } from "./runtime.js";
+import type { StructShape, UnionShape } from "./shape.js";
 import type {
   CellValue,
   ObservedValue,
@@ -41,43 +41,47 @@ export type ScalarObservationMeta =
   | { type: "rangedInt"; min: number; max: number }
   | { type: "number"; min?: number; max?: number };
 
-/**
- * Type metadata describing an observed value. A scalar carries its own
- * type/bounds; an array carries its element shape so the host extracts a
- * complete element-typed list; a Struct carries one entry per declared field.
- */
-export type ObservationMeta =
-  | ScalarObservationMeta
-  | ArrayObservationMeta
-  | StructObservationMeta;
+/** Ordered scalar alternatives for one whole observation result. */
+export type UnionObservationMeta = UnionShape<ScalarObservationMeta>;
 
 /** Element shape of an observed list; every element is a complete value. */
 export type ArrayObservationMeta = {
   type: "array";
-  element: ScalarObservationMeta | StructObservationMeta;
-};
-
-/** Recursive field schema of an observed Struct. */
-export type StructObservationMeta = {
-  type: "struct";
-  fields: Record<string, StructObservationField>;
+  element: ScalarObservationMeta | UnionObservationMeta | StructObservationMeta;
 };
 
 /**
- * One declared field of an observed Struct: its rendered question and its type
- * metadata. A Struct's current value is carried whole by the brief.
+ * One declared field of an observed struct: its rendered question and its type
+ * metadata. A struct's current value is carried whole by the brief.
  */
 export type StructObservationField = {
   question: SemanticText;
   meta: ObservationMeta;
 };
 
+/** Recursive field schema of an observed struct. */
+export type StructObservationMeta = StructShape<StructObservationField>;
+
 /**
- * An observation opportunity the host may resolve for this turn.
- *
- * `mode` preserves the authored action:
+ * Type metadata describing an observed value. Scalars carry their type/bounds,
+ * unions their ordered alternatives, arrays their element shape, and structs
+ * their declared fields.
+ */
+export type ObservationMeta =
+  | ScalarObservationMeta
+  | UnionObservationMeta
+  | ArrayObservationMeta
+  | StructObservationMeta;
+
+/**
+ * Authored action an observation brief preserves:
  * - `observe`: silent semantic observation only
  * - `observeOrAsk`: the host may either resolve it silently or choose to ask
+ */
+export type ObservationMode = "observe" | "observeOrAsk";
+
+/**
+ * An observation opportunity the host may resolve for this turn.
  *
  * `currentValue` is included when the traversal already holds a value, so the
  * host can decide whether a refresh is still needed.
@@ -93,7 +97,7 @@ export type ObservationBrief = {
   sourceRef: NodeRef;
   guidance?: SemanticText;
   cell: string;
-  mode: "observe" | "observeOrAsk";
+  mode: ObservationMode;
   question: SemanticText;
   currentValue?: ObservedValue;
   hostParams: PayloadValue;
@@ -131,7 +135,7 @@ export type ObservationGroupBrief = {
   id: BriefId;
   sourceRef: NodeRef;
   guidance?: SemanticText;
-  mode: "observe" | "observeOrAsk";
+  mode: ObservationMode;
   hostParams: PayloadValue;
   fields: ObservationGroupField[];
 };
@@ -169,7 +173,7 @@ export type InstructionBrief = {
   sourceRef: NodeRef;
   guidance?: SemanticText;
   mode: InstructionAction["mode"];
-  phase: "apply" | "postcheck";
+  phase: InstructionPhase;
   text: SemanticText;
   hostParams: PayloadValue;
   postcheck?: InstructionPostcheck;
@@ -186,6 +190,69 @@ export type HostCallBrief = {
   arguments: PayloadValue[];
   hostParams: PayloadValue;
 };
+
+/**
+ * High-level moves offered by the current action brief through `allowedMoves`.
+ *
+ * - `proceed`: report semantic results and continue traversal
+ * - `deflect`: initiate or acknowledge deflection at the active node.
+ * - `interrupt`: interrupt pending work without acknowledging it.
+ * - `poison`: mark the active arc as unusable because the host cannot execute
+ *   the current frontier contract.
+ */
+export type ActionMove = "proceed" | "deflect" | "interrupt" | "poison";
+
+/**
+ * The walk's position moved from one node to another.
+ *
+ * `position` is the node the walk now stands at: evaluation continues there,
+ * and the next dialog must be projected for it. `exited`
+ * and `entered` tell how the walk got there — the nodes it left (innermost
+ * first) and the nodes it newly opened (outermost first). Both are arrays
+ * because one transition covers a whole stretch of moves with no authored
+ * evaluation in between: a guard-less enter chain opens several nodes at once,
+ * and a deflection can unwind several. On a pure entry, `position` is the
+ * innermost entered node; on an exit, it is the caller returned to, which
+ * appears in neither array because it was already open.
+ *
+ * `hostParams` is the position node's authored `hostParams` (`undefined` when
+ * it declares none), carried so the host can decide how to project without a
+ * document lookup. A transition-bearing brief carries no other work: the host
+ * answers `proceed`, and the point of that report is the dialog supplied with
+ * it, freshly projected for `position`.
+ */
+export type NodeTransition = TransitionStretch & {
+  position: NodeRef;
+  hostParams: PayloadValue;
+};
+
+/** Host-visible runtime issue surfaced while advancing from the previous yield. */
+export type RuntimeIssue =
+  | {
+      kind: "poisoned-traversal";
+      arc: ArcRef;
+      active: NodeRef;
+      source?: SourceRange;
+      reasonCode?: string;
+      reason?: string;
+    }
+  | {
+      kind: "invalid-report";
+      reasonCode?: string;
+      reason?: string;
+    }
+  | {
+      kind: "invalid-item";
+      briefId: BriefId;
+      reasonCode?: string;
+      reason?: string;
+    }
+  | {
+      kind: "ambiguous-match";
+      matchableArcs: ArcRef[];
+      reasonCode?: string;
+      reason?: string;
+    };
 
 /**
  * Multi-arc trigger brief for the current traversal probe.
@@ -354,6 +421,12 @@ export type HostCallReport = {
   value?: PayloadValue;
 };
 
+/** Host-defined interruption identity and optional explanation. */
+export type ActionInterruption = {
+  id: string;
+  reason?: string;
+};
+
 /** Host-supplied diagnostic for `ActionReport.move = "poison"`. */
 export type ActionPoisonReason = {
   reasonCode?: string;
@@ -375,12 +448,6 @@ export type TriggerReport = {
   judgments?: Record<BriefId, boolean>;
   observations?: Record<BriefId, ObservationReport | ObservationGroupReport>;
   hostCalls?: Record<BriefId, HostCallReport>;
-};
-
-/** Host-defined interruption identity and optional explanation. */
-export type ActionInterruption = {
-  id: string;
-  reason?: string;
 };
 
 /**

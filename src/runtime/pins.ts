@@ -1,16 +1,16 @@
-import type { ElementId, SegKey } from "../types/parser.js";
+import type { ElementId, SegKey } from "../types/ir.js";
 import type {
   BriefId,
   PinEntry,
   PinTape,
   Traversal,
 } from "../types/runtime.js";
-import type { PayloadValue } from "../types/value.js";
 import {
   clonePayloadValue,
   cloneWithCanonicalNumbers,
   firstNonFiniteNumberPath,
-} from "../value-utils.js";
+  type PayloadValue,
+} from "../types/value.js";
 
 /**
  * The active pin cursor for one statement visit: the SEG's tape, the statement's

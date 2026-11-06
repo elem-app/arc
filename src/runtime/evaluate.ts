@@ -9,6 +9,7 @@ import {
   artifactPathRule,
   booleanRule,
   comparisonRule,
+  fmtRule,
   interpolationRule,
   numIsFiniteRule,
   producerGuaranteesArtifact,
@@ -26,6 +27,7 @@ import type {
   ScalarObservationMeta,
   StructObservationField,
   StructObservationMeta,
+  UnionObservationMeta,
 } from "../types/host-interaction.js";
 import type {
   ActionStatement,
@@ -46,10 +48,10 @@ import type {
   JudgeExpression,
   LocalExpression,
   Node,
-  ObservableArray,
-  ObservableField,
+  Observable,
   ObservableScalar,
   ObservableStruct,
+  ObservableUnion,
   ObserveAction,
   ObserveGroupAction,
   ObserveOrAskAction,
@@ -58,15 +60,16 @@ import type {
   SetAction,
   UnsetAction,
   ValueExpression,
-} from "../types/parser.js";
-import { fieldDeclarationAt, isSettableCell } from "../types/parser.js";
-import type {
-  ArcRef,
-  NodeRef,
-  NodeState,
-  Traversal,
+} from "../types/ir.js";
+import { fieldDeclarationAt, isSettableCell } from "../types/ir.js";
+import {
+  isArcRef,
+  qualifiedBriefSite,
+  type ArcRef,
+  type NodeRef,
+  type NodeState,
+  type Traversal,
 } from "../types/runtime.js";
-import { qualifiedBriefSite } from "../types/runtime.js";
 import type {
   ArrayElementSpec,
   CellSpec,
@@ -76,7 +79,14 @@ import type {
 import { fieldSpecAt, isObservableCellSpec } from "../types/spec.js";
 import {
   classifyArtifactValue,
+  clonePayloadValue,
+  cloneWithCanonicalNumbers,
+  createArtifactValue,
+  describeArtifactValueIssue,
+  firstInvalidPayloadValue,
+  firstNonFiniteNumberPath,
   isArtifactValue,
+  isPlainRecord,
   type ArrayElementValue,
   type ArrayValue,
   type ArtifactValue,
@@ -88,15 +98,6 @@ import {
   type SemanticTextPart,
   type StructValue,
 } from "../types/value.js";
-import {
-  clonePayloadValue,
-  cloneWithCanonicalNumbers,
-  createArtifactValue,
-  describeArtifactValueIssue,
-  firstInvalidPayloadValue,
-  firstNonFiniteNumberPath,
-  isPlainRecord,
-} from "../value-utils.js";
 import {
   assertAssignableChannelValue,
   isDialogCursorValue,
@@ -114,7 +115,6 @@ import {
   formatRef,
   getEntryForRef,
   getNodeForRef,
-  isArcRef,
   lexicalParentRef,
   resolveLexicalRef,
   traversalToNodeRef,
@@ -153,13 +153,10 @@ type ResolvedCellTarget = {
 };
 
 /**
- * Parser IR of the position a cell target selects: the root cell, a Struct
+ * Parser IR of the position a cell target selects: the root cell, a struct
  * field, or an array element.
  */
-type CellTargetLeaf = Cell | ObservableField | ArrayCell["element"];
-
-/** A cell target's leaf narrowed to its observable forms. */
-type ObservableTarget = ObservableScalar | ObservableArray | ObservableStruct;
+type CellTargetLeaf = Cell | Observable | ArrayCell["element"];
 
 function formatAuthoredCellTarget(target: CellTarget): string {
   const [root, ...accessors] = target;
@@ -167,8 +164,8 @@ function formatAuthoredCellTarget(target: CellTarget): string {
 }
 
 /**
- * Resolves a lexical cell target against the live traversal state. A Struct
- * accessor selects a declared field from the schema and requires a set Struct.
+ * Resolves a lexical cell target against the live traversal state. A struct
+ * accessor selects a declared field from the schema and requires a set struct.
  * Array accessors evaluate through the ordinary local-expression path, so
  * non-literal indices are pinned by the containing statement's pin tape, and
  * require a set array. An unset container fails here, before the action
@@ -299,7 +296,7 @@ function replaceRootState(
 }
 
 function replaceTargetState(
-  spec: Cell | ObservableField | ArrayElementSpec,
+  spec: Cell | Observable | ArrayElementSpec,
   state: PayloadValue,
   path: readonly (string | number)[],
   value: CellValue,
@@ -360,8 +357,8 @@ function replaceTargetState(
 
 /**
  * Validates and writes one complete concrete value at a resolved target. A
- * Struct root or subtree is replaced as a whole, and a field write replaces one
- * field of a set Struct.
+ * struct root or subtree is replaced as a whole, and a field write replaces one
+ * field of a set struct.
  */
 function writeResolvedCellTarget(
   target: ResolvedCellTarget,
@@ -383,8 +380,8 @@ function writeResolvedCellTarget(
 
 /**
  * Validates and writes one complete concrete value at a cell or at a declared
- * Struct field path of that cell, preserving the field's siblings. A field
- * path requires a set Struct; the replacement path checks it.
+ * struct field path of that cell, preserving the field's siblings. A field
+ * path requires a set struct; the replacement path checks it.
  */
 export function writeOwnedCellPath(
   ownerTraversal: Traversal,
@@ -519,7 +516,7 @@ export function applyObserveGroup(
   const mode = statement.kind === "observeGroup" ? "observe" : "observeOrAsk";
   const targets: {
     target: ResolvedCellTarget;
-    observable: ObservableTarget;
+    observable: Observable;
   }[] = [];
   for (const authoredTarget of statement.targets) {
     const result = resolveCellTarget(authoredTarget, traversal, node, accum);
@@ -612,7 +609,7 @@ export function applyObserveGroup(
 /**
  * Requires the resolved leaf to be observable.
  */
-function requireObservableTarget(target: ResolvedCellTarget): ObservableTarget {
+function requireObservableTarget(target: ResolvedCellTarget): Observable {
   const leaf = target.leaf;
   if (!isObservableCellSpec(leaf)) {
     throw runtimeError(
@@ -625,11 +622,9 @@ function requireObservableTarget(target: ResolvedCellTarget): ObservableTarget {
 
 /**
  * The extraction question authored on a target: its own `observing` for a
- * scalar or Struct, or the element's `observing` for an array.
+ * scalar or struct, or the element's `observing` for an array.
  */
-function cellObservingText(
-  observable: ObservableTarget,
-): SemanticString | undefined {
+function cellObservingText(observable: Observable): SemanticString | undefined {
   return observable.type === "array"
     ? observable.element.observing
     : observable.observing;
@@ -664,12 +659,17 @@ function scalarMetaOf(observable: ObservableScalar): ScalarObservationMeta {
   }
 }
 
+/** Preserves the ordered constraints for one union observation. */
+function unionMetaOf(observable: ObservableUnion): UnionObservationMeta {
+  return { type: "union", members: observable.members.map(scalarMetaOf) };
+}
+
 /**
- * Observation value metadata for a scalar, array, or Struct target. A Struct
+ * Observation value metadata for a scalar, union, array, or struct target. A struct
  * describes every declared field recursively with its rendered question.
  */
 function observationMetaForTarget(
-  observable: ObservableTarget,
+  observable: Observable,
   label: string,
   traversal: Traversal,
   node: Node,
@@ -687,17 +687,21 @@ function observationMetaForTarget(
               node,
               accum,
             )
-          : scalarMetaOf(observable.element),
+          : observable.element.type === "union"
+            ? unionMetaOf(observable.element)
+            : scalarMetaOf(observable.element),
     };
   }
   if (observable.type === "struct") {
     return structMetaOf(observable, label, traversal, node, accum);
   }
-  return scalarMetaOf(observable);
+  return observable.type === "union"
+    ? unionMetaOf(observable)
+    : scalarMetaOf(observable);
 }
 
 /**
- * Observation metadata for a Struct target or Struct array element: every
+ * Observation metadata for a struct target or struct array element: every
  * declared field with its rendered question and type metadata.
  */
 function structMetaOf(
@@ -736,7 +740,7 @@ function structMetaOf(
 
 /** Renders a target's own `observing` question, or a default when it declares none. */
 function renderCellObservingQuestion(
-  observable: ObservableTarget,
+  observable: Observable,
   targetLabel: string,
   traversal: Traversal,
   node: Node,
@@ -1085,6 +1089,7 @@ function isCompoundValueExpression(
     expression.kind === "numericUnary" ||
     expression.kind === "numIsFinite" ||
     expression.kind === "artifact" ||
+    expression.kind === "fmt" ||
     expression.kind === "template-string" ||
     expression.kind === "arrayLiteral" ||
     expression.kind === "structLiteral"
@@ -1217,7 +1222,8 @@ function computeCompoundValueExpression(
     if (!admitted.admitted) {
       throw runtimeError(admitted.violation.code, admitted.violation.detail);
     }
-    if (decision.mode === "struct") {
+    const selected = admitted.value.decision;
+    if (selected.mode === "struct") {
       const equal = payloadValuesEqual(
         admitted.value.left,
         admitted.value.right,
@@ -1227,8 +1233,8 @@ function computeCompoundValueExpression(
         value: expression.op === "==" ? equal : !equal,
       };
     }
-    if (isOrdering && decision.mode === "enum") {
-      const enumValues = decision.enumValues ?? [];
+    if (isOrdering && selected.mode === "enum") {
+      const enumValues = selected.enumValues ?? [];
       const li = enumValues.indexOf(admitted.value.left as string);
       const ri = enumValues.indexOf(admitted.value.right as string);
       return {
@@ -1242,8 +1248,8 @@ function computeCompoundValueExpression(
         expression.op,
         admitted.value.left,
         admitted.value.right,
-        decision.mode === "artifact",
-        decision.mode === "artifact",
+        selected.mode === "artifact",
+        selected.mode === "artifact",
       ),
     };
   }
@@ -1363,6 +1369,29 @@ function computeCompoundValueExpression(
     }
     return { status: "resolved", value: Number.isFinite(admission.value) };
   }
+  if (expression.kind === "fmt") {
+    const value = evaluateValueExpression(
+      expression.value,
+      traversal,
+      node,
+      accum,
+    );
+    if (value.status === "blocked") return value;
+    const projection = fmtRule.projectValue(
+      resolveProducer(
+        expression.value,
+        runtimeProducerContext(traversal, node, accum),
+      ),
+      value.value,
+      expression.config,
+    );
+    if (!projection.admitted)
+      throw runtimeError(
+        projection.violation.code,
+        projection.violation.detail,
+      );
+    return { status: "resolved", value: projection.value };
+  }
   if (expression.kind === "artifact") {
     return computeArtifactConstructExpression(
       expression,
@@ -1397,7 +1426,7 @@ function computeCompoundValueExpression(
     return { status: "resolved", value: elements };
   }
   if (expression.kind === "structLiteral") {
-    // A Struct value is concrete only when every field is concrete: an unset
+    // A struct value is concrete only when every field is concrete: an unset
     // field makes the whole literal unset, and its consumer applies its own
     // absence rule.
     const fields: Record<string, PayloadValue> = {};
@@ -1910,8 +1939,8 @@ export function getCellValue(
 }
 
 /**
- * Resolves the spec and stored value of a Struct field reference. The field
- * path is resolved from the receiver's spec, and a field of an unset Struct
+ * Resolves the spec and stored value of a struct field reference. The field
+ * path is resolved from the receiver's spec, and a field of an unset struct
  * reads as unset.
  */
 function readFieldState(
@@ -2009,7 +2038,7 @@ export function runtimeArrayElementSpec(
   return spec?.type === "array" ? spec.element : undefined;
 }
 
-/** Reads a Struct field's value, or `undefined` when its Struct is unset. */
+/** Reads a struct field's value, or `undefined` when its struct is unset. */
 function readFieldValue(
   field: FieldReference,
   traversal: Traversal,

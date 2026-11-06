@@ -612,20 +612,6 @@ function Main() {
       });
     });
 
-    it("rejects the removed static Dialog.*TurnsSince form", () => {
-      expect(() =>
-        parse(`
-"arc";
-function Main() {
-  let startedAt = Dialog.Cursor();
-  startedAt.$set(Dialog.cursor);
-  if (Dialog.userTurnsSince(startedAt) >= 1) {
-    $instruct(\`pivot\`);  }
-}
-`),
-      ).toThrow(/was replaced by cursor methods/);
-    });
-
     it("rejects cursor turn-difference calls with the wrong argument count", () => {
       expect(() =>
         parse(`
@@ -1092,5 +1078,146 @@ function Main() {
         }),
       ]);
     });
+  });
+});
+
+describe("Union operations", () => {
+  function run(body: string) {
+    const source = "union-operations";
+    const runtime = new Runtime()
+      .add(
+        source,
+        parse(`"arc"; function Main() { ${body} $instruct(\`done\`); }`),
+      )
+      .init();
+    const seeded = runtime.newTraversal(arc(source, "Main"));
+    seeded.phase = "entered";
+    return { runtime, seeded };
+  }
+
+  it("union.runtime equality is symmetric across covered alternatives and preserves Enum string equality", () => {
+    const { runtime, seeded } = run(`
+      let hour = Union([Num(), Enum(["no_preference"])]);
+      let first = Bool(); let second = Bool(); let third = Bool(); let fourth = Bool(); let missing = Bool();
+      missing.$set(hour == "no_preference");
+      hour.$set(9);
+      first.$set(hour == "no_preference"); second.$set("no_preference" != hour);
+      hour.$set("no_preference"); third.$set(hour == "no_preference");
+      let text = Str(); text.$set("no_preference"); fourth.$set(hour == text);
+    `);
+    const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+    expect(rootTraversal(brief).cells).toMatchObject({
+      first: false,
+      second: true,
+      third: true,
+      fourth: true,
+      missing: false,
+    });
+    expect(brief.issues).toEqual([]);
+  });
+
+  it("union.runtime ordering follows authored Enum order and never falls through after selection", () => {
+    const { runtime, seeded } = run(`
+      let forward = Union([Enum(["low", "high"]), Enum(["high", "low"])]);
+      let reverse = Union([Enum(["high", "low"]), Enum(["low", "high"])]);
+      let first = Bool(); let second = Bool();
+      forward.$set("low"); reverse.$set("low");
+      first.$set(forward < "high"); second.$set(reverse < "high");
+    `);
+    expect(
+      rootTraversal(startRun(runtime, [seeded], EMPTY_DIALOG)).cells,
+    ).toMatchObject({ first: true, second: false });
+    const invalid = run(`
+      let choice = Union([Enum(["low", "high"]), Str()]);
+      let result = Bool(); choice.$set("low"); result.$set(choice < "outside");
+    `);
+    const terminal = startTerminal(
+      invalid.runtime,
+      [invalid.seeded],
+      EMPTY_DIALOG,
+    );
+    expect(terminal.issues).toContainEqual(
+      expect.objectContaining({ reasonCode: "invalid-comparison-operands" }),
+    );
+    expect(rootTraversal(terminal).cells.result).toBeUndefined();
+  });
+
+  it("union.runtime unrelated declarations sharing one member do not authorize the selected incompatible pair", () => {
+    const { runtime, seeded } = run(`
+      let left = Union([Num(), Bool()]); let right = Union([Str(), Bool()]);
+      let result = Bool(); left.$set(9); right.$set("text"); result.$set(left == right);
+    `);
+    const terminal = startTerminal(runtime, [seeded], EMPTY_DIALOG);
+    expect(terminal.issues).toContainEqual(
+      expect.objectContaining({ reasonCode: "invalid-comparison-operands" }),
+    );
+    expect(rootTraversal(terminal).cells.result).toBeUndefined();
+  });
+
+  it("union.runtime recursively compares fixed containers using their Union fields and elements", () => {
+    const { runtime, seeded } = run(`
+      let mixed = Array(Union([Num(), Str()])); let numbers = Array(Num());
+      let left = Struct({ nested: Struct({ hour: Union([Num(), Str()]) }) });
+      let right = Struct({ nested: Struct({ hour: Num() }) });
+      let records = Array(Struct({ hour: Union([Num(), Str()]) }));
+      let expected = Array(Struct({ hour: Num() }));
+      let a = Bool(); let b = Bool(); let c = Bool(); let d = Bool();
+      mixed.$set([9, "no_preference"]); numbers.$set([9, 10]); a.$set(mixed == numbers);
+      left.$set({ nested: { hour: "no_preference" } }); right.$set({ nested: { hour: 9 } }); b.$set(left != right);
+      records.$set([{ hour: 9 }]); expected.$set([{ hour: 9 }]); c.$set(records == expected);
+      mixed.$set([]); numbers.$set([]); d.$set(mixed == numbers);
+    `);
+    const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+    expect(rootTraversal(brief).cells).toMatchObject({
+      a: false,
+      b: true,
+      c: true,
+      d: true,
+    });
+    expect(brief.issues).toEqual([]);
+  });
+
+  it("union.runtime judges literal arrays by aligned position", () => {
+    const { runtime, seeded } = run(`
+      let hour = Union([Num(), Enum(["no_preference"])]); let same = Bool();
+      hour.$set("no_preference"); same.$set([hour, 1] == ["no_preference", 1]);
+    `);
+    const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+    expect(rootTraversal(brief).cells.same).toBe(true);
+    expect(brief.issues).toEqual([]);
+    expect(() =>
+      run(`
+        let hour = Union([Num(), Enum(["no_preference"])]); let same = Bool();
+        same.$set([hour, 1] == [1, "no_preference"]);
+      `),
+    ).toThrow(/COMPARISON_VALUE_TYPE/);
+  });
+
+  it("union.runtime guards admit actual numeric boolean and regex operands without narrowing declarations", () => {
+    const { runtime, seeded } = run(`
+      let hour = Union([Num(), Enum(["no_preference"])]); let next = Num(); let finite = Bool();
+      hour.$set(9); if (!hour.isUnset() && hour != "no_preference") { next.$set(hour + 1); finite.$set(Num.isFinite(hour)); }
+      let flag = Union([Bool(), Str()]); let enabled = Bool(); flag.$set(true); if (flag) { enabled.$set(true); }
+      let text = Union([Str(), Num()]); let matched = Bool(); text.$set("hello"); matched.$set(/^he/.test(text));
+      let rendered = Str(); let values = Array(Union([Num(), Str()])); values.$set([9, "none"]);
+      rendered.$set(\`\${hour}:\${values}:\${fmt(values)}\`);
+    `);
+    const brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+    expect(rootTraversal(brief).cells).toMatchObject({
+      next: 10,
+      finite: true,
+      enabled: true,
+      matched: true,
+    });
+    expect(rootTraversal(brief).cells.rendered).toContain("9:9,none:");
+    expect(brief.issues).toEqual([]);
+    const invalid = run(
+      `let value = Union([Num(), Str()]); let result = Num(); value.$set("none"); result.$set(value + 1);`,
+    );
+    expect(
+      startTerminal(invalid.runtime, [invalid.seeded], EMPTY_DIALOG).issues,
+    ).toContainEqual(
+      expect.objectContaining({ reasonCode: "non-numeric-arithmetic-operand" }),
+    );
   });
 });

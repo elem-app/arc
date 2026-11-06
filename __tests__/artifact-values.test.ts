@@ -4,12 +4,13 @@ import { parse, validate } from "../src/parser/index.js";
 import { Runtime } from "../src/runtime/index.js";
 import { cellValuesEqual } from "../src/runtime/state.js";
 import type { ArtifactValue, PayloadValue } from "../src/types/index.js";
-import { classifyArtifactPath, isArtifactValue } from "../src/types/value.js";
 import {
+  classifyArtifactPath,
   clonePayloadValue,
   createArtifactValue,
+  isArtifactValue,
   mergeAndClonePayload,
-} from "../src/value-utils.js";
+} from "../src/types/value.js";
 
 describe("Artifact values", () => {
   it("artifact.value.factory creates a JSON-stable value without factory provenance", () => {

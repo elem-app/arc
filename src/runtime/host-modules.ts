@@ -1,7 +1,6 @@
 import { cloneParameterSpec } from "../spec/host-parameters.js";
 import { validateHostModuleSpec } from "../spec/validation.js";
 import {
-  structSpecOf,
   type ChannelSpec,
   type HostModuleSpec,
   type HostOperationSpec,
@@ -54,23 +53,7 @@ function cloneOperation(operation: HostOperationSpec): HostOperationSpec {
     kind: "operation",
     parameters: operation.parameters.map(cloneParameterSpec),
     ...(operation.returns
-      ? { returns: cloneChannelSpec(operation.returns) }
+      ? { returns: cloneParameterSpec(operation.returns) as ChannelSpec }
       : {}),
   };
-}
-
-function cloneChannelSpec(spec: ChannelSpec): ChannelSpec {
-  switch (spec.type) {
-    case "enum":
-      return { type: "enum", values: [...spec.values] };
-    case "array":
-      return {
-        type: "array",
-        element: cloneParameterSpec(spec.element),
-      } as ChannelSpec;
-    case "struct":
-      return structSpecOf(spec);
-    default:
-      return { type: spec.type };
-  }
 }

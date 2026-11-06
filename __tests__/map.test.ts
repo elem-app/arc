@@ -2017,3 +2017,84 @@ function Main() {
     });
   });
 });
+
+describe("Union map members", () => {
+  it("union.map uses pinned input values across restoration and commits a complete previously unset result", () => {
+    const source = "union-map-restore";
+    const document = parse(`"arc"; function Main() {
+      let items = Array(Union([Num(), Enum(["none"])])); let output = Array(Union([Num(), Enum(["none"])])); let gate = Bool();
+      items.$set([9, "none"]);
+      items.$map(() => { $observeOrAsk(gate); if (span.item != "none") { span.result.$set(span.item + 1); } else { span.result.$set("none"); } }, output);
+    }`);
+    const runtime = new Runtime().add(source, document).init();
+    const seeded = runtime.newTraversal(arc(source, "Main"));
+    seeded.phase = "entered";
+    const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+    expect(rootTraversal(first).cells.output).toBeUndefined();
+    const snapshot = JSON.parse(
+      JSON.stringify(first.traversals),
+    ) as ArcTraversalSet;
+    for (const corrupt of [
+      (map: MapActionState) => {
+        map.pinnedInput = [true];
+      },
+      (map: MapActionState) => {
+        map.terminals = [true];
+      },
+      (map: MapActionState) => {
+        map.staged = { set: true, value: true };
+      },
+    ]) {
+      const invalid = JSON.parse(JSON.stringify(snapshot)) as ArcTraversalSet;
+      const state = Object.values(invalid[0]!.frame.actionStates).find(
+        (state) => state?.kind === "map",
+      );
+      if (state?.kind !== "map" || !state.map)
+        throw new Error("Expected a suspended map");
+      corrupt(state.map);
+      expect(() => runtime.start(invalid, EMPTY_DIALOG)).toThrow(
+        /Invalid persisted traversal state/,
+      );
+    }
+    snapshot[0]!.cells.items = [100, 200];
+    const rebuilt = new Runtime().add(source, document).init();
+    const resumed = startRun(rebuilt, snapshot, EMPTY_DIALOG);
+    const next = progressBrief(rebuilt, resumed, {
+      move: "proceed",
+      observations: {
+        [resumed.observations[0]!.id]: { status: "resolved", value: true },
+      },
+    });
+    expect(rootTraversal(next).cells.output).toBeUndefined();
+    const done = progressTerminal(rebuilt, next, {
+      move: "proceed",
+      observations: {
+        [next.observations[0]!.id]: { status: "resolved", value: true },
+      },
+    });
+    expect(rootTraversal(done).cells.output).toEqual([10, "none"]);
+  });
+
+  it("union.map preserves span binding directions and requires every output member", () => {
+    const { brief } = runTerminal(
+      `"arc"; function Main() {
+      let items = Array(Num()); let output = Array(Union([Num(), Str()])); items.$set([9, 10]);
+      items.$map(() => { $enter(newcopy(Op), { args: { value: span.item }, returns: { value: span.result } }); }, output);
+      function Op(args = { value: Union([Num(), Str()]) }, returns = { value: Num() }) { this.effects = () => { returns.value.$set(args.value); }; }
+    }`,
+      "union-map-bindings",
+    );
+    expect(rootTraversal(brief).cells.output).toEqual([9, 10]);
+    expect(() =>
+      parse(
+        `"arc"; function Main() { let items = Array(Union([Num(), Str()])); items.$map(() => { $enter(newcopy(Op), { args: { value: span.item } }); }); function Op(args = { value: Num() }) {} }`,
+      ),
+    ).toThrow(/ENTER_CHANNEL_INCOMPATIBLE/);
+    const missing = runTerminal(
+      `"arc"; function Main() { let items = Array(Union([Num(), Str()])); let output = Array(Union([Num(), Str()])); items.$set([9]); items.$map(() => {}, output); }`,
+      "union-map-missing",
+    );
+    expect(missing.brief.issues.length).toBeGreaterThan(0);
+    expect(rootTraversal(missing.brief).cells.output).toBeUndefined();
+  });
+});

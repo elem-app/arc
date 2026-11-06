@@ -11,7 +11,12 @@ import { describe, expect, it } from "vitest";
 import { parseCellTarget } from "../src/parser/ast.js";
 import { analyzeDocument, parse, validate } from "../src/parser/index.js";
 import { createArtifactValue } from "../src/runtime/index.js";
-import type { ArcTraversalSet, Dialog, SetAction } from "../src/types/index.js";
+import type {
+  ArcTraversalSet,
+  Dialog,
+  ObservationReport,
+  SetAction,
+} from "../src/types/index.js";
 import { nodeSegKey } from "../src/types/index.js";
 import {
   actionProgress,
@@ -31,6 +36,50 @@ import {
 } from "./helpers.js";
 
 describe("cells", () => {
+  it("fmt.analysis preserves boolean and semantic reads inside compound inputs", () => {
+    const document = parse(
+      '"arc"; function Main() { let flag = Bool(); let missing = Str(); let text = Str(); text.$set(fmt({ branch: flag ? "a" : "b", answer: judge(`question ${fmt(missing)}`) })); }',
+    );
+    const analysis = analyzeDocument(document);
+    expect(analysis.lintIssues).toContainEqual(
+      expect.objectContaining({ code: "bare-cell-boolean" }),
+    );
+    expect(
+      analysis.lintIssues.filter(
+        (issue) => issue.code === "read-without-assignment",
+      ),
+    ).toHaveLength(2);
+    const ordered = analyzeDocument(
+      parse(
+        '"arc"; function Main() { let text = Str(); $instruct(`${fmt(text)}`); text.$set("later"); }',
+      ),
+    );
+    expect(ordered.lintIssues).toContainEqual(
+      expect.objectContaining({ code: "read-before-assignment" }),
+    );
+  });
+
+  it("fmt.analysis sees reads and nested host IDs below nested formatting", () => {
+    const document = parse(
+      '"arc"; import API from "host:api"; function Main() { let flag = Bool(); let text = Str(); text.$set(fmt(fmt({ x: fmt(API.value()), y: API.value() }))); $instruct(`${fmt(fmt(flag))}`); }',
+    );
+    const analysis = analyzeDocument(document);
+    expect(analysis.lintIssues).toContainEqual(
+      expect.objectContaining({ code: "read-without-assignment" }),
+    );
+    expect(validate(document)).toEqual([]);
+    const statement = document.roots[0]!.statements[0]!;
+    expect(statement).toMatchObject({
+      value: {
+        value: {
+          value: {
+            fields: { x: { value: { id: "body/0~0" } }, y: { id: "body/0~1" } },
+          },
+        },
+      },
+    });
+  });
+
   describe("cell.declaration-form", () => {
     it("accepts call-form declarations for every cell type", () => {
       const document = parse(`
@@ -57,19 +106,12 @@ function Main() {
       ]);
     });
 
-    it.each([
-      ["Enum", 'new Enum(["cold", "warm"])'],
-      ["Bool", "new Bool()"],
-      ["Str", "new Str()"],
-      ["RangedInt", "new RangedInt(1, 10)"],
-      ["Dialog.Cursor", "new Dialog.Cursor()"],
-      ["Artifact", 'new Artifact("research-log.md")'],
-    ])("rejects the former new %s declaration form", (_type, initializer) => {
+    it("rejects new expressions in cell declarations", () => {
       expect(() =>
         parse(`
 "arc";
 function Main() {
-  const value = ${initializer};
+  const value = new Bool();
 }
 `),
       ).toThrow(
@@ -82,7 +124,7 @@ function Main() {
         parse(`
 "arc";
 function Main() {
-  let ready = Bool(), legacy = new Bool();
+  let ready = Bool(), other = new Bool();
 }
 `),
       ).toThrow(
@@ -2879,7 +2921,7 @@ function Main() {
     it("rejects a bare element constructor, nesting, and extra arguments in Array()", () => {
       expect(() =>
         parse(`"arc";\nfunction Main() { let findings = Array(Str); }`),
-      ).toThrow(/element must be a constructed scalar cell/);
+      ).toThrow(/element must be a constructed declaration/);
       expect(() =>
         parse(`"arc";\nfunction Main() { let grid = Array(Array(Str())); }`),
       ).toThrow(/cannot nest arrays/);
@@ -3516,12 +3558,12 @@ function Main() {
       [
         "an Artifact field",
         "Struct({ file: Artifact() })",
-        /request\.file must be an observable scalar/,
+        /request\.file must be a scalar, Union, observable Array, or Struct constructor/,
       ],
       [
         "a Dialog.Cursor field",
         "Struct({ at: Dialog.Cursor() })",
-        /request\.at must be an observable scalar/,
+        /request\.at must be a scalar, Union, observable Array, or Struct constructor/,
       ],
       [
         "an Artifact-array field",
@@ -4418,5 +4460,196 @@ function Main() {
         /Invalid persisted traversal state/,
       );
     });
+  });
+});
+
+describe("Union cells and observation", () => {
+  function unionRun(body: string) {
+    const source = "union-cells";
+    const runtime = new Runtime()
+      .add(
+        source,
+        parse(`"arc"; function Main() { ${body} $instruct(\`done\`); }`),
+      )
+      .init();
+    const seeded = runtime.newTraversal(arc(source, "Main"));
+    seeded.phase = "entered";
+    return { runtime, seeded };
+  }
+
+  it("union.cells replace members unset and admit one-time writes by the current value", () => {
+    const { runtime, seeded } = unionRun(`
+      let choice = Union([Num(), Enum(["none"])]); let number = Num(); let text = Str(); let unset = Bool();
+      choice.$set(9); number.$set(choice); choice.$set("none"); text.$set(choice); choice.$unset(); unset.$set(choice.isUnset()); choice.$set(10);
+    `);
+    expect(
+      rootTraversal(startRun(runtime, [seeded], EMPTY_DIALOG)).cells,
+    ).toMatchObject({ choice: 10, number: 9, text: "none", unset: true });
+    const invalid = unionRun(
+      `let choice = Union([Num(), Enum(["none"])]); let number = Num(); choice.$set("none"); number.$set(choice);`,
+    );
+    invalid.seeded.cells.number = 7;
+    const terminal = startTerminal(
+      invalid.runtime,
+      [invalid.seeded],
+      EMPTY_DIALOG,
+    );
+    expect(rootTraversal(terminal).cells.number).toBe(7);
+    expect(terminal.issues.length).toBeGreaterThan(0);
+  });
+
+  it("union.cells preserve fixed container siblings and reject failed targets before evaluating the RHS", () => {
+    const { runtime, seeded } = unionRun(`
+      let record = Struct({ hour: Union([Num(), Str()]), sibling: Bool() });
+      let list = Array(Union([Num(), Str()])); let length = Num();
+      record.$set({ hour: 9, sibling: true }); record.hour.$set("none");
+      list.$set([9, "none"]); list[0].$set("changed"); length.$set(list.length);
+    `);
+    expect(
+      rootTraversal(startRun(runtime, [seeded], EMPTY_DIALOG)).cells,
+    ).toMatchObject({
+      record: { hour: "none", sibling: true },
+      list: ["changed", "none"],
+      length: 2,
+    });
+    const invalid = unionRun(
+      `let record = Struct({ hour: Union([Bool(), Num()]) }); record.hour.$set(judge(\`should not run\`));`,
+    );
+    const terminal = startTerminal(
+      invalid.runtime,
+      [invalid.seeded],
+      EMPTY_DIALOG,
+    );
+    expect(terminal.issues).toContainEqual(
+      expect.objectContaining({ reasonCode: "unset-value" }),
+    );
+    expect("judgments" in terminal).toBe(false);
+  });
+
+  it("union.observation uses one question and admits later refined alternatives without changing writes", () => {
+    const { runtime, seeded } = unionRun(`
+      let choice = Union([
+        RangedInt(1, 5),
+        Num({ observeAs: { kind: "number", min: 10, max: 20 } }),
+        Enum(["none"])
+      ], { observing: "choice" });
+      choice.$set(50); $observe(choice, "override");
+    `);
+    const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+    const observation = singleObservations(first)[0]!;
+    expect(observation).toMatchObject({
+      question: "override",
+      currentValue: 50,
+      meta: {
+        type: "union",
+        members: [
+          { type: "rangedInt", min: 1, max: 5 },
+          { type: "number", min: 10, max: 20 },
+          { type: "enum", values: ["none"] },
+        ],
+      },
+    });
+    const rejected = progressBrief(runtime, first, {
+      move: "proceed",
+      observations: { [observation.id]: { status: "resolved", value: 7 } },
+    });
+    expect(rootTraversal(rejected).cells.choice).toBe(50);
+    expect(rejected.observations).toHaveLength(1);
+    const accepted = progressBrief(runtime, rejected, {
+      move: "proceed",
+      observations: { [observation.id]: { status: "resolved", value: 12.5 } },
+    });
+    expect(rootTraversal(accepted).cells.choice).toBe(12.5);
+    expect(accepted.observations).toHaveLength(0);
+  });
+
+  it("union.observation reports the fault of the only member with the value's carrier type", () => {
+    const { runtime, seeded } = unionRun(`
+      let choice = Union([RangedInt(1, 5), Enum(["none"])], { observing: "choice" });
+      $observe(choice);
+    `);
+    const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+    const id = first.observations[0]!.id;
+    const reasonFor = (value: number | boolean) =>
+      progressBrief(runtime, first, {
+        move: "proceed",
+        observations: { [id]: { status: "resolved", value } },
+      }).issues[0];
+    expect(reasonFor(9)).toMatchObject({ reasonCode: "observation-range" });
+    expect(reasonFor(true)).toMatchObject({ reasonCode: "observation-type" });
+  });
+
+  it("union.observation unknown preserves values and observe-or-ask keeps waiting for an explicit answer", () => {
+    for (const action of ["$observe", "$observeOrAsk"]) {
+      const { runtime, seeded } = unionRun(
+        `let choice = Union([Num(), Enum(["none"])]); choice.$set(9); ${action}(choice);`,
+      );
+      const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const next = progressBrief(runtime, first, {
+        move: "proceed",
+        observations: { [first.observations[0]!.id]: { status: "unknown" } },
+      });
+      expect(rootTraversal(next).cells.choice).toBe(9);
+      expect(next.observations).toHaveLength(action === "$observe" ? 0 : 1);
+      if (action === "$observeOrAsk") {
+        const accepted = progressBrief(runtime, next, {
+          move: "proceed",
+          observations: {
+            [next.observations[0]!.id]: { status: "resolved", value: "none" },
+          },
+        });
+        expect(rootTraversal(accepted).cells.choice).toBe("none");
+      }
+    }
+  });
+
+  it("union.observation groups remain atomic across unknown and inadmissible complete-container outcomes", () => {
+    const { runtime, seeded } = unionRun(`
+      let choice = Union([Num(), Enum(["none"])]);
+      let record = Struct({ hours: Array(Union([Num(), Enum(["none"])])) });
+      choice.$set(9); record.$set({ hours: [9] }); $observeOrAsk({ choice, record });
+    `);
+    let brief = startRun(runtime, [seeded], EMPTY_DIALOG);
+    const group = brief.observations[0]!;
+    expect(group.kind).toBe("observation-group");
+    const outcomes: ObservationReport[] = [
+      { status: "unknown" },
+      { status: "resolved", value: { hours: [true] } },
+      { status: "resolved", value: {} },
+    ];
+    for (const record of outcomes) {
+      brief = progressBrief(runtime, brief, {
+        move: "proceed",
+        observations: {
+          [group.id]: {
+            fields: {
+              choice: { status: "resolved", value: "none" },
+              record,
+            },
+          },
+        },
+      });
+      expect(rootTraversal(brief).cells).toMatchObject({
+        choice: 9,
+        record: { hours: [9] },
+      });
+      expect(brief.observations).toHaveLength(1);
+    }
+    const accepted = progressBrief(runtime, brief, {
+      move: "proceed",
+      observations: {
+        [group.id]: {
+          fields: {
+            choice: { status: "resolved", value: "none" },
+            record: { status: "resolved", value: { hours: [9, "none"] } },
+          },
+        },
+      },
+    });
+    expect(rootTraversal(accepted).cells).toMatchObject({
+      choice: "none",
+      record: { hours: [9, "none"] },
+    });
+    expect(accepted.observations).toHaveLength(0);
   });
 });

@@ -23,6 +23,49 @@ import {
 } from "./helpers.js";
 
 describe("Arc entry and terminal action output", () => {
+  it("union.persistence owns declaration order and validates root arguments restored cells and channels", () => {
+    const document =
+      parse(`"arc"; function Main(args = { hour: Union([Num(), Enum(["none"])]) }) {
+      let choice = Union([Enum(["warm", "cold"]), Str()]);
+      let result = Bool();
+      choice.$set("warm"); result.$set(choice < "cold");
+      $instruct(\`Hour \${args.hour}; ordered \${result}\`);
+    }`);
+    const runtime = new Runtime().add("union-entry", document).init();
+    const declaration = document.roots[0]!.cells[0]!;
+    if (declaration.type !== "union") throw new Error("Expected Union");
+    declaration.members.reverse();
+    const reference = arc("union-entry", "Main");
+    for (const hour of [9, "none"]) {
+      const first = actionProgress(
+        runtime.enterArc(reference, EMPTY_DIALOG, { args: { hour } }),
+      );
+      expect(first.instructions[0]?.text).toBe(`Hour ${hour}; ordered true`);
+      const snapshot = JSON.parse(
+        JSON.stringify(first.traversals),
+      ) as ArcTraversalSet;
+      const resumed = actionProgress(runtime.start(snapshot, EMPTY_DIALOG));
+      expect(resumed.instructions).toEqual(first.instructions);
+      snapshot[0]!.cells.choice = false;
+      expect(() => runtime.start(snapshot, EMPTY_DIALOG)).toThrow(
+        /union guarantee/,
+      );
+    }
+    expect(() =>
+      runtime.enterArc(reference, EMPTY_DIALOG, { args: { hour: false } }),
+    ).toThrow();
+    const first = actionProgress(
+      runtime.enterArc(reference, EMPTY_DIALOG, { args: { hour: "none" } }),
+    );
+    const invalid = JSON.parse(
+      JSON.stringify(first.traversals),
+    ) as ArcTraversalSet;
+    invalid[0]!.enterChannels.args.hour = { kind: "value", value: false };
+    expect(() => runtime.start(invalid, EMPTY_DIALOG)).toThrow(
+      /union guarantee/,
+    );
+  });
+
   it("proto.arc-entry bypasses trigger consultation and activates only the requested Arc", () => {
     const runtime = new Runtime()
       .add(

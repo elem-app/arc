@@ -1,5 +1,6 @@
 import type * as acorn from "acorn";
 
+import { validateFmtConfig } from "../spec/fmt.js";
 import { isHostStructFieldName } from "../spec/host-parameters.js";
 import { isStructFieldName } from "../spec/struct.js";
 import {
@@ -12,6 +13,7 @@ import {
   type ComparisonOperator,
   type FieldReceiver,
   type FieldReference,
+  type FmtConfig,
   type HostCallArgument,
   type LocalExpression,
   type NodeSignature,
@@ -22,7 +24,7 @@ import {
   type TemplateStringPart,
   type ValueExpression,
   type ValueStringPart,
-} from "../types/parser.js";
+} from "../types/ir.js";
 import {
   fieldSpecAt,
   type ArrayElementSpec,
@@ -30,8 +32,10 @@ import {
   type ChannelSpec,
   type ObservableFieldSpec,
 } from "../types/spec.js";
-import { classifyArtifactPath } from "../types/value.js";
-import { describeArtifactPathIssue } from "../value-utils.js";
+import {
+  classifyArtifactPath,
+  describeArtifactPathIssue,
+} from "../types/value.js";
 import { parseTarget, type TargetParseContext } from "./targets.js";
 
 export type ExpressionParseContext = {
@@ -808,6 +812,26 @@ export function parseExpression(
   }
 
   if (node.type === "CallExpression") {
+    if (node.callee.type === "Identifier" && node.callee.name === "fmt") {
+      const value = node.arguments[0];
+      if (
+        !value ||
+        value.type === "SpreadElement" ||
+        node.arguments.length > 2
+      ) {
+        throw Object.assign(
+          new Error(
+            "Invalid fmt arguments: expected a value and an optional configuration object",
+          ),
+          { code: "INVALID_FMT_ARGUMENTS", loc: locOf(node) },
+        );
+      }
+      return {
+        kind: "fmt",
+        value: parseExpression(value, availableHostModules, briefable, context),
+        config: parseFmtConfig(node),
+      };
+    }
     if (node.callee.type === "Identifier" && node.callee.name === "Artifact") {
       return parseArtifactConstructCall(
         node,
@@ -1128,6 +1152,53 @@ function isDeflectionEscapedCall(node: acorn.CallExpression): boolean {
   );
 }
 
+function parseFmtConfig(call: acorn.CallExpression): FmtConfig {
+  const invalid = (detail: string): never => {
+    throw Object.assign(new Error(`Invalid fmt configuration: ${detail}`), {
+      code: "INVALID_FMT_CONFIG",
+      loc: locOf(call),
+    });
+  };
+  if (call.arguments.length === 1) return {};
+  const argument = call.arguments[1];
+  if (!argument || argument.type !== "ObjectExpression")
+    return invalid("expected a static object literal");
+  const read = (object: acorn.ObjectExpression): Record<string, unknown> => {
+    const result: Record<string, unknown> = Object.create(null);
+    for (const property of object.properties) {
+      if (
+        property.type !== "Property" ||
+        property.computed ||
+        property.method ||
+        property.shorthand ||
+        property.kind !== "init"
+      )
+        return invalid(
+          "settings must be explicit non-computed data properties",
+        );
+      const key =
+        property.key.type === "Identifier"
+          ? property.key.name
+          : property.key.type === "Literal" &&
+              typeof property.key.value === "string"
+            ? property.key.value
+            : undefined;
+      if (key === undefined || Object.hasOwn(result, key))
+        return invalid("invalid or duplicate setting name");
+      const value = property.value;
+      if (value.type === "ObjectExpression") result[key] = read(value);
+      else if (value.type === "Literal" && typeof value.value === "string")
+        result[key] = value.value;
+      else return invalid("setting values must be string or object literals");
+    }
+    return result;
+  };
+  const config = read(argument);
+  const issue = validateFmtConfig(config);
+  if (issue) return invalid(`${issue.detail} at ${issue.path}`);
+  return config as FmtConfig;
+}
+
 export function parseHostCallTarget(
   expression: acorn.Expression,
   availableHostModules: ReadonlyMap<string, string>,
@@ -1252,11 +1323,6 @@ function parseDialogTurnsSinceCall(
     throw new Error("Unsupported cursor turn-difference method");
   }
   const receiverNode = (callee as acorn.MemberExpression).object;
-  if (receiverNode.type === "Identifier" && receiverNode.name === "Dialog") {
-    throw new Error(
-      `Dialog.${operation}() was replaced by cursor methods; call ${operation}() on a cursor value, e.g. Dialog.cursor.${operation}(startedAt)`,
-    );
-  }
   if (node.arguments.length !== 1) {
     throw new Error(`.${operation}() accepts exactly one cursor`);
   }
@@ -1375,6 +1441,8 @@ export function containsBriefableExpression(
   expression: ValueExpression,
 ): boolean {
   switch (expression.kind) {
+    case "fmt":
+      return containsBriefableExpression(expression.value);
     case "judge":
     case "host-call":
       return true;

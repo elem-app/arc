@@ -21,47 +21,49 @@ import type {
   SetSpanAction,
   Statement,
   TriggerStatement,
-} from "../types/parser.js";
-import { mapResultsCell, mapResultsLabel } from "../types/parser.js";
-import type {
-  ActionState,
-  ArcRef,
-  ArcTraversal,
-  BriefId,
-  DeflectionContext,
-  EnterChannelLink,
-  InterruptionContext,
-  MapActionState,
-  NodeRef,
-  NodeState,
-  PinTape,
-  SegId,
-  StateSnapshot,
-  Traversal,
-} from "../types/runtime.js";
+} from "../types/ir.js";
+import { mapResultsCell, mapResultsLabel } from "../types/ir.js";
 import {
   catchSegKey,
   hookSegKey,
   invokeSegKey,
+  isArcRef,
+  isArcTraversal,
+  isEnteredTraversal,
+  isResolvedActionState,
+  isSuspendedArcTraversal,
   mapMemberSegKey,
   nodeSegKey,
   qualifiedBriefSite,
+  toNodeRef,
+  toNodeRefParts,
+  type ActionState,
+  type ArcRef,
+  type ArcTraversal,
+  type BriefId,
+  type DeflectionContext,
+  type EnterChannelLink,
+  type InterruptionContext,
+  type MapActionState,
+  type NodeRef,
+  type NodeState,
+  type PinTape,
+  type SegId,
+  type StateSnapshot,
+  type Traversal,
 } from "../types/runtime.js";
 import type { ArrayElementSpec } from "../types/spec.js";
 import {
+  cloneWithCanonicalNumbers,
+  firstNonFiniteNumberPath,
+  mergeAndClonePayload,
   type ArrayElementValue,
   type ArrayValue,
   type CellValue,
   type PayloadValue,
 } from "../types/value.js";
-import {
-  cloneWithCanonicalNumbers,
-  firstNonFiniteNumberPath,
-  mergeAndClonePayload,
-} from "../value-utils.js";
 import { resolveReturnChannelBinding } from "./enter-channels.js";
 import {
-  type ActionOutcome,
   assertAssignableValue,
   evaluateValueExpression,
   findCellOwner,
@@ -75,6 +77,7 @@ import {
   truthy,
   writeOwnedCellPath,
   writeOwnedCellValue,
+  type ActionOutcome,
 } from "./evaluate.js";
 import {
   evaluatorNarrowScope,
@@ -97,18 +100,18 @@ import {
   formatRef,
   getEntryForRef,
   getNodeForRef,
-  isArcRef,
-  isArcTraversal,
   resolveLexicalRef,
   rootRefOf,
   toAnonymousCopyRef,
-  toNodeRef,
-  toNodeRefParts,
   traversalToNodeRef,
 } from "./refs.js";
 import { runtimeError } from "./report-validation.js";
 import { captureReadSet, readSetRewalkStep } from "./rewalk.js";
 import {
+  blockSeg,
+  blockTraversal,
+  requestDeflection,
+  runSeg,
   type BranchResult,
   type IfLike,
   type LeafStep,
@@ -116,14 +119,8 @@ import {
   type SegFrame,
   type SegHooks,
   type SegOutcome,
-  blockSeg,
-  blockTraversal,
-  requestDeflection,
-  runSeg,
 } from "./seg.js";
 import {
-  type Accumulator,
-  type EnterTarget,
   actionPreSnapshot,
   briefSiteQualifiers,
   canBatchInstruction,
@@ -146,10 +143,7 @@ import {
   getMapArena,
   hasPendingTransitionLatch,
   instructionBatchSignature,
-  isEnteredTraversal,
   isInstructionBatchActive,
-  isResolvedActionState,
-  isSuspendedArcTraversal,
   latchEnteredTransition,
   latchExitedTransition,
   makeHostCallId,
@@ -164,6 +158,8 @@ import {
   selectActionRootTraversal,
   setActiveTraversal,
   stampEnteredBy,
+  type Accumulator,
+  type ResolvedEnterTarget,
 } from "./state.js";
 
 type TerminalTraversalState = Extract<NodeState, "covered" | "skipped">;
@@ -1524,7 +1520,7 @@ function runEnterIteration(
   callerTraversal: Traversal,
   callerNode: Node,
   statement: Extract<ActionStatement, { kind: "enter-node" | "enter-loop" }>,
-  target: EnterTarget,
+  target: ResolvedEnterTarget,
   accum: Accumulator,
 ): EnterActionOutcome {
   const callerRef = traversalToNodeRef(callerTraversal);
@@ -1610,7 +1606,7 @@ function latchEnterTransition(
 
 function findExistingEnterTarget(
   callerTraversal: Traversal,
-  target: EnterTarget,
+  target: ResolvedEnterTarget,
   accum: Accumulator,
 ): Traversal | undefined {
   if (target.kind === "anonymous-copy") {
@@ -2703,7 +2699,7 @@ function resolveEnterTarget(
   traversal: Traversal,
   node: Node,
   statement: Extract<ActionStatement, { kind: "enter-node" | "enter-loop" }>,
-): EnterTarget | undefined {
+): ResolvedEnterTarget | undefined {
   const ownerEntry =
     getEntryForRef(accum.entries, traversal.ref) ?? accum.entry;
 

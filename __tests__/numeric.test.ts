@@ -341,17 +341,7 @@ function Main() {
       ).toBe(Number.POSITIVE_INFINITY);
     });
 
-    it("rejects legacy numeric specs and malformed observeAs in public IR", () => {
-      const legacy = parse(`"arc"; function Main() { let n = Num(); }`);
-      Object.assign(legacy.roots[0]!.cells[0]!, {
-        type: "rangedInt",
-        min: 0,
-        max: 1,
-      });
-      expect(validate(legacy)).toContainEqual(
-        expect.objectContaining({ code: "NON_CANONICAL_NUMERIC_SPEC" }),
-      );
-
+    it("rejects malformed observeAs in public IR", () => {
       const malformed = parse(`"arc"; function Main() { let n = Num(); }`);
       Object.assign(malformed.roots[0]!.cells[0]!, {
         observeAs: { kind: "integer", min: 0.5, extra: true },

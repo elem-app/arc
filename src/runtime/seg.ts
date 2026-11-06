@@ -1,4 +1,4 @@
-import type { ElementId, Node, ValueExpression } from "../types/parser.js";
+import type { ElementId, Node, ValueExpression } from "../types/ir.js";
 import type {
   DeflectionContext,
   InterruptionContext,

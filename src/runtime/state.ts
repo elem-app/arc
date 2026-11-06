@@ -1,3 +1,4 @@
+import { normalizeFmtConfig } from "../spec/fmt.js";
 import type {
   ActionBrief,
   HostCallBrief,
@@ -9,10 +10,12 @@ import type {
   ObservationGroupReport,
   ObservationMeta,
   ObservationReport,
+  RuntimeIssue,
   ScalarObservationMeta,
   StructObservationMeta,
   TriggerBrief,
   TriggerReport,
+  UnionObservationMeta,
 } from "../types/host-interaction.js";
 import type {
   ActionStatement,
@@ -38,48 +41,48 @@ import type {
   TriggerStatement,
   UnsetAction,
   ValueExpression,
-} from "../types/parser.js";
-import type {
-  ActionState,
-  ActionStateOf,
-  ArcRef,
-  ArcTraversal,
-  ArcTraversalSet,
-  BriefId,
-  BriefSiteQualifier,
-  EnterChannelLink,
-  EnterChannelState,
-  MapActionState,
-  NodeFrame,
-  NodeRef,
-  NodeState,
-  NodeTraversal,
-  PendingActionExtras,
-  PinTape,
-  RuntimeIssue,
-  SegId,
-  StateSnapshot,
-  TransitionStretch,
-  Traversal,
+} from "../types/ir.js";
+import {
+  isArcRef,
+  isArcTraversal,
+  isTerminalNodeTraversal,
+  mapMemberSegKey,
+  type ActionState,
+  type ActionStateOf,
+  type ArcRef,
+  type ArcTraversal,
+  type ArcTraversalSet,
+  type BriefId,
+  type BriefSiteQualifier,
+  type EnterChannelLink,
+  type EnterChannelState,
+  type MapActionState,
+  type NodeFrame,
+  type NodeRef,
+  type NodeState,
+  type NodeTraversal,
+  type PendingActionExtras,
+  type PinTape,
+  type SegId,
+  type StateSnapshot,
+  type TransitionStretch,
+  type Traversal,
 } from "../types/runtime.js";
-import { mapMemberSegKey } from "../types/runtime.js";
 import type { ArrayElementSpec, HostModuleSpec } from "../types/spec.js";
-import type {
-  ArrayElementValue,
-  ArrayValue,
-  CellValue,
-  Dialog,
-  DialogCursor,
-  ObservedValue,
-  PayloadValue,
-  SemanticText,
-} from "../types/value.js";
 import {
   clonePayloadValue,
   cloneWithCanonicalNumbers,
   firstNonFiniteNumberPath,
   mergeAndClonePayload,
-} from "../value-utils.js";
+  type ArrayElementValue,
+  type ArrayValue,
+  type CellValue,
+  type Dialog,
+  type DialogCursor,
+  type ObservedValue,
+  type PayloadValue,
+  type SemanticText,
+} from "../types/value.js";
 import {
   clonePinTapes,
   dropAllPinTapes,
@@ -90,8 +93,6 @@ import {
   arcToNodeRef,
   findTraversalInSet,
   formatRef,
-  isArcRef,
-  isArcTraversal,
   lexicalParentRef,
   traversalToNodeRef,
 } from "./refs.js";
@@ -117,7 +118,7 @@ export type RegistryEntry = {
  * root of an imported arc; an `anonymous-copy` target is a blank copy keyed to
  * the enter statement.
  */
-export type EnterTarget =
+export type ResolvedEnterTarget =
   | { kind: "owned"; ref: NodeRef; node: Node }
   | { kind: "referenced"; ref: ArcRef; entry: RegistryEntry }
   | { kind: "anonymous-copy"; ref: NodeRef; node: Node };
@@ -603,25 +604,6 @@ export function payloadValuesEqual(a: unknown, b: unknown): boolean {
   return false;
 }
 
-export function isStopped(traversal: ArcTraversal): boolean {
-  return (
-    traversal.phase === "completed" ||
-    traversal.phase === "suspended" ||
-    traversal.phase === "poisoned"
-  );
-}
-
-export function isEnteredTraversal(traversal: Traversal): boolean {
-  return isArcTraversal(traversal)
-    ? traversal.phase === "entered" &&
-        (traversal.state === undefined || traversal.state === "interrupted")
-    : traversal.state === undefined || traversal.state === "interrupted";
-}
-
-export function isSuspendedArcTraversal(traversal: Traversal): boolean {
-  return isArcTraversal(traversal) && traversal.phase === "suspended";
-}
-
 export function selectActionRootTraversal(
   traversals: ArcTraversalSet,
   preferredRoot?: ArcRef,
@@ -734,7 +716,17 @@ function cloneActionState(state: ActionState): ActionState {
   }
 }
 
-/** Clones a scalar shape, copying the member list an `enum` carries. */
+/** Clones a union's ordered member constraints. */
+function cloneUnionObservationMeta(
+  spec: UnionObservationMeta,
+): UnionObservationMeta {
+  return {
+    type: "union",
+    members: spec.members.map(cloneScalarObservationMeta),
+  };
+}
+
+/** Clones a scalar shape, copying the member list an Enum carries. */
 function cloneScalarObservationMeta(
   spec: ScalarObservationMeta,
 ): ScalarObservationMeta {
@@ -756,16 +748,20 @@ function cloneScalarObservationMeta(
   }
 }
 
-/** Clones observation value metadata, recursing through Struct fields. */
+/** Clones observation value metadata, recursing through struct fields. */
 function cloneObservationMeta(meta: ObservationMeta): ObservationMeta {
   switch (meta.type) {
+    case "union":
+      return cloneUnionObservationMeta(meta);
     case "array":
       return {
         type: "array",
         element:
           meta.element.type === "struct"
             ? cloneStructObservationMeta(meta.element)
-            : cloneScalarObservationMeta(meta.element),
+            : meta.element.type === "union"
+              ? cloneUnionObservationMeta(meta.element)
+              : cloneScalarObservationMeta(meta.element),
       };
     case "struct":
       return cloneStructObservationMeta(meta);
@@ -800,14 +796,14 @@ function cloneObservedValue(
     : (clonePayloadValue(value) as ObservedValue);
 }
 
-/** Deep-clones an array, slot, or Struct field reference. */
+/** Deep-clones an array, slot, or struct field reference. */
 function cloneArrayReference(reference: ArrayReference): ArrayReference {
   return reference.kind === "field"
     ? cloneFieldReference(reference)
     : { ...reference };
 }
 
-/** Deep-clones a Struct field reference. */
+/** Deep-clones a struct field reference. */
 function cloneFieldReference(reference: FieldReference): FieldReference {
   return {
     kind: "field",
@@ -830,7 +826,7 @@ function cloneArrayElementRead(read: ArrayElementRead): ArrayElementRead {
   };
 }
 
-/** Normalized comparison form of an array, slot, or Struct field reference. */
+/** Normalized comparison form of an array, slot, or struct field reference. */
 function normalizeArrayReference(reference: ArrayReference): unknown {
   if (reference.kind !== "field") return { ...reference };
   return {
@@ -893,27 +889,6 @@ export function cloneObservationGroupBrief(
       currentValue: cloneObservedValue(field.currentValue),
       meta: cloneObservationMeta(field.meta),
     })),
-  };
-}
-
-export function cloneRuntimeIssue(issue: RuntimeIssue): RuntimeIssue {
-  if (issue.kind === "invalid-item" || issue.kind === "invalid-report") {
-    return { ...issue };
-  }
-  if (issue.kind === "ambiguous-match") {
-    return {
-      ...issue,
-      matchableArcs: [...issue.matchableArcs],
-    };
-  }
-  return {
-    ...issue,
-    source: issue.source
-      ? {
-          start: { ...issue.source.start },
-          end: { ...issue.source.end },
-        }
-      : undefined,
   };
 }
 
@@ -1151,6 +1126,12 @@ export function cloneValueExpression(
           };
         }),
       };
+    case "fmt":
+      return {
+        kind: "fmt",
+        value: cloneValueExpression(expression.value),
+        config: normalizeFmtConfig(expression.config),
+      };
     case "artifact":
       return {
         kind: "artifact",
@@ -1277,15 +1258,6 @@ export function ensureEphemeralTraversal(
   );
 }
 
-/** Whether a prior copy ended its attempt and may be replaced by a fresh copy. */
-export function isTerminalNodeTraversal(traversal: NodeTraversal): boolean {
-  return (
-    traversal.state === "covered" ||
-    traversal.state === "skipped" ||
-    traversal.state === "deflected"
-  );
-}
-
 export function resolveTraversalForBrief(
   traversals: ArcTraversalSet,
   active: NodeRef,
@@ -1387,10 +1359,6 @@ export function clearActionState(
   actionId: ElementId,
 ): void {
   delete traversal.frame.actionStates[actionId];
-}
-
-export function isResolvedActionState(state: ActionState | undefined): boolean {
-  return state?.status === "resolved";
 }
 
 // `ActionState` is discriminated so read sites cannot reach continuation state
@@ -1907,6 +1875,12 @@ export function normalizeValueExpression(expression: ValueExpression): unknown {
             expression: normalizeValueExpression(part.expression),
           };
         }),
+      };
+    case "fmt":
+      return {
+        kind: "fmt",
+        value: normalizeValueExpression(expression.value),
+        config: normalizeFmtConfig(expression.config),
       };
     case "artifact":
       return {

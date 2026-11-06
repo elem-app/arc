@@ -9,9 +9,9 @@ import {
   type CoherenceJudgment,
 } from "../src/spec/resolution.js";
 import { validateSpec } from "../src/spec/validation.js";
-import { fieldDeclarationAt } from "../src/types/parser.js";
+import { fieldDeclarationAt } from "../src/types/ir.js";
 import { fieldSpecAt, type StructSpec } from "../src/types/spec.js";
-import { createArtifactValue } from "../src/value-utils.js";
+import { createArtifactValue } from "../src/types/value.js";
 
 const kind = (judgment: CoherenceJudgment) => judgment.kind;
 
@@ -507,5 +507,106 @@ function Main() {
       type: "string",
       observing: expect.anything(),
     });
+  });
+});
+
+describe("Union admission and compatibility", () => {
+  const preference = {
+    type: "union" as const,
+    members: [
+      { type: "number" as const },
+      { type: "enum" as const, values: ["none"] },
+    ],
+  };
+
+  it("union.spec reports the violation of the only member with the value's carrier type", () => {
+    const violationCode = (value: unknown) => {
+      const admission = admitValue(preference, value);
+      return admission.admitted ? undefined : admission.violation.code;
+    };
+    expect(violationCode(Infinity)).toBe("non-finite-number");
+    expect(violationCode("outside")).toBe("invalid-enum");
+    expect(violationCode(true)).toBe("invalid-union");
+  });
+
+  it("union.spec admits one member while preserving finite dense and complete-container requirements", () => {
+    expect(admitValue(preference, 9).admitted).toBe(true);
+    expect(admitValue(preference, "none").admitted).toBe(true);
+    for (const value of [
+      true,
+      null,
+      undefined,
+      Infinity,
+      NaN,
+      "outside",
+      {},
+      [],
+    ])
+      expect(admitValue(preference, value).admitted).toBe(false);
+    const array = { type: "array" as const, element: preference };
+    expect(admitValue(array, [9, "none"]).admitted).toBe(true);
+    expect(admitValue(array, [9, , "none"]).admitted).toBe(false);
+    const struct = { type: "struct" as const, fields: { hour: preference } };
+    expect(admitValue(struct, { hour: "none" }).admitted).toBe(true);
+    expect(admitValue(struct, {}).admitted).toBe(false);
+    expect(admitValue(struct, { hour: 9, extra: false }).admitted).toBe(false);
+  });
+
+  it("union.spec distinguishes value-dependent landing from complete directional binding coverage", () => {
+    expect(
+      kind(
+        judgeOneTimeLanding(
+          { kind: "site", spec: preference },
+          { type: "number" },
+        ),
+      ),
+    ).toBe("unknown");
+    expect(
+      kind(
+        judgeOneTimeLanding(
+          { kind: "site", spec: preference },
+          { type: "boolean" },
+        ),
+      ),
+    ).toBe("incompatible");
+    expect(
+      kind(
+        judgeOneTimeLanding(
+          { kind: "site", spec: { type: "number" } },
+          preference,
+        ),
+      ),
+    ).toBe("compatible");
+    expect(reusableSpecCompatible(preference, { type: "number" })).toBe(false);
+    expect(reusableSpecCompatible({ type: "number" }, preference)).toBe(true);
+    const split = {
+      type: "union" as const,
+      members: [
+        { type: "enum" as const, values: ["a"] },
+        { type: "enum" as const, values: ["b"] },
+      ],
+    };
+    expect(
+      reusableSpecCompatible({ type: "enum", values: ["a", "b"] }, split),
+    ).toBe(true);
+    expect(reusableSpecCompatible({ type: "string" }, split)).toBe(false);
+    const wrap = (element: typeof preference | { type: "number" }) => ({
+      type: "struct" as const,
+      fields: { hours: { type: "array" as const, element } },
+    });
+    expect(
+      reusableSpecCompatible(wrap({ type: "number" }), wrap(preference)),
+    ).toBe(true);
+    expect(
+      reusableSpecCompatible(wrap(preference), wrap({ type: "number" })),
+    ).toBe(false);
+    expect(
+      kind(
+        reduceAlternativeJudgments([
+          { kind: "unknown" },
+          { kind: "incompatible" },
+        ]),
+      ),
+    ).toBe("incompatible");
   });
 });

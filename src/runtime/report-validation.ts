@@ -10,21 +10,28 @@ import type {
   ObservationGroupReport,
   ObservationMeta,
   ObservationReport,
+  RuntimeIssue,
   ScalarObservationMeta,
   StructObservationMeta,
   TriggerReport,
+  UnionObservationMeta,
 } from "../types/host-interaction.js";
-import type { SourceRange } from "../types/parser.js";
-import type { ArcRef, NodeRef, RuntimeIssue } from "../types/runtime.js";
-import type { HostModuleSpec, ScalarValueSpec } from "../types/spec.js";
-import type { ObservedValue, PayloadValue } from "../types/value.js";
+import type { SourceRange } from "../types/ir.js";
+import type { ArcRef, NodeRef } from "../types/runtime.js";
+import {
+  isUnionMemberSpec,
+  type HostModuleSpec,
+  type ScalarSpec,
+} from "../types/spec.js";
 import {
   clonePayloadValue,
   cloneWithCanonicalNumbers,
   firstInvalidPayloadValue,
   firstNonFiniteNumberPath,
   isPlainRecord,
-} from "../value-utils.js";
+  type ObservedValue,
+  type PayloadValue,
+} from "../types/value.js";
 
 export type ReportValidation<TReport> = {
   accepted: TReport;
@@ -447,6 +454,22 @@ function observationValueFault(
   value: unknown,
 ): { code: string; detail: string } | undefined {
   switch (meta.type) {
+    case "union": {
+      const metaFault = unionObservationMetaFault(meta);
+      if (metaFault) return metaFault;
+      for (const member of meta.members) {
+        if (!observationValueFault(member, value)) return undefined;
+      }
+      const sameCarrier = meta.members.filter(
+        (member) => typeof value === scalarObservationCarrier(member),
+      );
+      return sameCarrier.length === 1
+        ? observationValueFault(sameCarrier[0]!, value)
+        : {
+            code: "observation-type",
+            detail: "value does not satisfy any Union observation member",
+          };
+    }
     case "struct":
       return structObservationValueFault(meta, value);
     case "array":
@@ -466,7 +489,10 @@ function arrayObservationValueFault(
   value: unknown,
 ): { code: string; detail: string } | undefined {
   if (meta.element.type !== "struct") {
-    const metaFault = scalarObservationMetaFault(meta.element);
+    const metaFault =
+      meta.element.type === "union"
+        ? unionObservationMetaFault(meta.element)
+        : scalarObservationMetaFault(meta.element);
     if (metaFault) return metaFault;
   }
   if (!Array.isArray(value)) {
@@ -476,6 +502,43 @@ function arrayObservationValueFault(
     const fault = observationValueFault(meta.element, entry);
     if (fault)
       return { code: fault.code, detail: `[${index}]: ${fault.detail}` };
+  }
+  return undefined;
+}
+
+function scalarObservationCarrier(meta: ScalarObservationMeta): string {
+  switch (meta.type) {
+    case "enum":
+      return "string";
+    case "rangedInt":
+      return "number";
+    default:
+      return meta.type;
+  }
+}
+
+/** Validates every scalar alternative, including when observing an empty list. */
+function unionObservationMetaFault(
+  meta: UnionObservationMeta,
+): { code: string; detail: string } | undefined {
+  if (!Array.isArray(meta.members) || meta.members.length < 2) {
+    return {
+      code: "observation-type",
+      detail: "Union metadata requires at least two members",
+    };
+  }
+  for (const member of meta.members) {
+    if (
+      !member ||
+      (!isUnionMemberSpec(member) && member.type !== "rangedInt")
+    ) {
+      return {
+        code: "observation-type",
+        detail: "Union observation members must be scalar",
+      };
+    }
+    const fault = scalarObservationMetaFault(member);
+    if (fault) return fault;
   }
   return undefined;
 }
@@ -494,9 +557,9 @@ function scalarObservationValueFault(
 }
 
 /**
- * A resolved Struct value must be a plain data record carrying every declared
+ * A resolved struct value must be a plain data record carrying every declared
  * field with a valid concrete value. An incomplete record, including `{}` for
- * a nonempty Struct, never stands in for unknown.
+ * a nonempty struct, never stands in for unknown.
  */
 function structObservationValueFault(
   meta: StructObservationMeta,
@@ -528,7 +591,7 @@ function structObservationValueFault(
   return undefined;
 }
 
-function scalarObservationSpec(meta: ScalarObservationMeta): ScalarValueSpec {
+function scalarObservationSpec(meta: ScalarObservationMeta): ScalarSpec {
   switch (meta.type) {
     case "boolean":
       return { type: "boolean" };

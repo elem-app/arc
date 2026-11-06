@@ -25,6 +25,8 @@ const reservedImportAliases = [
   "RangedInt",
   "State",
   "Str",
+  "Struct",
+  "Union",
   "args",
   "forgetful",
   "invoke",

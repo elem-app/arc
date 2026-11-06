@@ -49,6 +49,64 @@ function Main() {
 `;
 
 describe("pins", () => {
+  it("fmt.pins resumes nested formatting and preserves earlier reads across reconstruction", () => {
+    const body =
+      'let text = Str(); let suffix = Str(); suffix.$set("before"); text.$set(fmt(fmt({ label: fmt(suffix), value: API.value() }), { str: "json" })); $instruct(`${text}`);';
+    const source = "fmt-pin-reconstruction";
+    const document = parse(
+      `"arc"; import API from "host:api"; function Main() { ${body} }`,
+    );
+    const runtime = new Runtime().add(source, document).init();
+    const seeded = runtime.newTraversal(arc(source, "Main"));
+    seeded.phase = "entered";
+    const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+    expect(first.hostCalls).toHaveLength(1);
+    const snapshot = JSON.parse(
+      JSON.stringify(first.traversals),
+    ) as ArcTraversalSet;
+    snapshot[0]!.cells.suffix = "after";
+    const rebuilt = new Runtime().add(source, document).init();
+    const resumed = startRun(rebuilt, snapshot, EMPTY_DIALOG);
+    expect(resumed.hostCalls[0]!.id).toBe(first.hostCalls[0]!.id);
+    const next = progressBrief(rebuilt, resumed, {
+      move: "proceed",
+      hostCalls: {
+        [resumed.hostCalls[0]!.id]: { status: "resolved", value: 7 },
+      },
+    });
+    expect(next.instructions[0]?.text).toBe(
+      JSON.stringify('{"label":"before","value":7}'),
+    );
+    const secondSnapshot = JSON.parse(
+      JSON.stringify(next.traversals),
+    ) as ArcTraversalSet;
+    secondSnapshot[0]!.cells.suffix = "later";
+    const again = startRun(
+      new Runtime().add(source, document).init(),
+      secondSnapshot,
+      EMPTY_DIALOG,
+    );
+    expect(again.instructions[0]?.text).toBe(next.instructions[0]?.text);
+    expect(again.hostCalls).toHaveLength(0);
+  });
+
+  it("fmt.pins independent later formatting sees a subsequent write", () => {
+    const source = "fmt-independent-pins";
+    const document = parse(
+      '"arc"; function Main() { let item = Struct({ name: Str() }); item.$set({ name: "Ada" }); $instruct(`${fmt(item)}`); item.$set({ name: "Grace" }); $instruct(`${fmt(item)}`); }',
+    );
+    const runtime = new Runtime().add(source, document).init();
+    const seeded = runtime.newTraversal(arc(source, "Main"));
+    seeded.phase = "entered";
+    const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+    expect(first.instructions[0]?.text).toBe('{"name":"Ada"}');
+    const next = progressBrief(runtime, first, {
+      move: "proceed",
+      instructions: appliedInstructions(first),
+    });
+    expect(next.instructions[0]?.text).toBe('{"name":"Grace"}');
+  });
+
   describe("seg.pins", () => {
     it("artifact.construct blocks and resumes a nested host path exactly once", () => {
       const document = parse(`
@@ -1023,5 +1081,66 @@ function Open() {
         ),
       ).toEqual(["about music"]);
     });
+  });
+});
+
+describe("Union replay", () => {
+  it("union.pins rederives field and element precedence from replayed values after live cells change", () => {
+    for (const [index, [expression, hostValue]] of (
+      [
+        ["record.hour < Values.nextEnum()", "warm"],
+        ["items[0] < Values.nextEnum()", "warm"],
+        ["(true ? record.hour : items[0]) < Values.nextEnum()", "warm"],
+        ["[record.hour] == [Values.nextEnum()]", "cold"],
+      ] as Array<[string, string | string[]]>
+    ).entries()) {
+      const source = `union-pin-${index}`;
+      const document = parse(`
+        "arc"; import Values from "host:values";
+        function Main() {
+          let record = Struct({ hour: Union([Enum(["cold", "warm"]), Num()]) });
+          let items = Array(Union([Enum(["cold", "warm"]), Num()]));
+          let result = Bool();
+          record.$set({ hour: "cold" }); items.$set(["cold"]);
+          result.$set(${expression});
+          $instruct(\`done\`);
+        }
+      `);
+      const runtime = new Runtime().add(source, document).init();
+      const seeded = runtime.newTraversal(arc(source, "Main"));
+      seeded.phase = "entered";
+      const first = startRun(runtime, [seeded], EMPTY_DIALOG);
+      const snapshot = JSON.parse(
+        JSON.stringify(first.traversals),
+      ) as ArcTraversalSet;
+      snapshot[0]!.cells.record = { hour: 9 };
+      snapshot[0]!.cells.items = [9];
+      const rebuilt = new Runtime().add(source, document).init();
+      const pending = startRun(rebuilt, snapshot, EMPTY_DIALOG);
+      const result = progressBrief(rebuilt, pending, {
+        move: "proceed",
+        hostCalls: {
+          [pending.hostCalls[0]!.id]: { status: "resolved", value: hostValue },
+        },
+      });
+      expect(rootTraversal(result).cells.result).toBe(true);
+      expect(result.issues).toEqual([]);
+      const pins =
+        rootTraversal(result).frame.pinTapes[nodeSegKey("body")] ?? {};
+      for (const entry of Object.values(pins).flat()) {
+        expect(
+          Object.keys(entry).every((key) =>
+            [
+              "kind",
+              "resolved",
+              "subtreeSize",
+              "hasValue",
+              "value",
+              "briefId",
+            ].includes(key),
+          ),
+        ).toBe(true);
+      }
+    }
   });
 });

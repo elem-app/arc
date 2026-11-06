@@ -43,11 +43,11 @@ Arc passes arguments by position. Parameter names such as `name` and `artifact` 
 
 ## Arguments and returned values
 
-An argument can use any value marker in the reference below. Arrays, tuples, and Structs can nest recursively.
+An argument can use any value marker in the reference below. Arrays, tuples, and structs can nest recursively.
 
-An operation’s returned value can be declared with `hmd.Bool()`, `hmd.Str()`, `hmd.Enum(...)`, `hmd.Num()`, `hmd.Index()`, `hmd.Artifact()`, or `hmd.Dialog.Cursor()`.
+An operation’s returned value can be declared with `hmd.Bool()`, `hmd.Str()`, `hmd.Enum(...)`, `hmd.Num()`, `hmd.Union(...)`, `hmd.Index()`, `hmd.Artifact()`, or `hmd.Dialog.Cursor()`.
 
-An operation can also return a `hmd.Struct({...})` record, or a one-level array of booleans, strings, Enum members, finite numbers, Artifacts, or Struct records. A returned Struct's fields use `Bool`, `Str`, `Enum`, `Num`, a nested `Struct`, or a one-level array of any of these, and none is `Omittable`. For example:
+An operation can also return a `hmd.Struct({...})` record, or a one-level array of booleans, strings, Enum members, finite numbers, unions, Artifacts, or struct records. A returned struct's fields use `Bool`, `Str`, `Enum`, `Num`, `Union`, a nested `Struct`, or a one-level array of any of these, and none is `Omittable`. For example:
 
 ```js
 const storeModule = hmd.define({
@@ -68,6 +68,7 @@ An Arc caller can use an operation's returned value in an expression, such as `S
 | `hmd.Str()` | A plain string. |
 | `hmd.Enum(["a", "b"])` | One of the listed strings. The list must be nonempty and contain no duplicates. |
 | `hmd.Num()` | A finite number. |
+| `hmd.Union([markerA, markerB, ...])` | A scalar admitted by at least one member. Members are Bool, Str, Enum, or Num markers; at least two are required. |
 | `hmd.Index()` | A non-negative safe integer. |
 | `hmd.Artifact()` | An Artifact. |
 | `hmd.Dialog.Cursor()` | A dialog cursor. |
@@ -76,9 +77,22 @@ An Arc caller can use an operation's returned value in an expression, such as `S
 | `hmd.Struct({ field: marker })` | An object with the declared fields, each satisfying its corresponding marker. |
 | `hmd.SemanticText()` | Semantic text. |
 
+## Scalar alternatives with union
+
+`hmd.Union` declares a union with an ordered list of scalar member specs. It works for arguments, returned values, and scalar positions inside their containers:
+
+```js
+const preferencesModule = hmd.define({
+  choose: (hour = hmd.Union([hmd.Num(), hmd.Enum(["no_preference"])])) =>
+    hmd.Union([hmd.Num(), hmd.Enum(["no_preference"])]),
+});
+```
+
+The caller supplies a number or the explicit string `"no_preference"`; the host returns either ordinary value. Overlap and repeated alternatives are valid, and declaration order is preserved. Members form one flat list: nested unions, Index, containers, and other markers are rejected. `hmd.Omittable(hmd.Union(...))` separately permits absence of an argument or field.
+
 ## Omittable arguments and fields
 
-`hmd.Omittable(marker)` allows an argument or Struct field to be absent. Omitted arguments and fields remain absent; the host implementation determines any defaults. Supplied values must satisfy the wrapped marker; unset and null values are invalid.
+`hmd.Omittable(marker)` allows an argument or struct field to be absent. Omitted arguments and fields remain absent; the host implementation determines any defaults. Supplied values must satisfy the wrapped marker; unset and null values are invalid.
 
 For example, an operation can declare an omittable second argument:
 
@@ -91,11 +105,11 @@ const storeModule = hmd.define({
 
 Arc callers may write `Store.lookup("x")` or `Store.lookup("x", 10)`.
 
-Required arguments precede omittable arguments. A caller can omit any trailing portion of the omittable arguments, and an operation may make all its arguments omittable. Named Struct fields have no ordering requirement; omittable fields may appear anywhere in the declaration.
+Required arguments precede omittable arguments. A caller can omit any trailing portion of the omittable arguments, and an operation may make all its arguments omittable. Named struct fields have no ordering requirement; omittable fields may appear anywhere in the declaration.
 
-`Omittable` can wrap any value marker. It applies only to operation parameters and Struct fields; wrapping array elements, tuple positions, another `Omittable`, or an operation's returned value is invalid.
+`Omittable` can wrap any value marker. It applies only to operation parameters and struct fields; wrapping array elements, tuple positions, another `Omittable`, or an operation's returned value is invalid.
 
-## Object arguments with Struct
+## Object arguments with struct
 
 `hmd.Struct({...})` declares the fields an object argument accepts:
 
@@ -117,9 +131,9 @@ Arc callers must supply `title`. They may omit `limit`; when supplied, it must b
 { title: "Review", limit: 3 }
 ```
 
-Field order is irrelevant. `hmd.Struct({})` accepts an empty object; a Struct whose fields are all omittable also accepts an empty object.
+Field order is irrelevant. `hmd.Struct({})` accepts an empty object; a struct whose fields are all omittable also accepts an empty object.
 
-An omittable field can contain a nested Struct:
+An omittable field can contain a nested struct:
 
 ```js
 const recordsModule = hmd.define({
@@ -144,7 +158,7 @@ Field names must be nonempty and cannot be `__proto__`, `prototype`, or `constru
 
 ## Declaration errors and call validation
 
-`hmd.define()` rejects invalid declarations. Namespace and Struct field declaration objects must be plain objects, including objects with a null prototype. Their properties must be own enumerable data properties. Accessors, symbol properties, non-enumerable properties, custom prototypes, and cycles are invalid. Namespace and operation names must be nonempty and cannot begin with `$`.
+`hmd.define()` rejects invalid declarations. Namespace and struct field declaration objects must be plain objects, including objects with a null prototype. Their properties must be own enumerable data properties. Accessors, symbol properties, non-enumerable properties, custom prototypes, and cycles are invalid. Namespace and operation names must be nonempty and cannot begin with `$`.
 
 Operations must be synchronous functions that declare arguments and returned values through HMD markers. Async functions, Promise-returning declarations, invalid Enum lists, and unsupported uses of markers are rejected.
 

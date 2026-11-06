@@ -2,9 +2,10 @@ import type {
   HostOperationSpec,
   HostParameterSpec,
   HostParameterValueSpec,
+  ScalarSpec,
 } from "../types/spec.js";
 
-/** Field names admitted by host Struct declarations and authored objects. */
+/** Field names admitted by host struct declarations and authored objects. */
 export function isHostStructFieldName(name: string): boolean {
   return (
     name.length > 0 &&
@@ -45,12 +46,18 @@ export function hostParameterValueSpec(
 }
 
 /** Copies a validated parameter spec into independent ownership. */
+export function cloneParameterSpec(spec: ScalarSpec): ScalarSpec;
 export function cloneParameterSpec(
   spec: HostParameterValueSpec,
 ): HostParameterValueSpec;
 export function cloneParameterSpec(spec: HostParameterSpec): HostParameterSpec;
 export function cloneParameterSpec(spec: HostParameterSpec): HostParameterSpec {
   switch (spec.type) {
+    case "union":
+      return {
+        type: "union",
+        members: spec.members.map((member) => cloneParameterSpec(member)),
+      };
     case "omittable":
       return { type: "omittable", spec: cloneParameterSpec(spec.spec) };
     case "enum":

@@ -8,24 +8,23 @@ import type {
   SetAction,
   SetReturnAction,
   UnsetAction,
-} from "../types/parser.js";
-import type { Traversal } from "../types/runtime.js";
+} from "../types/ir.js";
+import { isResolvedActionState, type Traversal } from "../types/runtime.js";
 import {
-  type ActionOutcome,
   applyObserve,
   applyObserveGroup,
   applySet,
   applySetReturn,
   applyUnset,
+  type ActionOutcome,
 } from "./evaluate.js";
-import { type LeafStep, blockSeg, writeDiffStep } from "./seg.js";
+import { blockSeg, writeDiffStep, type LeafStep } from "./seg.js";
 import {
-  type Accumulator,
   getActionState,
   getEvaluatorActionState,
-  isResolvedActionState,
   markActionResolved,
   markEvaluatorActionResolved,
+  type Accumulator,
 } from "./state.js";
 
 /**

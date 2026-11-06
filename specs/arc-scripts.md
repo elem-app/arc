@@ -47,6 +47,33 @@ import Random from "host:rng";
 
 `Random` is a local name chosen by the script.
 
+## Execution Model
+
+Arc scripts are interpreted by the Arc runtime. The runtime handles control flow according to the action graph, and it works together with a supplied host which drives the runtime and handles semantic work or external effects.
+
+```text
+┌────────────┐                    ┌─────────┐                        ┌──────┐
+│            │                    │         │  ── delegates to ──▶   │      │
+│ Arc script │ ◀── interprets ──  │ Runtime │                        │ Host │
+│            │                    │         │  ◀──── drives ──────   │      │
+└────────────┘                    └─────────┘                        └──────┘
+```
+
+The runtime does not advance on its own like an event loop in a separate process or thread. A useful analogy is a kernel: The host drives runtime entry, the runtime interprets the graph and decides what work is now reachable and delegates some to the host. Delegated work later hands new facts back for the runtime to interpret and drives the runtime forward.
+
+A node's action graph, its executable logic, is the unit the runtime interprets. The runtime works through the graph until it reaches an action it cannot resolve itself, then delegates that action in one of two ways:
+
+- to the host, for actions whose outcome must be supplied externally;
+- to another node or arc's action graph, for `$enter(...)` and `$enterLoop(...)`.
+
+Delegated work produces inputs back to the runtime, such as a host report or an entered node's resulting state. The runtime interprets those inputs and decides whether the current action resolves normally.
+
+When the delegated action resolves, the runtime continues executing the action graph.
+
+Work delegated to the host is described in a **brief**, and the host answers with a report. One pass through the action graph is a **walk**. Resolved actions stay resolved, so a later walk does not repeat them.
+
+A **runtime error** **poisons** the traversal: the arc stops permanently, and the host receives the cause. A violation that can be found before the script runs is rejected at that point instead.
+
 ## Nodes
 
 A node (function) body contains four sections, in order:
@@ -87,7 +114,7 @@ Arc uses arrow functions for hooks and authored resolution logic. An arrow may u
 | `this.displayName` | string literal | Optional human-facing label. Presentation metadata only. |
 | `this.description` | string literal | Brief summary. |
 | `this.guidance` | string literal or template literal | Standing guidance carried on action-stage semantic work emitted by this node. |
-| `this.forgetfulEntry` | boolean literal | Default `false`. When `true`, each new entry is forgetful: it clears the prior outcome and action frame, so resolved-once actions run again. During the entry, resolved-once actions remain remembered normally. Cell values, child traversals, and canonical identity are preserved. This setting does not start a new entry when an ordinary canonical entry reaches an already-covered target. |
+| `this.forgetfulEntry` | boolean literal | Default `false`. When `true`, each new entry is forgetful; see [Targets](#targets). This setting does not start a new entry when an ordinary canonical entry reaches an already-covered target. |
 | `this.trigger` | arrow function | Trigger condition for dormant arcs. See [Trigger](#thistrigger). |
 | `this.deflectWhen` | string literal, template literal, or arrow function | Default deflection policy inherited by instruction actions in this node subtree. See [DeflectWhen](#thisdeflectwhen). |
 | `this.catchDeflection` | arrow function | Deflection interception hook for the current node. See [CatchDeflection](#thiscatchdeflection). |
@@ -114,7 +141,7 @@ Cells are a node's persistent typed state. Each cell is scoped to the node that 
 
 Inner values are written only through dedicated channels: `cell.$set(...)`, a resolved `$observe(...)` or `$observeOrAsk(...)` report, and `returns` committed by a covered `$enter(...)` (see [Control Transfer](#control-transfer)).
 
-`$set(...)` stores a deep copy of its value and keeps no connection to the cells that value was read from. After `people[0].$set(person)`, a later write to `person` or to `people[0]` changes only that target, and the same holds for a cell read inside a Struct or array literal, such as `person.$set({ name: nickname })`.
+`$set(...)` stores a deep copy of its value and keeps no connection to the cells that value was read from. After `people[0].$set(person)`, a later write to `person` or to `people[0]` changes only that target, and the same holds for a cell read inside a struct or array literal, such as `person.$set({ name: nickname })`.
 
 A cell starts _unset_ and stays so until a write action provides its inner value. An Artifact declaration with a path instead initializes on first entry. A cell becomes unset again when `cell.$unset()` resolves. Using a cell in a value position attempts its inner value: a set cell produces the inner value, while an unset cell resolves only where [Operators](#operators) define a result for an unset operand, and any other evaluation of it raises a runtime error. Member forms target the cell itself rather than its inner value and stay available while unset: `cell.isUnset()` reports whether the cell is unset, and `$set`, `$unset`, `observing`, and observation calls work the same way on set and unset cells.
 
@@ -154,10 +181,11 @@ let report = Artifact(`reports/${reportName}.md`);
 | `Str(config?)` | Arbitrary plain string value. |  |
 | `Num(config?)` | IEEE-754 number. |  |
 | `RangedInt(min, max, config?)` | Authoring shorthand for an integer-observed `Num`. | `min: safe integer, max: safe integer` |
+| `Union(members, config?)` | One value admitted by ordered member specs. See [unions](#unions). | `members: at least two constructed scalar specs` |
 | `Dialog.Cursor()` | Snapshot of a scoped dialog cursor. |  |
 | `Artifact(path?)` | Nominal host Artifact value, optionally initialized from a logical path. | `path?: string-valued expression` |
-| `Array(elementCell)` | Ordered list of one scalar, Struct, or Artifact element shape. See [Arrays](#arrays). | `elementCell: constructed scalar observable cell, Struct(...), or zero-argument Artifact()` |
-| `Struct(fields, config?)` | Record of named observable fields. See [Structs](#structs). | `fields: object literal of constructed observable cells` |
+| `Array(elementCell)` | Ordered list with a fixed scalar, union, struct, or Artifact element spec. See [Arrays](#arrays). | `elementCell: constructed scalar declaration, Union(...), Struct(...), or zero-argument Artifact()` |
+| `Struct(fields, config?)` | Record of named observable fields. See [structs](#structs). | `fields: object literal of constructed observable cells` |
 
 The optional `config` object supports `observing`, a string literal or template literal. `Num` additionally supports `observeAs`, which constrains values accepted from observation reports:
 
@@ -182,7 +210,7 @@ Bounds are inclusive, finite, and ordered. Integer-observation bounds must thems
 
 `RangedInt(min, max, config?)` is shorthand for `Num({ ...config, observeAs: { kind: "integer", min, max } })`. Its `min` and `max` must be ordered safe integers, and its config supports `observing` but not another `observeAs`. For example, a `let cell = RangedInt(1, 10)` observation must be an integer from 1 through 10, while `cell.$set(10.5)` and `cell.$set(20)` are valid direct writes.
 
-Only `Enum`, `Bool`, `Str`, `Num`, `RangedInt`, `Struct`, and arrays of scalar or Struct elements are observable. `$observe(...)` and `$observeOrAsk(...)` accept only these types, whether observed singly or in a group.
+Only `Enum`, `Bool`, `Str`, `Num`, `RangedInt`, `Union`, `Struct`, and arrays of scalar, union, or struct elements are observable. `$observe(...)` and `$observeOrAsk(...)` accept only these types, whether observed singly or in a group.
 
 Enum ordering comparisons use **ordinal position** within the declared values array. For `Enum(["cold", "lukewarm", "curious", "enthusiastic"])`, `interest >= "lukewarm"` is true when `interest` is `"lukewarm"` (index 1), `"curious"` (index 2), or `"enthusiastic"` (index 3). Equality and inequality compare the produced strings directly, so they do not require matching Enum declarations or membership of a literal operand.
 
@@ -194,13 +222,51 @@ Artifact construction snapshots its path. The constructor does not retain or sub
 
 Artifact values otherwise follow ordinary value-cell semantics and compare equal when their logical paths are equal. In a value-position template literal, an Artifact contributes its logical path as ordinary string text. In semantic text, it remains a structured Artifact reference for the host.
 
-The same `Artifact(path)` syntax constructs an Artifact value in an ordinary value position, such as `researchLog.$set(Artifact(linkedPath))` or ``researchLog.$set(Artifact(`archive/${slug}.md`))``. The path is required in a value position, and construction runs when the expression is reached. Any expression that resolves to a string is accepted; a statically known non-string path is rejected, while a dynamic producer such as a host call is checked at runtime. Briefable path work completes before Arc validates the resulting string and before the surrounding write or return can mutate its destination. `$enter(...).args` stays a channel-binding map, so an inline constructor must first be written to an Artifact cell before that cell is bound as an argument.
+The same `Artifact(path)` syntax constructs an Artifact value in an ordinary value position, such as `researchLog.$set(Artifact(linkedPath))` or ``researchLog.$set(Artifact(`archive/${slug}.md`))``. The path is required in a value position, and construction runs when the expression is reached. Any expression that resolves to a string is accepted, and a path known not to be a string is rejected. Host work in the path, such as a host call, completes before Arc validates the resulting string and before the surrounding write or return can mutate its destination. `$enter(...).args` stays a channel-binding map, so an inline constructor must first be written to an Artifact cell before that cell is bound as an argument.
 
-Arc statically judges each cell or return write from the producer evidence available at that site. A read from a cell or channel supplies its declared guarantee; literals retain their exact value; fixed operations supply their carrier or intrinsic provenance; arrays retain element evidence; a definitively declared host call supplies its result spec; and an environment-free host call supplies no source fact. A provably incompatible landing is rejected. A landing the rule cannot prove either way is deferred and still validated before mutation. Exact literals are checked against destination refinements immediately, so an undeclared string literal cannot land in an `Enum`; a general `Str` producer may reach that one-time landing only subject to runtime Enum admission. Reusable channel bindings are stricter and reject `Str` providers for `Enum` receivers because every future provider value must be safe. `Num` and `Index`, Artifact and Struct, cursor, boolean, and array relationships follow the same destination-directed rule rather than one global value-family test.
+Arc checks each cell and return write against its destination before the script runs. A write that can never succeed is rejected. A write that depends on the runtime value is checked before mutation. For example, a string literal outside an `Enum`'s values is rejected, while a `Str` cell can be written to an `Enum` cell when its value is a member at runtime.
+
+Channel bindings are stricter because they carry every future value: a `Str` cannot bind to an `Enum` channel.
+
+#### Unions
+
+`Union([SpecA(), SpecB(), ...], config?)` declares a union cell with at least two ordered member specs. Union is a distinct declaration kind alongside scalar, Array, and struct declarations. Members are constructed Bool, Str, Enum, Num, or RangedInt declarations. Authors write a flat member list; nested unions are rejected. Members follow their enclosing position's constructor rules and cannot be Index, Array, struct, Artifact, or Dialog.Cursor. A union starts unset; its members declare alternatives rather than independently initialized cells. The optional config contains `observing`.
+
+```js
+let meetingHour = Union([Num(), Enum(["no_preference"])], {
+  observing: `the user's preferred meeting hour, or an explicit lack of preference`,
+});
+let hours = Array(Union([Num(), Enum(["no_preference"])]));
+let request = Struct({ hour: Union([Num(), Enum(["no_preference"])]) });
+```
+
+A set union holds the concrete scalar admitted by at least one member. Overlapping, redundant, and shadowed members are valid. The **preceding spec** is the first admitting member in authored order. Each destination uses its own declaration. An operation follows that preceding spec without falling back to later members when it fails. Member order can affect Enum ordering, but the value carries no member index or tag. Struct and array schemas remain fixed when a union leaf changes value.
+
+One-time writes admit the actual value: a numeric `meetingHour` can be written to a Num destination, while `"no_preference"` cannot. A write that can never succeed is rejected before the script runs, and any other write is checked against the runtime value. Bindings require every provider value to fit the receiver. A union of Num and an Enum answer cannot provide a Num argument, but can receive a Num return. Receiver members may collectively cover an Enum provider. These rules recurse through fixed containers.
+
+Union observation asks for one value. Its question belongs to the whole union; member constructors cannot declare `observing`. Members may carry `observeAs`. A report is accepted when any member accepts it, including that member's `observeAs`. `observeAs` does not affect later writes or which member is the preceding spec. An explicit Enum answer is never inferred from an unknown outcome.
+
+Operations use each union operand's preceding spec. Equality compares values normally when their specs are compatible, including `Enum` and `Str`.
+
+`==` and `!=` also allow otherwise incompatible types when one operand has a union declaration that accepts both sides. A union operand is checked using its preceding spec; another typed operand is checked using its declared spec. The union must accept every value those specs allow. For a literal, it only needs to accept that literal's value. When these checks pass, the incompatible types compare unequal. For example, `meetingHour != "no_preference"` is true when `meetingHour` holds a number. The same comparison against a `Str` cell holding `"no_preference"` fails: `Str` allows strings outside the union. A `Num` cell is allowed because every number fits the union.
+
+Standalone `1 != ""` is incompatible because neither side declares a union. Sharing a member is also insufficient: a `Union([Num(), Bool()])` holding `9` cannot be compared with a `Union([Str(), Bool()])` holding `"text"`, because neither union accepts both selected types.
+
+These equality rules also apply to union fields and array elements; the surrounding structs and arrays must still meet their structural comparison rules. Unset operands follow the shared unset-comparison rule. Ordering requires compatible preceding specs and does not permit the cross-type comparisons described above.
+
+```js
+if (!meetingHour.isUnset() && meetingHour != "no_preference") {
+  nextHour.$set(meetingHour + 1);
+}
+```
+
+A guard controls execution but does not narrow the declared type. Arithmetic, boolean positions, `Num.isFinite(...)`, and regex tests check the actual value at runtime. Scalar formatting and primitive-array interpolation apply to the actual value.
+
+Channels accept unions without observation config. Index is eligible as a standalone channel and cannot be a union member. Host parameters and returns accept the same flat unions, authored through `hmd.Union`.
 
 #### Arrays
 
-`Array(elementCell)` declares an array cell whose inner value is an ordered list of one element shape. The element is a constructed scalar observable cell — `Bool`, `Str`, `Enum`, or `Num`, including the `RangedInt(...)` shorthand — a `Struct(...)`, or zero-argument `Artifact()`. The element guarantee is declared once and applies to every stored member:
+`Array(elementCell)` declares an array cell whose inner value is an ordered list of one element shape. The element is a constructed scalar declaration — `Bool`, `Str`, `Enum`, or `Num`, including the `RangedInt(...)` shorthand — a `Union(...)`, a `Struct(...)`, or zero-argument `Artifact()`. The element guarantee is declared once and applies to every stored member:
 
 ```js
 let findings = Array(Str({ observing: `a finding ${user} mentioned` }));
@@ -209,7 +275,7 @@ let people = Array(Struct({ name: Str(), age: Num() }));
 let artifacts = Array(Artifact());
 ```
 
-For a scalar array, the element's `observing` is the per-item extraction question. An `Artifact()` element takes no arguments and makes the array non-observable. `Array(Str)` (a bare constructor), a nested array, and extra arguments are parse errors.
+For an observable array, the element's `observing` is the per-item extraction question. An `Artifact()` element takes no arguments and makes the array non-observable. `Array(Str)` (a bare constructor), a nested array, and extra arguments are parse errors.
 
 An array cell holds a whole list value and supports:
 
@@ -218,13 +284,13 @@ An array cell holds a whole list value and supports:
 - `items[index].$set(...)` as an existing-element cell write,
 - `items.length` as a non-negative-safe-integer read,
 - `items.isUnset()`,
-- observation as a whole collection or as one element, only when the element is scalar or Struct.
+- observation as a whole collection or as one element, only when the element is scalar, union, or struct.
 
-An action cell target is a lexical cell name followed by zero or more accesses into its inner value. A direct target such as `items` addresses the whole cell; `items[i]` addresses one element and evaluates `i` when the action reaches it. Only arrays and Structs support access paths in cell targets.
+An action cell target is a lexical cell name followed by zero or more accesses into its inner value. A direct target such as `items` addresses the whole cell; `items[i]` addresses one element and evaluates `i` when the action reaches it. Only arrays and structs support access paths in cell targets.
 
-An element target must select an existing position. `$set(...)` replaces that element without changing its siblings. Observation is available only for scalar- and Struct-element arrays; `$observe(items[i])` briefs and writes the element using its type and `observing` question. `$unset()` remains a whole-cell operation: `items[i].$unset()` is a parse error because array values are dense and have no unset element slots. An array literal contributes element evidence to its consuming context, as in `items.$set(["a", "b"])`, `artifacts.$set([Artifact("a.md")])`, or an equality expression; the destination or operation supplies the element guarantee, and each concrete element is validated against it before mutation.
+An element target must select an existing position. `$set(...)` replaces that element without changing its siblings. Observation is available for arrays whose elements are scalar, union, or struct; `$observe(items[i])` briefs and writes the element using its type and `observing` question. `$unset()` remains a whole-cell operation: `items[i].$unset()` is a parse error because array values are dense and have no unset element slots. An array literal takes its element type from where it is used, as in `items.$set(["a", "b"])`, `artifacts.$set([Artifact("a.md")])`, or an equality expression, and each element is validated against that type before mutation.
 
-Equality and inequality require one shared element authority, admit every concrete element under it, and then compare ordered element values structurally. Scalar arrays use their boolean, string, or number family; Enum elements participate as strings because equality does not apply Enum ordering domains. Artifact arrays use Artifact authority and compare members by admitted path, while two dynamic object arrays do not become Artifact arrays from shape alone. Struct-element arrays compare their records by Struct equality. The shared unset-comparison rule applies unchanged (equality involving an unset array is `false`, inequality is `true`). Ordering, arithmetic, and boolean evaluation of a whole array are rejected. Template interpolation renders a primitive array by JavaScript array stringification — elements joined with commas, an empty array as the empty string. A whole Artifact or Struct array is not renderable; index an Artifact array first to project one path in a value template or emit one structured Artifact part in semantic text, and read a field of a Struct element.
+Equality and inequality compare arrays element by element, in order. Both arrays must hold one kind of element: boolean, string, number, Artifact, or struct. Enum elements compare as strings, Artifact elements by logical path, and struct elements by struct equality. Union-element arrays apply the union comparison rules to each aligned pair of values. The shared unset-comparison rule applies (equality involving an unset array is `false`, inequality is `true`). Ordering, arithmetic, and boolean evaluation of a whole array are rejected.
 
 Indexing, targeting an element, or reading `length` on an unset array is a runtime error. An index must resolve to a non-negative safe integer and select an existing position; other values and positions outside the current array are runtime errors. Index expressions may use arithmetic over literals and locally available values, such as `items[i + 1]` and `items[i + 1].$set(value)`. They cannot contain a host call or another expression that requires host resolution.
 
@@ -232,7 +298,7 @@ A whole-array write and an element write must match the array's element type and
 
 #### Structs
 
-`Struct(fields, config?)` declares a cell whose inner value is a record of named fields. Each field is declared with a constructed observable cell — `Bool`, `Str`, `Enum`, `Num`, `RangedInt(...)`, an observable `Array(...)`, or a nested `Struct(...)` — and may carry its own `observing` question. The config `observing` is the question for the whole record:
+`Struct(fields, config?)` declares a cell whose inner value is a record of named fields. Each field is declared with a constructed observable cell — `Bool`, `Str`, `Enum`, `Num`, `RangedInt(...)`, `Union(...)`, an observable `Array(...)`, or a nested `Struct(...)` — and may carry its own `observing` question. The config `observing` is the question for the whole record:
 
 ```js
 let request = Struct(
@@ -250,9 +316,9 @@ let request = Struct(
 
 A field name is an identifier or string key. `isUnset`, a `$`-prefixed name, an unsafe object key such as `__proto__`, a repeated name, a spread, and an Artifact, `Dialog.Cursor`, or Artifact-array field are parse errors.
 
-A Struct is set when it holds a complete record, in which every declared field holds a value, recursively; otherwise the whole Struct is unset. `request.isUnset()` reports whether the record is held. `isUnset()` applies to a whole cell, so `request.destination.isUnset()` is a parse error. An empty `Struct({})` holds `{}` when set and follows the ordinary cell lifecycle.
+A struct is set when it holds a complete record, in which every declared field holds a value, recursively; otherwise the whole struct is unset. `request.isUnset()` reports whether the record is held. `isUnset()` applies to a whole cell, so `request.destination.isUnset()` is a parse error. An empty `Struct({})` holds `{}` when set and follows the ordinary cell lifecycle.
 
-`request.destination` and `request["destination"]` read a field. A member name is interpreted by the receiver's declaration, so a field named `state` or `length` reads that field, and a name the Struct does not declare is a parse error. A field of an unset Struct is unset, so `request.destination == "Tokyo"` is `false` while `request` is unset.
+`request.destination` and `request["destination"]` read a field. A member name is interpreted by the receiver's declaration, so a field named `state` or `length` reads that field, and a name the struct does not declare is a parse error. A field of an unset struct is unset, so `request.destination == "Tokyo"` is `false` while `request` is unset.
 
 Fields are also cell targets:
 
@@ -260,13 +326,37 @@ Fields are also cell targets:
 - `request.preferences.$set({ ... })` and `request.destination.$set(value)` replace one subtree or field of a set record and preserve its siblings.
 - `$unset()` applies only to a whole cell, so `request.preferences.$unset()` is a parse error.
 
-Writing or observing a field of an unset Struct is a runtime error, raised before the value expression is evaluated or any brief is emitted.
+Writing or observing a field of an unset struct is a runtime error, raised before the value expression is evaluated or any brief is emitted.
 
-`$observe(request)` briefs the declared fields with their questions, and the held record when the Struct is set. A reported value is a complete record. A field target such as `$observe(request.preferences)` observes that subtree of a set record.
+`$observe(request)` briefs the declared fields with their questions, and the held record when the struct is set. A reported value is a complete record. A field target such as `$observe(request.preferences)` observes that subtree of a set record.
 
-Equality and inequality compare two Structs field by field, recursively, regardless of the order in which fields were declared or written. The two Structs must declare the same field names, and each pair of fields must be comparable for equality, so a `Str` field compares with an `Enum` field and a `Str` field does not compare with a `Num` field. An unset Struct follows the shared unset-comparison rule. Ordering and template interpolation of a whole Struct are rejected; read a field instead.
+Equality and inequality compare two structs field by field, recursively, regardless of the order in which fields were declared or written. The two structs must declare the same field names, and each pair of fields must be comparable for equality, so a `Str` field compares with an `Enum` field and a `Str` field does not compare with a `Num` field. An unset struct follows the shared unset-comparison rule. Ordering and direct template interpolation of a whole struct are rejected; use `fmt(value, config?)` for its textual representation or read a field.
 
-An `Array(Struct(...))` element is a complete record. `people[0].name` and `span.item.name` read element fields, including nested fields. Whole-array writes, element writes such as `people[0].$set({ name: "Ada", age: 36 })`, and element-field writes such as `people[0].name.$set("Ada")` follow the Struct write rules. Observing a Struct-element array asks for a list of complete records, each field described by the element's declaration.
+An `Array(Struct(...))` element is a complete record. `people[0].name` and `span.item.name` read element fields, including nested fields. Whole-array writes, element writes such as `people[0].$set({ name: "Ada", age: 36 })`, and element-field writes such as `people[0].name.$set("Ada")` follow the struct write rules. Observing a struct-element array asks for a list of complete records, each field described by the element's declaration.
+
+### Expressions
+
+Arc expressions are shared across value positions, including `if` tests, hook returns, `cell.$set(...)` values, template interpolations, and expression-position host calls. They support:
+
+- Value-bearing cell references — `interest`, `musicSurfaced`, `startedAt`
+- Array element and struct field reads — `items[i]`, `request.destination`, `people[i].name`
+- Numeric arithmetic — `subtotal + tax`, `distance / duration`, `i + 1`, `-offset`
+- Numeric finiteness checks — `Num.isFinite(arith)`
+- Comparisons — `interest >= "lukewarm"`, `ready == true`
+- Node state checks — `Spark.state == State.COVERED`
+- Semantic checks — ``judge(`semantic question`)``
+- Host calls — `Dice.roll(20)`, `Store.flags.enabled()`
+- Artifact construction — `Artifact("report.md")`, ``Artifact(`reports/${slug}.md`)``
+- Value formatting — `fmt(request)`, `fmt(people, { array: { style: "json" } })` (see [Formatting values](#formatting-values)).
+- Regex tests — `/pattern/flags.test(target)` (e.g., `/music|band/i.test(Dialog.lastUserMessage)`)
+- Cursor turn differences — `Dialog.cursor.userTurnsSince(startedAt)`, `endedAt.totalTurnsSince(startedAt)`
+- Unset checks — `topic.isUnset()`, `startedAt.isUnset()`
+- Logical composition — `&&`, `||`, `!`
+- Ternary conditionals — `ready ? "continue" : "wait"`
+
+A **boolean position** — an `if` test, the operands of `&&`, `||`, and `!`, a ternary test, and a `this.trigger`, `this.catchDeflection`, `this.catchInterruption`, `resolveWhen`, or `deflectWhen` return — accepts only a boolean value, without coercion. A comparison, `Num.isFinite(...)`, `&&` / `||` / `!`, `judge(...)`, a regex `.test(...)`, `.isUnset()`, `this.deflection.escaped(...)`, and a set `Bool` cell are booleans; a `Str`, `Num`, `Enum`, `Dialog.Cursor`, Artifact, array, or struct value is not, and must be compared explicitly — `count > 0`, never `count`.
+
+A non-boolean value in a boolean position is rejected at parse time when its type is statically known, and poisons the traversal at runtime otherwise. An unset `Bool` used bare poisons the traversal too — its type passes the parse check, but there is no boolean to read — so either compare it (`== true` / `== false`, which are `false` on an unset cell) or ensure it is set before the bare read.
 
 #### Operators
 
@@ -295,14 +385,58 @@ To guard against such poisoning, use `Num.isFinite(expr)` as a precheck. It retu
 
 Comparison operators pair two values and produce a boolean:
 
-- Equality — `==` and `!=` — compares by value. Numeric equality is exact, with no rounding tolerance. Scalars are otherwise equal when their values are identical, Artifacts are equal when their logical paths are equal, and arrays are equal when they hold the same elements in the same order (see [Arrays](#arrays)). When either operand is an unset cell, `==` is `false` and `!=` is `true`.
-- Ordering — `>`, `>=`, `<`, and `<=` — compares magnitude. Numbers order numerically. When either operand supplies one proven Enum domain, both operands must be guaranteed members of that same domain, exact member literals, or dynamic values that pass concrete membership admission; a known `Str` site and conflicting Enum domains are rejected. Admitted Enum members order by their declared ordinal positions. Without a proven Enum domain, admitted strings order lexicographically. When either operand is an unset cell, all four are `false`. Artifacts and arrays have no ordering.
+- Equality — `==` and `!=` — compares by value. Numeric equality is exact, with no rounding tolerance. Scalars are otherwise equal when their values are identical, Artifacts are equal when their logical paths are equal, arrays are equal when they hold the same elements in the same order (see [Arrays](#arrays)), and structs are equal when their fields are equal (see [Structs](#structs)). When either operand is an unset cell, `==` is `false` and `!=` is `true`.
+- Ordering — `>`, `>=`, `<`, and `<=` — compares magnitude. Numbers order numerically, strings order lexicographically, and `Enum` values order by declared position. When one operand is an `Enum`, the other must be a member literal, an `Enum` with the same values in the same order, or a value that is a member at runtime; a `Str` cell is rejected. When either operand is an unset cell, all four are `false`. Artifacts, arrays, and structs have no ordering.
 
 `&&` and `||` are logical conjunction and disjunction over boolean operands, producing a boolean. Each short-circuits: `&&` evaluates its right operand only when its left is `true`, and `||` only when its left is `false`, so a blocking or effectful right operand runs only where the left has not already decided the result.
 
 `!` returns the negation of its operand.
 
 The ternary `test ? consequent : alternate` returns its consequent when the test is `true` and its alternate otherwise, evaluating only the branch it returns. Unlike `&&` and `||`, it selects a value: its branches may be any type.
+
+#### Formatting values
+
+A template literal in a value position renders each interpolation to text and produces an ordinary string. Primitive values render as text. Primitive arrays render their elements joined with commas and no surrounding delimiters, and an empty array produces empty text. An Artifact contributes its logical path. A whole Artifact array and a struct are rejected; indexing an Artifact array contributes the selected Artifact's path.
+
+`fmt(value, config?)` provides an alternative and more refined way to convert a concrete value into an ordinary string. Use it to interpolate whole structs and arrays, control array layout, or encode a string as JSON. The input may be any supported value expression, including a cell, field, array element, typed channel, `span.item`, literal, arithmetic, conditional, or another formatting result:
+
+```js
+$instruct(`explain ${fmt(people, { array: { parentheses: "[]" } })}`);
+summary.$set(fmt(request));
+encoded.$set(fmt(fmt(request), { str: "json" }));
+```
+
+Formatting reads the input at its evaluation site and returns text without changing it. The result can be used wherever an ordinary string-valued expression is accepted. In a semantic template, the input cannot require host work. In other value positions, host work in the input completes before formatting. A position that accepts only local expressions, such as an array index, applies that limit to the input.
+
+The call takes one value argument and an optional static configuration object. Omitted configuration and `{}` have the same defaults:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `array.separator` | `", "` | Text between recursively formatted elements. |
+| `array.parentheses` | `""` | One of `""`, `"[]"`, `"()"`, or `"{}"`; the empty string uses no delimiters. |
+| `array.style` | Omitted | `"json"` serializes the entire array subtree as JSON. |
+| `struct.style` | `"json"` | Serializes the entire struct subtree as JSON. |
+| `str` | `"bare"` | `"bare"` preserves string contents; `"json"` produces a quoted, escaped JSON string literal. |
+
+Array layout settings and `array: { style: "json" }` are mutually exclusive. An empty array in default layout produces empty text; in JSON style it produces `[]`. A set empty struct produces `{}`. Keys must be non-computed identifier or string-literal properties; setting values must be the specified string literals or nested configuration objects. Duplicate or unknown keys, spread, shorthand, methods, accessors, dynamic settings, extra arguments, and invalid modes are authoring errors. Every setting is validated even when shadowed or unused.
+
+Formatting descends from the outer value inward. The first subtree-wide style controls its entire subtree. JSON style encodes descendants directly as JSON data and takes precedence over their configuration. Array layout controls only its enclosing delimiters and separator, delegating element rendering to the child rules. Configuration property order does not affect precedence.
+
+| Expression | Result contents for people named Ada and Grace |
+| --- | --- |
+| `fmt(people)` | `{"name":"Ada"}, {"name":"Grace"}` |
+| `fmt(people, { array: { parentheses: "[]" } })` | `[{"name":"Ada"}, {"name":"Grace"}]` |
+| `fmt(people, { array: { style: "json" }, str: "bare" })` | `[{"name":"Ada"},{"name":"Grace"}]` |
+
+The default struct JSON style also governs nested arrays and string fields, so a struct's nested array uses JSON brackets even when array layout elsewhere uses empty delimiters. JSON output is compact. Array order and each evaluated record's `Object.keys` order are preserved. Finite numbers render independently of locale, with negative zero represented as `0`.
+
+Calls compose through nesting: each outer call formats the inner call's string value using fresh defaults. For a person named Ada, `fmt(person)` and `fmt(fmt(person), { str: "bare" })` both produce `{"name":"Ada"}`. `fmt(fmt(person), { str: "json" })` produces `"{\"name\":\"Ada\"}"`. Repeated calls with `str: "json"` add an encoding layer each time. An array of formatted strings remains an array of strings under JSON style; an array of struct values produces JSON objects directly.
+
+Strings and Enum values use `str`; booleans and finite numbers use their ordinary textual values. Arrays and structs format recursively. An Artifact formats as its logical path, using the `str` setting or an enclosing JSON style. A value with a declared type is validated against that declaration before rendering, including its exact fields and nested types. `Dialog.Cursor`, `null`, malformed payloads, unset values, and non-finite numbers fail formatting. These failures produce no formatted result for a consuming write or host emission.
+
+When using conditionals as the first argument of `fmt()`, every branch must produce a value that `fmt()` supports. If Arc reports ambiguous formatting, call `fmt()` within each branch instead: `condition ? fmt(a) : fmt(b)`.
+
+`fmt` is reserved for the built-in and cannot name a node, cell, or import binding. Struct fields, channel names, and imported host operations may use the name `fmt`.
 
 ### Action Graph
 
@@ -318,7 +452,7 @@ Some action forms are statement-only. Others can also appear inside expressions.
 
 Statement forms:
 
-- `$observe(target, question?)` — extraction from the host context. See [Observations](#observations).
+- `$observe(target, question?)` — extraction from the host context.
 - `$observeOrAsk(target, question?)` — extraction with fallback to asking a participant of the run.
 - `$observe({ cellA, cellB })` and `$observeOrAsk({ cellA, cellB })` — grouped extraction of several cells as one action.
 - `target.$set(value)` — typed direct-cell or existing-array-element write.
@@ -333,6 +467,7 @@ Statement forms:
 Expression-capable forms:
 
 - ``judge(`semantic question`)`` — semantic boolean check against conversation context. Returns `boolean`.
+- `fmt(value, config?)` — converts a value into an ordinary string. Returns `string`.
 - Host calls through imported `host:*` modules — yields a host-provided value. See [Host Modules](#host-modules).
 
 `$observe()`, `target.$set(...)`, and `cell.$unset()` can also appear in hooks. Hooks can use expression-capable forms in their expressions. `this.catchDeflection` and `this.catchInterruption` hooks also allow `$observeOrAsk(...)`.
@@ -371,13 +506,7 @@ $observeOrAsk(depth);
 $observe({ topic, depth });
 ```
 
-Each action has three forms:
-
-- `$observe(target)` and `$observeOrAsk(target)` observe one target with its declared question.
-- ``$observe(target, `question`)`` and ``$observeOrAsk(target, `question`)`` observe one target with a question for this call.
-- `$observe({ a, b })` and `$observeOrAsk({ a, b })` observe several cells as one action. See [Grouped Observation](#grouped-observation).
-
-A target is an observable cell or a position inside one: an array element such as `items[i]`, a Struct field such as `request.destination`, or an element field such as `people[0].name`. A position inside a cell requires that cell to be set. `args`, `returns`, and `span` are not observation targets.
+A target is an observable cell or a position inside one: an array element such as `items[i]`, a struct field such as `request.destination`, or an element field such as `people[0].name`. A position inside a cell requires that cell to be set. `args`, `returns`, and `span` are not observation targets.
 
 ##### Observation Questions
 
@@ -391,16 +520,16 @@ Where a target declares its question depends on the target:
 
 | Target | Declared question |
 | --- | --- |
-| Scalar cell | `observing` in the declaration config, or a later `cell.observing = ...` assignment. |
+| Scalar or union cell | `observing` in the declaration config, or a later `cell.observing = ...` assignment. |
 | Array cell or element | The element's `observing`, as in `Array(Str({ observing: ... }))`. For a whole array, it is the per-item question. |
-| Struct cell | `observing` in the Struct config, which asks for the whole record. Each field's own `observing` is briefed with it. |
-| Struct field | The field's own `observing`. |
+| struct cell | `observing` in the struct config, which asks for the whole record. Each field's own `observing` is briefed with it. |
+| struct field | The field's own `observing`. |
 
-A second definition of a target's `observing` is a parse error. A question for one call replaces only the target's own question, so a Struct's field questions stay as declared.
+A second definition of a target's `observing` is a parse error. A question for one call replaces only the target's own question, so struct field questions stay as declared.
 
 ##### Observation Results
 
-`$observe(...)` leaves each named target holding a reported value or unchanged. `$observeOrAsk(...)` completes only when each named target holds a reported value. A named target is written as a whole, so a Struct or array receives a complete value or none.
+`$observe(...)` leaves each named target holding a reported value or unchanged. `$observeOrAsk(...)` completes only when each named target holds a reported value. A named target is written as a whole, so a struct or array receives a complete value or none.
 
 - `$observe(target)` writes a reported value. An `unknown` report consumes the action and preserves any existing value.
 - `$observeOrAsk(target)` writes only a reported value. Any other report writes nothing, and the observation resurfaces.
@@ -453,13 +582,13 @@ Authoring rules:
 
 Execution semantics:
 
-1. The runtime emits an instruction text along with its `deflectWhen` and `resolveWhen` frontier.
+1. The runtime emits the instruction text along with the semantic checks its `deflectWhen` and `resolveWhen` currently need.
 2. The host reports the instruction's application and/or semantic results needed by the checks.
 3. The runtime evaluates `deflectWhen` if possible, followed by `resolveWhen`.
 4. If `deflectWhen` becomes true, the runtime requests host acknowledgement before beginning deflection handling.
 5. Prior to `deflectWhen` resolution, or after `deflectWhen` becomes false, `$instruct` resolves when application is reported, and `$instructLoop` resolves when `resolveWhen` becomes true.
 
-Only the currently reachable semantic checks from `deflectWhen` / `resolveWhen` surface in a given brief. See [arc-runtime-api.md](./arc-runtime-api.md) for the `InstructionBrief` and `postcheck` protocol.
+Only the semantic checks currently reachable from `deflectWhen` / `resolveWhen` are asked at any one time.
 
 An instruction may carry an optional `hostParams` that will be merged over (or override) node-level `this.hostParams` when both values are plain objects (or when either is a scalar or an array). Semantic work emitted while evaluating that instruction's `deflectWhen` or `resolveWhen` uses the same merged host params. See node-level [`hostParams`](#host-params) for its semantics and constraints.
 
@@ -533,8 +662,8 @@ The callback admits the same actions as an `invoke` body — control flow, `cell
 
 Results and length:
 
-- The receiver may be an array cell, a typed `args`/`returns` array channel, or an array field of a Struct cell or channel; `$map` never writes it.
-- `results` is a bare array cell or an array field of a Struct cell, such as `request.tags`, whose element type must match what the callback produces. The outputs commit to it in one write, in element order, when the whole `$map` resolves; a field commit writes only that field and requires its Struct to be set.
+- The receiver may be an array cell, a typed `args`/`returns` array channel, or an array field of a struct cell or channel; `$map` never writes it.
+- `results` is a bare array cell or an array field of a struct cell, such as `request.tags`, whose element type must match what the callback produces. The outputs commit to it in one write, in element order, when the whole `$map` resolves; a field commit writes only that field and requires its struct to be set.
 - With `results` bound, every element must set `span.result`; an element that finishes without one is a runtime error. Referencing `span.result` in a forEach `$map` is a parse error.
 - `$map` preserves length: one output per input, no filtering. `results` may be the receiver itself, replacing it in one write.
 
@@ -556,36 +685,10 @@ Different actions and expressions resolve as follows:
 | `$instructLoop(...)` | Resolves when its `resolveWhen` evaluates true. While pending, the runtime checks reported `deflectWhen` evidence, `resolveWhen` evidence, and application reporting independently. |
 | `$enter(Target)` | Resolves when the target traversal reaches `State.COVERED` or `State.SKIPPED`. Covered targets commit staged `returns`; skipped targets resolve without committing staged `returns`. |
 | `$enterLoop(Target, { resolveWhen, ... })` | Resolves after a covered or skipped target iteration when the caller-side `resolveWhen` evaluates true. Otherwise the loop action remains pending or starts another target iteration. |
-| `judge(...)` and expression-position host calls | These are value dependencies, not actions. A host report supplies the value. |
+| `judge(...)` and expression-position host calls | Resolves when a host report supplies the result value. |
+| `fmt(value, config?)` | Resolves after the input value is available and formatting succeeds. |
 | `invoke(() => { ... })` | Does not carry resolved-once semantics. Each run treats the `$` actions in its body as unresolved; a blocked run resumes on the next report. |
 | `arr.$map(callback, results?)` | Resolves after the callback has run for every element. With `results`, commits the constructed array in one write. A blocked element resumes on the next report. |
-
-### Expressions
-
-Arc expressions are shared across value positions, including `if` tests, hook returns, `cell.$set(...)` values, template interpolations, and expression-position host calls. They support:
-
-- Value-bearing cell references — `interest`, `musicSurfaced`, `startedAt`
-- Array element and Struct field reads — `items[i]`, `request.destination`, `people[i].name`
-- Numeric arithmetic — `subtotal + tax`, `distance / duration`, `i + 1`, `-offset`
-- Numeric finiteness checks — `Num.isFinite(arith)`
-- Comparisons — `interest >= "lukewarm"`, `ready == true`
-- Node state checks — `Spark.state == State.COVERED`
-- Semantic checks — ``judge(`semantic question`)``
-- Host calls — `Dice.roll(20)`, `Store.flags.enabled()`
-- Artifact construction — `Artifact("report.md")`, ``Artifact(`reports/${slug}.md`)``
-- Regex tests — `/pattern/flags.test(target)` (e.g., `/music|band/i.test(Dialog.lastUserMessage)`)
-- Cursor turn differences — `Dialog.cursor.userTurnsSince(startedAt)`, `endedAt.totalTurnsSince(startedAt)`
-- Unset checks — `topic.isUnset()`, `startedAt.isUnset()`
-- Logical composition — `&&`, `||`, `!`
-- Ternary conditionals — `ready ? "continue" : "wait"`
-
-Comparison and logical composition evaluate by the rules in [Operators](#operators).
-
-A template literal in a value position renders each interpolation to ordinary string text. Primitive values and primitive arrays use their existing string rendering, while an Artifact contributes its logical path. A whole Artifact array is rejected; indexing it first contributes the selected Artifact's path. The rendered result is an ordinary string regardless of which supported values contributed to it.
-
-A **boolean position** — an `if` test, the operands of `&&`, `||`, and `!`, a ternary test, and a `this.trigger`, `this.catchDeflection`, `this.catchInterruption`, `resolveWhen`, or `deflectWhen` return — accepts only a boolean value, without coercion. A comparison, `Num.isFinite(...)`, `&&` / `||` / `!`, `judge(...)`, a regex `.test(...)`, `.isUnset()`, `this.deflection.escaped(...)`, and a set `Bool` cell are booleans; a `Str`, `Num`, `Enum`, `Dialog.Cursor`, Artifact, array, or Struct value is not, and must be compared explicitly — `count > 0`, never `count`.
-
-A non-boolean value in a boolean position is rejected at parse time when its type is statically known, and poisons the traversal at runtime otherwise. An unset `Bool` used bare poisons the traversal too — its type passes the parse check, but there is no boolean to read — so either compare it (`== true` / `== false`, which are `false` on an unset cell) or ensure it is set before the bare read.
 
 ### Host Modules
 
@@ -598,7 +701,7 @@ import Random from "host:rng";
 import Memoir from "host:memoir";
 ```
 
-The local import alias cannot be a reserved Arc identifier. Reserved aliases are `$enter`, `$enterLoop`, `$instruct`, `$instructLoop`, `$observe`, `$observeOrAsk`, `Array`, `Artifact`, `Bool`, `Dialog`, `Enum`, `Index`, `Num`, `RangedInt`, `State`, `Str`, `args`, `forgetful`, `invoke`, `judge`, `newcopy`, `returns`, `self`, `user`, and `span`. This keeps the same Arc form unambiguous everywhere it is recognized.
+The local import alias cannot be a reserved Arc identifier. Reserved aliases are `$enter`, `$enterLoop`, `$instruct`, `$instructLoop`, `$observe`, `$observeOrAsk`, `Array`, `Artifact`, `Bool`, `Dialog`, `Enum`, `Index`, `Num`, `RangedInt`, `State`, `Str`, `Struct`, `Union`, `args`, `fmt`, `forgetful`, `invoke`, `judge`, `newcopy`, `returns`, `self`, `span`, and `user`. This keeps the same Arc form unambiguous everywhere it is recognized.
 
 The runtime associates every imported module with a typed operation surface. Each operation defines its ordered parameters and whether it returns a value. Arc authors consume that contract through host calls; how the host supplies it is outside the Arc script language.
 
@@ -718,10 +821,7 @@ this.deflectWhen = () => {
 };
 ```
 
-It accepts the same two authored forms as instruction-level `deflectWhen`:
-
-- a string literal or template literal, which desugars to `return judge(...)`;
-- an arrow function using the trigger-style subset.
+It accepts the same authored forms as instruction-level `deflectWhen`; see [Instructions](#instructions).
 
 Inheritance rules:
 
@@ -921,7 +1021,7 @@ If an anonymous copy blocks, the same copy resumes for that call. Once the copy 
 - It preserves canonical identity and therefore still participates in `ReferenceName.state`.
 - It preserves cell values and child traversals.
 - It clears the prior canonical outcome.
-- It clears the action frame before the forgetful entry begins.
+- It forgets resolved actions before the forgetful entry begins.
 - It is valid only as a direct target to `$enter(...)` and `$enterLoop(...)`.
 
 The forgetting happens once when the new entry begins. If that entry blocks, its later report resumes the same traversal without forgetting again. Each continuing `$enterLoop(forgetful(...))` iteration begins another forgetful entry of the canonical target.
@@ -941,24 +1041,14 @@ Arc supports three enter forms:
 Form rules:
 
 - `$enterLoop(...)` requires `resolveWhen`.
-- `resolveWhen` accepts the same authored forms as instruction `resolveWhen`:
-  - a string literal or template literal, which desugars to `return judge(...)`
-  - an arrow function using the constrained statement subset allowed in `this.trigger`
+- `resolveWhen` accepts the same authored forms as instruction `resolveWhen`; see [Instructions](#instructions).
 - `$enter(...)` does not expose authored `resolveWhen`. Its resolution depends on the target node state.
-
-Target selection:
-
-- `Target` may be `ReferenceName`, `newcopy(ReferenceName)`, or `forgetful(ReferenceName)`.
-- If `Target` is `ReferenceName`, the canonical target form, the callee outcome is reflected through `ReferenceName.state` (`COVERED`, `DEFLECTED`, `SKIPPED`, `INTERRUPTED`).
-- If `Target` is `newcopy(ReferenceName)`, the callee outcome is not reflected through `ReferenceName.state`.
-- If `Target` is `forgetful(ReferenceName)`, the runtime starts a forgetful entry on the canonical traversal before control transfers: prior terminal node state and action-frame progress are forgotten, cell values and child traversals are preserved, and the entry's eventual outcome becomes the new meaning of `ReferenceName.state`.
 
 #### Execution flow
 
 When entering a node target, the runtime follows this sequence:
 
-1. The runtime prepares the target using the target semantics:
-   - `newcopy(...)` creates a blank copy of the target without a node state, while `forgetful(...)` clears the canonical target's prior state and action progress.
+1. The runtime prepares the target as described in [Targets](#targets), then by its state:
    - A target without a defined state begins its first entry or continues its pending entry.
    - A canonical target in `COVERED` returns that outcome without running its guard, body, or effects again.
    - A canonical target in `DEFLECTED` or `SKIPPED` begins a new entry: the runtime clears its state, increments its entry count, and reruns the guard. Action progress is retained unless the entry is forgetful.
@@ -1022,7 +1112,7 @@ function Op(
 
 A node may declare `args`, `returns`, both, or neither; when both are present `args` precedes `returns`, and no other parameter name is admitted.
 
-Each channel key has a type. A key's type is `Bool()`, `Str()`, `Enum(...)`, `Num()`, `Artifact()`, `Dialog.Cursor()`, `Array(elementSpec)`, or `Struct({ ... })`, with no observation config. `Array` accepts the same element specs as a cell array; nested channel arrays remain invalid. `Struct` accepts the same field specs as a Struct cell. `Index()` is a channel-only non-negative-safe-integer refinement of `Num()` and cannot declare a cell or array element.
+Each channel key has a type. A key's type is `Bool()`, `Str()`, `Enum(...)`, `Num()`, `Union(...)`, `Artifact()`, `Dialog.Cursor()`, `Array(elementSpec)`, or `Struct({ ... })`, with no observation config. `Array` accepts the same element specs as a cell array; nested channel arrays remain invalid. `Struct` accepts the same field specs as a struct cell. `Index()` is a channel-only non-negative-safe-integer refinement of `Num()` and cannot declare a cell or array element.
 
 `$enter(...)` and `$enterLoop(...)` bind caller cells to the target's keys:
 
@@ -1159,29 +1249,6 @@ Cursor values cannot be observed with `$observe()` or `$observeOrAsk()`.
 | `State.SKIPPED` | The current entry attempt was bypassed by its guard. A later entry may reconsider the guard. |
 | `State.INTERRUPTED` | Execution was interrupted. Re-entry resumes the same entry with its progress retained. |
 
-## Execution Model
-
-Arc scripts are interpreted by the Arc runtime. The runtime handles control flow according to the action graph, and it works together with a supplied host which drives the runtime and handles semantic work or external effects.
-
-```text
-┌────────────┐                    ┌─────────┐                        ┌──────┐
-│            │                    │         │  ── delegates to ──▶   │      │
-│ Arc script │ ◀── interprets ──  │ Runtime │                        │ Host │
-│            │                    │         │  ◀──── drives ──────   │      │
-└────────────┘                    └─────────┘                        └──────┘
-```
-
-The runtime does not advance on its own like an event loop in a separate process or thread. A useful analogy is a kernel: The host drives runtime entry, the runtime interprets the graph and decides what work is now reachable and delegates some to the host. Delegated work later hands new facts back for the runtime to interpret and drives the runtime forward.
-
-A node's action graph is the unit the runtime interprets. The runtime works the graph to find the next reachable action frontier. Reaching an action creates a delegation boundary. The runtime then delegates that action in one of two ways:
-
-- to the host, for actions whose outcome must be supplied externally;
-- to another node or arc's action graph, for `$enter(...)` and `$enterLoop(...)`.
-
-Delegated work produces inputs back to the runtime, such as a host report or an entered node's resulting state. The runtime interprets those inputs and decides whether the current action resolves normally.
-
-When the delegated action resolves, the runtime continues executing the action graph.
-
 ## Authoring Rules of Thumb
 
 - Use JavaScript familiarity for syntax shape, not behavior. Arc looks like JavaScript so functions, blocks, imports, calls, conditions, and template literals are easy to write, but the runtime semantics are the ones in this spec.
@@ -1235,7 +1302,7 @@ if (judge(`${user} wants to learn something specific`)) {
 }
 ```
 
-A forgetful-entry node — the prior action frame is forgotten upon re-entry, so the user is asked about readiness on every entry:
+A forgetful-entry node — resolved actions are forgotten upon re-entry, so the user is asked about readiness on every entry:
 
 ```js
 function SeeWine() {
