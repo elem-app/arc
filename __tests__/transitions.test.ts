@@ -9,7 +9,7 @@
 import { describe, expect, it } from "vitest";
 
 import { parse } from "../src/parser/index.js";
-import type { Dialog } from "../src/types/index.js";
+import type { ArcTraversalSet, Dialog } from "../src/types/index.js";
 import {
   actionProgress,
   appliedInstructions,
@@ -51,6 +51,199 @@ function Main() {
     seeded.phase = "entered";
     return { runtime, seeded };
   }
+
+  describe("trans.initializers", () => {
+    const dialog = (message: string): Dialog => ({
+      cursor: { user: 1, self: 0 },
+      lastTurns: [{ role: "user", message }],
+      view: message,
+    });
+
+    it.each(["owned", "imported", "newcopy", "forgetful"] as const)(
+      "trans.initializers gates %s paths before evaluation and restores exactly once",
+      (mode) => {
+        const child = `
+function Child(args = { prefix: Str() }) {
+  let file = Artifact(\`\${args.prefix}/\${Dialog.lastUserMessage}.md\`);
+  let copy = Artifact(\`copy/\${file}\`);
+  this.guard = () => { if (judge("skip")) return State.SKIPPED; };
+  $instruct(\`use \${file} and \${copy}\`);
+}
+`;
+        const target =
+          mode === "newcopy" || mode === "forgetful"
+            ? `${mode}(Child)`
+            : "Child";
+        const source = `
+"arc";
+${mode === "imported" ? 'import { Child } from "initializer-child";' : ""}
+function Main() {
+  let prefix = Str();
+  prefix.$set("notes");
+  $enter(${target}, { args: { prefix } });
+  ${mode === "imported" ? "" : child}
+}
+`;
+        const makeRuntime = () => {
+          const runtime = new Runtime().add("initializer-entry", parse(source));
+          if (mode === "imported") {
+            runtime.add("initializer-child", parse(`"arc"; ${child}`));
+          }
+          return runtime.init();
+        };
+        const runtime = makeRuntime();
+        const entry = actionProgress(
+          runtime.enterArc(arc("initializer-entry", "Main"), dialog("parent")),
+        );
+        expect(entry.transition).toBeDefined();
+        expect(entry.judgments).toEqual([]);
+        expect(entry.instructions).toEqual([]);
+        const serialized = JSON.stringify(entry.traversals);
+        expect(serialized).not.toContain("parent.md");
+
+        const restoredRuntime = makeRuntime();
+        const restored = actionProgress(
+          restoredRuntime.start(
+            JSON.parse(serialized) as ArcTraversalSet,
+            dialog("restoring"),
+          ),
+        );
+        expect(restored.transition).toEqual(entry.transition);
+        expect(JSON.stringify(restored.traversals)).toBe(serialized);
+        const rejected = actionProgress(
+          restoredRuntime.progress(
+            restored,
+            { move: "deflect" },
+            dialog("rejected"),
+          ),
+        );
+        expect(rejected.issues[0]?.kind).toBe("invalid-report");
+        expect(rejected.transition).toEqual(entry.transition);
+        expect(JSON.stringify(rejected.traversals)).toBe(serialized);
+
+        const guard = actionProgress(
+          restoredRuntime.progress(
+            rejected,
+            { move: "proceed" },
+            dialog("child"),
+          ),
+        );
+        expect(guard.transition).toBeUndefined();
+        expect(guard.judgments).toHaveLength(1);
+        const finalRuntime = makeRuntime();
+        const restoredGuard = actionProgress(
+          finalRuntime.start(
+            JSON.parse(JSON.stringify(guard.traversals)) as ArcTraversalSet,
+            dialog("later"),
+          ),
+        );
+        const work = actionProgress(
+          finalRuntime.progress(
+            restoredGuard,
+            {
+              move: "proceed",
+              judgments: { [restoredGuard.judgments[0]!.id]: false },
+            },
+            dialog("later"),
+          ),
+        );
+        expect(work.instructions[0]?.text).toEqual([
+          { kind: "text", value: "use " },
+          { kind: "artifact", path: "notes/child.md" },
+          { kind: "text", value: " and " },
+          { kind: "artifact", path: "copy/notes/child.md" },
+        ]);
+      },
+    );
+
+    it("trans.initializers splits an enter chain at an intermediate initializer", () => {
+      const runtime = new Runtime()
+        .add(
+          "initializer-chain",
+          parse(`
+"arc";
+function Main() {
+  $enter(A);
+  function A() {
+    let file = Artifact(\`\${Dialog.lastUserMessage}.md\`);
+    $enter(B);
+    function B() { $instruct(\`use \${file}\`); }
+  }
+}
+`),
+        )
+        .init();
+      const entry = actionProgress(
+        runtime.enterArc(arc("initializer-chain", "Main"), dialog("parent")),
+      );
+      expect(entry.transition?.entered).toEqual([
+        node("initializer-chain", "Main.A"),
+      ]);
+      expect(entry.transition?.position).toBe(
+        node("initializer-chain", "Main.A"),
+      );
+      const nested = actionProgress(
+        runtime.progress(entry, { move: "proceed" }, dialog("a")),
+      );
+      expect(nested.transition?.entered).toEqual([
+        node("initializer-chain", "Main.A.B"),
+      ]);
+      const work = actionProgress(
+        runtime.progress(nested, { move: "proceed" }, dialog("b")),
+      );
+      expect(work.instructions[0]?.text).toEqual([
+        { kind: "text", value: "use " },
+        { kind: "artifact", path: "a.md" },
+      ]);
+    });
+
+    it.each([
+      { parent: "../invalid", child: "valid.md", outcome: "work" },
+      { parent: "valid.md", child: "../invalid", outcome: "poisoned" },
+    ])(
+      "trans.initializers validates the acknowledged path with outcome $outcome",
+      ({ parent, child, outcome }) => {
+        const runtime = new Runtime()
+          .add(
+            "initializer-validation",
+            parse(`
+"arc";
+function Main() {
+  $enter(Child);
+  function Child() {
+    let file = Artifact(Dialog.lastUserMessage);
+    $instruct(\`use \${file}\`);
+  }
+}
+`),
+          )
+          .init();
+        const entry = actionProgress(
+          runtime.enterArc(
+            arc("initializer-validation", "Main"),
+            dialog(parent),
+          ),
+        );
+        expect(entry.transition?.position).toBe(
+          node("initializer-validation", "Main.Child"),
+        );
+        const next = runtime.progress(
+          entry,
+          { move: "proceed" },
+          dialog(child),
+        );
+        if (outcome === "poisoned") {
+          expect(next.canProgress).toBe(false);
+          expect(next.issues[0]?.reasonCode).toBe("invalid-artifact-path");
+        } else {
+          expect(actionProgress(next).instructions[0]?.text).toEqual([
+            { kind: "text", value: "use " },
+            { kind: "artifact", path: "valid.md" },
+          ]);
+        }
+      },
+    );
+  });
 
   describe("trans.shapes", () => {
     it("yields an exclusive entry transition carrying the position's host params", () => {

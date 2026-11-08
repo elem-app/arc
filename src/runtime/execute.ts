@@ -108,7 +108,6 @@ import {
 import { runtimeError } from "./report-validation.js";
 import { captureReadSet, readSetRewalkStep } from "./rewalk.js";
 import {
-  blockSeg,
   blockTraversal,
   requestDeflection,
   runSeg,
@@ -392,7 +391,7 @@ function evaluateIfBranch<TStatement extends { kind: string }, TResult>(
     accum,
   );
   if (result.status === "blocked") {
-    return blockSeg(accum, traversal);
+    return blockTraversal(accum, traversal);
   }
   return {
     status: "branch",
@@ -421,7 +420,7 @@ function evaluateBooleanReturn(
     accum,
   );
   if (result.status === "blocked") {
-    return blockSeg(accum, traversal);
+    return blockTraversal(accum, traversal);
   }
   return { status: "done", value: truthy(result.value) };
 }
@@ -497,7 +496,7 @@ function runGuardStatements(
           accum,
         );
         if (result.status === "blocked") {
-          return blockSeg(accum, traversal);
+          return blockTraversal(accum, traversal);
         }
         if (isResultNodeState(result))
           return { status: "done", value: result.value };
@@ -542,10 +541,15 @@ export function continueArc(accum: Accumulator): void {
     throw new Error(
       `Unknown root traversal node: ${formatRef(accum.traversal.ref)}`,
     );
-  if (shouldInitializeRootArtifactCells(accum.traversal, rootNode)) {
-    initializeArtifactCells(accum.traversal, rootNode, accum);
-  }
-  runTraversal(accum.traversal, rootNode, accum, true);
+  runTraversal(
+    accum.traversal,
+    rootNode,
+    accum,
+    true,
+    shouldInitializeRootArtifactCells(accum.traversal, rootNode)
+      ? { kind: "initializers" }
+      : undefined,
+  );
 }
 
 function nodeForTraversal(accum: Accumulator, traversal: Traversal): Node {
@@ -823,6 +827,13 @@ function runTraversal(
       return controlled;
     }
 
+    if (seg?.kind === "initializers") {
+      accum.activeSeg = seg;
+      const gated = maybeBlockForTransition(accum, traversal);
+      if (gated) return gated;
+      initializeArtifactCells(traversal, node, accum);
+    }
+
     const ownerFirstResume =
       seg !== undefined &&
       (isHookSeg(seg) || seg.kind === "invoke" || seg.kind === "mapMember");
@@ -892,6 +903,12 @@ function runTraversal(
   }
 }
 
+function hasArtifactInitializers(node: Node): boolean {
+  return node.cells.some(
+    (cell) => cell.type === "artifact" && cell.initializer !== undefined,
+  );
+}
+
 function shouldInitializeRootArtifactCells(
   traversal: Traversal,
   node: Node,
@@ -902,9 +919,7 @@ function shouldInitializeRootArtifactCells(
     (traversal.control === undefined ||
       traversal.control.phase === "complete") &&
     (!("activeFrame" in traversal) || traversal.activeFrame === undefined) &&
-    node.cells.some(
-      (cell) => cell.type === "artifact" && cell.initializer !== undefined,
-    )
+    hasArtifactInitializers(node)
   );
 }
 
@@ -1156,7 +1171,7 @@ function stepActionLeaf(
     isInstructionBatchActive(accum, traversal) &&
     statement.kind !== "instruction"
   ) {
-    return blockSeg(accum, traversal);
+    return blockTraversal(accum, traversal);
   }
 
   const narrow = stepNarrowLeaf<void>(
@@ -1219,12 +1234,12 @@ function stepStandaloneHostCall(
     if (accum.phase === "plan") {
       emitStandaloneHostCall(statement, existing.call, id, traversal, accum);
     }
-    return blockSeg(accum, traversal);
+    return blockTraversal(accum, traversal);
   }
 
   // Apply walks cannot introduce work that was absent from the accepted brief.
   // The following plan walk captures and emits the fresh logical invocation.
-  if (accum.phase === "apply") return blockSeg(accum, traversal);
+  if (accum.phase === "apply") return blockTraversal(accum, traversal);
 
   const rendered = renderHostCallInvocation(statement, traversal, node, accum);
   const call = {
@@ -1242,7 +1257,7 @@ function stepStandaloneHostCall(
     traversal,
     accum,
   );
-  return blockSeg(accum, traversal);
+  return blockTraversal(accum, traversal);
 }
 
 function standaloneHostCallId(
@@ -1366,7 +1381,7 @@ function runEnterAction(
           stagedReturns,
           preSnapshot,
         );
-        return blockSeg(accum, traversal);
+        return blockTraversal(accum, traversal);
       }
       accum.activeSeg = { kind: "body" };
       clearEvaluatorActionStates(
@@ -1546,9 +1561,6 @@ function runEnterIteration(
       referencedTraversal,
       accum,
     );
-    if (firstEntry) {
-      initializeArtifactCells(referencedTraversal, target.entry.root, accum);
-    }
     // Mark the referenced arc as owned by this enter so completion bubbles back
     // to the exact caller node and action (replacing `returnTo`).
     stampEnteredBy(referencedTraversal, callerRef, statement.id);
@@ -1558,6 +1570,9 @@ function runEnterIteration(
       target.entry.root,
       accum,
       false,
+      firstEntry && hasArtifactInitializers(target.entry.root)
+        ? { kind: "initializers" }
+        : undefined,
     );
     return toEnterActionOutcome(outcome, referencedTraversal);
   }
@@ -1578,13 +1593,18 @@ function runEnterIteration(
     childTraversal,
     accum,
   );
-  if (firstEntry) {
-    initializeArtifactCells(childTraversal, target.node, accum);
-  }
   stampEnteredBy(childTraversal, callerRef, statement.id);
   latchEnterTransition(accum, statement, childTraversal);
 
-  const childOutcome = runTraversal(childTraversal, target.node, accum, false);
+  const childOutcome = runTraversal(
+    childTraversal,
+    target.node,
+    accum,
+    false,
+    firstEntry && hasArtifactInitializers(target.node)
+      ? { kind: "initializers" }
+      : undefined,
+  );
   return toEnterActionOutcome(childOutcome, childTraversal);
 }
 
@@ -1808,7 +1828,7 @@ function stepInvoke(
     // In-body pending instructions hold the invocation open at its end; the
     // next report seeks the body and settles them.
     accum.activeSeg = { kind: "invoke", owner: statement.id };
-    return blockSeg(accum, traversal);
+    return blockTraversal(accum, traversal);
   }
 
   // Completed: the invocation is over. Its slot and tape clear (a fresh walk
@@ -1975,7 +1995,7 @@ function runMapMember(
     // arena row, action state, and tape live until the batch is acknowledged;
     // only then may the driver terminalize it and advance to the next member.
     accum.activeSeg = { kind: "mapMember", owner: statement.id, index };
-    return blockSeg(accum, traversal);
+    return blockTraversal(accum, traversal);
   }
 
   const staged = arena.staged;
@@ -2034,7 +2054,7 @@ function stepSetSpan(
     node,
     accum,
   );
-  if (value.status === "blocked") return blockSeg(accum, traversal);
+  if (value.status === "blocked") return blockTraversal(accum, traversal);
   if (!member.resultSpec) {
     throw runtimeError(
       "invalid-span-result",
@@ -2107,7 +2127,7 @@ function runInstructionAction(
     isInstructionBatchActive(accum, traversal) &&
     !canBatchInstruction(accum, node, statement)
   ) {
-    return blockSeg(accum, traversal);
+    return blockTraversal(accum, traversal);
   }
 
   const actionState = getActionState(traversal, statement);
@@ -2193,7 +2213,7 @@ function emitPendingInstruction(
     preSnapshot,
     instructionPhase: "apply",
   });
-  return { status: "advance" };
+  return blockTraversal(accum, traversal);
 }
 
 /**
@@ -2232,7 +2252,7 @@ function surfacePendingInstruction(
     resolveWhenOutcome: bankedResolve,
   });
   emitInstruction(statement, traversal, node, accum, phase, postcheck);
-  return { status: "advance" };
+  return blockTraversal(accum, traversal);
 }
 
 /**
@@ -2345,9 +2365,8 @@ function stepReportedInstruction(
           ? truthy(resolveResult.value)
           : undefined),
     });
-    // Hook still blocked: leave the hook SEG active so the enclosing block
-    // records it as the frontier.
-    return { status: "advance" };
+    // Suspend at the instruction owner while its checks remain pending.
+    return blockTraversal(accum, traversal);
   }
   accum.activeSeg = { kind: "body" };
   if (truthy(resolveResult.value)) {
@@ -2367,7 +2386,7 @@ function stepReportedInstruction(
     instructionPhase: "apply",
   });
   emitInstruction(statement, traversal, node, accum, "apply");
-  return { status: "advance" };
+  return blockTraversal(accum, traversal);
 }
 
 function evaluateInstructionResolution(
@@ -2610,7 +2629,7 @@ export function evaluateBooleanHook(
         node,
         accum,
       );
-      if (result.status === "blocked") return blockSeg(accum, traversal);
+      if (result.status === "blocked") return blockTraversal(accum, traversal);
       if (typeof result.value !== "boolean")
         throw new Error(
           "this.catchInterruption must explicitly return a boolean",

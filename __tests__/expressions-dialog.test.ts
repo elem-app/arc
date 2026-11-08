@@ -908,9 +908,8 @@ function Main() {
       view: "reviewer",
     };
 
-    // The cursor comparison sits behind an observation: dialog reads are
-    // pinned per walk, so the comparison re-fires through the observation
-    // write's rewalk (a real state change), not through dialog advancement.
+    // Capture the baseline before the observation and instruction. The later
+    // comparison reads the live cursor only after both actions resolve.
     function markedRuntime(name: string) {
       const document = parse(`
 "arc";
@@ -1019,10 +1018,7 @@ function Main() {
       const { runtime, seeded } = markedRuntime("cursor-cross-view-arc");
       const first = startRun(runtime, [seeded], REVIEWER_DIALOG);
 
-      // The stored mark carries view "reviewer"; after the observation resolves,
-      // the following comparison reads the live default-view cursor and poisons
-      // the run as an authored runtime error.
-      const poisoned = progressTerminal(
+      const work = progressBrief(
         runtime,
         first,
         {
@@ -1031,6 +1027,17 @@ function Main() {
             [first.observations[0]!.id]: { status: "resolved", value: "x" },
           },
         },
+        { cursor: { user: 2, self: 0 }, lastTurns: [] },
+      );
+      expect(work.instructions.map((item) => item.text)).toEqual(["work"]);
+      expect(work.issues).toEqual([]);
+
+      // After the instruction is applied, compare the reviewer-view baseline
+      // with the live default-view cursor and report the authored error.
+      const poisoned = progressTerminal(
+        runtime,
+        work,
+        { move: "proceed", instructions: appliedInstructions(work) },
         { cursor: { user: 2, self: 0 }, lastTurns: [] },
       );
       expect(poisoned.issues).toHaveLength(1);
@@ -1059,7 +1066,7 @@ function Main() {
         view: "reviewer",
       });
 
-      const poisoned = progressTerminal(
+      const work = progressBrief(
         runtime,
         first,
         {
@@ -1068,6 +1075,14 @@ function Main() {
             [first.observations[0]!.id]: { status: "resolved", value: "x" },
           },
         },
+        { cursor: { user: 1, self: 0 }, lastTurns: [], view: "reviewer" },
+      );
+      expect(work.instructions.map((item) => item.text)).toEqual(["work"]);
+      expect(work.issues).toEqual([]);
+      const poisoned = progressTerminal(
+        runtime,
+        work,
+        { move: "proceed", instructions: appliedInstructions(work) },
         { cursor: { user: 1, self: 0 }, lastTurns: [], view: "reviewer" },
       );
       expect(rootTraversal(poisoned).phase).toBe("poisoned");

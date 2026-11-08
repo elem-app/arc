@@ -18,7 +18,7 @@ import {
   applyUnset,
   type ActionOutcome,
 } from "./evaluate.js";
-import { blockSeg, writeDiffStep, type LeafStep } from "./seg.js";
+import { blockTraversal, writeDiffStep, type LeafStep } from "./seg.js";
 import {
   getActionState,
   getEvaluatorActionState,
@@ -125,7 +125,7 @@ function settleNarrowLeaf<TResult>(
   accum: Accumulator,
   markResolved: () => void,
 ): LeafStep<TResult> {
-  if (apply.status === "blocked") return blockSeg(accum, traversal);
+  if (apply.status === "blocked") return blockTraversal(accum, traversal);
   markResolved();
   return writeDiffStep(node, apply.value.changed);
 }

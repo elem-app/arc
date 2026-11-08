@@ -117,6 +117,8 @@ export type DeflectionContext = {
  *
  * Guard progress is stored on the traversal independently of this suspension
  * identity. Ordinary execution completes an unfinished guard before the body.
+ * The `initializers` site gates first-entry Artifact evaluation before the
+ * guard, preserving that pending evaluation across a transition acknowledgement.
  *
  * The hook kinds (`resolveWhen` / `deflectWhen` / `enterLoop`) record an attached
  * hook body as the deepest blocked SEG, carrying the `owner` action whose hook
@@ -135,6 +137,7 @@ export type DeflectionContext = {
  * evaluator action states — with nothing to record here.
  */
 export type SegId =
+  | { kind: "initializers" }
   | { kind: "guard" }
   | { kind: "body" }
   | { kind: "effects" }

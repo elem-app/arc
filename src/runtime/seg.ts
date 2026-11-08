@@ -262,15 +262,6 @@ function unwindSegBreak<TStatement extends { kind: string }>(
   throw new Error(`Unhandled break label: ${label}`);
 }
 
-/** Suspends the current SEG and records the resume point on the action root. */
-export function blockSeg<TResult>(
-  accum: Accumulator,
-  traversal: Traversal,
-): SegOutcome<TResult> {
-  blockTraversal(accum, traversal);
-  return { status: "blocked" };
-}
-
 /** Suspends at a new deflection origin until the host acknowledges it. */
 export function requestDeflection(
   accum: Accumulator,

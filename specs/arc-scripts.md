@@ -381,7 +381,7 @@ To guard against such poisoning, use `Num.isFinite(expr)` as a precheck. It retu
 
 Comparison operators pair two values and produce a boolean:
 
-- Equality — `==` and `!=` — compares by value and accepts any two values except `Dialog.Cursor`s, which cannot be compared. Values of different types are unequal, without coercion, so `1 == "1"` is `false`. A comparison that can never be equal is legal, and Arc reports it as a lint warning. Numeric equality is exact, with no rounding tolerance. Scalars are otherwise equal when their values are identical, Artifacts are equal when their logical paths are equal, arrays are equal when they hold the same elements in the same order (see [Arrays](#arrays)), and structs are equal when their fields are equal (see [Structs](#structs)). When either operand is an unset cell, `==` is `false` and `!=` is `true`.
+- Equality — `==` and `!=` — is structural: two values are equal when they have the same shape and contents, whatever their declarations. Values of different kinds, such as a number and a string, are therefore never equal, and nothing is coerced, so `1 == "1"` is `false`. Two empty arrays are equal whatever their element types. `Dialog.Cursor`s cannot be compared. A comparison that can never be equal is legal, and Arc reports it as a lint warning. Numeric equality is exact, with no rounding tolerance. Scalars are otherwise equal when their values are identical, Artifacts are equal when their logical paths are equal, arrays are equal when they hold the same elements in the same order (see [Arrays](#arrays)), and structs are equal when their fields are equal (see [Structs](#structs)). When either operand is an unset cell, `==` is `false` and `!=` is `true`.
 - Ordering — `>`, `>=`, `<`, and `<=` — compares magnitude. Numbers order numerically, strings order lexicographically, and `Enum` values order by declared position. When one operand is an `Enum`, the other must be a member literal, an `Enum` with the same values in the same order, or a value that is a member at runtime; a `Str` cell is rejected. When either operand is an unset cell, all four are `false`. Artifacts, arrays, and structs have no ordering.
 
 `&&` and `||` are logical conjunction and disjunction over boolean operands, producing a boolean. Each short-circuits: `&&` evaluates its right operand only when its left is `true`, and `||` only when its left is `false`, so a blocking or effectful right operand runs only where the left has not already decided the result.
@@ -580,8 +580,9 @@ Execution semantics:
 1. The runtime emits the instruction text along with the semantic checks its `deflectWhen` and `resolveWhen` currently need.
 2. The host reports the instruction's application and/or semantic results needed by the checks.
 3. The runtime evaluates `deflectWhen` if possible, followed by `resolveWhen`.
-4. If `deflectWhen` becomes true, the runtime requests host acknowledgement before beginning deflection handling.
-5. Prior to `deflectWhen` resolution, or after `deflectWhen` becomes false, `$instruct` resolves when application is reported, and `$instructLoop` resolves when `resolveWhen` becomes true.
+4. If `deflectWhen` becomes true, the runtime marks `$instruct` resolved if application has been reported, or `$instructLoop` resolved if `resolveWhen` is true, then requests host acknowledgement before beginning deflection handling. A resolved instruction does not repeat if the deflection is caught.
+5. If `deflectWhen` is false or absent, `$instruct` resolves when application is reported, and `$instructLoop` resolves when `resolveWhen` becomes true. A false `resolveWhen` starts another iteration.
+6. While `deflectWhen` remains unresolved, the instruction stays pending and retains any application or `resolveWhen` result already received.
 
 Only the semantic checks currently reachable from `deflectWhen` / `resolveWhen` are asked at any one time.
 
