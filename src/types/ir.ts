@@ -95,6 +95,16 @@ export type NodeSignature = {
   returns: Record<string, ChannelSpec>;
 };
 
+/** Returns the spec of an own channel key declared by the node signature. */
+export function getChannelSpec(
+  signature: NodeSignature | undefined,
+  namespace: ChannelNamespace,
+  key: string,
+): ChannelSpec | undefined {
+  const schema = signature?.[namespace];
+  return schema && Object.hasOwn(schema, key) ? schema[key] : undefined;
+}
+
 /**
  * The source an `$enter(...)` channel key binds to. Discriminated so every
  * binding-resolution site handles each source exhaustively:

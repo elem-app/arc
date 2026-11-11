@@ -1794,80 +1794,32 @@ function Main() {
       ]);
     });
 
-    it("poisons traversal at runtime when args channel keys are not wired by $enter()", () => {
-      const document = parse(`
+    it("compose.args rejects undeclared reads in effects during parsing", () => {
+      expect(() =>
+        parse(`
 "arc";
-
 function Main() {
   $enter(Child);
-
   function Child() {
-    this.effects = () => {
-      if (args.ready == true) {
-      }
-      if (args.ready == false) {
-      }
-    };
+    this.effects = () => { if (args.ready == true) {} };
   }
 }
-`);
-      const runtime = new Runtime()
-        .add("enter-missing-args-arc", document)
-        .init();
-      const seeded = runtime.newTraversal(
-        arc("enter-missing-args-arc", "Main"),
-      );
-      seeded.phase = "entered";
-
-      const brief = startTerminal(runtime, [seeded], {
-        cursor: { user: 0, self: 0 },
-        lastTurns: [],
-      });
-      expect(rootTraversal(brief).phase).toBe("poisoned");
-      expect(brief.canProgress).toBe(false);
-      expect(brief.issues).toEqual([
-        expect.objectContaining({
-          kind: "poisoned-traversal",
-          reasonCode: "unknown-channel-key",
-          reason: expect.stringContaining('Unknown args channel key "ready"'),
-        }),
-      ]);
+`),
+      ).toThrow(/UNKNOWN_CHANNEL_KEY/);
     });
 
-    it("poisons traversal when args channel keys are read in normal action flow but not wired", () => {
-      const document = parse(`
+    it("compose.args rejects undeclared reads in action flow during parsing", () => {
+      expect(() =>
+        parse(`
 "arc";
-
 function Main() {
   $enter(Child);
-
   function Child() {
-    if (args.ready == true) {
-      $instruct(\`ready\`);    }
+    if (args.ready == true) { $instruct(\`ready\`); }
   }
 }
-`);
-      const runtime = new Runtime()
-        .add("enter-missing-args-action-arc", document)
-        .init();
-      const seeded = runtime.newTraversal(
-        arc("enter-missing-args-action-arc", "Main"),
-      );
-      seeded.phase = "entered";
-
-      const brief = startTerminal(runtime, [seeded], {
-        cursor: { user: 0, self: 0 },
-        lastTurns: [],
-      });
-      expect(rootTraversal(brief).phase).toBe("poisoned");
-      expect(brief.canProgress).toBe(false);
-      expect(brief.issues).toEqual([
-        expect.objectContaining({
-          kind: "poisoned-traversal",
-          reasonCode: "unknown-channel-key",
-          reason: expect.stringContaining('Unknown args channel key "ready"'),
-        }),
-      ]);
+`),
+      ).toThrow(/UNKNOWN_CHANNEL_KEY/);
     });
 
     it("rejects reading an args channel into a cell of an incompatible type", () => {
@@ -2137,8 +2089,8 @@ function Main() {
 "arc";
 function Main() {
   let verdict = Bool();
-  $enter(Child, { returns: { verdict } });
-  function Child() {}
+  $enter(Child, { returns: { a: verdict } });
+  function Child(returns = { a: Bool(), b: Bool() }) {}
 }
 `);
       const enterAction = document.roots[0]?.statements[0] as EnterNodeAction;
@@ -2270,45 +2222,18 @@ function Main() {
       expect(rootTraversal(brief).cells.note).toBe("untouched");
     });
 
-    it("poisons traversal when returns channel keys are not wired by $enter()", () => {
-      const document = parse(`
+    it("compose.returns rejects undeclared writes during parsing", () => {
+      expect(() =>
+        parse(`
 "arc";
-
 function Main() {
-  $enter(Child, {
-    returns: {},
-  });
-
+  $enter(Child, { returns: {} });
   function Child() {
-    this.effects = () => {
-      returns.verdict.$set(true);
-    };
+    this.effects = () => { returns.verdict.$set(true); };
   }
 }
-`);
-      const runtime = new Runtime()
-        .add("enter-missing-returns-arc", document)
-        .init();
-      const seeded = runtime.newTraversal(
-        arc("enter-missing-returns-arc", "Main"),
-      );
-      seeded.phase = "entered";
-
-      const brief = startTerminal(runtime, [seeded], {
-        cursor: { user: 0, self: 0 },
-        lastTurns: [],
-      });
-      expect(rootTraversal(brief).phase).toBe("poisoned");
-      expect(brief.canProgress).toBe(false);
-      expect(brief.issues).toEqual([
-        expect.objectContaining({
-          kind: "poisoned-traversal",
-          reasonCode: "unknown-channel-key",
-          reason: expect.stringContaining(
-            "returns.verdict.$set() targets an undeclared returns channel",
-          ),
-        }),
-      ]);
+`),
+      ).toThrow(/UNKNOWN_CHANNEL_KEY/);
     });
 
     it("rejects a returns.*.$set(...) value of an incompatible type", () => {

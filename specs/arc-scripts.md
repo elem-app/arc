@@ -1106,7 +1106,7 @@ function Op(
 }
 ```
 
-A node may declare `args`, `returns`, both, or neither; when both are present `args` precedes `returns`, and no other parameter name is admitted.
+A node may declare `args`, `returns`, both, or neither; when both are present `args` precedes `returns`, and no other parameter name is admitted. Every `args` or `returns` channel used by a node must be declared in that node's signature.
 
 Each channel key has a type. A key's type is `Bool()`, `Str()`, `Enum(...)`, `Num()`, `Union(...)`, `Artifact()`, `Dialog.Cursor()`, `Array(elementSpec)`, or `Struct({ ... })`, with no observation config. `Array` accepts the same element specs as a cell array; nested channel arrays remain invalid. `Struct` accepts the same field specs as a struct cell. `Index()` is a channel-only non-negative-safe-integer refinement of `Num()` and cannot declare a cell or array element.
 
@@ -1139,7 +1139,7 @@ Binding rules:
 - A `returns` binding is a caller cell the node writes.
 - Each executed entry site resolves its bindings in the current caller context, using shorthand (`{ ready }`) or renamed (`{ input: ready }`) keys.
 - The value provider must be assignable to the receiving channel, including scalar type, enum members, and array element types recursively. `Index()` is assignable to `Num()`, while `Num()` is not assignable to `Index()` because an arbitrary number may be fractional, negative, or outside the safe-integer range. For `args`, the caller binding provides the value; for `returns`, the declared return channel provides the value to the caller cell.
-- Binding a key the target does not declare is an error. Within one `returns` map, each caller cell may back at most one key.
+- Every bound key must be declared by the target. Within one `returns` map, each caller cell may back at most one key.
 - `args` and `returns` must be object literals (no spread, no computed keys).
 
 Channel behavior:
@@ -1147,7 +1147,7 @@ Channel behavior:
 1. Inside the node, `args.<key>` reads the cell bound to that key.
 2. `returns.<key>.$set(...)` stages a value; it does not write the caller cell immediately, and it is valid only inside `this.effects`.
 3. A caller cell updates when the `$enter`/`$enterLoop` resolves normally; a key the node never sets leaves its caller cell unchanged.
-4. A declared key the caller leaves unbound is legal: an unbound `args` key reads as unset, and a write to an unbound `returns` key is discarded at resolution. Reading or writing a key the node does not declare poisons the traversal.
+4. A declared key the caller leaves unbound is legal: an unbound `args` key reads as unset, and a write to an unbound `returns` key is discarded at resolution.
 
 ## Channels
 

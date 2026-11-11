@@ -1,6 +1,6 @@
 import {
+  channelBindingCompatible,
   resolveReferenceSpec,
-  reusableSpecCompatible,
 } from "../spec/resolution.js";
 import type {
   ArrayReference,
@@ -11,6 +11,7 @@ import type {
   NodeSignature,
   Statement,
 } from "../types/ir.js";
+import { getChannelSpec } from "../types/ir.js";
 import {
   toArcRef,
   toArcRefParts,
@@ -218,7 +219,7 @@ function checkEnterBinding(
   checkBindings(
     "args",
     statement.args,
-    targetSignature?.args ?? {},
+    targetSignature,
     statement.target.identifier,
     label,
     (source) => sourceSpec(source, callerNode.signature, cells, map),
@@ -230,7 +231,7 @@ function checkEnterBinding(
   checkBindings(
     "returns",
     statement.returns,
-    targetSignature?.returns ?? {},
+    targetSignature,
     statement.target.identifier,
     label,
     (source) => sourceSpec(source, callerNode.signature, cells, map),
@@ -244,7 +245,7 @@ function checkEnterBinding(
 function checkBindings(
   namespace: "args" | "returns",
   bindings: Record<string, EnterChannelBindingSource> | undefined,
-  schema: Readonly<Record<string, ChannelSpec>>,
+  signature: NodeSignature | undefined,
   target: string,
   label: string,
   provided: (source: EnterChannelBindingSource) => ChannelSpec | undefined,
@@ -254,7 +255,7 @@ function checkBindings(
   issues: RuntimeRegistryIssue[],
 ): void {
   for (const [key, source] of Object.entries(bindings ?? {})) {
-    const declared = schema[key];
+    const declared = getChannelSpec(signature, namespace, key);
     if (!declared) {
       issues.push({
         ...bindingIssueContext(
@@ -286,10 +287,7 @@ function checkBindings(
       });
       continue;
     }
-    const providerSpec = namespace === "args" ? providedSpec : declared;
-    const receiverSpec = namespace === "args" ? declared : providedSpec;
-    const compatible = reusableSpecCompatible(providerSpec, receiverSpec);
-    if (!compatible) {
+    if (!channelBindingCompatible(namespace, providedSpec, declared)) {
       issues.push({
         ...bindingIssueContext(
           "ENTER_CHANNEL_INCOMPATIBLE",
@@ -340,7 +338,7 @@ function sourceSpec(
       return cell ? cellSpecToChannelSpec(cell) : undefined;
     }
     case "argsProjection":
-      return signature?.args[source.key];
+      return getChannelSpec(signature, "args", source.key);
     case "span":
       if (source.key === "index") return { type: "index" };
       return source.key === "item" ? map?.receiver : map?.result;

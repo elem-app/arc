@@ -10,6 +10,7 @@ import {
   arithmeticRule,
   artifactPathRule,
   booleanRule,
+  channelBindingCompatible,
   comparisonRule,
   fmtRule,
   interpolationRule,
@@ -21,7 +22,6 @@ import {
   resolveHostOperation,
   resolveProducer,
   resolveReferenceSpec,
-  reusableSpecCompatible,
   stringOperandRule,
 } from "../spec/resolution.js";
 import { isStructFieldName } from "../spec/struct.js";
@@ -31,6 +31,7 @@ import type {
   CatchDeflectionStatement,
   Cell,
   CellTarget,
+  ChannelNamespace,
   Document,
   DocumentAnalysis,
   DocumentAnalysisOptions,
@@ -78,6 +79,7 @@ import type {
   WriteDiffMode,
 } from "../types/ir.js";
 import {
+  getChannelSpec,
   isArrayCell,
   isObservableCell,
   isScalarCell,
@@ -2165,7 +2167,6 @@ function parseNodeStatement(
   visibleNodeNames: Set<string>,
   visibleCellNames: Set<string>,
   availableHostModules: Map<string, string>,
-
   defaultDeflectWhen: ResolutionStatement[] | undefined,
   enclosing: EnclosingNode,
 ): Statement[] {
@@ -2248,7 +2249,7 @@ function parseNodeStatement(
   }
 
   if (statement.type !== "ExpressionStatement") {
-    throw unsupportedArcStatement("an Arc action graph", statement);
+    throw unsupportedArcStatement(statement, "an Arc action graph");
   }
   const expression = statement.expression;
   if (expression.type === "AssignmentExpression") {
@@ -2273,15 +2274,20 @@ function parseNodeStatement(
   return [action];
 }
 
+type StatementScope =
+  | "an Arc action graph"
+  | "this.trigger"
+  | "this.guard"
+  | "this.deflectWhen"
+  | "this.catchDeflection"
+  | "this.catchInterruption"
+  | "this.effects"
+  | `${"$instruct" | "$instructLoop"}().${"resolveWhen" | "deflectWhen"}`
+  | "$enterLoop().resolveWhen";
+
 function unsupportedArcStatement(
-  scope:
-    | "an Arc action graph"
-    | "this.trigger"
-    | "this.guard"
-    | "this.catchDeflection"
-    | "this.catchInterruption"
-    | "this.effects",
   statement: acorn.Statement,
+  scope: StatementScope,
 ): Error {
   switch (statement.type) {
     case "VariableDeclaration":
@@ -2315,7 +2321,6 @@ function parseStatementList(
   visibleNodeNames: Set<string>,
   visibleCellNames: Set<string>,
   availableHostModules: Map<string, string>,
-
   defaultDeflectWhen: ResolutionStatement[] | undefined,
   enclosing: EnclosingNode,
 ): Statement[] {
@@ -2341,7 +2346,6 @@ function parseActionExpression(
   visibleNodeNames: Set<string>,
   visibleCellNames: Set<string>,
   availableHostModules: Map<string, string>,
-
   defaultDeflectWhen: ResolutionStatement[] | undefined,
   enclosing: EnclosingNode,
 ): Statement | undefined {
@@ -2655,7 +2659,6 @@ function parseMapResults(
  */
 function parseInvokeCall(
   expression: acorn.CallExpression,
-
   availableImports: Set<string>,
   visibleNodeNames: Set<string>,
   visibleCellNames: Set<string>,
@@ -2728,26 +2731,24 @@ function parseInvokeCall(
 
 function parseTriggerArrowFunction(
   expression: acorn.Expression,
-  label: string,
-
+  scope: StatementScope,
   availableHostModules: Map<string, string>,
 ): TriggerStatement[] {
   if (expression.type !== "ArrowFunctionExpression") {
-    throw new Error(`${label} must be an arrow function`);
+    throw new Error(`${scope} must be an arrow function`);
   }
   const body = getHookBodyStatements(expression, "return");
-  if (!body) throw new Error(`${label} must be a function`);
-  return parseTriggerStatements(body, availableHostModules);
+  if (!body) throw new Error(`${scope} must be a function`);
+  return parseTriggerStatements(body, scope, availableHostModules);
 }
 
 function parseResolutionDefinition(
   expression: acorn.Expression,
-  label: string,
-
+  scope: StatementScope,
   availableHostModules: Map<string, string>,
 ): ResolutionStatement[] {
   if (expression.type === "ArrowFunctionExpression") {
-    return parseTriggerArrowFunction(expression, label, availableHostModules);
+    return parseTriggerArrowFunction(expression, scope, availableHostModules);
   }
 
   const question = parseSemanticString(expression, availableHostModules);
@@ -2769,7 +2770,6 @@ function parseResolutionDefinition(
 function createInstructionAction(
   template: SemanticString,
   mode: InstructionAction["mode"],
-
   loc: SourceRange | undefined,
   hostParams: PayloadValue,
   resolveWhen?: ResolutionStatement[],
@@ -2790,7 +2790,6 @@ function createInstructionAction(
 function parseInstructionCall(
   expression: acorn.CallExpression,
   availableHostModules: Map<string, string>,
-
   defaultDeflectWhen?: ResolutionStatement[],
 ): InstructionAction {
   const callee =
@@ -2945,7 +2944,6 @@ function parseEnterCall(
   availableImports: Set<string>,
   visibleNodeNames: Set<string>,
   visibleCellNames: Set<string>,
-
   enclosing: EnclosingNode,
 ): Statement {
   const target = parseTarget(expression.arguments[0], "enter", {
@@ -3018,7 +3016,6 @@ function parseEnterLoopCall(
   visibleNodeNames: Set<string>,
   visibleCellNames: Set<string>,
   availableHostModules: Map<string, string>,
-
   enclosing: EnclosingNode,
 ): Statement {
   const target = parseTarget(expression.arguments[0], "enterLoop", {
@@ -3204,7 +3201,6 @@ type ObserveMethod = "observe" | "observeOrAsk";
 function parseObserveCall(
   expression: acorn.CallExpression,
   method: ObserveMethod,
-
   availableHostModules: ReadonlyMap<string, string> = new Map(),
   expressionContext?: ExpressionParseContext,
 ):
@@ -3308,7 +3304,6 @@ function assertOrdinaryCellTarget(target: CellTarget, owner: string): void {
 function parseCellMutationCall(
   expression: acorn.CallExpression,
   availableHostModules: Map<string, string>,
-
   context: "action" | "effects",
   expressionContext?: ExpressionParseContext,
 ): SetAction | UnsetAction | SetReturnAction | undefined {
@@ -3394,16 +3389,16 @@ function parseCellMutationCall(
 
 function parseTriggerStatements(
   statements: acorn.Statement[],
-
+  scope: StatementScope,
   availableHostModules: Map<string, string>,
 ): TriggerStatement[] {
   return statements.flatMap<TriggerStatement>((statement) => {
     if (statement.type === "LabeledStatement") {
       if (statement.label.type !== "Identifier") {
-        throw new Error("this.trigger labels must use identifier names");
+        throw new Error(`${scope} labels must use identifier names`);
       }
       if (statement.body.type !== "BlockStatement") {
-        throw new Error("this.trigger labels must target a block statement");
+        throw new Error(`${scope} labels must target a block statement`);
       }
       return [
         {
@@ -3412,6 +3407,7 @@ function parseTriggerStatements(
           label: statement.label.name,
           body: parseTriggerStatements(
             statement.body.body,
+            scope,
             availableHostModules,
           ),
           loc: locOf(statement),
@@ -3421,7 +3417,7 @@ function parseTriggerStatements(
 
     if (statement.type === "BreakStatement") {
       if (!statement.label || statement.label.type !== "Identifier") {
-        throw new Error("this.trigger break statements must specify a label");
+        throw new Error(`${scope} break statements must specify a label`);
       }
       return [
         {
@@ -3441,11 +3437,13 @@ function parseTriggerStatements(
           test: parseExpression(statement.test, availableHostModules, true),
           consequent: parseTriggerStatements(
             getBlockStatements(statement.consequent),
+            scope,
             availableHostModules,
           ),
           alternate: statement.alternate
             ? parseTriggerStatements(
                 getBlockStatements(statement.alternate),
+                scope,
                 availableHostModules,
               )
             : undefined,
@@ -3468,12 +3466,12 @@ function parseTriggerStatements(
     }
 
     if (statement.type !== "ExpressionStatement") {
-      throw unsupportedArcStatement("this.trigger", statement);
+      throw unsupportedArcStatement(statement, scope);
     }
     const expression = statement.expression;
     if (expression.type !== "CallExpression") {
       throw new Error(
-        `Unsupported this.trigger expression statement: ${expression.type}`,
+        `Unsupported ${scope} expression statement: ${expression.type}`,
       );
     }
 
@@ -3503,13 +3501,12 @@ function parseTriggerStatements(
       return [mutation];
     }
 
-    throw new Error("Unsupported this.trigger call");
+    throw new Error(`Unsupported ${scope} call`);
   });
 }
 
 function parseGuardStatements(
   statements: acorn.Statement[],
-
   availableHostModules: Map<string, string>,
 ): GuardStatement[] {
   return statements.flatMap<GuardStatement>((statement) => {
@@ -3583,7 +3580,7 @@ function parseGuardStatements(
     }
 
     if (statement.type !== "ExpressionStatement") {
-      throw unsupportedArcStatement("this.guard", statement);
+      throw unsupportedArcStatement(statement, "this.guard");
     }
     const expression = statement.expression;
     if (expression.type !== "CallExpression") {
@@ -3624,7 +3621,6 @@ function parseGuardStatements(
 
 function parseCatchStatements(
   statements: acorn.Statement[],
-
   availableHostModules: Map<string, string>,
   availableImports: Set<string>,
   visibleNodeNames: Set<string>,
@@ -3722,7 +3718,7 @@ function parseCatchStatements(
     }
 
     if (statement.type !== "ExpressionStatement") {
-      throw unsupportedArcStatement(`this.${hook}`, statement);
+      throw unsupportedArcStatement(statement, `this.${hook}`);
     }
     const expression = statement.expression;
     if (expression.type !== "CallExpression") {
@@ -3804,7 +3800,6 @@ function parseGuardReturnValue(
 
 function parseEffectStatements(
   statements: acorn.Statement[],
-
   availableHostModules: Map<string, string>,
   expressionContext: ExpressionParseContext,
 ): EffectStatement[] {
@@ -3874,7 +3869,7 @@ function parseEffectStatements(
     }
 
     if (statement.type !== "ExpressionStatement") {
-      throw unsupportedArcStatement("this.effects", statement);
+      throw unsupportedArcStatement(statement, "this.effects");
     }
     const expression = statement.expression;
     if (expression.type !== "CallExpression") {
@@ -3924,7 +3919,6 @@ function parseEffectStatements(
 
 function parseStandaloneHostCall(
   expression: acorn.CallExpression,
-
   availableHostModules: Map<string, string>,
   expressionContext?: ExpressionParseContext,
 ): HostCall | undefined {
@@ -4061,7 +4055,7 @@ function validateEnterChannelBindings(
     }
     if (source.kind === "argsProjection") {
       // Forwards the caller's own declared args channel.
-      const declared = callerSignature?.args[source.key];
+      const declared = getChannelSpec(callerSignature, "args", source.key);
       if (!declared) {
         issues.push({
           code: "UNKNOWN_ARGS_PROJECTION",
@@ -4093,15 +4087,18 @@ function validateEnterChannelBindings(
 
   for (const [key, source] of Object.entries(statement.args ?? {})) {
     const provided = sourceSpec(source);
-    if (targetSignature) {
-      const declared = targetSignature.args[key];
+    if (targetNode) {
+      const declared = getChannelSpec(targetSignature, "args", key);
       if (!declared) {
         issues.push({
           code: "UNDECLARED_ARGS_KEY",
           message: `${callLabel}() binds args.${key}, which ${statement.target.identifier} does not declare`,
           loc: statement.loc,
         });
-      } else if (provided && !reusableSpecCompatible(provided, declared)) {
+      } else if (
+        provided &&
+        !channelBindingCompatible("args", provided, declared)
+      ) {
         issues.push({
           code: "ENTER_CHANNEL_INCOMPATIBLE",
           message: `${callLabel}() args.${key} binding is incompatible with the declared channel type`,
@@ -4124,15 +4121,18 @@ function validateEnterChannelBindings(
       boundReturnCells.add(source.cell);
     }
     const provided = sourceSpec(source);
-    if (targetSignature) {
-      const declared = targetSignature.returns[key];
+    if (targetNode) {
+      const declared = getChannelSpec(targetSignature, "returns", key);
       if (!declared) {
         issues.push({
           code: "UNDECLARED_RETURNS_KEY",
           message: `${callLabel}() binds returns.${key}, which ${statement.target.identifier} does not declare`,
           loc: statement.loc,
         });
-      } else if (provided && !reusableSpecCompatible(declared, provided)) {
+      } else if (
+        provided &&
+        !channelBindingCompatible("returns", provided, declared)
+      ) {
         issues.push({
           code: "ENTER_CHANNEL_INCOMPATIBLE",
           message: `${callLabel}() returns.${key} binding is incompatible with the declared channel type`,
@@ -5973,9 +5973,16 @@ function validateEffectStatement(
 
   if (statement.kind === "set-return") {
     const signature = options.references?.currentNode.signature;
+    const declared = validateChannelDeclaration(
+      "returns",
+      statement.key,
+      issues,
+      options,
+      statement.loc,
+    );
     validateExpression(statement.value, cells, nodes, issues, options);
     checkTypedAssignable(
-      signature?.returns[statement.key],
+      declared,
       statement.value,
       cells,
       signature,
@@ -6239,7 +6246,8 @@ function expressionIsArray(
     }
     case "channel":
       return (
-        signature?.[expression.namespace][expression.key]?.type === "array"
+        getChannelSpec(signature, expression.namespace, expression.key)
+          ?.type === "array"
       );
     case "conditional":
       return (
@@ -6299,7 +6307,26 @@ function checkBooleanValue(
   }
 }
 
-/** Validates an array element / length read receiver and records its read. */
+/** Requires a channel spec in the owning node's signature. */
+function validateChannelDeclaration(
+  namespace: ChannelNamespace,
+  key: string,
+  issues: ValidationIssue[],
+  options: ValidationOptions,
+  loc?: SourceRange,
+): ChannelSpec | undefined {
+  const node = options.references?.currentNode;
+  const declared = getChannelSpec(node?.signature, namespace, key);
+  if (!declared) {
+    issues.push({
+      code: "UNKNOWN_CHANNEL_KEY",
+      message: `${namespace}.${key} is not declared by the enclosing node`,
+      loc: loc ?? node?.loc,
+    });
+  }
+  return declared;
+}
+
 /**
  * Validates a struct field reference against its receiver's declaration and
  * records the receiver read. Returns the selected field's declaration.
@@ -6327,14 +6354,13 @@ function validateFieldReference(
   } else if (receiver.kind === "channel") {
     recordChannelRead(receiver.namespace, receiver.key);
     label = `${receiver.namespace}.${receiver.key}`;
-    receiverSpec = signature?.[receiver.namespace][receiver.key];
-    if (!receiverSpec) {
-      issues.push({
-        code: "UNKNOWN_CHANNEL_KEY",
-        message: `Unknown ${label} channel for a Struct field read`,
-      });
-      return undefined;
-    }
+    receiverSpec = validateChannelDeclaration(
+      receiver.namespace,
+      receiver.key,
+      issues,
+      options,
+    );
+    if (!receiverSpec) return undefined;
   } else {
     recordCellRead(receiver.name);
     label = receiver.name;
@@ -6361,6 +6387,7 @@ function validateFieldReference(
   return spec;
 }
 
+/** Validates an array element / length read receiver and records its read. */
 function validateArrayReference(
   array: ArrayReference,
   operation: "index" | "length",
@@ -6369,7 +6396,6 @@ function validateArrayReference(
   issues: ValidationIssue[],
   options: ValidationOptions,
 ): void {
-  const signature = options.references?.currentNode.signature;
   if (array.kind === "field") {
     const spec = validateFieldReference(array, cells, nodes, issues, options);
     if (spec && spec.type !== "array") {
@@ -6382,9 +6408,12 @@ function validateArrayReference(
   }
   if (array.kind === "channel") {
     recordChannelRead(array.namespace, array.key);
-    // A channel receiver must be a declared array channel. An undeclared key or
-    // a node without a signature is left to the runtime channel read.
-    const declared = signature?.[array.namespace][array.key];
+    const declared = validateChannelDeclaration(
+      array.namespace,
+      array.key,
+      issues,
+      options,
+    );
     if (declared && declared.type !== "array") {
       issues.push({
         code: operation === "index" ? "INDEX_NON_ARRAY" : "LENGTH_NON_ARRAY",
@@ -6534,13 +6563,16 @@ function validateExpression(
       );
       return;
     case "channel":
-      // Channels (`args.*` / `returns.*`) are caller-backed live reads; record
-      // them so a caller-cell change during child execution is caught. No
-      // structural validation applies to a channel reference itself.
-      recordChannelRead(expression.namespace, expression.key);
-      return;
     case "channelIsUnset":
+      // Channels (`args.*` / `returns.*`) are caller-backed live reads; record
+      // them so a caller-cell change during child execution is caught.
       recordChannelRead(expression.namespace, expression.key);
+      validateChannelDeclaration(
+        expression.namespace,
+        expression.key,
+        issues,
+        options,
+      );
       return;
     case "judge":
       validateSemanticString(

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { parse } from "../src/parser/index.js";
 import {
   admitValue,
+  channelBindingCompatible,
   judgeOneTimeLanding,
   reduceAlternativeJudgments,
   reusableSpecCompatible,
@@ -496,6 +497,21 @@ describe("spec judgments", () => {
         { type: "array", element: { type: "artifact" } },
       ),
     ).toBe(false);
+  });
+
+  it("compose.typed-binding assigns provider direction by channel namespace", () => {
+    const index = { type: "index" } as const;
+    const number = { type: "number" } as const;
+    expect(channelBindingCompatible("args", index, number)).toBe(true);
+    expect(channelBindingCompatible("args", number, index)).toBe(false);
+    expect(channelBindingCompatible("returns", number, index)).toBe(true);
+    expect(channelBindingCompatible("returns", index, number)).toBe(false);
+    for (const namespace of ["args", "returns"] as const) {
+      expect(channelBindingCompatible(namespace, index, index)).toBe(true);
+      expect(
+        channelBindingCompatible(namespace, number, { type: "string" }),
+      ).toBe(false);
+    }
   });
 
   it("struct.field-path resolves a nested field with the receiver's field family", () => {

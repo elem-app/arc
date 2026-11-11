@@ -1197,6 +1197,55 @@ function Bad() {
       ).toThrow(/this\.effects must be an arrow function/);
     });
 
+    it.each([
+      ["this.trigger", (body: string) => `this.trigger = () => { ${body} };`],
+      [
+        "this.deflectWhen",
+        (body: string) => `this.deflectWhen = () => { ${body} };`,
+      ],
+      [
+        "$instruct().deflectWhen",
+        (body: string) =>
+          `$instruct("outer", { deflectWhen: () => { ${body} } });`,
+      ],
+      [
+        "$instructLoop().deflectWhen",
+        (body: string) =>
+          `$instructLoop("outer", { resolveWhen: () => false, deflectWhen: () => { ${body} } });`,
+      ],
+      [
+        "$instructLoop().resolveWhen",
+        (body: string) =>
+          `$instructLoop("outer", { resolveWhen: () => { ${body} } });`,
+      ],
+      [
+        "$enterLoop().resolveWhen",
+        (body: string) =>
+          `$enterLoop(Child, { resolveWhen: () => { ${body} } }); function Child() {}`,
+      ],
+    ])("cfg.hook-shapes names %s in statement diagnostics", (scope, hook) => {
+      for (const body of [
+        '$instruct("inner");',
+        'if (true) { $instruct("inner"); }',
+        'if (false) {} else { $instruct("inner"); }',
+        'nested: { $instruct("inner"); }',
+      ]) {
+        expect(() => parse(`"arc"; function Main() { ${hook(body)} }`)).toThrow(
+          new Error(`Unsupported ${scope} call`),
+        );
+      }
+
+      for (const [body, message] of [
+        ["true;", `Unsupported ${scope} expression statement: Literal`],
+        ["nested: true;", `${scope} labels must target a block statement`],
+        ["while (true) {}", `\`while\` is not supported in ${scope}`],
+      ] as const) {
+        expect(() => parse(`"arc"; function Main() { ${hook(body)} }`)).toThrow(
+          new Error(message),
+        );
+      }
+    });
+
     it("accepts a concise-body this.trigger and desugars it to a return", () => {
       const document = parse(`
 "arc";

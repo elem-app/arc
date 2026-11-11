@@ -4,6 +4,7 @@ import { validateFmtConfig } from "../spec/fmt.js";
 import { isHostStructFieldName } from "../spec/host-parameters.js";
 import { isStructFieldName } from "../spec/struct.js";
 import {
+  getChannelSpec,
   UNSTAMPED_ID,
   type ArithmeticOperator,
   type ArrayReference,
@@ -107,9 +108,11 @@ export function resetDeclarationScope(): void {
 
 function scopedSlotSpec(reference: SlotReference): ScopedSpec | undefined {
   if (reference.kind === "channel") {
-    return declarationScope.at(-1)?.signature?.[reference.namespace][
-      reference.key
-    ];
+    return getChannelSpec(
+      declarationScope.at(-1)?.signature,
+      reference.namespace,
+      reference.key,
+    );
   }
   for (let index = declarationScope.length - 1; index >= 0; index -= 1) {
     const cell = declarationScope[index]!.cells.get(reference.name);

@@ -234,6 +234,201 @@ function Other() {}
     ).not.toThrow();
   });
 
+  it.each([
+    {
+      name: "widened args",
+      namespace: "args",
+      body: 'let value = Enum(["a"]); ENTRY',
+      binding: "value",
+      target: "args = { value: Str() }",
+      outcome: "accepted",
+    },
+    {
+      name: "narrowed args",
+      namespace: "args",
+      body: "let value = Str(); ENTRY",
+      binding: "value",
+      target: 'args = { value: Enum(["a"]) }',
+      outcome: "incompatible",
+    },
+    {
+      name: "widened return sinks",
+      namespace: "returns",
+      body: "let value = Str(); ENTRY",
+      binding: "value",
+      target: 'returns = { value: Enum(["a"]) }',
+      outcome: "accepted",
+    },
+    {
+      name: "narrowed return sinks",
+      namespace: "returns",
+      body: 'let value = Enum(["a"]); ENTRY',
+      binding: "value",
+      target: "returns = { value: Str() }",
+      outcome: "incompatible",
+    },
+    {
+      name: "args without a signature",
+      namespace: "args",
+      body: "let value = Str(); ENTRY",
+      binding: "value",
+      target: "",
+      outcome: "undeclared",
+    },
+    {
+      name: "args with an empty signature",
+      namespace: "args",
+      body: "let value = Str(); ENTRY",
+      binding: "value",
+      target: "args = {}",
+      outcome: "undeclared",
+    },
+    {
+      name: "returns without a signature",
+      namespace: "returns",
+      body: "let value = Str(); ENTRY",
+      binding: "value",
+      target: "",
+      outcome: "undeclared",
+    },
+    {
+      name: "returns with an empty signature",
+      namespace: "returns",
+      body: "let value = Str(); ENTRY",
+      binding: "value",
+      target: "returns = {}",
+      outcome: "undeclared",
+    },
+    {
+      name: "widened forwarded args",
+      namespace: "args",
+      parameters: "args = { input: Index() }",
+      body: "ENTRY",
+      binding: "args.input",
+      target: "args = { value: Num() }",
+      outcome: "accepted",
+    },
+    {
+      name: "narrowed forwarded args",
+      namespace: "args",
+      parameters: "args = { input: Num() }",
+      body: "ENTRY",
+      binding: "args.input",
+      target: "args = { value: Index() }",
+      outcome: "incompatible",
+    },
+    {
+      name: "matching struct map items",
+      namespace: "args",
+      body: "let input = Array(Struct({ field: Num() })); input.$map(() => { ENTRY });",
+      binding: "span.item",
+      target: "args = { value: Struct({ field: Num() }) }",
+      outcome: "accepted",
+    },
+    {
+      name: "incompatible struct map items",
+      namespace: "args",
+      body: "let input = Array(Struct({ field: Num() })); input.$map(() => { ENTRY });",
+      binding: "span.item",
+      target: "args = { value: Struct({ field: Str() }) }",
+      outcome: "incompatible",
+    },
+    {
+      name: "widened map indices",
+      namespace: "args",
+      body: "let input = Array(Str()); input.$map(() => { ENTRY });",
+      binding: "span.index",
+      target: "args = { value: Num() }",
+      outcome: "accepted",
+    },
+    {
+      name: "incompatible map indices",
+      namespace: "args",
+      body: "let input = Array(Str()); input.$map(() => { ENTRY });",
+      binding: "span.index",
+      target: "args = { value: Bool() }",
+      outcome: "incompatible",
+    },
+    {
+      name: "widened map results",
+      namespace: "returns",
+      body: "let input = Array(Num()); let output = Array(Str()); input.$map(() => { ENTRY }, output);",
+      binding: "span.result",
+      target: 'returns = { value: Enum(["a"]) }',
+      outcome: "accepted",
+    },
+    {
+      name: "narrowed map results",
+      namespace: "returns",
+      body: 'let input = Array(Num()); let output = Array(Enum(["a"])); input.$map(() => { ENTRY }, output);',
+      binding: "span.result",
+      target: "returns = { value: Str() }",
+      outcome: "incompatible",
+    },
+  ])(
+    "compose.typed-binding local and imported enforcers agree on $name",
+    ({ namespace, parameters, body, binding, target, outcome }) => {
+      for (const entry of ["$enter", "$enterLoop"]) {
+        const action = `${entry}(newcopy(Op), { ${namespace}: { value: ${binding} }, ${entry === "$enterLoop" ? "resolveWhen: () => true" : ""} });`;
+        const targetSource = `function Op(${target}) {}`;
+        const source = (imported: boolean) => `
+"arc";
+${imported ? 'import { Op } from "op-arc";' : ""}
+function Main(${parameters ?? ""}) {
+  ${body.replace("ENTRY", action)}
+  ${imported ? "" : targetSource}
+}
+`;
+        if (outcome === "accepted") {
+          expect(() =>
+            new Runtime().add("local", parse(source(false))).init(),
+          ).not.toThrow();
+        } else {
+          const code =
+            outcome === "incompatible"
+              ? "ENTER_CHANNEL_INCOMPATIBLE"
+              : namespace === "args"
+                ? "UNDECLARED_ARGS_KEY"
+                : "UNDECLARED_RETURNS_KEY";
+          expect(() => parse(source(false))).toThrow(code);
+        }
+
+        const caller = parse(source(true));
+        const callee = parse(`"arc"; ${targetSource}`);
+        for (const targetFirst of [false, true]) {
+          const runtime = new Runtime();
+          const documents = [
+            ["caller", caller],
+            ["op-arc", callee],
+          ] as const;
+          for (const [name, document] of targetFirst
+            ? [...documents].reverse()
+            : documents) {
+            runtime.add(name, document);
+          }
+          if (outcome === "accepted") {
+            expect(() => runtime.init()).not.toThrow();
+          } else {
+            const error = registrationError(() => runtime.init());
+            expect(error.operation).toBe("init");
+            expect(error.issues).toEqual([
+              expect.objectContaining({
+                phase: "registry",
+                code:
+                  outcome === "incompatible"
+                    ? "ENTER_CHANNEL_INCOMPATIBLE"
+                    : "ENTER_CHANNEL_UNDECLARED",
+                target: "Op",
+                namespace,
+                key: "value",
+              }),
+            ]);
+          }
+        }
+      }
+    },
+  );
+
   it("rejects channel keys absent from an imported target signature", () => {
     const document = parse(`
 "arc";
@@ -247,6 +442,80 @@ function Main() {
     expect(() =>
       new Runtime().add("caller", document).add("op-arc", op()).init(),
     ).toThrow(/ENTER_CHANNEL_UNDECLARED/);
+  });
+
+  it("compose.typed-binding rejects every undeclared imported binding before execution", () => {
+    for (const entry of ["$enter", "$enterLoop"]) {
+      const document = parse(`
+"arc";
+import { Op } from "op-arc";
+function Main() {
+  let input = Bool();
+  let output = Bool();
+  if (false) {
+    ${entry}(Op, {
+      args: { input },
+      returns: { output },
+      ${entry === "$enterLoop" ? "resolveWhen: () => true" : ""}
+    });
+  }
+}
+`);
+      const branch = document.roots[0]!.statements[0]!;
+      if (branch.kind !== "if") throw new Error("Expected branch");
+      const action = branch.consequent[0]!;
+      if (action.kind !== "enter-node" && action.kind !== "enter-loop") {
+        throw new Error("Expected entry");
+      }
+      action.args = {
+        ...action.args,
+        constructor: { kind: "cell" as const, cell: "input" },
+      };
+      for (const parameters of [
+        "",
+        "args = {}, returns = {}",
+        "args = { other: Bool() }",
+      ]) {
+        const target = parse(`"arc"; function Op(${parameters}) {}`);
+        for (const targetFirst of [false, true]) {
+          const runtime = new Runtime();
+          const documents = [
+            ["caller", document],
+            ["op-arc", target],
+          ] as const;
+          for (const [source, value] of targetFirst
+            ? [...documents].reverse()
+            : documents) {
+            runtime.add(source, value);
+          }
+          const error = registrationError(() => runtime.init());
+          expect(error.operation).toBe("init");
+          expect(error.issues).toHaveLength(3);
+          expect(error.issues).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                code: "ENTER_CHANNEL_UNDECLARED",
+                namespace: "args",
+                key: "input",
+              }),
+              expect.objectContaining({
+                code: "ENTER_CHANNEL_UNDECLARED",
+                namespace: "args",
+                key: "constructor",
+              }),
+              expect.objectContaining({
+                code: "ENTER_CHANNEL_UNDECLARED",
+                namespace: "returns",
+                key: "output",
+              }),
+            ]),
+          );
+          expect(() =>
+            runtime.add("extra", parse('"arc"; function Extra() {}')),
+          ).not.toThrow();
+        }
+      }
+    }
   });
 
   it("carries map receiver and result element specs into imported bindings", () => {

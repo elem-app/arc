@@ -109,6 +109,30 @@ function Other() {
     });
   });
 
+  it("proto.arc-entry enters an Arc whose omitted trigger leaves it unmatched", () => {
+    const runtime = new Runtime()
+      .add(
+        "direct-omitted-trigger",
+        parse('"arc"; function Main() { $instruct(`direct entry`); }'),
+      )
+      .init();
+    const ref = arc("direct-omitted-trigger", "Main");
+    const trigger = runtime.startTrigger([], EMPTY_DIALOG);
+    expect(trigger.matched).toBeUndefined();
+    expect(trigger.matchableArcs).toEqual([]);
+    expect(trigger.traversals).toEqual([]);
+
+    const brief = actionProgress(runtime.enterArc(ref, EMPTY_DIALOG));
+    expect(brief.instructions.map((item) => item.text)).toEqual([
+      "direct entry",
+    ]);
+    expect(rootTraversal(brief)).toMatchObject({
+      ref,
+      phase: "entered",
+      enterCount: 1,
+    });
+  });
+
   it("proto.arc-entry reaches the same first frontier as trigger selection", () => {
     const source = `
 "arc";

@@ -32,6 +32,72 @@ import {
 
 describe("hooks", () => {
   describe("hook.trigger-eval", () => {
+    it.each([false, true])(
+      "hook.trigger-eval leaves an omitted trigger unmatched with explicit scope %s",
+      (scoped) => {
+        const runtime = new Runtime()
+          .add("omitted-trigger", parse('"arc"; function Main() {}'))
+          .init();
+        const ref = arc("omitted-trigger", "Main");
+        const traversal = runtime.newTraversal(ref);
+        const brief = startTrigger(runtime, EMPTY_DIALOG, [traversal], {
+          arcRefs: scoped ? [ref] : undefined,
+        });
+
+        expect(brief.matched).toBeUndefined();
+        expect(brief.matchableArcs).toEqual([]);
+        expect(brief.judgments).toEqual([]);
+        expect(brief.observations).toEqual([]);
+        expect(brief.hostCalls).toEqual([]);
+        expect(brief.issues).toEqual([]);
+        expect(brief.traversals).toEqual([traversal]);
+        expect(brief.traversals[0]).toMatchObject({
+          phase: "dormant",
+          enterCount: 0,
+        });
+
+        const rejected = runtime.progressTrigger(
+          brief,
+          { preferredMatch: ref },
+          EMPTY_DIALOG,
+        );
+        expect(rejected.matched).toBeUndefined();
+        expect(rejected.matchableArcs).toEqual([]);
+        expect(rejected.traversals).toEqual([traversal]);
+        expect(rejected.issues).toEqual([
+          expect.objectContaining({
+            kind: "invalid-report",
+            reasonCode: "unknown-trigger-match",
+          }),
+        ]);
+      },
+    );
+
+    it("hook.trigger-eval selects an explicit true trigger beside an omitted trigger", () => {
+      const runtime = new Runtime()
+        .add(
+          "explicit-trigger",
+          parse(`
+"arc";
+function Manual() {}
+function Automatic() {
+  this.trigger = () => true;
+}
+`),
+        )
+        .init();
+
+      const brief = startTrigger(runtime, EMPTY_DIALOG);
+      expect(brief.matched).toBe(arc("explicit-trigger", "Automatic"));
+      expect(brief.issues).toEqual([]);
+      expect(brief.traversals).toHaveLength(1);
+      expect(brief.traversals[0]).toMatchObject({
+        ref: arc("explicit-trigger", "Automatic"),
+        phase: "entered",
+        enterCount: 1,
+      });
+    });
+
     it("builds a trigger brief and yields an owned child as the active traversal", () => {
       const document = parse(METAL_SOURCE);
       const runtime = new Runtime().add("metal-arc", document).init();

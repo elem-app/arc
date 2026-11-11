@@ -431,7 +431,7 @@ export function runTrigger(
   accum: Accumulator,
   tape: PinTape,
 ): boolean {
-  if (!node.trigger) return true;
+  if (!node.trigger) return false;
 
   // The trigger consultation's pin tape is call-state supplied by the trigger
   // brief chain (per candidate), not traversal state — a process restart

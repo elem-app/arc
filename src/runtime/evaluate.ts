@@ -61,7 +61,11 @@ import type {
   UnsetAction,
   ValueExpression,
 } from "../types/ir.js";
-import { fieldDeclarationAt, isSettableCell } from "../types/ir.js";
+import {
+  fieldDeclarationAt,
+  getChannelSpec,
+  isSettableCell,
+} from "../types/ir.js";
 import {
   isArcRef,
   qualifiedBriefSite,
@@ -828,7 +832,7 @@ export function applySetReturn(
   // A return write validates against the child's own declared returns schema,
   // never the caller sink: a declared-unbound return stages locally and is
   // discarded at enter resolution, so no sink is resolved here.
-  const declared = node.signature?.returns[statement.key];
+  const declared = getChannelSpec(node.signature, "returns", statement.key);
   if (!declared) {
     throw runtimeError(
       "unknown-channel-key",
@@ -1975,9 +1979,11 @@ function readReceiverState(
     }
     case "channel":
       return {
-        spec: nodeForTraversal(traversal, accum)?.signature?.[
-          receiver.namespace
-        ][receiver.key],
+        spec: getChannelSpec(
+          nodeForTraversal(traversal, accum)?.signature,
+          receiver.namespace,
+          receiver.key,
+        ),
         state: readChannelValue(
           traversal,
           receiver.namespace,
@@ -2065,7 +2071,7 @@ export function channelIsDeclared(
   accum: Accumulator,
 ): boolean {
   const signature = nodeForTraversal(traversal, accum)?.signature;
-  return signature ? key in signature[namespace] : false;
+  return getChannelSpec(signature, namespace, key) !== undefined;
 }
 
 export function readChannelValue(
@@ -2074,21 +2080,20 @@ export function readChannelValue(
   key: string,
   accum: Accumulator,
 ): CellValue | undefined {
+  if (!channelIsDeclared(traversal, namespace, key, accum)) {
+    throw runtimeError(
+      "unknown-channel-key",
+      `Unknown ${namespace} channel key "${key}" for ${formatRef(traversalToNodeRef(traversal))}`,
+    );
+  }
   const channelState = traversal.enterChannels;
   if (namespace === "returns" && key in channelState.stagedReturns) {
     return cloneCellValue(channelState.stagedReturns[key]);
   }
   const link = channelState[namespace][key];
   if (!link) {
-    // A declared-but-unbound channel reads as an unset cell; only an undeclared
-    // key is an error.
-    if (channelIsDeclared(traversal, namespace, key, accum)) {
-      return undefined;
-    }
-    throw runtimeError(
-      "unknown-channel-key",
-      `Unknown ${namespace} channel key "${key}" for ${formatRef(traversalToNodeRef(traversal))}`,
-    );
+    // A declared-but-unbound channel reads as an unset cell.
+    return undefined;
   }
   if (link.kind === "value") {
     return cloneCellValue(link.value);

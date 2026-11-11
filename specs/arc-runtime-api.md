@@ -57,7 +57,7 @@ Expected document and registry incoherence is reported through `RuntimeRegistrat
 
 **`add(source, document)`** — validate and collect one document. `source` is the filename stem (e.g. `"heavy-metal"`). The runtime keeps a private copy, so the caller's object is not mutated and later caller mutation does not change runtime behavior. Hand-built IR may omit element IDs.
 
-`add()` performs every document-local and host-module check: document grammar, semantic validity, every imported host module and action path, exact operation arity, compatible parameter operands, and satisfaction of each consumer's result demand. An action consumer creates no result demand. It does not require imported Arc documents to have been added yet.
+`add()` performs every document-local and host-module check: document grammar, semantic validity, channel uses and local entry bindings, every imported host module and action path, exact operation arity, compatible parameter operands, and satisfaction of each consumer's result demand. An action consumer creates no result demand. It does not require imported Arc documents to have been added yet.
 
 `add()` is atomic. A failed call, including a duplicate source or Arc ref, collects nothing. A document that fails grammar or semantic validation is not checked against host modules, so fixing it may reveal further issues.
 
@@ -144,7 +144,7 @@ The stable causes for runtime-initiated poison are:
 | `invalid-enum-value` | A value written to `Enum` is not one of its declared values. |
 | `unknown-cell` | Runtime evaluation cannot resolve the cell targeted by `$set()`, `$unset()`, `$observe()`, or an internal write. Validated documents should normally prevent this. |
 | `invalid-observation-target` | Runtime evaluation reaches `$observe()`, `$observeOrAsk()`, or a grouped `$observe({ ... })` field with a non-observable cell such as `Dialog.Cursor`. Validated documents should normally prevent this. |
-| `unknown-channel-key` | An `args.*` or `returns.*` key is read or written that the node does not declare. A declared key the caller leaves unbound is legal. |
+| `unknown-channel-key` | An undeclared `args` or `returns` channel reached evaluation despite validation. |
 | `invalid-channel-binding` | A wired channel points to a caller cell or owner traversal that no longer exists. |
 | `invalid-return-value` | A `returns.*.$set()` value has the wrong value shape, or violates an `Index()` channel's non-negative-safe-integer refinement. |
 | `invalid-array-literal` | An array literal element is not a valid value. |

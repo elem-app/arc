@@ -233,15 +233,16 @@ describe("grouped observation contexts", () => {
     },
   );
 
-  it.each([...HOOKS_WITHOUT_ASK])(
+  it.each([
+    ["trigger", "Unsupported this.trigger call"],
+    ["guard", "Unsupported this.guard call"],
+    ["effects", "observeOrAsk() is forbidden inside this.effects"],
+    ["instruction resolveWhen", "Unsupported $instructLoop().resolveWhen call"],
+    ["instruction deflectWhen", "Unsupported $instruct().deflectWhen call"],
+    ["enterLoop resolveWhen", "Unsupported $enterLoop().resolveWhen call"],
+  ] as const)(
     "act.observe-group rejects observeOrAsk in %s",
-    (context) => {
-      const message =
-        context === "effects"
-          ? /observeOrAsk\(\) is forbidden inside this\.effects/
-          : context === "guard"
-            ? /Unsupported this\.guard call/
-            : /Unsupported this\.trigger call/;
+    (context, message) => {
       expect(() => parse(contextSource(context, "observeOrAsk").main)).toThrow(
         message,
       );

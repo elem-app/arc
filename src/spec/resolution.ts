@@ -1,6 +1,7 @@
 import type {
   ArrayReference,
   Cell,
+  ChannelNamespace,
   ComparisonOperator,
   FieldReceiver,
   FmtConfig,
@@ -10,6 +11,7 @@ import type {
   SemanticString,
   ValueExpression,
 } from "../types/ir.js";
+import { getChannelSpec } from "../types/ir.js";
 import {
   cellSpecToChannelSpec,
   fieldSpecAt,
@@ -412,6 +414,17 @@ export function reusableSpecCompatible(
   return true;
 }
 
+/** Checks a binding with the provider/receiver direction of its namespace. */
+export function channelBindingCompatible(
+  namespace: ChannelNamespace,
+  callerSpec: ChannelSpec,
+  targetSpec: ChannelSpec,
+): boolean {
+  return namespace === "args"
+    ? reusableSpecCompatible(callerSpec, targetSpec)
+    : reusableSpecCompatible(targetSpec, callerSpec);
+}
+
 function sameFieldNames(
   left: Record<string, unknown>,
   right: Record<string, unknown>,
@@ -505,7 +518,11 @@ export function resolveProducer(
         : { kind: "dynamic" };
     }
     case "channel": {
-      const spec = context.signature?.[expression.namespace][expression.key];
+      const spec = getChannelSpec(
+        context.signature,
+        expression.namespace,
+        expression.key,
+      );
       return spec
         ? { kind: "fact", fact: { kind: "site", spec } }
         : { kind: "dynamic" };
@@ -2282,7 +2299,11 @@ export function resolveReferenceSpec(
   context: ProducerContext,
 ): ChannelSpec | undefined {
   if (reference.kind === "channel") {
-    return context.signature?.[reference.namespace][reference.key];
+    return getChannelSpec(
+      context.signature,
+      reference.namespace,
+      reference.key,
+    );
   }
   if (reference.kind === "cell") {
     const cell = findCell(context, reference.name);

@@ -30,7 +30,7 @@ import type {
   Statement,
   ValidationIssue,
 } from "../types/ir.js";
-import { mapResultsLabel } from "../types/ir.js";
+import { getChannelSpec, mapResultsLabel } from "../types/ir.js";
 import {
   isArcRef,
   toArcRef,
@@ -406,9 +406,8 @@ export class Runtime {
     this.#assertInitialized();
     const entry = this.#getEntry(arc);
     const traversal = restartTraversal(entry);
-    const declaredArgs = entry.root.signature?.args ?? {};
     for (const [key, value] of Object.entries(options.args ?? {})) {
-      const spec = declaredArgs[key];
+      const spec = getChannelSpec(entry.root.signature, "args", key);
       if (!spec) {
         throw new Error(
           `Unknown args channel key "${key}" for direct Arc entry: ${formatRef(arc)}`,
@@ -668,7 +667,7 @@ function assertPersistedTraversalValues(
       for (const [key, link] of Object.entries(
         traversal.enterChannels[namespace],
       )) {
-        const spec = signature?.[namespace][key];
+        const spec = getChannelSpec(signature, namespace, key);
         if (!spec) {
           throw new Error(
             `Persisted traversal contains undeclared ${namespace}.${key} binding for ${formatRef(traversal.ref)}`,
@@ -686,7 +685,7 @@ function assertPersistedTraversalValues(
     for (const [key, value] of Object.entries(
       traversal.enterChannels.stagedReturns,
     )) {
-      const spec = signature?.returns[key];
+      const spec = getChannelSpec(signature, "returns", key);
       if (!spec) {
         throw new Error(
           `Persisted traversal contains undeclared staged returns.${key} for ${formatRef(traversal.ref)}`,
@@ -810,7 +809,7 @@ function assertPersistedActionState(
       );
     }
     for (const [key, value] of Object.entries(state.stagedReturns)) {
-      const spec = target.signature?.returns[key];
+      const spec = getChannelSpec(target.signature, "returns", key);
       if (!spec) {
         throw invalidPersistedState(
           `${state.kind} state contains undeclared staged returns.${key}`,
@@ -1041,7 +1040,7 @@ function assertPersistedSnapshot(
   const expectedChannels = new Map<string, ChannelSpec>();
   for (const channel of plan.channels) {
     const key = `${channel.namespace}.${channel.key}`;
-    const spec = node.signature?.[channel.namespace][channel.key];
+    const spec = getChannelSpec(node.signature, channel.namespace, channel.key);
     if (!spec) {
       throw invalidPersistedState(
         `pre-snapshot channel ${key} has no registered authority`,
