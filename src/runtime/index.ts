@@ -965,10 +965,20 @@ function assertPersistedMapState(
     );
   }
   assertPersistedAdmitted("$map pinned input", receiver, map.pinnedInput);
+  if (
+    !Number.isSafeInteger(map.nextIndex) ||
+    map.nextIndex < 0 ||
+    map.nextIndex >= map.pinnedInput.length
+  ) {
+    throw invalidPersistedState("$map cursor must identify a pending member");
+  }
+  if (!Array.isArray(map.terminals)) {
+    throw invalidPersistedState("$map terminals must be an array");
+  }
 
   if (action.results === undefined) {
     if (
-      map.terminals.some((value) => value !== undefined) ||
+      map.terminals.length !== 0 ||
       map.staged?.set === true ||
       map.staged?.value !== undefined
     ) {
@@ -979,6 +989,14 @@ function assertPersistedMapState(
     return;
   }
 
+  if (
+    map.terminals.length > map.nextIndex ||
+    (!action.skipUnset && map.terminals.length !== map.nextIndex)
+  ) {
+    throw invalidPersistedState(
+      "$map retained output count does not match the completed members",
+    );
+  }
   const result = lexical(
     typeof action.results === "string"
       ? { kind: "cell", name: action.results }
@@ -990,9 +1008,7 @@ function assertPersistedMapState(
     );
   }
   for (const [index, value] of map.terminals.entries()) {
-    if (value !== undefined) {
-      assertPersistedAdmitted(`$map terminal[${index}]`, result.element, value);
-    }
+    assertPersistedAdmitted(`$map terminal[${index}]`, result.element, value);
   }
   if (map.staged?.set) {
     if (map.staged.value === undefined) {

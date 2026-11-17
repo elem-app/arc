@@ -940,13 +940,25 @@ function statement(role: Body): Rule {
       kind: oneOf("invoke"),
       body: body("action"),
     }),
-    map: stmt<"map">({
-      ...meta,
-      kind: oneOf("map"),
-      receiver: arrayReference,
-      results: optional(mapResults),
-      body: body("action"),
-    }),
+    map: refine(
+      stmt<"map">({
+        ...meta,
+        kind: oneOf("map"),
+        receiver: arrayReference,
+        results: optional(mapResults),
+        skipUnset: optional(oneOf(true)),
+        body: body("action"),
+      }),
+      (value, path, issues) => {
+        const action = value as IR.MapAction;
+        if (action.skipUnset && action.results === undefined)
+          issue(
+            issues,
+            fieldPath(path, "results"),
+            "skipUnset requires a results target",
+          );
+      },
+    ),
     "host-call": expressionRules["host-call"],
   } satisfies Record<AnyStatement["kind"], Rule>;
   const allowed =

@@ -451,7 +451,7 @@ Transitions surface only during the action stage; trigger probing evaluates agai
 
 ### Work Items
 
-Each work item identifies its request with `id` and its source node with `sourceRef`. Work from an `invoke(() => { ... })` body or an `arr.$map(callback, results?)` callback carries the enclosing node's ref, while an `$enter(newcopy(...))` inside a callback briefs under the entered copy. Match reports to briefs by id rather than interpreting the ref. Alongside work-specific inputs, it carries `hostParams`. Action-stage work also carries optional `guidance?: SemanticText` rendered from that node's `this.guidance`; trigger work neither evaluates nor carries guidance. The host applies guidance as standing context; observation groups share it across their fields. Undeclared guidance is absent, and an explicitly empty string is preserved.
+Each work item identifies its request with `id` and its source node with `sourceRef`. Work from an `invoke(() => { ... })` body or a `$map` or `$filterMap` callback carries the enclosing node's ref, while an `$enter(newcopy(...))` inside a callback briefs under the entered copy. Match reports to briefs by id rather than interpreting the ref. Alongside work-specific inputs, it carries `hostParams`. Action-stage work also carries optional `guidance?: SemanticText` rendered from that node's `this.guidance`; trigger work neither evaluates nor carries guidance. The host applies guidance as standing context; observation groups share it across their fields. Undeclared guidance is absent, and an explicitly empty string is preserved.
 
 #### Semantic Text
 

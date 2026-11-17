@@ -813,7 +813,8 @@ export type InvokeAction = {
  * `arr.$map(callback, results?)`: a `$` resolved-once action that reads one
  * pinned input array, runs its callback once per element, and (when `results`
  * is bound) commits one constructed output array in a single write when it
- * resolves. It never writes its receiver.
+ * resolves. The result-producing `$filterMap` sets `skipUnset` to collect only
+ * members that wrote `span.result`. Both forms may target the receiver.
  *
  * `receiver` is the input array — a lexical array cell, a typed read-only
  * array channel, or an array field of either. `results` is the output array
@@ -826,10 +827,12 @@ export type MapAction = {
   id: ElementId;
   kind: "map";
   receiver: ArrayReference;
-  results?: MapResultsTarget;
   body: Statement[];
   loc?: SourceRange;
-};
+} & (
+  | { results?: MapResultsTarget; skipUnset?: never }
+  | { results: MapResultsTarget; skipUnset: true }
+);
 
 /** Any executable action statement in a node body. */
 export type ActionStatement =

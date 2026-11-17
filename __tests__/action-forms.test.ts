@@ -7,6 +7,7 @@
  */
 import { describe, expect, it } from "vitest";
 
+import { hmd } from "../src/host-utils/index.js";
 import { parse } from "../src/parser/index.js";
 import { applyUnset } from "../src/runtime/evaluate.js";
 import { createArtifactValue } from "../src/runtime/index.js";
@@ -1511,6 +1512,45 @@ function Main() {
   });
 
   describe("act.host-call", () => {
+    it("dispatches map and filterMap operations on host imports", () => {
+      const hostModules = new Map([
+        [
+          "sample",
+          hmd.define({
+            map: (key = hmd.Num()) => {},
+            group: { filterMap: (key = hmd.Num()) => {} },
+          }),
+        ],
+      ]);
+      const document = parse(`
+        "arc"; import Host from "host:sample";
+        function Main() {
+          Host.$map(4);
+          Host.group.$filterMap(1);
+        }`);
+      const runtime = new Runtime({ hostModules })
+        .add("host-map", document)
+        .init();
+      const root = runtime.newTraversal(arc("host-map", "Main"));
+      root.phase = "entered";
+      const first = startRun(runtime, [root], EMPTY_DIALOG);
+      expect(first.hostCalls).toMatchObject([
+        { module: "sample", target: [], operation: "map", arguments: [4] },
+      ]);
+      const second = progressBrief(runtime, first, {
+        move: "proceed",
+        hostCalls: resolvedHostCalls(first),
+      });
+      expect(second.hostCalls).toMatchObject([
+        {
+          module: "sample",
+          target: ["group"],
+          operation: "filterMap",
+          arguments: [1],
+        },
+      ]);
+    });
+
     it("uses the declaration to distinguish Artifact and object-shaped arguments", () => {
       const document = parse(`
 "arc";

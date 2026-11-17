@@ -226,10 +226,12 @@ export type ActionStatus = "pending" | "resolved";
 
 /**
  * The pending `$map` arena: the pinned input read once at first reach, and the
- * index-keyed member table driving sequential member execution.
+ * retained results from sequential member execution.
  *
  * Members `[0, nextIndex)` are terminal, their validated `span.result` held in
- * `terminals`. The member at `nextIndex` is in-progress or not yet started; its
+ * `terminals` in input order. Effects-only maps leave `terminals` empty, and
+ * result-producing maps with `skipUnset` omit skipped members.
+ * The member at `nextIndex` is in-progress or not yet started; its
  * `span.result` accumulates in `staged` until it terminalizes, whereupon it
  * moves to `terminals` and `nextIndex` advances. When `nextIndex` reaches the
  * input length every member is terminal and the action resolves. `results` is
@@ -240,8 +242,10 @@ export type MapActionState = {
   pinnedInput: ArrayValue;
   results?: string;
   nextIndex: number;
-  terminals: (ArrayElementValue | undefined)[];
-  staged?: { set: boolean; value?: ArrayElementValue };
+  terminals: ArrayValue;
+  staged?:
+    | { set: false; value?: never }
+    | { set: true; value: ArrayElementValue };
 };
 
 /**

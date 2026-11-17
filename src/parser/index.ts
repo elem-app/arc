@@ -119,6 +119,7 @@ import {
   getMemberTarget,
   getThisProperty,
   locOf,
+  matchHostMemberReference,
   parseArrayReference,
   parseArtifactConstructCall,
   parseCellTarget,
@@ -2431,10 +2432,13 @@ function parseActionExpression(
       expression.callee.type === "MemberExpression" &&
       !expression.callee.computed &&
       expression.callee.property.type === "Identifier" &&
-      expression.callee.property.name === "$map"
+      (expression.callee.property.name === "$map" ||
+        expression.callee.property.name === "$filterMap") &&
+      !matchHostMemberReference(expression.callee, availableHostModules)
     ) {
       return parseMapCall(
         expression,
+        expression.callee.property.name,
         availableImports,
         visibleNodeNames,
         visibleCellNames,
@@ -2502,7 +2506,7 @@ function parseSetSpanCall(
 }
 
 /**
- * Parses `receiver.$map(callback, results?)` into a `MapAction`. The receiver is
+ * Parses `$map` and `$filterMap` into a `MapAction`. The receiver is
  * an array cell, a typed array channel, or a struct field of either; the
  * callback is a zero-arg arrow parsed under the invoke dialect in the enclosing
  * node's scope; `results`, when present, is an output array cell or a struct
@@ -2510,6 +2514,7 @@ function parseSetSpanCall(
  */
 function parseMapCall(
   expression: acorn.CallExpression,
+  method: "$map" | "$filterMap",
   availableImports: Set<string>,
   visibleNodeNames: Set<string>,
   visibleCellNames: Set<string>,
@@ -2523,34 +2528,34 @@ function parseMapCall(
     callee.computed ||
     callee.object.type === "Super"
   ) {
-    throw new Error("$map must be called as receiver.$map(...)");
+    throw new Error(`${method} must be called as receiver.${method}(...)`);
   }
   const receiver = parseArrayReference(callee.object, availableHostModules);
   if (!receiver) {
     throw new Error(
-      "$map receiver must be an array cell, a typed array channel, or a Struct field",
+      `${method} receiver must be an array cell, a typed array channel, or a Struct field`,
     );
   }
 
   const [arrow, resultsArg, ...rest] = expression.arguments;
   if (!arrow || rest.length > 0) {
-    throw new Error("$map takes a callback and an optional results cell");
+    throw new Error(`${method} takes a callback and an optional results cell`);
   }
   if (arrow.type === "FunctionExpression") {
     throw new Error(
-      "$map callback must be a zero-arg arrow function, not a function expression",
+      `${method} callback must be a zero-arg arrow function, not a function expression`,
     );
   }
   if (arrow.type !== "ArrowFunctionExpression") {
-    throw new Error("$map callback must be a zero-arg arrow function");
+    throw new Error(`${method} callback must be a zero-arg arrow function`);
   }
   if (arrow.params.length > 0) {
-    throw new Error("A $map callback cannot declare parameters");
+    throw new Error(`A ${method} callback cannot declare parameters`);
   }
 
   let results: MapResultsTarget | undefined;
   if (resultsArg) {
-    results = parseMapResults(resultsArg, availableHostModules);
+    results = parseMapResults(resultsArg, availableHostModules, method);
   }
 
   const receiverSpec = scopedReferenceSpec(receiver);
@@ -2572,7 +2577,9 @@ function parseMapCall(
     id: UNSTAMPED_ID,
     kind: "map",
     receiver,
-    results,
+    ...(method === "$filterMap" && results !== undefined
+      ? { results, skipUnset: true as const }
+      : { results }),
     body,
     loc: locOf(expression),
   };
@@ -2626,6 +2633,7 @@ function parseMapCallback(
 function parseMapResults(
   node: acorn.Expression | acorn.SpreadElement,
   availableHostModules: Map<string, string>,
+  method: "$map" | "$filterMap",
 ): MapResultsTarget {
   if (node.type === "Identifier" && !availableHostModules.has(node.name)) {
     return node.name;
@@ -2635,7 +2643,9 @@ function parseMapResults(
       ? parseFieldReference(node, availableHostModules)
       : undefined;
   if (field?.receiver.kind === "cell") return field;
-  throw new Error("$map results must be an array cell or a Struct cell field");
+  throw new Error(
+    `${method} results must be an array cell or a Struct cell field`,
+  );
 }
 
 /**
@@ -5404,7 +5414,7 @@ function checkMapCallbackBody(
         case "map":
           issues.push({
             code: "MAP_NESTED",
-            message: "$map cannot be nested inside a $map callback",
+            message: "Map callbacks cannot contain $map or $filterMap",
             loc: statement.loc,
           });
           break;
@@ -5420,8 +5430,7 @@ function checkMapCallbackBody(
           if (!hasResults && spanResultBinding(statement.returns)) {
             issues.push({
               code: "MAP_SPAN_RESULT_NO_RESULTS",
-              message:
-                "span.result is unavailable in a $map without a results binding",
+              message: "span.result requires a results binding",
               loc: statement.loc,
             });
           }
@@ -5473,8 +5482,7 @@ function checkMapCallbackBody(
           if (!hasResults) {
             issues.push({
               code: "MAP_SPAN_RESULT_NO_RESULTS",
-              message:
-                "span.result is unavailable in a $map without a results binding",
+              message: "span.result requires a results binding",
               loc: statement.loc,
             });
           }

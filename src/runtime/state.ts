@@ -526,21 +526,13 @@ function cloneMapActionState(map: MapActionState): MapActionState {
     pinnedInput,
     results: map.results,
     nextIndex: map.nextIndex,
-    terminals: map.terminals.map((value) =>
-      value === undefined
-        ? undefined
-        : (cloneCellValue(value) as ArrayElementValue),
-    ),
-    staged: map.staged
+    terminals: cloneCellValue(map.terminals) as ArrayValue,
+    staged: map.staged?.set
       ? {
-          set: map.staged.set,
-          ...(map.staged.value === undefined
-            ? {}
-            : {
-                value: cloneCellValue(map.staged.value) as ArrayElementValue,
-              }),
+          set: true,
+          value: cloneCellValue(map.staged.value) as ArrayElementValue,
         }
-      : undefined,
+      : map.staged && { set: false },
   };
 }
 

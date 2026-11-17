@@ -234,7 +234,7 @@ Channel bindings are stricter because they carry every future value: a `Str` can
 
 ```js
 let meetingHour = Union([Num(), Enum(["no_preference"])], {
-  observing: `the user's preferred meeting hour, or an explicit lack of preference`,
+  observing: `${user}'s preferred meeting hour, or an explicit lack of preference`,
 });
 let hours = Array(Union([Num(), Enum(["no_preference"])]));
 let request = Struct({ hour: Union([Num(), Enum(["no_preference"])]) });
@@ -457,7 +457,8 @@ Statement forms:
 - `$enter(Target)` — enters a node or arc target.
 - `$enter(Target, { args, returns })` — enters a node or arc target with explicit input/output cell wiring.
 - `$enterLoop(Target, { resolveWhen, args?, returns? })` — repeatedly enters a target until the caller-authored loop condition resolves true.
-- `arr.$map(callback, results?)` — runs a callback once per array element, optionally building a new array. See [Map](#map).
+- `arr.$map(callback, results?)` — runs a callback once per array element, optionally building a new array.
+- `arr.$filterMap(callback, results?)` — collects the outputs of elements that set `span.result`.
 
 Expression-capable forms:
 
@@ -629,9 +630,9 @@ Not supported: `return`, parameters or call arguments, the `function`-expression
 
 #### Map
 
-`arr.$map(callback, results?)` runs a callback once per element of an array. With `results` it builds a new array of the same length; without it the callback runs for its effects only. It is a resolved-once action and never writes its receiver.
+Both `arr.$map(callback, results?)` and `arr.$filterMap(callback, results?)` run a zero-argument callback once per input element. When a results target is supplied, `$map` requires one output per input element and `$filterMap` allows the callback to skip an element. Without a target, both forms run for effects only.
 
-The callback is a zero-argument arrow attached to the `$map`. Inside it, `span` channel names the current element:
+Inside the callback, the `span` channel names the current element:
 
 - `span.item` — the current element's value.
 - `span.index` — the current element's zero-based position.
@@ -656,14 +657,23 @@ input.$map(
 
 The callback admits the same actions as an `invoke` body — control flow, `cell.$set(...)`, observations, instructions, `$enter(...)`, `$enterLoop(...)`, and a nested `invoke(...)`. Every `$enter(...)` target in the callback must be `newcopy(...)`, so each element runs its own copy.
 
-Results and length:
+The receiver may be an array cell, a typed `args` or `returns` array channel, or an array field of a struct cell or channel. The optional `results` target is an array cell or an array field of a set struct cell, such as `request.tags`. It may be the receiver itself. Both actions are resolved once and commit the output to the target in one write, in input order, after every callback completes.
 
-- The receiver may be an array cell, a typed `args`/`returns` array channel, or an array field of a struct cell or channel; `$map` never writes it.
-- `results` is a bare array cell or an array field of a struct cell, such as `request.tags`, whose element type must match what the callback produces. The outputs commit to it in one write, in element order, when the whole `$map` resolves; a field commit writes only that field and requires its struct to be set.
-- With `results` bound, every element must set `span.result`; an element that finishes without one is a runtime error. Referencing `span.result` in a forEach `$map` is a parse error.
-- `$map` preserves length: one output per input, no filtering. `results` may be the receiver itself, replacing it in one write.
+- With a target, a `$map` callback that finishes with `span.result` unset raises a runtime error.
+- With a target, `$filterMap` skips an element whose callback finishes with `span.result` unset. If every input is skipped or the input is empty, the target is set to `[]`, even if it was previously unset.
+- Without a target, referencing `span.result` in either form is a parse error.
 
-The callback may block on an observation, an instruction, or an entered child that waits on the host. Elements run one at a time, and a blocked element resumes where it left off on the next report. A deflection escaping an element aborts the whole `$map`, discarding any outputs earlier elements produced, and reaches the node's `this.catchDeflection`, where `escaped(...)` matches the callback's authored target. Cell writes and host-call actions that earlier elements already resolved stay resolved.
+```js
+input.$set([1, 0, 1, 0]);
+input.$filterMap(() => {
+  if (span.item > 0) {
+    span.result.$set(span.item);
+  }
+}, output);
+// output is [1, 1].
+```
+
+The callback may block on an observation, an instruction, or an entered child that waits on the host. Elements run one at a time, and a blocked element resumes where it left off on the next report. A deflection escaping an element aborts the map action, discarding any outputs earlier elements produced, and reaches the node's `this.catchDeflection`, where `escaped(...)` matches the callback's authored target. Cell writes and host-call actions that earlier elements already resolved stay resolved.
 
 #### Resolution Rules
 
@@ -684,7 +694,7 @@ Different actions and expressions resolve as follows:
 | `judge(...)` and expression-position host calls | Resolves when a host report supplies the result value. |
 | `fmt(value, config?)` | Resolves after the input value is available and formatting succeeds. |
 | `invoke(() => { ... })` | Does not carry resolved-once semantics. Each run treats the `$` actions in its body as unresolved; a blocked run resumes on the next report. |
-| `arr.$map(callback, results?)` | Resolves after the callback has run for every element. With `results`, commits the constructed array in one write. A blocked element resumes on the next report. |
+| `arr.$map(callback, results?)`, `arr.$filterMap(callback, results?)` | Resolves after the callback has run for every element. With `results`, commits the constructed array in one write. A blocked element resumes on the next report. |
 
 ### Host Modules
 
@@ -716,7 +726,7 @@ if (lucky) {
 }
 ```
 
-**Action position** — a host call used for its host-side action. It is accepted anywhere an action statement is accepted, including direct node bodies, nested `if` and label blocks, `invoke(...)`, `$map(...)`, and `this.effects`.
+**Action position** — a host call used for its host-side action. It is accepted anywhere an action statement is accepted, including direct node bodies, nested `if` and label blocks, `invoke(...)`, `$map(...)`, `$filterMap(...)`, and `this.effects`.
 
 ```js
 Memoir.facts.$apply(`${user} survived the tavern brawl`);
@@ -1000,13 +1010,15 @@ A control-transfer target in Arc is one of:
 
 A node may not enter itself in any form: `$enter(...)` and `$enterLoop(...)` are rejected at parse time when the target resolves to the enclosing node, whether bare, `forgetful(...)`, or `newcopy(...)`.
 
-`newcopy(ReferenceName)` requests a blank anonymous copy for the current call. Anonymous copies are non-addressable:
+`newcopy(ReferenceName)` requests a blank anonymous copy of that node or arc for the current call. The copy starts with fresh cells, action progress, and owned child traversals. This applies recursively to nested child nodes: an ordinary `$enter(Child)` inside the copy enters that copy's own fresh child.
+
+Fresh state follows lexical ownership. An ordinary entry of a node outside the copied subtree, or of an imported arc referenced from within it, uses that target's canonical traversal.
+
+Anonymous copies are non-addressable:
 
 - They do not participate in `ReferenceName.state`.
 - They are not queryable from Arc source.
 - They are valid only as direct targets to `$enter(...)` and `$enterLoop(...)`.
-
-For owned child nodes, `newcopy(ReferenceName)` creates a blank anonymous copy of that child for the current call.
 
 For imported arcs, `newcopy(ReferenceName)` creates a blank anonymous copy of the imported arc. This does not reset, replace, or mutate the canonical imported arc managed by the runtime.
 
@@ -1021,6 +1033,30 @@ If an anonymous copy blocks, the same copy resumes for that call. Once the copy 
 - It is valid only as a direct target to `$enter(...)` and `$enterLoop(...)`.
 
 The forgetting happens once when the new entry begins. If that entry blocks, its later report resumes the same traversal without forgetting again. Each continuing `$enterLoop(forgetful(...))` iteration begins another forgetful entry of the canonical target.
+
+The following example compares repeated entries of a parent with an owned child:
+
+```js
+"arc";
+
+function Main() {
+  $enter(newcopy(Parent));
+  $enter(newcopy(Parent));
+  $enter(forgetful(Parent));
+  $enter(forgetful(Parent));
+
+  function Parent() {
+    $instruct(`Run the parent.`);
+    $enter(Child);
+
+    function Child() {
+      $instruct(`Run the child.`);
+    }
+  }
+}
+```
+
+Each `newcopy(Parent)` runs both instructions with fresh state throughout the owned subtree. The first `forgetful(Parent)` enters the canonical parent and child and runs both instructions. The second reruns the parent's instruction while its child remains `COVERED`, so `$enter(Child)` immediately returns that outcome. The same distinction applies across `$enterLoop` iterations: `newcopy(Parent)` gives each iteration fresh parent and child state; `forgetful(Parent)` preserves the child's completed traversal.
 
 ### Control Transfer
 
@@ -1157,7 +1193,7 @@ Channels expose values and operations supplied by an execution context. A node d
 | --- | --- | --- |
 | `args` | Caller bindings for the entered node. | Reads the node's declared inputs. See [Args and Returns](#args-and-returns). |
 | `returns` | The entered node. | Stages declared outputs in `this.effects` for commit on normal entry resolution. See [Args and Returns](#args-and-returns). |
-| `span` | The current `$map` callback. | Reads `item` and `index`; writes `result` when results are bound. See [Map](#map). |
+| `span` | The current `$map` or `$filterMap` callback. | Reads `item` and `index`; writes `result` when results are bound. See [Map](#map). |
 | `Dialog` | Host-provided conversation context. | Supplies participant references, messages, and cursors. |
 | `this.deflection` | `this.catchDeflection` and deflected `this.effects`. | Queries the deflection being finalized. |
 | `this.interruption` | `this.catchInterruption`. | Reads the current interruption's `id` and `reason`. |

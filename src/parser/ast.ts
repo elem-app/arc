@@ -1528,7 +1528,10 @@ export function parseTemplateString(
         parts.push({ kind: "ref", name: participant });
         continue;
       }
-      const hostVar = matchHostVarReference(expression, availableHostModules);
+      const hostVar = matchHostMemberReference(
+        expression,
+        availableHostModules,
+      );
       if (hostVar) {
         parts.push({
           kind: "hostVar",
@@ -1597,7 +1600,7 @@ export function parseSemanticString(
  * member path, or `undefined` when the expression is not a host-module member
  * reference.
  */
-export function matchHostVarReference(
+export function matchHostMemberReference(
   node: acorn.Expression,
   availableHostModules: ReadonlyMap<string, string>,
 ): { module: string; path: string[] } | undefined {

@@ -1913,15 +1913,6 @@ function stepMap(
   // Every member is terminal: construct the output in index order and commit it
   // to `results` in one write (absent for the forEach shape).
   if (statement.results !== undefined) {
-    const output: ArrayValue = arena.terminals.map((value) => {
-      if (value === undefined) {
-        throw runtimeError(
-          "map-missing-result",
-          "$map produced a member with no span.result",
-        );
-      }
-      return value;
-    });
     const root = mapResultsCell(statement.results)!;
     const owner = findCellOwner(root, traversal, accum);
     if (!owner) {
@@ -1933,7 +1924,7 @@ function stepMap(
       owner.traversal,
       owner.cell,
       typeof statement.results === "string" ? [] : statement.results.path,
-      output,
+      arena.terminals,
     );
   }
   clearMapSubtreeState(traversal, statement);
@@ -2000,15 +1991,14 @@ function runMapMember(
 
   const staged = arena.staged;
   if (statement.results !== undefined) {
-    if (!staged?.set) {
+    if (staged?.set) {
+      arena.terminals.push(staged.value);
+    } else if (!statement.skipUnset) {
       throw runtimeError(
         "map-missing-result",
         "$map member completed without setting span.result",
       );
     }
-    arena.terminals[index] = staged.value;
-  } else {
-    arena.terminals[index] = undefined;
   }
   arena.staged = undefined;
   arena.nextIndex = index + 1;

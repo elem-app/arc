@@ -221,6 +221,123 @@ function Main() {
     });
   });
 
+  describe("map.filter-map", () => {
+    it("collects only written results from a serialized filterMap Document", () => {
+      const source = "filter-map-positive";
+      const document = parse(`
+        "arc"; function Main() {
+          let arr1 = Array(Num());
+          let arr2 = Array(Num());
+          arr1.$set([1, 0, 1, 0]);
+          arr1.$filterMap(() => {
+            if (span.item > 0) { span.result.$set(span.item); }
+          }, arr2);
+        }`);
+      const runtime = new Runtime()
+        .add(source, JSON.parse(JSON.stringify(document)))
+        .init();
+      const root = runtime.newTraversal(arc(source, "Main"));
+      root.phase = "entered";
+      expect(
+        rootTraversal(startTerminal(runtime, [root], EMPTY_DIALOG)).cells.arr2,
+      ).toEqual([1, 1]);
+
+      const action = document.roots[0]!.statements.find(
+        (s) => s.kind === "map",
+      )!;
+      expect(action.skipUnset).toBe(true);
+      Reflect.deleteProperty(action, "results");
+      expect(() => new Runtime().add(source, document)).toThrow(
+        /INVALID_DOCUMENT_SHAPE/,
+      );
+    });
+
+    it("commits an empty filterMap result for all-skipped and empty input", () => {
+      for (const [input, initialize] of [
+        ["[0, 0]", ""],
+        ["[]", "out.$set([9]);"],
+      ]) {
+        const { brief } = runTerminal(
+          `
+          "arc"; function Main() {
+            let nums = Array(Num());
+            let out = Array(Num());
+            nums.$set(${input});
+            ${initialize}
+            nums.$filterMap(() => {
+              if (span.item > 0) { span.result.$set(span.item); }
+            }, out);
+          }`,
+          "filter-map-empty",
+        );
+        expect(rootTraversal(brief).cells.out).toEqual([]);
+      }
+    });
+
+    it("runs filterMap without a destination for effects and leaves span.result unbound", () => {
+      const source = (statement: string) => `"arc"; function Main() {
+        let nums = Array(Num());
+        let total = Num();
+        nums.$set([1, 2, 3]);
+        total.$set(0);
+        ${statement}
+      }`;
+      const { brief } = runTerminal(
+        source("nums.$filterMap(() => total.$set(total + span.item));"),
+        "filter-map-effects",
+      );
+      expect(rootTraversal(brief).cells.total).toBe(6);
+      expect(() =>
+        parse(source("nums.$filterMap(() => span.result.$set(span.item));")),
+      ).toThrow(/MAP_SPAN_RESULT_NO_RESULTS/);
+      expect(() =>
+        parse(
+          source('nums.$filterMap(() => span.result.$set("wrong"), nums);'),
+        ),
+      ).toThrow(/SPAN_TYPE/);
+    });
+
+    it("preserves retained zero and input indices across filterMap suspension and deflection", () => {
+      const { runtime, brief } = run(
+        `
+        "arc"; function Main() {
+          let nums = Array(Num());
+          let out = Array(Num());
+          let ready = Bool();
+          nums.$set([1, 0, 1]);
+          out.$set([99]);
+          nums.$filterMap(() => {
+            if (span.index == 2) { $observeOrAsk(ready); }
+            if (span.item > 0) {
+              $enter(newcopy(Op), { args: { i: span.index }, returns: { i: span.result } });
+            }
+          }, out);
+          function Op(args = { i: Index() }, returns = { i: Index() }) {
+            this.effects = () => { returns.i.$set(args.i); };
+          }
+        }`,
+        "filter-map-resume",
+      );
+      expect(rootTraversal(brief).cells.out).toEqual([99]);
+      const restored = actionProgress(
+        runtime.start(
+          JSON.parse(JSON.stringify(brief.traversals)),
+          EMPTY_DIALOG,
+        ),
+      );
+      const done = progressTerminal(runtime, restored, {
+        move: "proceed",
+        observations: {
+          [restored.observations[0]!.id]: { status: "resolved", value: true },
+        },
+      });
+      expect(rootTraversal(done).cells.out).toEqual([0, 2]);
+      const deflected = progressTerminal(runtime, brief, { move: "deflect" });
+      expect(deflected.outcome).toBe("deflected");
+      expect(rootTraversal(deflected).cells.out).toEqual([99]);
+    });
+  });
+
   describe("map.for-each", () => {
     it("runs members for effects and writes no output array when results is omitted", () => {
       const { brief } = runTerminal(
@@ -824,6 +941,38 @@ function Main() {
   });
 
   describe("map.json-restart", () => {
+    it("resumes effects-only map and filterMap after a completed member", () => {
+      for (const method of ["$map", "$filterMap"]) {
+        const { runtime, brief } = run(
+          `"arc"; function Main() {
+            let items = Array(Num());
+            let total = Num();
+            let ready = Bool();
+            items.$set([1, 10]);
+            total.$set(0);
+            items.${method}(() => {
+              if (span.index == 1) { $observeOrAsk(ready); }
+              total.$set(total + span.item);
+            });
+          }`,
+          "effects-only-restart",
+        );
+        expect(rootTraversal(brief).cells.total).toBe(1);
+        const restored = startRun(
+          runtime,
+          JSON.parse(JSON.stringify(brief.traversals)),
+          EMPTY_DIALOG,
+        );
+        const done = progressTerminal(runtime, restored, {
+          move: "proceed",
+          observations: {
+            [restored.observations[0]!.id]: { status: "resolved", value: true },
+          },
+        });
+        expect(rootTraversal(done).cells.total).toBe(11);
+      }
+    });
+
     it("resumes a blocked member across a JSON round-trip with earlier terminals intact", () => {
       const { runtime, brief } = run(
         `
@@ -894,9 +1043,54 @@ function Main() {
         },
         /\$map staged span\.result violates its string guarantee/i,
       ],
+      [
+        "strict result count",
+        (state: MapActionState) => {
+          state.terminals = [];
+        },
+        /Invalid persisted traversal state/,
+      ],
+      [
+        "surplus strict result",
+        (state: MapActionState) => {
+          state.terminals.push("extra");
+        },
+        /Invalid persisted traversal state/,
+      ],
+      [
+        "surplus filtered result",
+        (state: MapActionState) => {
+          state.terminals.push("extra");
+        },
+        /Invalid persisted traversal state/,
+        "$filterMap",
+      ],
+      [
+        "missing retained element",
+        (state: MapActionState) => {
+          delete state.terminals[0];
+        },
+        /Invalid persisted traversal state/,
+      ],
+      [
+        "fractional cursor",
+        (state: MapActionState) => {
+          state.nextIndex = 1.5;
+        },
+        /Invalid persisted traversal state/,
+        "$filterMap",
+      ],
+      [
+        "cursor past the last member",
+        (state: MapActionState) => {
+          state.nextIndex = state.pinnedInput.length;
+        },
+        /Invalid persisted traversal state/,
+        "$filterMap",
+      ],
     ])(
       "rejects a restored arena with an invalid %s before member replay",
-      (_label, corrupt, message) => {
+      (_label, corrupt, message, method = "$map") => {
         const { runtime, brief } = run(
           `
 "arc";
@@ -905,7 +1099,7 @@ function Main() {
   let out = Array(Str());
   let label = Str();
   nums.$set(["p", "q"]);
-  nums.$map(() => {
+  nums.${method}(() => {
     $observeOrAsk(label);
     span.result.$set(label);
   }, out);
