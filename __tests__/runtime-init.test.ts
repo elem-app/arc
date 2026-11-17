@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import { parse } from "../src/parser/index.js";
-import { Runtime, RuntimeRegistrationError } from "../src/runtime/index.js";
+import {
+  Runtime,
+  RuntimeRegistrationError,
+  toNodeRef,
+} from "../src/runtime/index.js";
 
 function registrationError(run: () => unknown): RuntimeRegistrationError {
   let thrown: unknown;
@@ -146,6 +150,41 @@ function Main() {}
     expect(() => runtime.init()).toThrow(/UNRESOLVED_IMPORT/);
     expect(() => runtime.add("op-arc", op())).not.toThrow();
     expect(() => runtime.init()).not.toThrow();
+  });
+
+  it("proto.registration isolates inspected children and copy targets across runtimes", () => {
+    const caller = parse(`"arc"; import { Imported } from "lib";
+      function Main(){ function Child() {} $enter(newcopy(Child)); $enter(newcopy(Imported)); }`);
+    const root = toNodeRef("caller", ["Main"]);
+    const child = toNodeRef("caller", ["Main", "Child"]);
+    const first = new Runtime().add("caller", caller);
+    first.nodeForRef(root)!.children.length = 0;
+    expect(first.nodeForRef(child)?.identifier).toBe("Child");
+    const register = (runtime: Runtime, description: string) =>
+      runtime
+        .add(
+          "lib",
+          parse(
+            `"arc"; function Imported(){this.description = ${JSON.stringify(description)};}`,
+          ),
+        )
+        .init();
+    const second = register(new Runtime().add("caller", caller), "second");
+    register(first, "first");
+    for (const alias of caller.roots[0]!.newcopyAliases) {
+      const ref = toNodeRef("caller", ["Main", alias.identifier]);
+      expect(first.nodeForRef(ref)?.identifier).toBe(alias.target);
+      first.nodeForRef(ref)!.identifier = "changed";
+      expect(first.nodeForRef(ref)?.identifier).toBe(alias.target);
+      if (alias.imported) {
+        expect(first.nodeForRef(ref)?.description).toBe("first");
+        expect(second.nodeForRef(ref)?.description).toBe("second");
+      }
+    }
+    expect(caller.roots[0]!.newcopyAliases).toHaveLength(2);
+    expect(
+      first.nodeForRef(toNodeRef("caller", ["Main", "Missing"])),
+    ).toBeUndefined();
   });
 
   it("reports every independent registry issue in one initialization error", () => {

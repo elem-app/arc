@@ -67,6 +67,8 @@ Initialization commits atomically. A failed `init()` leaves the runtime collecti
 
 **`has(arc)`** — check whether an arc is registered.
 
+**`nodeForRef(ref)`** — return a detached copy of the resolved node, or `undefined` if the reference cannot be resolved.
+
 **`newTraversalSet()`** — create an empty traversal set for a fresh trigger or action session.
 
 **`newTraversal(arc)`** — after initialization, create a fresh arc traversal in the `"dormant"` phase with `enterCount = 0`.

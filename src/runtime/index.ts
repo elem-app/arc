@@ -81,6 +81,7 @@ import {
 } from "./payload.js";
 import {
   arcToNodeRef,
+  cacheInitializedNodes,
   formatRef,
   getEntryForRef,
   getNodeForRef,
@@ -276,6 +277,7 @@ export class Runtime {
     for (const [arc, entry] of resolution.entries) {
       this.#entries.set(arc, entry);
     }
+    cacheInitializedNodes(this.#entries);
     this.#initialized = true;
     return this;
   }
@@ -286,7 +288,8 @@ export class Runtime {
 
   nodeForRef(ref: ArcRef | NodeRef): Node | undefined {
     const entry = getEntryForRef(this.#entries, ref);
-    return entry && getNodeForRef(this.#entries, entry, ref);
+    const node = entry && getNodeForRef(this.#entries, entry, ref);
+    return node && cloneWithCanonicalNumbers(node);
   }
 
   newTraversalSet(): ArcTraversalSet {

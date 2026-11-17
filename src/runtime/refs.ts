@@ -14,6 +14,22 @@ import {
 
 import type { RegistryEntry } from "./state.js";
 
+// Lookup helpers receive the registry, so they use its identity to find the cache here.
+// Runtime.init() installs one cache per registry. The weak key lets it be collected with the registry.
+const resolvedNodes = new WeakMap<
+  ReadonlyMap<ArcRef, RegistryEntry>,
+  Map<RegistryEntry, Map<ArcRef | NodeRef, Node>>
+>();
+
+export function cacheInitializedNodes(
+  entries: ReadonlyMap<ArcRef, RegistryEntry>,
+) {
+  resolvedNodes.set(
+    entries,
+    new Map(Array.from(entries.values(), (entry) => [entry, new Map()])),
+  );
+}
+
 export function rootRefOf(ref: ArcRef | NodeRef): ArcRef {
   if (isArcRef(ref)) return ref;
   const { source, path } = toNodeRefParts(ref);
@@ -65,6 +81,19 @@ export function indexTraversals(
 }
 
 export function getNodeForRef(
+  entries: ReadonlyMap<ArcRef, RegistryEntry>,
+  entry: RegistryEntry,
+  ref: ArcRef | NodeRef,
+): Node | undefined {
+  const cache = resolvedNodes.get(entries)?.get(entry);
+  const cached = cache?.get(ref);
+  if (cached) return cached;
+  const node = resolveNode(entries, entry, ref);
+  if (node) cache?.set(ref, node);
+  return node;
+}
+
+function resolveNode(
   entries: ReadonlyMap<ArcRef, RegistryEntry>,
   entry: RegistryEntry,
   ref: ArcRef | NodeRef,
